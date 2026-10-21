@@ -20,7 +20,7 @@
 
 ```sh
 npm ci
-npm run build      # 生成 service/dist（service.mjs、sfe.mjs、web/）与 extension/dist
+npm run build      # 生成 service/dist（service.mjs、sfe.mjs、web/）、extension/dist 与 extension/dist-harness（仅演示用，不打包）
 npm run check      # 类型检查、离线测试、构建与仓库秘密扫描
 ```
 

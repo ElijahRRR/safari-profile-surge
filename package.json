@@ -18,6 +18,7 @@
     "test": "vitest run",
     "build": "npm run build --workspaces --if-present",
     "check": "npm run typecheck && npm test && npm run build && npm run scan",
+    "demo": "node service/dist/service.mjs --demo --web-root service/dist/web --extension-harness-root extension/dist-harness",
     "scan": "node tools/check/repo-scan.mjs"
   },
   "devDependencies": {
