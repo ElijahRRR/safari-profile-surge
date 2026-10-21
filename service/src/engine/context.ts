@@ -271,8 +271,13 @@ export class Engine {
 
   // ---------- Surge 事实与能力上下文 ----------
 
-  /** 只读 Surge 基础事实（版本、启动时间、当前配置、接管、自动重载）；从不写。 */
+  /**
+   * 只读 Surge 基础事实（版本、启动时间、当前配置、接管、自动重载）；从不写。同时重读本机事实（macOS 构建号、
+   * Safari 版本）：服务常驻运行，Safari 可单独经软件更新升级而不重启，能力门槛（激活前、写入 ACTIVE 前、对账）
+   * 必须按当前版本判定，不能沿用启动时的值。
+   */
   async readBasicFacts(): Promise<SurgeFacts> {
+    await this.refreshHostFacts();
     // 从空事实开始，但清掉“尚未读取”的占位提示：本次读取的结论会重新填写 message。
     const facts: SurgeFacts = {
       ...emptySurgeFacts(),

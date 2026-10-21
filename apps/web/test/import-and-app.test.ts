@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { ImportPreview } from '@sfe/contract';
 import ImportView from '../src/views/ImportView.vue';
 import App from '../src/App.vue';
-import { bytesToBase64, importFormatOf, parseJsonRecords } from '../src/lib/files';
+import { bytesToBase64, importFormatOf } from '../src/lib/files';
 import { createMemoryTokenStore } from '../src/api/session-token';
 import { createConsoleContext } from '../src/store/context';
 import { byText, click, fakeFetch, flush, manualTimers, mountWith, snapshot, testContext, TOKEN, type Call } from './fixtures';
@@ -117,6 +117,27 @@ describe('import page', () => {
     m.unmount();
   });
 
+  it('sends a JSON file unparsed, like CSV/XLSX, so the service importer decides its shape and encoding', async () => {
+    const { ctx, calls } = testContext((c: Call) => (c.url === '/api/imports/preview' ? { status: 200, body: preview() } : NOT_FOUND), snapshot());
+    const m = await mountWith(ImportView, ctx, {}, '/import');
+    // 服务要求的形状 { "environments": [...] }（带 UTF-8 BOM）：网页不得自行拒绝，也不改写内容
+    const text = '\ufeff{"environments":[{"display_name":"US-买家05","proxy_host":"203.0.113.50"}]}';
+    await chooseFile('buyers.json', text);
+    expect(document.body.textContent).not.toContain('读取文件失败');
+    const button = document.body.querySelector<HTMLButtonElement>('[data-test="import-preview"]')!;
+    expect(button.disabled).toBe(false);
+    click(button);
+    await flush();
+    const previewCall = calls.find((c) => c.url === '/api/imports/preview')!;
+    expect(previewCall.body).toEqual({
+      format: 'json',
+      content_base64: bytesToBase64(new TextEncoder().encode(text)),
+      default_front_proxy_id: null,
+      default_site: null,
+    });
+    m.unmount();
+  });
+
   it('rejects unsupported file types without reading them', async () => {
     const { ctx } = testContext(() => NOT_FOUND, snapshot());
     const m = await mountWith(ImportView, ctx, {}, '/import');
@@ -128,14 +149,11 @@ describe('import page', () => {
 });
 
 describe('file helpers', () => {
-  it('detects formats and parses JSON records', () => {
+  it('detects formats', () => {
     expect(importFormatOf('A.CSV')).toBe('csv');
     expect(importFormatOf('a.xlsx')).toBe('xlsx');
+    expect(importFormatOf('b.JSON')).toBe('json');
     expect(importFormatOf('a.xls')).toBeNull();
-    expect(parseJsonRecords('[{"display_name":"x"}]')).toHaveLength(1);
-    expect(parseJsonRecords('{"records":[1,2]}')).toEqual([1, 2]);
-    expect(() => parseJsonRecords('{"x":1}')).toThrow('records');
-    expect(() => parseJsonRecords('nope')).toThrow('不是有效的 JSON');
   });
 
   it('base64-encodes large inputs in chunks', () => {

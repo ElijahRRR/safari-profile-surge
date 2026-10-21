@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { afterEach, describe, expect, test } from 'vitest';
-import { PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, rid, verify, type Harness } from './harness.js';
+import { PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, grantForCurrentHost, rid, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -203,6 +203,22 @@ describe('periodic reconcile is read-only and sticky', () => {
     const route = h.repos.routeState.get();
     expect(route.warnings).toContain('probe_expired');
     expect(route.phase).toBe('active_verified');
+  });
+
+  test('Safari updated while the service keeps running → activation capability stale → entry_unverified, never written', async () => {
+    h = await createHarness();
+    grantForCurrentHost(h, ['safari_process_attribution']);
+    await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get().warnings).not.toContain('entry_unverified');
+    h.host.safariVersion = '19.1';
+    const before = writes();
+    await h.app.runPeriodicReconcile();
+    const route = h.repos.routeState.get();
+    expect(route.warnings).toContain('entry_unverified');
+    expect(route.phase).toBe('attention');
+    expect(writes()).toEqual(before);
+    expect((await h.app.ensureInControl()).ok).toBe(false);
   });
 
   test('an orphaned switching/rolling_back phase (no running owner) → attention + entry_unverified, never written', async () => {

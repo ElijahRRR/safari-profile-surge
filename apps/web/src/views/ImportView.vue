@@ -21,12 +21,12 @@ import { useConsole } from '../store/context';
 import { isApiError } from '../api/client';
 import { newRequestId } from '../lib/request-id';
 import { IMPORT_STATUS_LABELS } from '../lib/labels';
-import { MAX_IMPORT_BYTES, bytesToBase64, formatBytes, importFormatOf, parseJsonRecords, saveText } from '../lib/files';
+import { MAX_IMPORT_BYTES, bytesToBase64, formatBytes, importFormatOf, saveText } from '../lib/files';
 import { formatCount } from '../lib/format';
 
 const { api, store, toasts, viewer } = useConsole();
 
-const file = reactive({ name: '', size: 0, format: null as ImportFormat | null, contentBase64: null as string | null, records: null as unknown[] | null, error: null as string | null });
+const file = reactive({ name: '', size: 0, format: null as ImportFormat | null, contentBase64: null as string | null, error: null as string | null });
 const defaultSite = ref<SiteCode | null>(null);
 const defaultFront = ref<FrontProxyId | null>(null);
 const previewing = ref(false);
@@ -42,7 +42,6 @@ const previewRequest = ref<ImportPreviewRequest | null>(null);
 
 function clearContent() {
   file.contentBase64 = null;
-  file.records = null;
   previewRequest.value = null;
 }
 onBeforeUnmount(clearContent);
@@ -66,28 +65,20 @@ async function onFileChange(event: Event) {
     file.error = `读取文件失败：文件超过 ${formatBytes(MAX_IMPORT_BYTES)}`;
     return;
   }
+  // JSON 与 CSV/XLSX 一样原样发送：由服务的导入器（与 sfe、agent 同一份）判定形状与 UTF-8 编码
   try {
-    if (format === 'json') file.records = parseJsonRecords(await f.text());
-    else file.contentBase64 = bytesToBase64(new Uint8Array(await f.arrayBuffer()));
+    file.contentBase64 = bytesToBase64(new Uint8Array(await f.arrayBuffer()));
   } catch (e) {
     file.error = e instanceof Error ? e.message : '读取文件失败';
   }
 }
 
 function baseRequest(): ImportPreviewRequest | null {
-  if (!file.format) return null;
-  const req: ImportPreviewRequest = { format: file.format, default_front_proxy_id: defaultFront.value, default_site: defaultSite.value };
-  if (file.format === 'json') {
-    if (!file.records) return null;
-    req.records = file.records;
-  } else {
-    if (!file.contentBase64) return null;
-    req.content_base64 = file.contentBase64;
-  }
-  return req;
+  if (!file.format || !file.contentBase64) return null;
+  return { format: file.format, content_base64: file.contentBase64, default_front_proxy_id: defaultFront.value, default_site: defaultSite.value };
 }
 
-const canPreview = computed(() => !file.error && (file.contentBase64 !== null || file.records !== null) && !previewing.value);
+const canPreview = computed(() => !file.error && file.contentBase64 !== null && !previewing.value);
 
 function defaultDecision(row: ImportRowPreview): string | null {
   if (row.status === 'create') return 'create';

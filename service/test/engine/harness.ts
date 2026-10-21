@@ -69,6 +69,8 @@ export interface Harness {
   events: ServiceEvent[];
   responses: unknown[];
   frontId: string;
+  /** 本机事实（macOS 构建号、Safari 版本）；可在启动后修改，模拟服务运行期间 Safari 或 macOS 单独更新。 */
+  host: { macosBuild: string; safariVersion: string };
   /** 模拟服务崩溃：旧实例放弃（不等待其挂起的写入），在同一数据库与 FakeSurge 上启动新实例。 */
   crash(): Promise<EngineAppService>;
   grant(keys: readonly CapabilityKey[], note?: string | null): void;
@@ -81,6 +83,19 @@ export interface Harness {
 
 export function anyContext(): CapabilityContext {
   return Object.fromEntries(CAPABILITY_CONTEXT_FIELDS.map((f) => [f, 'any'])) as unknown as CapabilityContext;
+}
+
+/** 按当前本机事实（macOS 构建号、Safari 版本）记录能力，其余字段不限：之后修改 h.host 即让这些记录过期。 */
+export function grantForCurrentHost(h: Harness, keys: readonly CapabilityKey[]): void {
+  for (const key of keys) {
+    h.repos.capabilities.upsert({
+      key,
+      status: 'supported',
+      context: { ...anyContext(), macosBuild: h.host.macosBuild, safariVersion: h.host.safariVersion },
+      verifiedAt: h.clock.now().toISOString(),
+      note: '测试记录',
+    });
+  }
 }
 
 export async function createHarness(opts: HarnessOptions = {}): Promise<Harness> {
@@ -141,6 +156,7 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     for (const key of keys) repos.capabilities.upsert({ key, status: 'unverified' });
   };
   grant(opts.capabilities ?? ALL_CAPS);
+  const hostState = { macosBuild: '25A000', safariVersion: '19.0' };
 
   const makeApp = () => createAppService({
     repos,
@@ -154,7 +170,7 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     paths: { dataDir: dir, tmpDir: join(dir, 'tmp'), backupsDir: join(dir, 'backups'), homedir: join(dir, 'home') },
     surgeCliPath: null,
     demo: false,
-    host: { macosBuild: async () => '25A000', safariVersion: async () => '19.0', signingIdentity: () => 'TEAMTEST01', processPathExists: () => true },
+    host: { macosBuild: async () => hostState.macosBuild, safariVersion: async () => hostState.safariVersion, signingIdentity: () => 'TEAMTEST01', processPathExists: () => true },
     verifyEndpoints: [TEST_ENDPOINT],
     loginUrl: () => ({ url: 'http://127.0.0.1:61847/auth/exchange?code=x', expiresAt: clock.now().toISOString() }),
     serviceVersion: '0.0.0-test',
@@ -182,6 +198,7 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     events,
     responses,
     frontId,
+    host: hostState,
     grant,
     revoke,
     async crash() {

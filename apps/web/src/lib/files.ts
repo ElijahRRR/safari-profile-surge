@@ -1,4 +1,4 @@
-// 导入文件只在浏览器内读取，转成 base64 或 JSON 记录后发给本机服务；不发往其他地方，不落盘。
+// 导入文件只在浏览器内读取，原样转成 base64 后发给本机服务（JSON 也一样，由服务统一解析）；不发往其他地方，不落盘。
 
 import type { ImportFormat } from '@sfe/contract';
 
@@ -19,19 +19,6 @@ export function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
   }
   return btoa(binary);
-}
-
-/** JSON 导入：顶层数组，或 { records: [...] }。 */
-export function parseJsonRecords(text: string): unknown[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
-  } catch {
-    throw new Error('读取文件失败：不是有效的 JSON');
-  }
-  if (Array.isArray(parsed)) return parsed;
-  if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { records?: unknown }).records)) return (parsed as { records: unknown[] }).records;
-  throw new Error('读取文件失败：JSON 顶层应为记录数组，或包含 records 数组');
 }
 
 export function formatBytes(n: number): string {

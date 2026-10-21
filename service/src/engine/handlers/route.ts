@@ -32,8 +32,27 @@ import { currentPreflight, recordPreflight } from './probes.js';
 
 // ---------- 小工具 ----------
 
-/** 撤销本应用入口（普通模式、回滚）的入口切换选项：只有这些方向可以改写被外部修改的本应用入口文件（§5.5）。 */
-const UNDO: EntryTransitionOptions = { undo: true };
+/**
+ * 撤销本应用入口（普通模式、回滚）的入口切换选项：只有这些方向可以改写被外部修改的本应用入口文件、逐条清理无法按位确定的
+ * 本应用临时规则（§5.5）。清理的每一步（运行时读回确认之后）写入一条操作步骤，并累积到操作结果 entryCleanup（脱敏），
+ * 之后失败也保留。
+ */
+function undoOptions(engine: Engine, opId: string): EntryTransitionOptions {
+  return {
+    undo: true,
+    onCleanup: (c) => {
+      const { repos } = engine;
+      const safe = engine.scrubber.scrubDeep({ ...c });
+      repos.tx(() => {
+        const cur = repos.operations.get(opId)!;
+        const prev = cur.result?.entryCleanup;
+        repos.operations.update(opId, { result: { ...(cur.result ?? {}), entryCleanup: [...(Array.isArray(prev) ? prev : []), safe] } });
+      });
+      const kind = c.kind === 'unrecognized' ? '无法识别的规则' : c.kind;
+      engine.step(opId, `撤销入口时逐条清理本应用的临时规则：${c.action === 'add' ? '加入' : '移除'} ${kind}「${c.rule}」（运行时读回确认）`);
+    },
+  };
+}
 
 function routePayload(op: OperationRecord): RoutePayload {
   const r = payloadOf(op).route;
@@ -760,7 +779,7 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
     let mode = confirmed;
     if (mode !== 'BLOCKED') {
       // 从 VERIFY_ONLY/未知状态回到阻断（撤销入口：可改写被外部修改的本应用入口文件）；绝不走向 NORMAL
-      await ctrl.transition('BLOCKED', undefined, UNDO);
+      await ctrl.transition('BLOCKED', undefined, undoOptions(engine, opId));
       mode = 'BLOCKED';
     }
     repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
@@ -866,7 +885,7 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
           repos.operations.update(op.id, { result: { ...(cur.result ?? {}), changedEntryFiles: changedFiles } });
           engine.step(op.id, `本应用的入口文件已被外部修改（${changedFiles.join('、')}）：撤销入口时按读到的内容比较后改写`);
         }
-        const precedenceIssues = await blockForNormal(ctrl);
+        const precedenceIssues = await blockForNormal(ctrl, undoOptions(engine, op.id));
         confirmed = 'BLOCKED';
         repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
         if (precedenceIssues) {
@@ -882,7 +901,7 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
           { route: true },
         );
         await killForNormal(engine, op.id);
-        await ctrl.transition('NORMAL', undefined, UNDO);
+        await ctrl.transition('NORMAL', undefined, undoOptions(engine, op.id));
         confirmed = 'NORMAL';
       }
     } else if (route.entryMode !== 'NORMAL') {
@@ -930,9 +949,9 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
  * 普通模式的中间阻断。优先级问题只阻止 VERIFY_ONLY/ACTIVE（§5.2、§5.5）：入口位已全部确认为 BLOCKED、
  * 只因有规则排在入口之前而最终读回不能宣称受控时，返回这些规则并继续撤销入口；其他失败照常抛出。
  */
-async function blockForNormal(ctrl: EntryController): Promise<EntryReadback['precedenceIssues'] | null> {
+async function blockForNormal(ctrl: EntryController, undo: EntryTransitionOptions): Promise<EntryReadback['precedenceIssues'] | null> {
   try {
-    await ctrl.transition('BLOCKED', undefined, UNDO);
+    await ctrl.transition('BLOCKED', undefined, undo);
     return null;
   } catch (err) {
     if (err instanceof SfeError && err.code === 'PRECEDENCE_VIOLATION' && confirmedModeFrom(err, 'UNKNOWN') === 'BLOCKED') {

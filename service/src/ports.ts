@@ -216,9 +216,19 @@ export interface EntryReadback {
   changedOwnedFiles?: string[];
 }
 
+/** 撤销清理的一步：temp_rule 撤销入口时逐条加入或移除的一整条本应用临时规则（不是单个位的变更，§5.5）。 */
+export interface EntryCleanupStep {
+  action: 'add' | 'remove';
+  /** 规则所属的位；本应用记录但无法识别的规则为 unrecognized。 */
+  kind: keyof EntryBits | 'unrecognized';
+  rule: string;
+}
+
 export interface EntryTransitionOptions {
   /** 撤销本应用入口（普通模式、回滚；目标 BLOCKED/NORMAL）：允许改写 changedOwnedFiles。激活中的阻断步骤不设置。 */
   undo?: boolean;
+  /** 撤销清理的每一步运行时读回并确认归属之后调用（写入操作步骤与结果）；只有 undo 时可能调用。 */
+  onCleanup?: (step: EntryCleanupStep) => void;
 }
 
 export interface EntryController {

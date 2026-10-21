@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { ENTRY_RULESET_FILES, ROUTE_GROUP_NAME, type ActivateRequest, type RollbackResult } from '@sfe/contract';
 import { FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
-import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
+import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, grantForCurrentHost, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -43,6 +43,40 @@ describe('step 13: gates re-checked before ACTIVE', () => {
     expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(1);
     expect(safariOutcome(h).failed).toBe(true);
     expect(safariOutcome(h, FAKE_VERIFY_HOST).failed).toBe(true);
+  });
+
+  test('Safari updated during the VERIFY_ONLY wait while the service keeps running → rollback, entry never ACTIVE', async () => {
+    h = await createHarness();
+    grantForCurrentHost(h, ['safari_process_attribution']);
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    const opId = await startSwitch(env);
+    expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
+    // Safari 经软件更新单独升级，未重启、服务未重启：启动时读到的版本已过时
+    h.host.safariVersion = '19.1';
+    await verify(h, PROFILE_A, opId);
+    const op = h.repos.operations.get(opId)!;
+    expect(op.phase).toBe('FAILED');
+    expect(op.error?.code).toBe('CAPABILITY_UNVERIFIED');
+    expect((op.error?.details as { missing: Array<{ key: string; staleReasons: string[] }> }).missing).toContainEqual({ key: 'safari_process_attribution', staleReasons: ['safariVersion'] });
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: null });
+    expect(h.repos.environments.get(env)!.lastVerifiedProxyRevision).toBeNull();
+    expect(safariOutcome(h).failed).toBe(true);
+  });
+
+  test('Safari updated after service start, before activation → the operation fails before touching the route', async () => {
+    h = await createHarness();
+    grantForCurrentHost(h, ['safari_process_attribution']);
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    h.host.safariVersion = '19.1';
+    const updates = h.fake.calls.updateExternalResource ?? 0;
+    const opId = await startSwitch(env);
+    const op = h.repos.operations.get(opId)!;
+    expect(op.phase).toBe('FAILED');
+    expect(op.error?.code).toBe('CAPABILITY_UNVERIFIED');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', activeEnvironmentId: null });
+    expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(0);
   });
 
   test('fact-derived warnings come back right after the commit (no wait for the next periodic reconcile)', async () => {
