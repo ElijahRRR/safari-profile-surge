@@ -1,0 +1,158 @@
+// 能力门槛：记录的结论与当前上下文比较后的有效状态。任一依赖字段不匹配 → 待验证。
+// 比较规则：记录为 any 匹配任何当前值；当前值读不到（null）时只匹配记录的 null 或 any；
+// adapterMechanism 只比较该能力依赖的原语（规范 JSON）。见 docs/ARCHITECTURE.md §5.2。
+
+import {
+  CAPABILITY_CONTEXT_DEPS,
+  CAPABILITY_KEYS,
+  CAPABILITY_LABELS,
+  CAPABILITY_PRIMITIVES,
+  GATING_COVERAGE_ITEMS,
+  SfeError,
+  type CapabilityContext,
+  type CapabilityContextField,
+  type CapabilityKey,
+  type CapabilityStatus,
+  type CapabilityView,
+  type ProtocolCoverage,
+  type ProtocolCoverageItem,
+} from '@sfe/contract';
+import type { CapabilityGate } from '../ports.js';
+
+export interface CapabilityRecordInput {
+  key: CapabilityKey;
+  status: CapabilityStatus;
+  context: CapabilityContext | null;
+  proposalId: string | null;
+  verifiedAt: string | null;
+  note: string | null;
+  protocolCoverage?: ProtocolCoverage | null;
+}
+
+/** 该能力依赖的原语在映射中的实现，规范 JSON（键排序；缺失记为 unavailable）。 */
+export function mechanismFingerprint(key: CapabilityKey, mechanismMap: Record<string, string>): string {
+  const prims = [...(CAPABILITY_PRIMITIVES[key] ?? [])].sort();
+  const obj: Record<string, string> = {};
+  for (const p of prims) obj[p] = typeof mechanismMap[p] === 'string' ? mechanismMap[p]! : 'unavailable';
+  return JSON.stringify(obj);
+}
+
+function parseMechanism(value: string): Record<string, string> | null {
+  try {
+    const v = JSON.parse(value) as unknown;
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
+    return v as Record<string, string>;
+  } catch {
+    return null;
+  }
+}
+
+export function contextFieldMatches(
+  key: CapabilityKey,
+  field: CapabilityContextField,
+  recorded: string | null,
+  current: string | null,
+): boolean {
+  if (recorded === 'any') return true;
+  if (current === null) return recorded === null;
+  if (recorded === null) return false;
+  if (field === 'adapterMechanism') {
+    const r = parseMechanism(recorded);
+    const c = parseMechanism(current);
+    if (!r || !c) return recorded === current;
+    return mechanismFingerprint(key, r) === mechanismFingerprint(key, c);
+  }
+  return recorded === current;
+}
+
+export function staleReasonsFor(key: CapabilityKey, recorded: CapabilityContext | null, current: CapabilityContext): CapabilityContextField[] {
+  const deps = CAPABILITY_CONTEXT_DEPS[key];
+  if (!recorded) return [...deps];
+  return deps.filter((f) => !contextFieldMatches(key, f, recorded[f], current[f]));
+}
+
+/** 全部能力（按 CAPABILITY_KEYS 顺序）的视图；没有记录的项为待验证。 */
+export function computeCapabilityViews(records: readonly CapabilityRecordInput[], current: CapabilityContext): CapabilityView[] {
+  const byKey = new Map(records.map((r) => [r.key, r]));
+  return CAPABILITY_KEYS.map((key) => {
+    const r = byKey.get(key);
+    if (!r) {
+      return {
+        key,
+        label: CAPABILITY_LABELS[key],
+        status: 'unverified',
+        effectiveStatus: 'unverified',
+        staleReasons: [],
+        context: null,
+        protocolCoverage: null,
+        verifiedAt: null,
+        proposalId: null,
+        note: null,
+      } satisfies CapabilityView;
+    }
+    const staleReasons = r.status === 'unverified' ? [] : staleReasonsFor(key, r.context, current);
+    return {
+      key,
+      label: CAPABILITY_LABELS[key],
+      status: r.status,
+      effectiveStatus: r.status === 'unverified' || staleReasons.length > 0 ? 'unverified' : r.status,
+      staleReasons,
+      context: r.context,
+      protocolCoverage: r.protocolCoverage ?? null,
+      verifiedAt: r.verifiedAt,
+      proposalId: r.proposalId,
+      note: r.note,
+    } satisfies CapabilityView;
+  });
+}
+
+/** 确认 supported 前的逐协议覆盖检查：每个门槛项必须 pass，或写明说明的 limitation。 */
+export function coverageAllowsSupported(coverage: ProtocolCoverage | null): { ok: boolean; missing: ProtocolCoverageItem[] } {
+  const missing = GATING_COVERAGE_ITEMS.filter((item) => {
+    const e = coverage?.[item];
+    if (!e) return true;
+    if (e.result === 'pass') return false;
+    return !(e.result === 'limitation' && typeof e.note === 'string' && e.note.trim() !== '');
+  });
+  return { ok: missing.length === 0, missing };
+}
+
+export interface CapabilityGateOptions {
+  list: () => readonly CapabilityRecordInput[] | Promise<readonly CapabilityRecordInput[]>;
+  currentContext: () => Promise<CapabilityContext>;
+}
+
+export interface ExtendedCapabilityGate extends CapabilityGate {
+  /** 有效状态不能是 unverified（supported 或带影响记录的 unsupported 均可）。 */
+  requireMeasured(keys: readonly CapabilityKey[]): Promise<void>;
+  views(): Promise<CapabilityView[]>;
+}
+
+function missingError(views: CapabilityView[], keys: readonly CapabilityKey[], suffix: string): SfeError {
+  const items = views.filter((v) => keys.includes(v.key));
+  return new SfeError('CAPABILITY_UNVERIFIED', `执行失败：${items.map((v) => v.label).join('、')}${suffix}`, {
+    details: { missing: items.map((v) => ({ key: v.key, staleReasons: v.staleReasons })) },
+  });
+}
+
+export function createCapabilityGate(opts: CapabilityGateOptions): ExtendedCapabilityGate {
+  const views = async (): Promise<CapabilityView[]> => computeCapabilityViews(await opts.list(), await opts.currentContext());
+  const missing = async (keys: readonly CapabilityKey[]): Promise<CapabilityKey[]> => {
+    const v = await views();
+    return keys.filter((k) => v.find((x) => x.key === k)?.effectiveStatus !== 'supported');
+  };
+  return {
+    views,
+    missing,
+    async require(keys) {
+      const v = await views();
+      const miss = keys.filter((k) => v.find((x) => x.key === k)?.effectiveStatus !== 'supported');
+      if (miss.length > 0) throw missingError(v, miss, '尚未通过实测');
+    },
+    async requireMeasured(keys) {
+      const v = await views();
+      const miss = keys.filter((k) => (v.find((x) => x.key === k)?.effectiveStatus ?? 'unverified') === 'unverified');
+      if (miss.length > 0) throw missingError(v, miss, '尚未实测');
+    },
+  };
+}
