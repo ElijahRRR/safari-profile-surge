@@ -5,11 +5,11 @@ import { isIP } from 'node:net';
 import { isSiteCode, type EnvironmentChanges, type EnvironmentInput, type FieldError, type SecretChange } from '@sfe/contract';
 
 /**
- * 当前 Surge 节点行中可以安全表达的代理用户名/密码字符。不允许逗号、引号、等号、空白、
- * `#`、`;`、反斜杠、反引号、控制字符和非 ASCII：这些在节点行里可能被当作分隔符或注释，
- * 而 6.5 是否支持带引号的值尚未实测（见 docs/ARCHITECTURE.md §5.4）。
+ * 当前 Surge 节点行中可以安全表达的代理用户名/密码字符。先只允许字母、数字和 `. _ ~ -`：
+ * 其他符号在 6.5 节点行中是否会被当作分隔符、注释或转义尚未实测。P0 的凭据字符夹具
+ * （tools/p0）逐个证明安全后，才在这里放宽（见 docs/ARCHITECTURE.md §5.4）。
  */
-export const SURGE_SAFE_CREDENTIAL_RE = /^[A-Za-z0-9._~!@$%^&*()+\-[\]{}|:<>?/]{1,128}$/;
+export const SURGE_SAFE_CREDENTIAL_RE = /^[A-Za-z0-9._~-]{1,128}$/;
 
 /** Surge 中可被 underlying-proxy 引用的已有节点名：不得含逗号、等号、引号、换行或前后空白。 */
 const SURGE_REF_NAME_RE = /^[^,="\r\n#;]{1,128}$/;
@@ -85,7 +85,7 @@ function validateSecretChange(
   if (change.action !== 'replace' || typeof change.value !== 'string') return [{ field, message: '修改方式不正确' }];
   if (kind === 'proxy') {
     if (!isSurgeSafeCredential(change.value)) {
-      return [{ field, message: '包含当前 Surge 语法无法安全表达的字符（逗号、引号、等号、空格、#、; 或非 ASCII 等），请更换凭据' }];
+      return [{ field, message: '只能包含字母、数字和 . _ ~ -：其他字符在当前 Surge 节点语法中尚未证明可安全表达，请更换凭据' }];
     }
     return [];
   }

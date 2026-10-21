@@ -29,9 +29,9 @@ describe('validateHost', () => {
 describe('credential safety', () => {
   test('accepts conservative charset', () => {
     expect(isSurgeSafeCredential('user_01')).toBe(true);
-    expect(isSurgeSafeCredential('P@ss-w0rd!(x)')).toBe(true);
+    expect(isSurgeSafeCredential('Pass-w0rd.x~y')).toBe(true);
   });
-  test.each(['a,b', 'a"b', "a'b", 'a=b', 'a b', 'a#b', 'a;b', 'a\\b', 'a`b', 'pässwort', 'a\nb', ''])('rejects %j', (v) => {
+  test.each(['P@ss', 'a!b', 'a/b', 'a:b', 'a%b', 'a,b', 'a"b', "a'b", 'a=b', 'a b', 'a#b', 'a;b', 'a\\b', 'a`b', 'pässwort', 'a\nb', ''])('rejects %j', (v) => {
     expect(isSurgeSafeCredential(v)).toBe(false);
   });
   test('reference names', () => {

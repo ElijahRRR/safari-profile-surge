@@ -2,6 +2,7 @@
 // 事件已过期时服务端发送 snapshot.required，客户端改读完整快照。事件中不含任何秘密。
 
 import type {
+  CapabilityProposalView,
   CapabilityView,
   EnvironmentId,
   EnvironmentView,
@@ -18,7 +19,7 @@ export type ServiceEventPayload =
   | { type: 'environment.deleted'; environmentId: EnvironmentId }
   | { type: 'route.updated'; route: RouteStateView }
   | { type: 'surge.status'; surge: SurgeStatusView }
-  | { type: 'capabilities.updated'; capabilities: CapabilityView[] }
+  | { type: 'capabilities.updated'; capabilities: CapabilityView[]; proposals: CapabilityProposalView[] }
   | { type: 'frontProxies.updated'; frontProxies: FrontProxyView[] }
   | { type: 'settings.updated'; settings: SettingsView }
   | { type: 'snapshot.required'; reason: string };

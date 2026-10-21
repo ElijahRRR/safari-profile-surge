@@ -1,8 +1,11 @@
 // Safari 扩展 ↔ 原生桥 ↔ 本机服务 的消息契约。
 //
-// 扩展只发送 NativeEnvelope；原生桥（SafariWebExtensionHandler）从 SFExtensionProfileKey 取得
-// 可信场景 ID，包装成 BridgeEnvelope 经 Unix 套接字转发给服务。扩展自己提供的任何身份字段都
-// 不被信任。请求/响应模式，不假定存在常驻推送通道。
+// 扩展只发送 NativeEnvelope；原生桥（SafariWebExtensionHandler，签名的 App Extension）从
+// SFExtensionProfileKey 取得可信场景 ID，加上传输令牌包装成 BridgeEnvelope 转发给服务。
+// 扩展自己提供的任何身份字段都不被信任。请求/响应模式，不假定存在常驻推送通道。
+//
+// 只有扩展页面（弹窗、准备页）与后台脚本可以发送原生消息；内容脚本只能向后台发送
+// requestLoginFill，由后台根据 runtime.MessageSender 填写 top_url 与 frame_is_top。
 
 import type { ApiErrorBody } from './errors.js';
 import type {
@@ -15,27 +18,47 @@ import type {
   OperationView,
   RequestId,
   RouteStateView,
+  RouteSummaryView,
 } from './models.js';
+import type { NeedsConfirmationDetails, Accepted } from './api.js';
 import type { OldSessionPolicy } from './phases.js';
-import type { Accepted } from './api.js';
 import type { SiteCode } from './sites.js';
 
 export const NATIVE_PROTOCOL_VERSION = 1 as const;
 /** 原生宿主 App 的 bundle identifier（Safari 会忽略 sendNativeMessage 的 application 参数，仍按惯例填写）。 */
 export const NATIVE_APP_ID = 'com.sfe.SafariProfileSurge';
+/** 单条 NDJSON 消息上限。 */
+export const NATIVE_MAX_MESSAGE_BYTES = 256 * 1024;
 
 export type NativeRequest =
   | { type: 'getCurrentState' }
+  /** 场景状态提示：窗口数、是否有 www.amazon.com 标签页、站点权限。只作提示，从不改变路由。 */
+  | { type: 'reportProfileState'; windows_open: number; amazon_tabs_open: boolean; site_permission_granted: boolean }
   | { type: 'bindCurrentProfile'; request_id: RequestId; environment_id: EnvironmentId; expected_revision: number }
   | { type: 'createAndBindEnvironment'; request_id: RequestId; environment: EnvironmentInput }
-  | { type: 'updateCurrentEnvironment'; request_id: RequestId; expected_revision: number; changes: EnvironmentChanges }
-  | { type: 'activateCurrentEnvironment'; request_id: RequestId; old_session_policy?: OldSessionPolicy }
-  | { type: 'enterNormalMode'; request_id: RequestId }
-  | { type: 'probeCurrentEnvironment'; request_id: RequestId }
+  | { type: 'updateCurrentEnvironment'; request_id: RequestId; environment_id: EnvironmentId; expected_revision: number; changes: EnvironmentChanges }
+  | {
+      type: 'activateCurrentEnvironment';
+      request_id: RequestId;
+      environment_id: EnvironmentId;
+      old_session_policy?: OldSessionPolicy;
+      confirmed_environment_id?: EnvironmentId | null;
+      proxy_revision?: number;
+      /** 本场景在发起时是否已有 Amazon 标签页（有则本次打开记为“未经启动验证”）。 */
+      amazon_tabs_open: boolean;
+    }
+  | { type: 'enterNormalMode'; request_id: RequestId; old_session_policy?: OldSessionPolicy; confirmed_environment_id?: EnvironmentId | null }
+  | { type: 'probeCurrentEnvironment'; request_id: RequestId; environment_id: EnvironmentId; kind: 'preflight' | 'safari' }
+  | { type: 'acknowledgeAccountChange'; request_id: RequestId; environment_id: EnvironmentId; expected_revision: number }
   | { type: 'getOperation'; operation_id: OperationId }
-  | { type: 'beginSafariVerification'; operation_id: OperationId }
+  /**
+   * 准备页在目标场景中调用：表示“绑定场景已到达，可以检测”。等待切换的操作由此继续；
+   * 入口到达 VERIFY_ONLY（或当前环境重测时的 ACTIVE）后返回一次性检测编号。
+   */
+  | { type: 'beginSafariVerification'; operation_id: OperationId; amazon_tabs_open: boolean }
   | {
       type: 'submitSafariVerification';
+      operation_id: OperationId;
       test_id: string;
       route_epoch: number;
       observed_ip: string | null;
@@ -46,11 +69,15 @@ export type NativeRequest =
     }
   | {
       type: 'requestLoginFill';
+      /** 由后台从 sender.tab.url / sender.url 填写，不采用内容脚本自报的值。 */
       top_url: string;
-      /** 内容脚本只在顶层框架运行；为 false 时服务直接拒绝。 */
+      /** 由后台从 sender.frameId === 0 填写。 */
       frame_is_top: boolean;
+      /** 内容脚本读取的表单目标；不在表单内的字段为 null，服务直接拒绝。 */
       form_action: string | null;
       fields: Array<'identifier' | 'password'>;
+      /** 内容脚本读取到的当前路由序号；过期即拒绝。 */
+      route_epoch: number;
     };
 
 export type NativeRequestType = NativeRequest['type'];
@@ -61,13 +88,15 @@ export interface NativeEnvelope {
 }
 
 export interface BridgeInfo {
-  /** 来自 SFExtensionProfileKey；macOS/Safari 不提供时为 null（视为不可信，只允许只读请求）。 */
+  /** 来自 SFExtensionProfileKey；系统不提供时为 null（只允许 getCurrentState）。 */
   profileId: string | null;
   bridgeVersion: string;
 }
 
 export interface BridgeEnvelope {
   v: typeof NATIVE_PROTOCOL_VERSION;
+  /** 原生桥与服务之间的每次安装随机令牌（由宿主 App 分发）；不是用户凭据。 */
+  auth: string;
   bridge: BridgeInfo;
   message: NativeRequest;
 }
@@ -83,49 +112,84 @@ export interface BindableEnvironment {
 
 export interface CurrentStateResponse {
   profile: {
-    /** 原生桥是否提供了可信场景 ID。 */
     identified: boolean;
     profileIdShort: string | null;
   };
+  /** 当前场景绑定的环境（未绑定或场景未识别时为 null）。 */
   environment: EnvironmentView | null;
-  route: RouteStateView;
-  /** 当前场景与全局活动环境的关系。 */
+  /** 只有当前场景绑定的正是活动环境时才返回完整路由；否则只返回摘要。 */
+  route: RouteStateView | null;
+  routeSummary: RouteSummaryView;
   relation: 'this_active' | 'other_active' | 'none_active';
   otherActiveLabel: string | null;
-  /** 当前场景绑定的环境正在等待 Safari 实测出口。 */
-  pendingVerification: { operation_id: OperationId; deadline: IsoTime } | null;
-  /** 仅未绑定时返回：可关联的未绑定环境。 */
+  /** 当前场景绑定的环境有等待场景到达或实测的路由操作。 */
+  pendingVerification: { operation_id: OperationId; kind: 'activate' | 'apply_new_revision' | 'reverify' | 'probe_safari'; deadline: IsoTime | null } | null;
+  /** 仅已识别且未绑定时返回：可关联的未绑定环境。 */
   bindable: BindableEnvironment[];
-  /** 服务端是否已具备激活所需的能力门槛（未通过时插件只展示原因，不提供假按钮）。 */
   activationAvailable: boolean;
   activationBlockedReason: string | null;
+  /** “打开或定位订单页”是否允许：当前场景是活动环境、实测有效、无接管/外部修改警告。 */
+  ordersAllowed: boolean;
+  ordersBlockedReason: string | null;
 }
 
-export interface BeginVerificationResponse {
-  test_id: string;
-  route_epoch: number;
-  verify_url: string;
-  deadline: IsoTime;
+export type BeginVerificationResponse =
+  | { status: 'pending'; phase: string; message: string }
+  | { status: 'ready'; test_id: string; route_epoch: number; verify_url: string; deadline: IsoTime }
+  | { status: 'not_needed'; message: string };
+
+/** 服务对原生桥的填充应答：账号标识直接给值；密码只给钥匙串引用，由签名的原生桥自行读取。 */
+export interface LoginFillServiceResponse {
+  fills: Array<{ field: 'identifier'; value: string } | { field: 'password'; keychainRef: string; expiresAt: IsoTime }>;
 }
 
+/** 原生桥交给扩展的填充值（原生桥解析钥匙串引用后）。扩展只在内存中短暂持有。 */
 export interface LoginFillResponse {
-  field: 'identifier' | 'password';
-  value: string;
+  fills: Array<{ field: 'identifier' | 'password'; value: string }>;
 }
 
 export interface NativeResponseMap {
   getCurrentState: CurrentStateResponse;
+  reportProfileState: { recorded: boolean };
   bindCurrentProfile: Accepted;
   createAndBindEnvironment: Accepted;
   updateCurrentEnvironment: Accepted;
   activateCurrentEnvironment: Accepted;
   enterNormalMode: Accepted;
   probeCurrentEnvironment: Accepted;
+  acknowledgeAccountChange: Accepted;
   getOperation: OperationView;
   beginSafariVerification: BeginVerificationResponse;
   submitSafariVerification: { accepted: boolean };
-  requestLoginFill: LoginFillResponse;
+  requestLoginFill: LoginFillServiceResponse;
 }
 
-/** 不需要可信场景 ID 的只读请求；其余请求在 profileId 为 null 时一律拒绝。 */
-export const PROFILE_OPTIONAL_REQUESTS: readonly NativeRequestType[] = ['getCurrentState', 'getOperation'];
+export type NativeNeedsConfirmation = NeedsConfirmationDetails;
+
+/**
+ * 按场景状态的权限矩阵（服务端强制）：
+ * - 未识别（profileId 为 null）：只允许 getCurrentState（不返回其他环境名称）。
+ * - 已识别未绑定：getCurrentState、reportProfileState、bindCurrentProfile（只能绑未绑定环境）、
+ *   createAndBindEnvironment、enterNormalMode（需确认）。
+ * - 已绑定：以上（除绑定类）+ 针对自己绑定环境的 update/activate/probe/acknowledge、
+ *   getOperation（只限自己环境的操作或自己发起的操作）、begin/submitSafariVerification
+ *   （只限自己环境）、requestLoginFill（只限自己环境且为当前活动环境）。
+ */
+export const NATIVE_PERMISSIONS: Record<NativeRequestType, ReadonlyArray<'unidentified' | 'unbound' | 'bound'>> = {
+  getCurrentState: ['unidentified', 'unbound', 'bound'],
+  reportProfileState: ['unbound', 'bound'],
+  bindCurrentProfile: ['unbound'],
+  createAndBindEnvironment: ['unbound'],
+  updateCurrentEnvironment: ['bound'],
+  activateCurrentEnvironment: ['bound'],
+  enterNormalMode: ['unbound', 'bound'],
+  probeCurrentEnvironment: ['bound'],
+  acknowledgeAccountChange: ['bound'],
+  getOperation: ['unbound', 'bound'],
+  beginSafariVerification: ['bound'],
+  submitSafariVerification: ['bound'],
+  requestLoginFill: ['bound'],
+};
+
+/** 内容脚本经后台可以发起的唯一请求类型。 */
+export const CONTENT_SCRIPT_ALLOWED: readonly NativeRequestType[] = ['requestLoginFill'];

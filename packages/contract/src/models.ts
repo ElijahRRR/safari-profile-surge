@@ -1,7 +1,8 @@
-// 对外（网页、插件、CLI）可见的脱敏视图模型。任何视图都不得包含代理密码、买家密码或
-// Surge 管理密钥；用户名/密码只给出“是否已配置”。
+// 对外（网页、插件、CLI）可见的脱敏视图模型。任何视图都不得包含代理密码、买家密码、
+// Surge 管理密钥、会话令牌或基于秘密内容的无密钥摘要；用户名/密码只给出“是否已配置”。
 
 import type {
+  CapabilityContextField,
   CapabilityKey,
   CapabilityStatus,
   EntryMode,
@@ -32,9 +33,12 @@ export interface ProxyInput {
   port: number;
   username?: SecretChange;
   password?: SecretChange;
-  /** null 表示使用全局默认前置；所有代理都必须最终解析到一个前置。 */
+  /** null 表示使用当前默认前置；保存时解析成具体 id 存储，之后修改默认值不影响已有环境。 */
   frontProxyId: FrontProxyId | null;
-  /** 用户提供的预期出口 IP；代理连接地址不能自动当作预期出口。 */
+  /**
+   * 用户提供的预期出口 IP；代理连接地址不能自动当作预期出口。它不是 Surge 节点参数：
+   * 只改它不会产生新节点版本，也不触发发布或切换。
+   */
   expectedExitIp?: string | null;
 }
 
@@ -80,81 +84,126 @@ export interface ProxyRevisionView {
   createdAt: IsoTime;
 }
 
-export type FrontProxyOwnership = 'user_existing' | 'sfe_managed';
 export type FrontProxyState = 'unverified' | 'ok' | 'missing' | 'failed';
 
+/** 首版前置只允许用户已有、经核对的固定节点（不接受组、DIRECT/REJECT 等内置策略或 SFE- 节点）。 */
 export interface FrontProxyView {
   id: FrontProxyId;
-  /** Surge 中被引用的节点名（用户已有节点或 SFE-F-*）。 */
   surgeName: string;
-  ownership: FrontProxyOwnership;
+  kind: 'node';
   state: FrontProxyState;
   isDefault: boolean;
+  retired: boolean;
   dependentEnvironmentIds: EnvironmentId[];
   lastCheckedAt: IsoTime | null;
 }
 
-export type BindingState = 'unbound' | 'bound';
-
+/**
+ * 场景关联状态。bound_unverified_id：已绑定，但原生场景 ID 的稳定性尚未通过 P0。
+ * 未绑定时 stage 记录首次关联向导进度（用户确认的步骤，不是系统事实）。
+ */
 export interface BindingView {
-  state: BindingState;
-  /** 原生 profile ID 只展示前 8 位，用于核对，不作为可伪造的客户端输入。 */
+  state: 'unbound' | 'bound' | 'bound_unverified_id';
+  stage: 'awaiting_profile' | 'awaiting_extension' | 'awaiting_association' | null;
+  /** 原生 profile ID 只展示前 8 位，用于核对。 */
   profileIdShort: string | null;
   boundAt: IsoTime | null;
+  /** 该场景最近一次上报的站点权限情况（提示性质）。 */
+  sitePermissionGranted: boolean | null;
 }
-
-export type PageIdentityState = 'unverified' | 'recognized' | 'mismatch';
 
 export interface AccountView {
   label: string | null;
   loginIdentifierMasked: string | null;
   hasLoginIdentifier: boolean;
   hasPassword: boolean;
-  /** 页面实际登录身份核验；编辑绑定账号不等于网页已切账号。 */
-  pageIdentity: PageIdentityState;
-  /** 配置账号在最近一次页面识别之后被修改过。 */
+  /**
+   * 页面实际登录身份。首版没有可靠的页面证据来源，始终为 unverified；
+   * 不能用填充成功或配置账号推断“已识别”。
+   */
+  pageIdentity: 'unverified';
+  /** 配置账号在用户最近一次确认后被修改过：显示“配置账号已更换，网页登录状态未核对”。 */
   changedSincePageCheck: boolean;
 }
 
 export type ProbeKind = 'preflight' | 'safari';
 export type ProbeOutcome = 'ok' | 'failed' | 'mismatch' | 'inconclusive';
 
+export interface SurgeRequestEvidence {
+  id: string;
+  remoteHost: string | null;
+  rule: string | null;
+  policyName: string | null;
+  startedAt: IsoTime | null;
+  newConnection: boolean | null;
+}
+
 export interface ProbeView {
+  id: string;
   kind: ProbeKind;
   outcome: ProbeOutcome;
-  /** 实际出口 IP（Safari 实测或预检节点出口）；预检只证明代理可用时为 null。 */
+  /** Safari 实测出口 IP。预检只证明代理可达时为 null（testPolicy 不返回出口）。 */
   exitIp: string | null;
   proxyRevision: number;
+  nodeName: string;
   routeEpoch: number | null;
-  /** Surge 侧核对到的策略与进程，仅 Safari 实测时有。 */
-  surgePolicy: string | null;
-  surgeProcessMatched: boolean | null;
+  configurationGeneration: number | null;
+  /** 检测时读回的入口模式。 */
+  entryMode: EntryMode | null;
+  testId: string | null;
+  /** Surge 侧核对到的对应请求（仅 Safari 实测）。 */
+  surgeRequest: SurgeRequestEvidence | null;
+  /** 前置链路证据说明；6.5 无法读出链路时说明依赖能力门槛，不把出口 IP 当作链路证明。 */
+  chainEvidence: string | null;
+  browser: { httpStatus: number | null; startedAt: IsoTime | null; finishedAt: IsoTime | null; error: string | null } | null;
   observedAt: IsoTime;
   /** 检测有效期，过期后显示“上次结果”，不得标为实时。 */
   expiresAt: IsoTime;
   message: string | null;
 }
 
-/** 环境整体就绪状态（导入批量结果也用它）。 */
+/** 环境各方面的独立状态；任何一面不满足都不能显示为可启动。 */
+export interface EnvironmentFacets {
+  input: 'valid' | 'invalid';
+  binding: BindingView['state'];
+  deployment: 'none' | 'pending' | 'blocked_by_capability' | 'deploying' | 'deployed' | 'readback_partial' | 'failed';
+  preflight: 'none' | 'ok' | 'failed' | 'inconclusive' | 'expired';
+  route: 'inactive' | 'waiting_route' | 'activating' | 'verifying' | 'active' | 'rolled_back';
+}
+
+/** 汇总状态，由 environmentReadiness() 从 facets 按固定优先级推导。 */
 export type EnvironmentReadiness =
-  | 'needs_binding'
   | 'invalid'
+  | 'needs_binding'
   | 'waiting_deployment'
   | 'deploying'
+  | 'sync_failed'
+  | 'proxy_unavailable'
   | 'deployed_unverified'
   | 'ready'
-  | 'active'
   | 'activating'
-  | 'failed';
+  | 'active'
+  | 'needs_reverify';
 
-export type NextAction =
-  | { kind: 'bind_profile'; message: string }
-  | { kind: 'publish_pending'; message: string }
-  | { kind: 'verify_capability'; message: string; capabilities: CapabilityKey[] }
-  | { kind: 'activate'; message: string }
-  | { kind: 'safari_verify'; message: string }
-  | { kind: 'fix_input'; message: string }
-  | { kind: 'none'; message: string };
+export type NextActionKind =
+  | 'fix_input'
+  | 'bind_profile'
+  | 'verify_capability'
+  | 'publish_pending'
+  | 'activate'
+  | 'apply_new_revision'
+  | 'safari_verify'
+  | 'reverify'
+  | 'probe_safari'
+  | 'open_orders'
+  | 'acknowledge_account_change'
+  | 'none';
+
+export interface NextAction {
+  kind: NextActionKind;
+  message: string;
+  capabilities?: CapabilityKey[];
+}
 
 export interface EnvironmentView {
   id: EnvironmentId;
@@ -170,15 +219,20 @@ export interface EnvironmentView {
     desired: ProxyRevisionView | null;
     deployed: ProxyRevisionView | null;
     active: ProxyRevisionView | null;
+    /** 最近一次通过 Safari 实测的版本；回滚与“返回上一版本”使用。 */
+    lastVerified: ProxyRevisionView | null;
   };
   account: AccountView;
+  facets: EnvironmentFacets;
   readiness: EnvironmentReadiness;
-  nextAction: NextAction;
+  /** 第一项是主要下一步。 */
+  nextActions: NextAction[];
   probes: {
     preflight: ProbeView | null;
     safari: ProbeView | null;
   };
   lastOperation: OperationSummary | null;
+  lastError: ApiErrorBody | null;
   createdAt: IsoTime;
   updatedAt: IsoTime;
 }
@@ -194,30 +248,80 @@ export interface OperationSummary {
   kind: OperationKind;
   phase: OperationPhase;
   status: OperationStatus;
+  error: ApiErrorBody | null;
   updatedAt: IsoTime;
+}
+
+export interface KillResult {
+  surgeRequestId: string;
+  processPath: string | null;
+  /** 只记录是否为检测域名连接，不持久化其他远端主机。 */
+  toVerifyHost: boolean;
+  ok: boolean;
+  error: string | null;
+  at: IsoTime;
+}
+
+export interface RollbackResult {
+  previousEnvironmentId: EnvironmentId | null;
+  previousProxyRevision: number | null;
+  /** 显示为“上次结果”，从不当作实时状态。 */
+  previousProbe: ProbeView | null;
+  restoredSelection: string | null;
+  entryModeAfter: EntryMode;
+  failedProxyRevision: number | null;
+  failureError: ApiErrorBody;
+  needsReverify: boolean;
+}
+
+export interface OperationEffective {
+  desiredProxyRevision: number | null;
+  deployedProxyRevision: number | null;
+  activeProxyRevision: number | null;
+  configurationGeneration: number | null;
+  routeEpoch: number | null;
 }
 
 export interface OperationView extends OperationSummary {
   requestId: RequestId;
   environmentId: EnvironmentId | null;
+  initiator: 'web' | 'agent' | 'admin' | 'bridge' | 'service';
   expectedRevision: number | null;
   resultRevision: number | null;
   routeEpoch: number | null;
+  probeKind: ProbeKind | null;
+  supersededBy: OperationId | null;
   steps: OperationStep[];
-  error: ApiErrorBody | null;
-  /** 部分操作的附加结果（例如回滚结论、导入批次），只含脱敏数据。 */
-  result: Record<string, unknown> | null;
+  effective: OperationEffective;
+  /** 结构化结果（全部脱敏）：路由操作含 killResults / rollback；发布含 readbackLevel；导入含批次条目。 */
+  result: {
+    killResults?: KillResult[];
+    rollback?: RollbackResult;
+    readbackLevel?: 'full' | 'partial';
+    uncheckedFields?: string[];
+    [key: string]: unknown;
+  } | null;
   createdAt: IsoTime;
 }
 
 export type RouteWarning =
   | 'old_windows_kept_open'
+  | 'managed_windows_on_original_rules'
+  | 'old_session_unproven'
+  | 'launch_unverified'
   | 'external_selection_change'
   | 'external_profile_change'
   | 'surge_unreachable'
+  | 'surge_restarted'
+  | 'takeover_lost'
+  | 'takeover_unknown'
+  | 'outbound_mode_changed'
   | 'entry_unverified'
+  | 'precedence_violation'
   | 'rollback_needs_reverify'
-  | 'probe_expired';
+  | 'probe_expired'
+  | 'probe_failed'
+  | 'exit_ip_mismatch';
 
 export interface RouteStateView {
   routeEpoch: number;
@@ -230,57 +334,127 @@ export interface RouteStateView {
   selectedNode: string | null;
   oldSessionPolicy: OldSessionPolicy | null;
   lastSafariProbe: ProbeView | null;
-  /** 当前（或最近一次）激活事务。 */
+  /** 当前（或最近一次）路由操作。 */
   operationId: OperationId | null;
+  /** 等待目标场景到达/实测的截止时间。 */
+  awaitingDeadline: IsoTime | null;
   warnings: RouteWarning[];
+  lastReconciledAt: IsoTime | null;
   updatedAt: IsoTime;
+}
+
+/** 对非当前环境绑定场景返回的受限路由信息。 */
+export interface RouteSummaryView {
+  routeEpoch: number;
+  entryMode: EntryMode;
+  phase: RoutePhase;
+}
+
+export interface CapabilityContext {
+  surgeVersion: string | null;
+  surgeBuild: string | null;
+  macosBuild: string | null;
+  safariVersion: string | null;
+  entryStrategy: EntryStrategy | null;
+  processPathsDigest: string | null;
+  workingProfileId: string | null;
+  autoReload: 'on' | 'off' | 'any' | null;
+  takeoverMode: 'enhanced' | 'system_proxy' | 'both' | null;
+  signingIdentity: string | null;
+  adapterMechanism: string | null;
 }
 
 export interface CapabilityView {
   key: CapabilityKey;
   label: string;
+  /** 记录的结论。 */
   status: CapabilityStatus;
-  /** 实测时的 Surge 版本；与当前版本不同则视为待验证。 */
-  surgeVersion: string | null;
+  /** 与当前上下文比较后的有效结论；上下文不一致时为 unverified。 */
+  effectiveStatus: CapabilityStatus;
+  staleReasons: CapabilityContextField[];
+  context: CapabilityContext | null;
   verifiedAt: IsoTime | null;
-  /** 证据文件的脱敏引用（测试 Mac 本地路径或报告编号），不是原始证据。 */
-  evidenceRef: string | null;
+  evidenceId: string | null;
+  /** P0 记录的限制说明（例如“协议覆盖：H3 已拒绝并回落 TCP；IPv6 未验证”）。 */
   note: string | null;
+}
+
+export interface CapabilityProposalView {
+  id: string;
+  key: CapabilityKey;
+  proposedStatus: Exclude<CapabilityStatus, 'unverified'>;
+  context: CapabilityContext;
+  summary: string;
+  evidenceDigest: string;
+  submittedAt: IsoTime;
+  submittedBy: 'agent' | 'admin' | 'web';
+}
+
+export interface TakeoverState {
+  enhancedMode: boolean | null;
+  systemProxy: boolean | null;
+  outboundMode: 'rule' | 'direct' | 'proxy' | null;
+  checkedAt: IsoTime | null;
+}
+
+export interface PrecedenceIssue {
+  /** 已脱敏的规则文本与来源（模块名/临时规则/配置）。 */
+  rule: string;
+  source: 'module' | 'temp_rule' | 'profile' | 'unknown';
+  severity: 'blocking' | 'warning';
 }
 
 export interface SurgeStatusView {
   reachable: boolean;
   version: string | null;
   build: string | null;
-  workingProfileName: string | null;
-  /** 当前活动配置是否是固定工作配置。 */
+  currentProfileName: string | null;
+  /** 当前活动配置是否是记录的固定工作配置。 */
   onWorkingProfile: boolean | null;
-  managedSectionPresent: boolean | null;
+  managedSectionsIntact: boolean | null;
   configurationGeneration: number;
-  resourceDigest: string | null;
+  takeover: TakeoverState;
+  autoReload: boolean | null;
+  httpApi: { configured: boolean; loopbackOnly: boolean | null };
+  /** Surge 配置目录在 iCloud 或其他同步/受保护位置。 */
+  profileDirectoryRisk: 'none' | 'synced' | 'protected' | null;
+  precedenceIssues: PrecedenceIssue[];
   lastCheckedAt: IsoTime | null;
   message: string | null;
 }
 
+export interface VerifyEndpoint {
+  id: string;
+  url: string;
+  host: string;
+  label: string;
+}
+
 export interface SettingsView {
-  surgeCliPath: string;
-  surgeHttpApiConfigured: boolean;
+  /** 只读：来自安装时写入的 0600 配置文件，网页不能修改。 */
+  surgeCliPath: string | null;
+  /** 只读：只能由维护初始化设置。 */
   workingProfilePath: string | null;
   entryStrategy: EntryStrategy | null;
-  /** 经 P0 实测确认的 Safari 网络进程完整路径。为空时任何入口模式都不可用。 */
+  /** 只读：随 safari_process_attribution 的实测证据确认。 */
   safariProcessPaths: string[];
-  verifyEndpointUrl: string;
+  verifyEndpointId: string;
   defaultFrontProxyId: FrontProxyId | null;
+  profileArrivalTimeoutSec: number;
   safariVerifyTimeoutSec: number;
   probeTtlSec: number;
+  reconcileIntervalSec: number;
 }
 
 export interface Snapshot {
   sequence: number;
   serviceVersion: string;
+  /** 演示模式：FakeSurge + 合成数据，界面必须显示常驻 DEMO 标识。 */
+  demoMode: boolean;
   environments: EnvironmentView[];
   route: RouteStateView;
   capabilities: CapabilityView[];
+  capabilityProposals: CapabilityProposalView[];
   surge: SurgeStatusView;
   frontProxies: FrontProxyView[];
   settings: SettingsView;

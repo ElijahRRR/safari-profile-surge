@@ -7,12 +7,15 @@ export const SFE_PREFIX = 'SFE-';
 export const ROUTE_GROUP_NAME = 'SFE-ROUTE';
 /** 只存本应用的环境出口节点。 */
 export const NODE_RESOURCE_FILE = 'sfe-nodes.list';
-/** ruleset_resource 入口策略使用的三个规则集文件，顺序即主配置中的顺序。 */
+/** ruleset_resource 入口策略使用的四个规则集文件，顺序即主配置中的顺序（udp > verify > block > active）。 */
 export const ENTRY_RULESET_FILES = {
+  udp: 'sfe-entry-udp.list',
   verify: 'sfe-entry-verify.list',
   block: 'sfe-entry-block.list',
   active: 'sfe-entry-active.list',
 } as const;
+/** 永不匹配的占位规则：关闭的位写入它，而不是写空文件。 */
+export const ENTRY_PLACEHOLDER_RULE = 'DOMAIN,sfe-disabled.invalid';
 export const MANAGED_BEGIN = '# SFE-BEGIN';
 export const MANAGED_END = '# SFE-END';
 export const WORKING_PROFILE_NAME = '日常-Safari环境';
