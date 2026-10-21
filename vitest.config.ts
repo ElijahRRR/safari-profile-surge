@@ -20,6 +20,14 @@ export default defineConfig({
           pool: 'forks',
         },
       },
+      {
+        test: {
+          name: 'p0',
+          root: './tools/p0',
+          include: ['test/**/*.test.ts'],
+          environment: 'node',
+        },
+      },
       './apps/web/vitest.config.ts',
       './extension/vitest.config.ts',
     ],
