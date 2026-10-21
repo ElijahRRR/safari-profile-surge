@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@sfe/contract": "0.1.0",
+    "@sfe/easyquick": "0.1.0",
     "vue": "3.5.43"
   }
 }

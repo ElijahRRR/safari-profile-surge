@@ -5,6 +5,7 @@
   "description": "Safari 用户场景驱动的 Surge 出口控制（本机后台、网页后台、Safari 扩展）",
   "workspaces": [
     "packages/contract",
+    "packages/easyquick",
     "service",
     "apps/web",
     "extension"
@@ -24,6 +25,8 @@
     "@vue/test-utils": "2.5.1",
     "esbuild": "0.28.2",
     "happy-dom": "20.14.5",
+    "postcss": "8.5.28",
+    "tailwindcss": "3.4.17",
     "tsx": "4.23.15",
     "typescript": "5.9.3",
     "vite": "8.2.4",
