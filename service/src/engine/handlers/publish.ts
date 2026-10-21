@@ -17,7 +17,7 @@ import {
 } from '@sfe/contract';
 import type { SurgeExternalResource } from '../../ports.js';
 import type { DeploymentRecord, FrontProxyRecord, NodeManifestEntry, OperationRecord, ProxyRevisionRecord } from '../../db/index.js';
-import { isPublishKind, payloadOf, routeTargetOf, type PublishTarget } from '../../domain/operations.js';
+import { isPublishKind, isRouteOperation, payloadOf, routeTargetOf, type PublishTarget } from '../../domain/operations.js';
 import type { PublishTargetOutcome, PublishTargetResult } from '../../domain/views.js';
 import { resourceFile } from '../../surge/generate.js';
 import { BUILTIN_POLICIES } from '../../surge/rules.js';
@@ -64,6 +64,28 @@ function fail(err: SfeError | ApiErrorBody): PublishStop {
 
 // ---------- 批次 ----------
 
+/** 合并进主操作批次的其他发布类操作（记在主操作 payload 上，崩溃恢复据此找回它们）。 */
+function batchMembersOf(op: Pick<OperationRecord, 'payload'>): string[] {
+  const m = payloadOf(op).batchMembers;
+  return Array.isArray(m) ? m.filter((x): x is string => typeof x === 'string') : [];
+}
+
+/**
+ * 重新合并恢复节点资源后的刷新要求，持久记在引擎键值中：跟随的发布失败、停泊或服务重启后，下一次发布
+ * （包括没有待部署修改的显式发布）仍会写入、定向刷新并读回；只有一次刷新与读回都成功的发布才清除它。
+ */
+const RESOURCE_REFRESH_KEY = 'resource:needsRefresh';
+
+/** 重新合并在写入恢复的节点资源之前调用：之后任何一次发布都不能走“没有修改”的捷径，直到刷新并读回成功。 */
+export function requireResourceRefresh(engine: Engine, operationId: string): void {
+  engine.kv.set(RESOURCE_REFRESH_KEY, { operationId });
+}
+
+/** 即使节点清单没有变化，也要写入、定向刷新并读回（Surge 可能已加载被篡改的内容）。 */
+function forcesRefresh(engine: Engine, batch: Batch): boolean {
+  return engine.kv.get(RESOURCE_REFRESH_KEY) !== null || batch.ops.some((o) => payloadOf(o).forceRefresh === true);
+}
+
 function pendingTargets(engine: Engine, environmentIds: readonly string[] | null | undefined): PublishTarget[] {
   const envs = engine.repos.environments.list().filter((e) => !environmentIds || environmentIds.includes(e.id));
   return envs
@@ -71,11 +93,16 @@ function pendingTargets(engine: Engine, environmentIds: readonly string[] | null
     .map((e) => ({ environmentId: e.id, proxyRevision: e.desiredProxyRevision! }));
 }
 
+/**
+ * 收集批次（调用方在同一事务内把全部操作标为 running）。崩溃后重新执行未开始写入的批次时，
+ * 上次已被标为 running 的逐行操作与合并进来的操作按主操作上的记录重新纳入，不会被遗留。
+ */
 function collectBatch(engine: Engine, primary: OperationRecord): Batch {
   const { repos } = engine;
   const ops: OperationRecord[] = [];
   const units: Unit[] = [];
   const has = (id: string) => ops.some((o) => o.id === id);
+  const open = (op: OperationRecord | null): op is OperationRecord => op !== null && (op.status === 'queued' || op.status === 'running');
   const addUnits = (op: OperationRecord, targets: readonly PublishTarget[]) => {
     for (const t of targets) units.push({ op, target: { environmentId: t.environmentId, proxyRevision: t.proxyRevision }, outcome: null, error: null });
   };
@@ -86,7 +113,7 @@ function collectBatch(engine: Engine, primary: OperationRecord): Batch {
       ops.push(op);
       for (const childId of p.children ?? []) {
         const child = repos.operations.get(childId);
-        if (!child || child.status !== 'queued' || has(child.id)) continue;
+        if (!open(child) || has(child.id)) continue;
         ops.push(child);
         addUnits(child, payloadOf(child).targets ?? []);
       }
@@ -104,6 +131,12 @@ function collectBatch(engine: Engine, primary: OperationRecord): Batch {
     addUnits(op, p.targets ?? []);
   };
   addOp(primary);
+  // 崩溃恢复：上次合并进来、仍未结束的操作
+  const members = batchMembersOf(primary);
+  for (const id of members) {
+    const member = repos.operations.get(id);
+    if (open(member)) addOp(member);
+  }
   // 合并其他已排队、可领取的发布类操作：一次生成一份资源，每个操作保留自己的结果。
   const now = engine.now().toISOString();
   for (const other of repos.operations.listByStatus(['queued'])) {
@@ -112,14 +145,18 @@ function collectBatch(engine: Engine, primary: OperationRecord): Batch {
     if (rows.length === 0) continue;
     repos.outbox.cancelForOperation(other.id);
     addOp(other);
+    if (!members.includes(other.id)) members.push(other.id);
+  }
+  if (members.length > 0) {
+    const cur = repos.operations.get(primary.id)!;
+    repos.operations.update(primary.id, { payload: { ...payloadOf(cur), batchMembers: members } });
   }
   return { primary, ops, units };
 }
 
 // ---------- 状态更新 ----------
 
-function setAll(engine: Engine, batch: Batch, phase: OperationPhase, status: OperationStatus, step: string, error: ApiErrorBody | null = null): void {
-  const envs = new Set(batch.units.map((u) => u.target.environmentId));
+function markAll(engine: Engine, batch: Batch, phase: OperationPhase, status: OperationStatus, step: string, error: ApiErrorBody | null = null): void {
   engine.repos.tx(() => {
     for (const op of batch.ops) {
       const cur = engine.repos.operations.get(op.id);
@@ -128,7 +165,15 @@ function setAll(engine: Engine, batch: Batch, phase: OperationPhase, status: Ope
       engine.repos.operations.appendStep(op.id, phase, step);
     }
   });
-  engine.emit({ operations: batch.ops.map((o) => o.id), environments: envs });
+}
+
+function emitBatch(engine: Engine, batch: Batch): void {
+  engine.emit({ operations: batch.ops.map((o) => o.id), environments: new Set(batch.units.map((u) => u.target.environmentId)) });
+}
+
+function setAll(engine: Engine, batch: Batch, phase: OperationPhase, status: OperationStatus, step: string, error: ApiErrorBody | null = null): void {
+  markAll(engine, batch, phase, status, step, error);
+  emitBatch(engine, batch);
 }
 
 function unitResults(units: readonly Unit[], op: OperationRecord): PublishTargetResult[] {
@@ -251,8 +296,13 @@ function retentionEntries(engine: Engine, input: RetentionInput): { entries: Res
 // ---------- 主流程 ----------
 
 export async function runPublish(engine: Engine, primary: OperationRecord): Promise<void> {
-  const batch = collectBatch(engine, primary);
-  setAll(engine, batch, 'VALIDATING', 'running', '开始校验并生成节点资源');
+  // 收集（取消被合并操作的 outbox 行、记录成员）与标记 running 在同一事务内：崩溃不会留下无人领取的操作
+  const batch = engine.repos.tx(() => {
+    const b = collectBatch(engine, primary);
+    markAll(engine, b, 'VALIDATING', 'running', '开始校验并生成节点资源');
+    return b;
+  });
+  emitBatch(engine, batch);
   try {
     await publishBatch(engine, batch);
   } catch (err) {
@@ -356,11 +406,13 @@ async function publishBatch(engine: Engine, batch: Batch): Promise<void> {
   if (!plan) throw fail({ code: 'BASELINE_CHANGED', message: '发布失败：工作配置或节点资源在生成期间多次被修改' });
 
   const pending = batch.units.filter((u) => u.outcome === null);
-  if (pending.length === 0 && plan.removed.length === 0 && plan.unchanged) {
+  const forced = forcesRefresh(engine, batch);
+  if (pending.length === 0 && plan.removed.length === 0 && plan.unchanged && !forced) {
     // 没有需要写入的内容：只结算各操作
     await settle(engine, batch, null);
     return;
   }
+  if (forced) for (const op of batch.ops) engine.step(op.id, '重新合并后：写入并定向刷新节点资源，逐节点读回 Surge 已加载的内容', false);
 
   // 5. 资源 key（恰好一个）
   const resources = await engine.surge.listExternalResources().catch((err: unknown) => {
@@ -397,8 +449,10 @@ async function publishBatch(engine: Engine, batch: Batch): Promise<void> {
       state: 'candidate',
       operationId: batch.primary.id,
     });
-    for (const u of batch.units) {
-      repos.deployments.addOperation({ generation: gen, operationId: u.op.id, environmentId: u.target.environmentId, proxyRevision: u.target.proxyRevision });
+    // 每个操作一行（一个发布操作可以有多个目标；逐目标结果在操作的 result.targets 中）
+    for (const [opId, targets] of unitsByOp(batch.units)) {
+      const only = targets.length === 1 ? targets[0]! : null;
+      repos.deployments.addOperation({ generation: gen, operationId: opId, environmentId: only?.environmentId ?? null, proxyRevision: only?.proxyRevision ?? null });
     }
     return d;
   });
@@ -443,6 +497,24 @@ async function publishBatch(engine: Engine, batch: Batch): Promise<void> {
 
   const acceptable = readback.level === 'full' || readbackCovered(engine.capabilityViews(), readback.unchecked);
   await settle(engine, batch, { deployment, plan, readback, acceptable });
+}
+
+function unitsByOp(units: readonly Unit[]): Map<string, PublishTarget[]> {
+  const out = new Map<string, PublishTarget[]>();
+  for (const u of units) {
+    const list = out.get(u.op.id) ?? [];
+    list.push(u.target);
+    out.set(u.op.id, list);
+  }
+  return out;
+}
+
+/** 操作在本代数中的结果：各目标一致时为该结果，否则为 mixed（逐目标结果见 result.targets）。 */
+function opOutcome(units: readonly Unit[], opId: string): string | null {
+  const outcomes = new Set(units.filter((u) => u.op.id === opId).map((u) => u.outcome));
+  if (outcomes.size === 0) return null;
+  if (outcomes.size > 1) return 'mixed';
+  return [...outcomes][0] ?? null;
 }
 
 interface Plan {
@@ -713,9 +785,19 @@ async function rollbackPublish(
     const content = prev ? await regenerate(engine, prev, ctx.fronts) : resourceFile(0, []);
     if (content === null) throw new SfeError('READBACK_MISMATCH', '回滚失败：无法重建上一份节点资源');
     const currentDigest = await files.digest(NODE_RESOURCE_FILE);
+    // 文件仍是本次发布刚写入的内容：先确认它属于本应用，回滚意图的写前摘要才是它；
+    // 否则回滚写入失败或中途崩溃后，本应用自己的写入会被误报为外部修改（BASELINE_CHANGED）。
+    const rec = repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
+    if (currentDigest !== null && rec?.state === 'pending_add' && rec.contentDigest === currentDigest) confirmResource(repos, engine.kv, currentDigest);
     const prevDigest = files.digestContent(content);
     recordResourceIntent(repos, engine.kv, prevDigest, batch.primary.id);
-    await files.writeAtomic(NODE_RESOURCE_FILE, content, currentDigest);
+    try {
+      await files.writeAtomic(NODE_RESOURCE_FILE, content, currentDigest);
+    } catch (err) {
+      // 原子替换失败时文件未变：意图回到写前状态
+      if (currentDigest !== null && (await files.digest(NODE_RESOURCE_FILE)) === currentDigest) confirmResource(repos, engine.kv, currentDigest);
+      throw err;
+    }
     await engine.surge.updateExternalResource(ctx.key);
     const members = await engine.surge.getGroupMembers(ROUTE_GROUP_NAME);
     const expected = (prev?.nodeManifest ?? []).map((m) => m.nodeName);
@@ -811,12 +893,9 @@ async function settle(engine: Engine, batch: Batch, s: SettleInput | null): Prom
           u.outcome = 'partial';
           u.error = { code: 'READBACK_MISMATCH', message: '已部署，读回不完整：需要相应能力的实测记录覆盖未核对字段' };
         }
-        repos.deployments.setOperationOutcome(s.deployment.generation, u.op.id, u.outcome);
       }
-      for (const u of batch.units) {
-        if (u.outcome !== null && !deployedNow.has(entryKey(u.target.environmentId, u.target.proxyRevision))) {
-          repos.deployments.setOperationOutcome(s.deployment.generation, u.op.id, u.outcome);
-        }
+      for (const opId of unitsByOp(batch.units).keys()) {
+        repos.deployments.setOperationOutcome(s.deployment.generation, opId, opOutcome(batch.units, opId));
       }
       // 已移除的旧版本：retired，并回收不再被引用的代理秘密
       for (const rev of s.plan.removed) {
@@ -826,6 +905,8 @@ async function settle(engine: Engine, batch: Batch, s: SettleInput | null): Prom
       retireStaleRevisions(engine, manifestKeys);
     });
     confirmResource(repos, engine.kv, s.plan.newDigest);
+    // 已写入、定向刷新且读回一致：重新合并留下的刷新要求已满足
+    engine.kv.delete(RESOURCE_REFRESH_KEY);
     if (s.plan.removed.length > 0) {
       for (const op of batch.ops) engine.step(op.id, `已移除不再使用的旧节点 ${s.plan.removed.length} 个`, false);
     }
@@ -867,7 +948,10 @@ async function settle(engine: Engine, batch: Batch, s: SettleInput | null): Prom
       enterWaitingRoute(engine, op.id, cont.target.environmentId, cont.target.proxyRevision);
       continue;
     }
-    const final = finalPhase(engine, own);
+    const final =
+      own.length === 0 && s
+        ? { phase: 'COMPLETED' as const, status: 'succeeded' as const, error: null, message: s.acceptable ? '已写入并定向刷新节点资源，读回一致' : '已写入并定向刷新节点资源，读回不完整' }
+        : finalPhase(engine, own);
     repos.tx(() => {
       repos.operations.update(op.id, { phase: final.phase, status: final.status, error: final.error, result });
       repos.operations.appendStep(op.id, final.phase, final.message);
@@ -946,17 +1030,68 @@ export async function recoverPublish(engine: Engine, op: OperationRecord): Promi
     const prev = resourcePreviousDigest(engine.kv);
     if (current !== null && (current === rec.contentDigest || current === prev)) confirmResource(repos, engine.kv, current);
   }
-  for (const d of repos.deployments.listByOperation(op.id)) {
-    const dep = repos.deployments.get(d.generation);
-    if (dep && dep.state === 'candidate') repos.deployments.update(d.generation, { state: 'failed' });
+  for (const generation of batchGenerations(engine, op.id)) {
+    const dep = repos.deployments.get(generation);
+    if (dep && dep.state === 'candidate') repos.deployments.update(generation, { state: 'failed' });
   }
   const body: ApiErrorBody = { code: 'UNKNOWN_STATE', message: '发布中断：服务重启时发布未完成，请重新发布待部署的修改' };
-  const children = op.kind === 'import.batch' ? (payloadOf(op).children ?? []) : [];
-  for (const id of [op.id, ...children]) {
+  // 批次内全部操作：主操作、合并进来的操作、导入的逐行操作，以及该次发布记录中的操作
+  for (const id of batchOperationIds(engine, op)) {
     const cur = repos.operations.get(id);
     if (!cur || (cur.status !== 'running' && cur.status !== 'queued')) continue;
     engine.updateOp(id, { phase: 'FAILED', status: 'failed', error: body }, body.message);
   }
+}
+
+/** 主操作发起的发布记录（代数）：发布记录的主操作，或发布包含的操作。 */
+function batchGenerations(engine: Engine, primaryId: string): number[] {
+  const { repos } = engine;
+  const out = new Set<number>(repos.deployments.listByOperation(primaryId).map((d) => d.generation));
+  for (const d of repos.deployments.list(200)) if (d.operationId === primaryId) out.add(d.generation);
+  return [...out].sort((a, b) => a - b);
+}
+
+/** 一个发布批次涉及的全部操作编号（主操作在前）。 */
+function batchOperationIds(engine: Engine, primary: OperationRecord): string[] {
+  const { repos } = engine;
+  const ids: string[] = [];
+  const visit = (id: string): void => {
+    if (ids.includes(id)) return;
+    const op = id === primary.id ? primary : repos.operations.get(id);
+    if (!op) return;
+    ids.push(id);
+    if (op.kind === 'import.batch') for (const child of payloadOf(op).children ?? []) visit(child);
+  };
+  visit(primary.id);
+  for (const id of batchMembersOf(primary)) visit(id);
+  for (const generation of batchGenerations(engine, primary.id)) {
+    for (const row of repos.deployments.listOperations(generation)) visit(row.operationId);
+  }
+  return ids;
+}
+
+/**
+ * 启动兜底（在执行器开始前调用）：仍为 running、却没有待处理 outbox 行、也不属于任何将被恢复的发布批次的
+ * 非路由操作，再也不会被领取。记为 FAILED（UNKNOWN_STATE），不重放任何写入；待部署的修改由下一次发布收敛。
+ */
+export function failOrphanedOperations(engine: Engine): string[] {
+  const { repos } = engine;
+  const covered = new Set<string>();
+  for (const op of repos.operations.listByStatus(['queued', 'running'])) {
+    if (repos.outbox.pendingForOperation(op.id).length === 0) continue;
+    // 将按发布路径执行或恢复的批次：其成员由主操作处理（已进入切换的发布按路由恢复，不再处理成员）
+    if (isPublishKind(op.kind) && !payloadOf(op).route) for (const id of batchOperationIds(engine, op)) covered.add(id);
+    else covered.add(op.id);
+  }
+  const body: ApiErrorBody = { code: 'UNKNOWN_STATE', message: '操作中断：服务重启时操作未完成且已无法继续，请检查后重试' };
+  const failed: string[] = [];
+  for (const op of repos.operations.listByStatus(['running'])) {
+    if (covered.has(op.id) || isRouteOperation(op)) continue;
+    engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message);
+    failed.push(op.id);
+  }
+  if (failed.length > 0) engine.log('warn', 'startup.orphaned_operations', { count: failed.length });
+  return failed;
 }
 
 export { routeTargetOf };

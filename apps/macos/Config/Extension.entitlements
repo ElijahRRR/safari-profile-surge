@@ -11,10 +11,7 @@
 	<array>
 		<string>$(TeamIdentifierPrefix)sfe</string>
 	</array>
-	<!-- 备选钥匙串方案（SFE_DATA_PROTECTION_KEYCHAIN）使用；首选的登录钥匙串方案不依赖它。 -->
-	<key>keychain-access-groups</key>
-	<array>
-		<string>$(AppIdentifierPrefix)com.sfe.shared</string>
-	</array>
+	<!-- 首选的登录钥匙串方案不需要 keychain-access-groups（受限权限，需要描述文件）。备选方案
+	     （SFE_DATA_PROTECTION_KEYCHAIN）改用 Extension-DataProtection.entitlements，见 project.yml 与 README。 -->
 </dict>
 </plist>

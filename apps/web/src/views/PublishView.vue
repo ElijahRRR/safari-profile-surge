@@ -1,10 +1,12 @@
 <script setup lang="ts">
 // 发布与 Surge：固定工作配置身份与配置代数、待部署与发布（受能力门槛约束）、前置代理、
-// 初始化向导（尚无工作配置时）与重新合并。
+// 初始化向导（尚无工作配置时）与重新合并。初始化成功后向导随 settings.updated 卸载，
+// 「在 Surge 中手动切换一次」由固定工作配置卡片持续提示，直到读回 Surge 正在使用工作配置。
 import { computed } from 'vue';
 import { WORKING_PROFILE_NAME } from '@sfe/contract';
 import { Badge, PageHeader } from '@sfe/easyquick';
 import KeyValueList from '../components/KeyValueList.vue';
+import NoticeBox from '../components/NoticeBox.vue';
 import PendingDeployCard from '../components/PendingDeployCard.vue';
 import FrontProxiesCard from '../components/FrontProxiesCard.vue';
 import InitWizardCard from '../components/InitWizardCard.vue';
@@ -17,6 +19,8 @@ const { store } = useConsole();
 const settings = computed(() => store.settings.value);
 const surge = computed(() => store.surge.value);
 const initialized = computed(() => !!settings.value?.workingProfilePath);
+/** 已有工作配置但没有确认 Surge 正在使用它（初始化后 Surge 事实可能尚未重新读取，为 null）。 */
+const needsManualSwitch = computed(() => initialized.value && surge.value?.onWorkingProfile !== true);
 
 const description = computed(() =>
   initialized.value ? `工作配置「${WORKING_PROFILE_NAME}」，配置代数 ${formatNumber(surge.value?.configurationGeneration)}` : '尚未初始化固定工作配置',
@@ -34,6 +38,19 @@ const description = computed(() =>
           <Badge v-else-if="surge?.onWorkingProfile === false" variant="danger">Surge 未使用工作配置</Badge>
         </div>
         <div class="card-body">
+          <NoticeBox
+            v-if="needsManualSwitch"
+            :tone="surge?.onWorkingProfile === false ? 'warning' : 'info'"
+            title="下一步：在 Surge 中手动切换一次"
+            class="mb-4"
+            data-test="manual-switch"
+          >
+            <p v-if="surge?.onWorkingProfile === false">
+              Surge 当前配置是「{{ surge?.currentProfileName ?? '无法读取' }}」，不是「{{ WORKING_PROFILE_NAME }}」。请在 Surge 中把当前配置手动切换到「{{ WORKING_PROFILE_NAME }}」一次。
+            </p>
+            <p v-else>还没有确认 Surge 正在使用「{{ WORKING_PROFILE_NAME }}」。如果初始化后还没有切换，请在 Surge 中把当前配置手动切换到「{{ WORKING_PROFILE_NAME }}」一次。</p>
+            <p>只需要这一次；本应用从不切换配置，也不会替你切换。读回 Surge 正在使用它之前，发布和激活环境都会被拒绝。</p>
+          </NoticeBox>
           <KeyValueList
             :items="[
               { key: 'path', label: '工作配置路径' },

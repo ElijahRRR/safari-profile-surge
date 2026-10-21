@@ -1,10 +1,11 @@
 import Foundation
 
 /// 原生桥的转发流程，与系统接口解耦以便测试：
-/// 校验信封 → 读取传输配置 → 包装 BridgeEnvelope → 回环往返 → 解析应答 → （requestLoginFill）解析钥匙串引用。
-/// 每次调用恰好回调一次；失败一律转换为 NativeResponse 错误应答。
+/// 校验信封 → 读取传输配置 → 生成 BridgePayload 与握手（令牌不上线路）→ 回环握手与往返 → 解析应答
+/// → （requestLoginFill）解析钥匙串引用。每次调用恰好回调一次；失败一律转换为 NativeResponse 错误应答。
 struct BridgeForwarder {
-    typealias Transport = (_ endpoint: BridgeEndpoint, _ line: Data, _ completion: @escaping (Result<Data, BridgeTransportError>) -> Void) -> Void
+    /// 连接 endpoint 并完成 BridgeConversation（BridgeClient.send）；回调服务的应答行。
+    typealias Transport = (_ endpoint: BridgeEndpoint, _ handshake: BridgeHandshake, _ completion: @escaping (Result<Data, BridgeTransportError>) -> Void) -> Void
 
     struct Outcome {
         /// 交给扩展的 NativeResponse。
@@ -20,6 +21,7 @@ struct BridgeForwarder {
     let readPassword: (String) -> Result<String, KeychainFailureReason>
     let bridgeVersion: String
     var now: () -> Date = { Date() }
+    var makeNonce: () -> [UInt8]? = { BridgeHandshake.randomNonce() }
 
     func handle(message raw: Any?, profileId: String?, completion: @escaping (Outcome) -> Void) {
         let envelope: NativeBridge.ValidatedEnvelope
@@ -41,19 +43,24 @@ struct BridgeForwarder {
             credentials = value
         }
 
-        let line: Data
-        switch NativeBridge.bridgeLine(message: envelope.message, token: credentials.token, profileId: profileId, bridgeVersion: bridgeVersion) {
+        let payload: String
+        switch NativeBridge.bridgePayload(message: envelope.message, profileId: profileId, bridgeVersion: bridgeVersion) {
         case .failure(let failure):
             completion(Self.outcome(failure, logType: logType))
             return
         case .success(let value):
-            line = value
+            payload = value
         }
+        guard let nonce = makeNonce() else {
+            completion(Self.outcome(.nonceUnavailable, logType: logType))
+            return
+        }
+        let handshake = BridgeHandshake(token: credentials.token, payload: payload, clientNonce: nonce)
 
         let isLoginFill = envelope.type == NativeBridge.loginFillType
         let readPassword = self.readPassword
         let now = self.now
-        transport(credentials.endpoint, line) { result in
+        transport(credentials.endpoint, handshake) { result in
             let response: [String: Any]
             switch result.mapError(NativeFailure.unreachable).flatMap(NativeBridge.parseResponse) {
             case .failure(let failure):

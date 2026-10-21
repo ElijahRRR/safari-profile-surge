@@ -55,6 +55,11 @@ const paged = computed(() => rows.value.slice((page.value - 1) * pageSize.value,
 watch([statusFilter, includeReconcile, search, pageSize], () => {
   page.value = 1;
 });
+// 操作结束后会离开「进行中」等筛选：当前页超出就退回最后一页，否则表格显示为空且分页被隐藏。
+watch(() => rows.value.length, (n) => {
+  const last = Math.max(1, Math.ceil(n / pageSize.value));
+  if (page.value > last) page.value = last;
+});
 
 const tabOptions = computed(() => [
   { value: 'all' as const, label: '全部' },

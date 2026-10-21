@@ -88,7 +88,7 @@ describe('output parsing', () => {
 });
 
 describe('ruleset strategy ownership edge cases', () => {
-  test('a pending intent whose file matches neither digest is treated as an external change', async () => {
+  test('a pending intent whose file matches neither digest is treated as an external change (overwritten only when undoing the entry)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'sfe-misc-'));
     try {
       createFakeSurgeEnvironment(dir);
@@ -110,7 +110,11 @@ describe('ruleset strategy ownership edge cases', () => {
         autoReloadCondition: () => 'off',
       });
       expect((await ctrl.read()).mode).toBe('UNKNOWN');
-      await expect(ctrl.transition('NORMAL')).rejects.toMatchObject({ code: 'UNKNOWN_STATE' });
+      await expect(ctrl.transition('ACTIVE')).rejects.toMatchObject({ code: 'UNKNOWN_STATE' });
+      // 激活中的阻断不改写它；撤销本应用入口（undo）改写这个本应用文件（比较并替换），普通模式不会因此卡住。
+      await expect(ctrl.transition('BLOCKED')).rejects.toMatchObject({ code: 'UNKNOWN_STATE' });
+      expect((await ctrl.transition('NORMAL', undefined, { undo: true })).mode).toBe('NORMAL');
+      expect((await ctrl.read()).mode).toBe('NORMAL');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -212,13 +212,20 @@ export interface EntryReadback {
   evidence: string[];
   /** 排在本应用入口之前、可能抢先匹配 Safari 流量的规则。 */
   precedenceIssues: Array<{ rule: string; source: SurgeRuleRecord['source']; severity: 'blocking' | 'warning' }>;
+  /** 本应用记录拥有、但被外部修改、无法识别或缺失的入口文件（只有撤销入口的方向会改写，§5.5）。 */
+  changedOwnedFiles?: string[];
+}
+
+export interface EntryTransitionOptions {
+  /** 撤销本应用入口（普通模式、回滚；目标 BLOCKED/NORMAL）：允许改写 changedOwnedFiles。激活中的阻断步骤不设置。 */
+  undo?: boolean;
 }
 
 export interface EntryController {
   readonly strategy: 'temp_rule' | 'ruleset_resource';
   read(): Promise<EntryReadback>;
   /** 按 planEntryTransition 的顺序执行，每步写入后运行时读回；任一步失败抛错并保留已确认的更严格状态。 */
-  transition(to: KnownEntryMode, onStep?: (step: EntryStep) => void): Promise<EntryReadback>;
+  transition(to: KnownEntryMode, onStep?: (step: EntryStep) => void, opts?: EntryTransitionOptions): Promise<EntryReadback>;
 }
 
 // ---------- 能力 ----------

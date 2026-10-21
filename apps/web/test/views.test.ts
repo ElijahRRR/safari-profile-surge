@@ -1,9 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { defineComponent, h, nextTick } from 'vue';
+import type { InitPreviewResponse, ProbeView } from '@sfe/contract';
 import EnvironmentsView from '../src/views/EnvironmentsView.vue';
+import OperationsView from '../src/views/OperationsView.vue';
 import SettingsPageView from '../src/views/SettingsPageView.vue';
 import BindingWizardView from '../src/views/BindingWizardView.vue';
 import OverviewView from '../src/views/OverviewView.vue';
+import PublishView from '../src/views/PublishView.vue';
+import InitWizardCard from '../src/components/InitWizardCard.vue';
 import RouteActionHost from '../src/components/RouteActionHost.vue';
 import RouteCard from '../src/components/RouteCard.vue';
 import AppLayout from '../src/components/AppLayout.vue';
@@ -48,6 +52,21 @@ describe('environments page', () => {
     await flush();
     expect(document.body.querySelectorAll('[data-test="env-table"] tbody tr')).toHaveLength(1);
     expect(document.body.querySelector('[data-test="env-table"] tbody')?.textContent).toContain('US-买家01');
+    m.unmount();
+  });
+
+  it('falls back to the last page when rows leave the current page instead of showing an empty table', async () => {
+    const envs = Array.from({ length: 21 }, (_, i) => environment({ id: `env_${i + 1}`, code: `E${String(i + 1).padStart(4, '0')}`, displayName: `US-买家${i + 1}` }));
+    const { ctx } = testContext(() => NOT_FOUND, snapshot({ environments: envs }));
+    const m = await mountWith(EnvironmentsView, ctx, {}, '/environments');
+    click(document.body.querySelector('nav[aria-label="分页"] button[aria-label="下一页"]'));
+    await flush();
+    expect(document.body.querySelectorAll('[data-test="env-table"] tbody tr')).toHaveLength(1);
+    // 第 2 页唯一的一行在别处被删除
+    ctx.store.applyEvent({ type: 'environment.deleted', sequence: 11, environmentId: 'env_21' });
+    await flush();
+    expect(document.body.querySelectorAll('[data-test="env-table"] tbody tr')).toHaveLength(20);
+    expect(document.body.textContent).not.toContain('没有符合条件的环境');
     m.unmount();
   });
 
@@ -113,6 +132,26 @@ describe('environments page', () => {
     await flush();
     expect(document.body.querySelector('[data-test="env-form"]')).not.toBeNull();
     expect(document.body.querySelectorAll('input[type="password"]')).toHaveLength(0);
+    m.unmount();
+  });
+});
+
+describe('operations page', () => {
+  it('falls back to the last page when operations leave the 进行中 filter', async () => {
+    const ops = Array.from({ length: 21 }, (_, i) => operation({ id: `op_${i}`, createdAt: `2026-10-21T08:${String(i).padStart(2, '0')}:00.000Z` }));
+    const { ctx } = testContext((c: Call) => (c.url.startsWith('/api/operations?') ? { status: 200, body: ops } : NOT_FOUND), snapshot({ pendingOperations: ops }));
+    const m = await mountWith(OperationsView, ctx, {}, '/operations');
+    await flush();
+    click(byText('button.tab', '进行中'));
+    await flush();
+    click(document.body.querySelector('nav[aria-label="分页"] button[aria-label="下一页"]'));
+    await flush();
+    expect(document.body.querySelectorAll('tbody tr')).toHaveLength(1);
+    // 第 2 页上最早的操作结束，离开「进行中」
+    ctx.store.applyEvent({ type: 'operation.updated', sequence: 11, operation: { ...ops[0]!, status: 'succeeded', phase: 'ACTIVE_VERIFIED', updatedAt: '2026-10-21T09:00:00.000Z' } });
+    await flush();
+    expect(document.body.querySelectorAll('tbody tr')).toHaveLength(20);
+    expect(document.body.textContent).not.toContain('没有符合条件的操作');
     m.unmount();
   });
 });
@@ -220,6 +259,80 @@ describe('overview and route card', () => {
   });
 });
 
+describe('overview reconcile time', () => {
+  it('uses the latest surge check when route.updated was not re-sent by an unchanged reconcile', async () => {
+    const snap = snapshot({ route: route({ lastReconciledAt: '2026-10-21T07:20:00.000Z' }) });
+    const { ctx } = testContext(() => NOT_FOUND, { ...snap, surge: { ...snap.surge, lastCheckedAt: '2026-10-21T08:00:30.000Z' } });
+    const m = await mountWith(OverviewView, ctx);
+    expect(document.body.querySelector('.page-description')?.textContent).toContain('最近对账于 30 秒前');
+    m.unmount();
+  });
+});
+
+describe('route card control state', () => {
+  const probe = (expiresAt: string): ProbeView => ({
+    id: 'p1', kind: 'safari', outcome: 'ok', exitIp: '192.0.2.44', proxyRevision: 1, nodeName: 'SFE-N-E0001-US01-v001',
+    routeEpoch: 1, configurationGeneration: 4, entryMode: 'VERIFY_ONLY', testId: null, surgeRequest: null, chainEvidence: null, browser: null,
+    observedAt: '2026-10-21T07:45:00.000Z', expiresAt, message: null,
+  });
+
+  it('never shows a green 受控 once the probe is shown as expired, even before the reconcile adds probe_expired', async () => {
+    // 本机时钟 08:01；实测 08:00:30 过期，服务端还没对账，warnings 为空
+    const { ctx } = testContext(() => NOT_FOUND, snapshot({
+      environments: [environment({ readiness: 'active' })],
+      route: route({ activeEnvironmentId: 'env_1', entryMode: 'ACTIVE', phase: 'active_verified', lastSafariProbe: probe('2026-10-21T08:00:30.000Z'), warnings: [] }),
+    }));
+    const m = await mountWith(RouteCard, ctx);
+    const card = document.body.querySelector('[data-test="route-card"]')!;
+    expect(card.textContent).toContain('上次结果');
+    expect(card.querySelector('.bg-green-500')).toBeNull();
+    expect(card.querySelector('.card-header .bg-yellow-500')).not.toBeNull();
+    expect(card.querySelector('.card-header')?.textContent).not.toContain('受控');
+    expect(card.querySelector('[data-warning="probe_expired"]')?.textContent).toContain('Safari 实测已过期');
+    const entry = card.querySelector('[data-test="entry-badge"]')!;
+    expect(entry.className).toContain('badge-warning');
+    expect(entry.textContent).toBe('受控（实测已过期）');
+    m.unmount();
+  });
+
+  it('shows 受控 in green only while the probe is ok and unexpired', async () => {
+    const { ctx } = testContext(() => NOT_FOUND, snapshot({
+      environments: [environment({ readiness: 'active' })],
+      route: route({ activeEnvironmentId: 'env_1', entryMode: 'ACTIVE', phase: 'active_verified', lastSafariProbe: probe('2026-10-21T08:15:00.000Z'), warnings: [] }),
+    }));
+    const m = await mountWith(RouteCard, ctx);
+    const card = document.body.querySelector('[data-test="route-card"]')!;
+    expect(card.querySelector('.card-header .bg-green-500')).not.toBeNull();
+    expect(card.querySelector('.card-header')?.textContent).toContain('受控');
+    expect(card.querySelector('[data-test="entry-badge"]')?.className).toContain('badge-success');
+    expect(card.querySelector('[data-warning]')).toBeNull();
+    m.unmount();
+  });
+
+  it('labels the cancel action with its effect, never a bare 取消', async () => {
+    const { ctx } = testContext(() => NOT_FOUND, snapshot({
+      route: route({ operationId: 'op_9', phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: 'env_1' }),
+      pendingOperations: [operation({ id: 'op_9', kind: 'deploy.publish', phase: 'WAITING_ROUTE', status: 'waiting' })],
+    }));
+    const m = await mountWith(RouteCard, ctx);
+    expect(document.body.querySelector('[data-test="route-cancel"]')?.textContent?.trim()).toBe('取消等待');
+    m.unmount();
+  });
+
+  it('the operation dialog keeps 关闭 for dismissing and names the cancel action', async () => {
+    const op = operation({ status: 'waiting' });
+    const { ctx } = testContext((c: Call) => (c.url === '/api/operations/op_1' ? { status: 200, body: op } : NOT_FOUND), snapshot({ pendingOperations: [op] }));
+    const m = await mountWith(RouteActionHost, ctx);
+    ctx.viewer.open('op_1', 'US-买家01');
+    await flush();
+    const footer = Array.from(document.body.querySelectorAll('.modal-footer button')).map((b) => b.textContent?.trim());
+    expect(footer).toContain('关闭');
+    expect(footer).not.toContain('取消');
+    expect(document.body.querySelector('[data-test="cancel-operation"]')?.textContent?.trim()).toBe('取消切换');
+    m.unmount();
+  });
+});
+
 describe('header normal-mode entry', () => {
   it('is offered while a managed environment is active and uses the confirmation flow', async () => {
     const { ctx, calls } = testContext(
@@ -246,6 +359,113 @@ describe('header normal-mode entry', () => {
     const m = await mountWith(AppLayout, ctx);
     expect(document.body.querySelector('[data-test="header-normal-mode"]')).toBeNull();
     expect(document.body.querySelector('header.glass')).not.toBeNull();
+    m.unmount();
+  });
+});
+
+describe('init wizard', () => {
+  const initPreview: InitPreviewResponse = {
+    preview_digest: 'hmac:init-1',
+    sourceProfileName: '默认',
+    sourceProfilePath: '/Users/test/Library/Application Support/Surge/Profiles/默认.conf',
+    workingProfilePath: '/Users/test/Library/Application Support/Surge/Profiles/日常-Safari环境.conf',
+    backupDirectory: '/Users/test/Library/Application Support/SafariProfileSurge/backups/init',
+    managedDiff: '',
+    referencedFiles: [],
+    managedConfigDetected: false,
+    profileDirectoryRisk: 'none',
+    autoReloadEnabled: false,
+    takeover: { enhancedMode: true, systemProxy: false, outboundMode: 'rule', checkedAt: '2026-10-21T08:00:00.000Z' },
+    httpApi: { configured: false, loopbackOnly: null },
+    remoteSources: [],
+    remoteUpdatesNotice: null,
+    checks: [],
+    nameCollisions: [],
+  };
+  const initOp = operation({ id: 'op_init', kind: 'maintenance.init', phase: 'VALIDATING', status: 'running', environmentId: null, steps: [] });
+
+  async function commitInit() {
+    const { ctx, calls } = testContext((c: Call) => {
+      if (c.url === '/api/maintenance/init/preview') return { status: 200, body: initPreview };
+      if (c.url === '/api/maintenance/init/commit') return { status: 202, body: { operation_id: 'op_init', environment_id: null, revision: null, duplicate: false } };
+      if (c.url === '/api/operations/op_init') return { status: 200, body: initOp };
+      return NOT_FOUND;
+    }, snapshot());
+    const m = await mountWith(InitWizardCard, ctx);
+    click(byText('button', '生成预览'));
+    await flush();
+    click(document.body.querySelector('[data-test="init-commit"]'));
+    await flush();
+    return { ctx, calls, m };
+  }
+
+  it('202 only shows progress; the next-step notice waits for the operation to succeed', async () => {
+    const { ctx, calls, m } = await commitInit();
+    expect(calls.find((c) => c.url === '/api/maintenance/init/commit')?.body).toEqual({ request_id: expect.any(String), preview_digest: 'hmac:init-1' });
+    expect(document.body.querySelector('[data-test="init-running"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-test="init-done"]')).toBeNull();
+    ctx.store.applyEvent({ type: 'operation.updated', sequence: 11, operation: { ...initOp, phase: 'COMPLETED', status: 'succeeded', updatedAt: '2026-10-21T08:02:00.000Z' } });
+    await flush();
+    expect(document.body.querySelector('[data-test="init-done"]')?.textContent).toContain('日常-Safari环境');
+    m.unmount();
+  });
+
+  it('the manual-switch instruction outlives the wizard once the server records the working profile', async () => {
+    // 成功时服务端连续发出 operation.updated(succeeded)、surge.status、settings.updated（已设置 workingProfilePath）；
+    // 初始化卡片随之卸载，下一步提示必须仍然可见。
+    const base = snapshot();
+    const before = snapshot({
+      settings: { ...base.settings, workingProfilePath: null },
+      surge: { ...base.surge, currentProfileName: '默认', onWorkingProfile: null },
+    });
+    const { ctx } = testContext((c: Call) => {
+      if (c.url === '/api/maintenance/init/preview') return { status: 200, body: initPreview };
+      if (c.url === '/api/maintenance/init/commit') return { status: 202, body: { operation_id: 'op_init', environment_id: null, revision: null, duplicate: false } };
+      if (c.url === '/api/operations/op_init') return { status: 200, body: initOp };
+      return NOT_FOUND;
+    }, before);
+    const m = await mountWith(PublishView, ctx, {}, '/publish');
+    expect(document.body.querySelector('[data-test="manual-switch"]')).toBeNull();
+    click(byText('button', '生成预览'));
+    await flush();
+    click(document.body.querySelector('[data-test="init-commit"]'));
+    await flush();
+    expect(document.body.querySelector('[data-test="init-running"]')?.textContent).toContain('手动切换');
+    ctx.store.applyEvent({ type: 'operation.updated', sequence: 11, operation: { ...initOp, phase: 'COMPLETED', status: 'succeeded', updatedAt: '2026-10-21T08:02:00.000Z' } });
+    // 初始化不刷新 Surge 事实：此时仍无法确认当前配置
+    ctx.store.applyEvent({ type: 'surge.status', sequence: 12, surge: before.surge });
+    ctx.store.applyEvent({ type: 'settings.updated', sequence: 13, settings: base.settings });
+    await flush();
+    expect(document.body.querySelector('[data-test="init-wizard"]')).toBeNull();
+    const hint = document.body.querySelector('[data-test="manual-switch"]');
+    expect(hint?.textContent).toContain('在 Surge 中手动切换一次');
+    expect(hint?.textContent).toContain('日常-Safari环境');
+    expect(hint?.textContent).toContain('本应用从不切换配置');
+    // 下一次对账读到仍不是工作配置：提示保留并说明当前配置
+    ctx.store.applyEvent({ type: 'surge.status', sequence: 14, surge: { ...before.surge, onWorkingProfile: false } });
+    await flush();
+    expect(document.body.querySelector('[data-test="manual-switch"]')?.textContent).toContain('Surge 当前配置是「默认」');
+    expect(document.body.querySelector('[data-test="manual-switch"]')?.className).toContain('bg-amber-50');
+    // 你切换后对账读到工作配置：提示消失
+    ctx.store.applyEvent({ type: 'surge.status', sequence: 15, surge: base.surge });
+    await flush();
+    expect(document.body.querySelector('[data-test="manual-switch"]')).toBeNull();
+    m.unmount();
+  });
+
+  it('a failed init shows the error and restores preview and commit', async () => {
+    const { ctx, m } = await commitInit();
+    ctx.store.applyEvent({
+      type: 'operation.updated',
+      sequence: 11,
+      operation: { ...initOp, phase: 'FAILED', status: 'failed', error: { code: 'NAME_COLLISION', message: '初始化失败：目标文件已存在' }, updatedAt: '2026-10-21T08:02:00.000Z' },
+    });
+    await flush();
+    expect(document.body.querySelector('[data-test="init-done"]')).toBeNull();
+    expect(document.body.querySelector('[data-test="init-running"]')).toBeNull();
+    expect(document.body.querySelector('[data-test="init-failed"]')?.textContent).toContain('初始化失败：目标文件已存在');
+    expect(document.body.querySelector('[data-test="init-commit"]')).not.toBeNull();
+    expect(byText('button', '生成预览')).not.toBeNull();
     m.unmount();
   });
 });

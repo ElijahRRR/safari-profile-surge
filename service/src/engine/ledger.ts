@@ -43,6 +43,19 @@ export function findDuplicateOperation(engine: Engine, requestId: string, digest
   return null;
 }
 
+/**
+ * 在主事务内再核对一次幂等后创建操作。受理在首次核对与主事务之间有 await（钥匙串写入、预览重算）时，
+ * 并发的同一请求可能已先提交：此时返回原操作（duplicate: true），摘要不同仍为 409，不会撞 request_id
+ * 唯一约束或误报版本冲突。create 在同一事务内同步执行。
+ */
+export function commitOperation(engine: Engine, requestId: string, digest: string, create: () => OperationRecord): { op: OperationRecord; duplicate: boolean } {
+  return engine.repos.tx(() => {
+    const again = findDuplicateOperation(engine, requestId, digest);
+    if (again) return { op: again, duplicate: true };
+    return { op: create(), duplicate: false };
+  });
+}
+
 /** 不创建操作的请求：已登记且摘要相同 → 返回登记的引用；不同 → 409；未登记 → null。 */
 export function findLedger<T>(engine: Engine, requestId: string, digest: string): { ref: T } | null {
   const entry = engine.kv.get<LedgerEntry>(`req:${requestId}`);

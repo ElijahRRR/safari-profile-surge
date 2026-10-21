@@ -1,16 +1,28 @@
 import XCTest
 
-/// 用假的传输与钥匙串驱动完整的转发流程（不连网络、不读真实钥匙串）。
+/// 用假的传输（内存中的 FakeBridgeServer，走完整握手）与钥匙串驱动完整的转发流程（不连网络、不读真实钥匙串）。
 final class BridgeForwarderTests: XCTestCase {
     private final class FakeTransport {
-        var sentLines: [Data] = []
+        let server: FakeBridgeServer
         var endpoints: [BridgeEndpoint] = []
-        var reply: Result<Data, BridgeTransportError> = .failure(.connectFailed)
 
-        func send(_ endpoint: BridgeEndpoint, _ line: Data, _ completion: @escaping (Result<Data, BridgeTransportError>) -> Void) {
+        /// serverToken：假服务持有的令牌；与原生桥不同时模拟不持有令牌的监听者。
+        init(serverToken: String = Fixtures.token) {
+            server = FakeBridgeServer(token: serverToken, reply: .failure(.connectFailed))
+        }
+
+        /// 证明通过后服务的应答（或传输失败）。
+        var reply: Result<Data, BridgeTransportError> {
+            get { server.reply }
+            set { server.reply = newValue }
+        }
+
+        /// 原生桥发出的每一行（hello、request）。
+        var sentLines: [Data] { server.received }
+
+        func send(_ endpoint: BridgeEndpoint, _ handshake: BridgeHandshake, _ completion: @escaping (Result<Data, BridgeTransportError>) -> Void) {
             endpoints.append(endpoint)
-            sentLines.append(line)
-            completion(reply)
+            BridgeConversation.run(handshake, over: server, completion: completion)
         }
     }
 
@@ -26,7 +38,7 @@ final class BridgeForwarderTests: XCTestCase {
         let fixedNow = now
         return BridgeForwarder(
             loadCredentials: { loaded },
-            transport: { endpoint, line, completion in transport.send(endpoint, line, completion) },
+            transport: { endpoint, handshake, completion in transport.send(endpoint, handshake, completion) },
             readPassword: readPassword,
             bridgeVersion: "test",
             now: { fixedNow }
@@ -51,11 +63,44 @@ final class BridgeForwarderTests: XCTestCase {
         XCTAssertEqual(JSONLine.bool(outcome.response["ok"]), true)
         XCTAssertEqual(transport.endpoints, [BridgeEndpoint(port: 61848)])
 
-        let sent = decodeLine(try XCTUnwrap(transport.sentLines.first))
-        XCTAssertEqual(sent["auth"] as? String, Fixtures.token)
+        // hello → request：令牌不在任何一行中；场景 ID 与消息只在服务证明之后的 request.payload 中
+        XCTAssertEqual(transport.sentLines.count, 2)
+        for line in transport.sentLines {
+            XCTAssertFalse(String(decoding: line, as: UTF8.self).contains(Fixtures.token))
+        }
+        XCTAssertEqual(transport.server.verifiedPayloads.count, 1)
+        let sent = try XCTUnwrap(transport.server.sentPayload)
+        XCTAssertNil(sent["auth"])
         XCTAssertEqual((sent["bridge"] as? [String: Any])?["profileId"] as? String, Fixtures.profileId)
+        XCTAssertEqual((sent["bridge"] as? [String: Any])?["bridgeVersion"] as? String, "test")
         XCTAssertEqual((sent["message"] as? [String: Any])?["type"] as? String, "reportProfileState")
         XCTAssertEqual(JSONLine.integer((sent["message"] as? [String: Any])?["windows_open"]), 1)
+    }
+
+    func testNothingButTheHelloReachesAListenerThatCannotProveTheToken() throws {
+        let transport = FakeTransport(serverToken: String(repeating: "B", count: 42) + "Q")
+        transport.reply = .success(Data(#"{"ok":true,"data":{}}"#.utf8))
+        let message = jsonObject(#"{"v":1,"message":{"type":"requestLoginFill","top_url":"https://www.amazon.com/ap/signin","frame_is_top":true,"form_action":"https://www.amazon.com/ap/signin","fields":["identifier"],"route_epoch":3}}"#)
+        let outcome = try XCTUnwrap(run(makeForwarder(transport: transport), message: message))
+
+        XCTAssertEqual(errorCode(outcome.response), "SURGE_UNREACHABLE")
+        XCTAssertEqual(errorReason(outcome.response), "auth_failed")
+        XCTAssertEqual(outcome.logCode, "SURGE_UNREACHABLE")
+        XCTAssertEqual(transport.sentLines.count, 1)
+        let hello = String(decoding: try XCTUnwrap(transport.sentLines.first), as: UTF8.self)
+        XCTAssertFalse(hello.contains(Fixtures.profileId))
+        XCTAssertFalse(hello.contains("requestLoginFill"))
+        XCTAssertFalse(hello.contains(Fixtures.token))
+        XCTAssertNil(transport.server.sentPayload)
+    }
+
+    func testNonceFailureSendsNothing() throws {
+        let transport = FakeTransport()
+        var forwarder = makeForwarder(transport: transport)
+        forwarder.makeNonce = { nil }
+        let outcome = try XCTUnwrap(run(forwarder, message: jsonObject(#"{"v":1,"message":{"type":"getCurrentState"}}"#)))
+        XCTAssertTrue(transport.sentLines.isEmpty)
+        XCTAssertEqual(errorCode(outcome.response), "INTERNAL")
     }
 
     func testIdentityFieldsInsideTheMessageAreNotTrusted() throws {
@@ -64,7 +109,7 @@ final class BridgeForwarderTests: XCTestCase {
         transport.reply = .success(Data(#"{"ok":true,"data":{}}"#.utf8))
         let message = jsonObject(#"{"v":1,"profileId":"forged","message":{"type":"getCurrentState"}}"#)
         _ = run(makeForwarder(transport: transport), message: message, profileId: nil)
-        let sent = decodeLine(try XCTUnwrap(transport.sentLines.first))
+        let sent = try XCTUnwrap(transport.server.sentPayload)
         XCTAssertTrue((sent["bridge"] as? [String: Any])?["profileId"] is NSNull)
         XCTAssertFalse(serialized(sent["bridge"] ?? NSNull()).contains("forged"))
     }
@@ -133,7 +178,9 @@ final class BridgeForwarderTests: XCTestCase {
         XCTAssertEqual(fills?.last?["value"] as? String, Fixtures.syntheticSecret)
         XCTAssertNil(fills?.last?["keychainRef"])
         // 发给服务的请求里没有任何秘密
-        XCTAssertFalse(String(decoding: try XCTUnwrap(transport.sentLines.first), as: UTF8.self).contains(Fixtures.syntheticSecret))
+        for line in transport.sentLines {
+            XCTAssertFalse(String(decoding: line, as: UTF8.self).contains(Fixtures.syntheticSecret))
+        }
     }
 
     func testLoginFillKeychainFailureReturnsFillNotAllowed() throws {

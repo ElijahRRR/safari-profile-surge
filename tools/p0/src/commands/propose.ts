@@ -12,8 +12,7 @@ import { NdjsonClientError, ndjsonRequest } from '../deps.js';
 import { failed, refused, usage, type ExitCode } from '../errors.js';
 import { computeEvidenceManifest } from '../evidence.js';
 import { buildProposal } from '../proposal.js';
-import { readResult, type CapabilityResult } from '../results.js';
-import type { RunDir } from '../run-dir.js';
+import { readResult, readResultHistory } from '../results.js';
 import { DEFAULT_HOST_APP, codesignTeamId } from '../system.js';
 import { measureContext, openRun, openSession, type Ctx, type Session } from './common.js';
 
@@ -22,17 +21,6 @@ function serviceDataDir(ctx: Ctx): string {
   return ctx.deps.platform === 'darwin'
     ? join(ctx.deps.home, 'Library', 'Application Support', 'SafariProfileSurge')
     : join(ctx.deps.home, '.local', 'share', 'safari-profile-surge');
-}
-
-/** 历史结果中 auto_reload_atomic_replace 在各声明设置下是否通过。 */
-export function autoReloadPassed(dir: RunDir): { on: boolean; off: boolean } {
-  const out = { on: false, off: false };
-  for (const f of dir.listFiles('results/history')) {
-    if (!f.includes('auto_reload_atomic_replace-')) continue;
-    const r = dir.readJson<CapabilityResult>(f);
-    if (r?.verdict === 'pass' && (r.declaredAutoReload === 'on' || r.declaredAutoReload === 'off')) out[r.declaredAutoReload] = true;
-  }
-  return out;
 }
 
 export async function runPropose(ctx: Ctx): Promise<ExitCode> {
@@ -72,7 +60,7 @@ export async function runPropose(ctx: Ctx): Promise<ExitCode> {
     evidenceDigest: manifest.digest,
     runId: dir.id,
     requestId,
-    autoReloadPassed: autoReloadPassed(dir),
+    history: readResultHistory(dir, key),
     note: ctx.args.strings.note ?? null,
     home,
     exists: (p) => existsSync(p),

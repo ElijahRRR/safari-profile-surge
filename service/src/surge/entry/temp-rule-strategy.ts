@@ -125,6 +125,12 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
     return order === null ? null : modeOfSemantic(semanticOfOrder(order));
   }
 
+  /** 只看临时规则与有效顺序（不看优先级）得到的模式。 */
+  function baseModeOf(s: TempState): EntryReadback['mode'] {
+    const known = knownModeOfBits(s.bits);
+    return s.anomalies.length === 0 && known !== null && semanticMode(s.order) === known ? known : 'UNKNOWN';
+  }
+
   function readbackOf(s: TempState): EntryReadback {
     const issues = precedenceOf(s);
     const known = knownModeOfBits(s.bits);
@@ -134,7 +140,7 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
       `有效规则顺序：${s.order ? s.order.join(' > ') || '无' : '无法确定'}`,
       ...s.anomalies.map((a) => `异常：${a}`),
     ];
-    let mode: EntryReadback['mode'] = s.anomalies.length === 0 && known !== null && sem === known ? known : 'UNKNOWN';
+    let mode = baseModeOf(s);
     if (mode !== 'UNKNOWN' && known !== sem) evidence.push('规则顺序与位组合不一致');
     if (mode !== 'NORMAL' && mode !== 'UNKNOWN' && hasBlockingIssue(issues)) {
       mode = 'UNKNOWN';
@@ -260,14 +266,17 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
         onStep?.(step);
       }
 
+      let finalState: TempState;
       let final: EntryReadback;
       try {
-        final = readbackOf(await load());
+        finalState = await load();
+        final = readbackOf(finalState);
       } catch (e) {
         throw withLastConfirmed(e, lastConfirmed, null);
       }
       if (final.mode !== to) {
-        const code = hasBlockingIssue(final.precedenceIssues) && to !== 'NORMAL' ? 'PRECEDENCE_VIOLATION' : 'READBACK_MISMATCH';
+        // 只有入口规则已是目标模式、仅因有规则排在入口之前而不能宣称受控时，才是 PRECEDENCE_VIOLATION。
+        const code = baseModeOf(finalState) === to && hasBlockingIssue(final.precedenceIssues) ? 'PRECEDENCE_VIOLATION' : 'READBACK_MISMATCH';
         throw new SfeError(code, '切换入口失败：最终读回不是目标模式', {
           details: { lastConfirmedBits: lastConfirmed, observedMode: final.mode, precedenceIssues: final.precedenceIssues },
         });

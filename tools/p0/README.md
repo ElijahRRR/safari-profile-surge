@@ -13,13 +13,14 @@ npx vitest run tools/p0/test     # 离线测试（只证明工具逻辑，不证
 - 切换 Surge 配置、重启 Surge、手动重载配置都由用户在 Surge 菜单中完成；写入前打印快照与精确回退。
 - 原始证据写到仓库外的限权目录（默认 `~/Library/Application Support/SafariProfileSurge/p0/<运行编号>/`，0700/0600）；终端与提议只含脱敏摘要；提议中的证据摘要是带运行密钥的 HMAC。
 - 测试代理（回显、SOCKS5 出口、SOCKS5 前置）只监听 127.0.0.1，只转发测试主机与少数固定的检测主机；测试凭据是合成的。
+- 结论失败即关闭：没有证据（对照应用没有测试主机记录、没有重载证据、对照时段本身不稳定、协议没有观察到）记为“不完整”或 not_tested，从不当作通过；提议中的 any 与其他声明必须有对应的测量，any 的任一取值下另有相反结论的测量即拒绝。操作员对服务执行的动作的读数（例如扩展弹窗「重新检测」）不作为协议覆盖的证据。
 
 | 文件 | 内容 |
 |---|---|
 | `src/cli.ts`、`src/args.ts` | 入口与参数解析（拒绝形似凭据的参数） |
 | `src/commands/*` | 各命令：inventory、test-servers、make-test-profile、attribution、charset、refresh、continuity、entry、chain、preflight、checklist、propose、rollback |
 | `src/servers/*` | 回显/WebSocket/测试页、SOCKS5 出口与前置、连接登记 |
-| `src/analysis/*` | 归属、入口放行窗口、连续性、重载信号的纯函数分析 |
+| `src/analysis/*` | 归属、入口放行窗口、UDP/QUIC 逐协议覆盖、连续性与同一配置重载影响、重载信号的纯函数分析 |
 | `src/test-profile.ts` | 测试配置生成（纯函数） |
 | `src/proposal.ts`、`src/context.ts` | 提议构造与上下文 |
 | `src/surge-access.ts` | 适配器组合、写入守卫、原语映射建议 |

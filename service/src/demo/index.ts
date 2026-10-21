@@ -83,7 +83,7 @@ export async function prepareDemoState(repos: Repositories, demo: DemoSurge, pep
 const ADMIN: Actor = { kind: 'admin' };
 
 async function native(app: EngineAppService, profileId: string, message: NativeRequest): Promise<NativeResponse> {
-  return app.handleNative({ v: NATIVE_PROTOCOL_VERSION, auth: 'demo', bridge: { profileId, bridgeVersion: 'demo' }, message });
+  return app.handleNative({ v: NATIVE_PROTOCOL_VERSION, bridge: { profileId, bridgeVersion: 'demo' }, message });
 }
 
 function must<T>(r: NativeResponse): T {

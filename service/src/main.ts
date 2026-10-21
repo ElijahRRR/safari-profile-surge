@@ -3,7 +3,7 @@
 // agent/maintenance 套接字。收到 SIGINT/SIGTERM 时只关闭监听与执行器，从不改变 Surge 的入口或选择。
 
 import { randomBytes } from 'node:crypto';
-import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -19,6 +19,7 @@ import { issueLoginUrl } from './http/login.js';
 import { createSessionStore } from './http/sessions.js';
 import { createAdminServer, type AdminServerHandle } from './ipc/admin-server.js';
 import { createBridgeServer, type BridgeServerHandle } from './ipc/bridge-server.js';
+import { createBridgeTokenSource, readBridgeTokenFile } from './ipc/bridge-token.js';
 import type { Logger, MaintenanceSurge, SecretStore, SurgeAdapter } from './ports.js';
 import { KeychainHelperStore } from './secrets/keychain-helper-store.js';
 import { MemorySecretStore } from './secrets/memory-store.js';
@@ -154,25 +155,6 @@ async function buildRealSurge(config: ServiceConfig, repos: Repositories, logger
   return createCompositeAdapter(parts);
 }
 
-function readOrCreateToken(path: string, generate: () => string): string {
-  try {
-    const fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-    try {
-      const st = fstatSync(fd);
-      const uid = process.getuid?.();
-      if (!st.isFile() || (uid !== undefined && st.uid !== uid) || (st.mode & 0o077) !== 0) {
-        throw new SfeError('UNSAFE_LOCATION', '启动失败：原生桥令牌文件权限不是 0600 或不属于当前用户');
-      }
-      return readFileSync(fd, 'utf8').trim();
-    } finally {
-      closeSync(fd);
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-  }
-  return '';
-}
-
 export async function startService(opts: StartOptions): Promise<RunningService> {
   const config = loadConfig({ argv: opts.argv, env: opts.env, platform: opts.platform, homedir: opts.homedir, cwd: opts.cwd });
   assertRuntime(config.nodeVersionPin);
@@ -257,16 +239,17 @@ export async function startService(opts: StartOptions): Promise<RunningService> 
 
   let bridge: BridgeServerHandle | null = null;
   if (opts.bridge ?? !config.demo) {
-    let token = readOrCreateToken(config.bridge.tokenFile, () => ids.token(32));
-    if (token === '') {
-      token = ids.token(32);
-      await createExclusivePrivateFile(config.bridge.tokenFile, `${token}\n`);
+    // 启动时文件不安全则拒绝启动；不存在时新建（宿主 App 之后会用 App Group 中的令牌覆盖它）。
+    if (readBridgeTokenFile(config.bridge.tokenFile).kind === 'missing') {
+      await createExclusivePrivateFile(config.bridge.tokenFile, `${ids.token(32)}\n`);
     }
-    const t = token;
     bridge = createBridgeServer({
       app,
       transport: config.bridge.transport === 'unix' ? { kind: 'unix', path: config.bridge.path } : { kind: 'tcp', host: '127.0.0.1', port: config.bridge.port },
-      token: () => t,
+      // 每个连接重新检查令牌文件：宿主 App 运行期间改写令牌后无需重启服务
+      token: createBridgeTokenSource(config.bridge.tokenFile, {
+        onChange: (state) => (state === 'loaded' ? logger.log('info', 'bridge.token_loaded') : logger.log('warn', 'bridge.token_unavailable', { issue: state })),
+      }),
       logger,
     });
     await bridge.listen();

@@ -58,7 +58,6 @@ describe('demo routes when demo=true', () => {
     expect(json(r)).toEqual({ ok: true, data: { relation: 'none_active' } });
     expect(h.app.callsTo('handleNative')[0]!.args[0]).toEqual({
       v: 1,
-      auth: 'demo',
       bridge: { profileId: 'ABCDEF12-3456-7890-ABCD-EF1234567890', bridgeVersion: 'demo' },
       message: { type: 'reportProfileState', windows_open: 1, amazon_tabs_open: false, site_permission_granted: true },
     });

@@ -24,10 +24,16 @@ describe('JSON document shapes', () => {
     expect(extractJsonRecords({ environments: [rec] })).toEqual([rec]);
   });
 
+  test('{ records: [...] } (the shape the web page and sfe used before)', () => {
+    expect(extractJsonRecords({ records: [rec] })).toEqual([rec]);
+  });
+
   test.each([
     ['plain object', { display_name: 'x' }],
     ['environments not an array', { environments: {} }],
     ['extra top-level keys', { environments: [], version: 1 }],
+    ['both wrappers', { environments: [], records: [] }],
+    ['records not an array', { records: {} }],
     ['string', 'x'],
     ['number', 1],
     ['null', null],

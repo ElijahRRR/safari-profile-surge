@@ -330,7 +330,6 @@ export function createHttpServer(opts: HttpServerOptions): HttpServerHandle {
     }
     const envelope: BridgeEnvelope = {
       v: NATIVE_PROTOCOL_VERSION,
-      auth: 'demo',
       bridge: { profileId: parsed.profileId, bridgeVersion: 'demo' },
       message: parsed.message,
     };

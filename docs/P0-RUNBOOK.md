@@ -54,7 +54,7 @@ npx tsx tools/p0/src/cli.ts help
 | 7 | 资源刷新与连续性 | 一个终端 `continuity`，另一个 `refresh`（自动重载开、关各一次） | auto_reload_atomic_replace、targeted_resource_refresh、policy_path_reread、fixed_profile_no_switch、connection_continuity |
 | 8 | 前置链路与凭据字符 | `chain`、`charset` | external_node_underlying_proxy；凭据字符白名单 |
 | 9 | 独立预检 | `preflight` | independent_node_preflight |
-| 10 | 重载影响 | `continuity` 期间在 Surge 中手动「重新加载配置」，输入 `reload` 标记 | same_profile_reload_impact |
+| 10 | 重载影响 | 单独运行 `continuity --reload-test`：对照 45 秒后输入 `reload`，再立即在 Surge 中手动「重新加载配置」 | same_profile_reload_impact |
 | 11 | 重启生命周期 | `entry --strategy … --restart-test` | entry_rules_after_restart |
 | 12 | 首请求与旧连接 | 按清单操作后 `checklist first_request_and_old_connections` | first_request_and_old_connections |
 | 13 | 只记录项 | `checklist open_profile_by_id`、`checklist profile_batch_create` | 两项只记录 |
@@ -115,7 +115,7 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 任何时候出现意外（页面持续无法访问、Chrome 受影响、读回不一致）：
 
 1. 入口回到普通模式：`npx tsx tools/p0/src/cli.ts entry --strategy <策略> --to NORMAL`（永远允许）。
-2. 删除本工具添加的临时规则：`rollback`（只打印）→ `rollback --execute`（确认后逐条按原文删除，读回确认；从不 flush，不删除你自己的临时规则）。
+2. 删除本工具添加的临时规则：`rollback`（只打印）→ `rollback --execute`（确认后逐条按原文删除，读回确认；回退计划与读回确认都按规范化文本比较，Surge 列出时改了空格的规则仍判定为存在；从不 flush，不删除你自己的临时规则）。
 3. 在 Surge 菜单「配置」中**手动**切回原配置（inventory 记录的名称）。
 4. 确认增强模式、系统代理与出站模式与盘点时一致。
 5. 在 test-servers 终端按 Ctrl+C。
@@ -144,12 +144,12 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 - **步骤**：
   1. `attribution`。按提示依次进行四步，每步完成后回车：
      - Safari 空白测试场景：打开 `http://echo.p0.example.test:<端口>/attr/safari`，依次点击 HTTP/1.1、IPv4、IPv6、WebSocket（等约 5 秒）、WebRTC；点击「打开 HTTP/2 · HTTP/3 测试页」，在新标签页刷新 3 次，输入最后一次 `http=` 的值。
-     - Safari 扩展页面（扩展已安装时）：在同一场景点扩展图标 →「重新检测」，让扩展页面请求检测服务（覆盖 `extension_page_fetch`）。未安装时输入 `skip`，之后补测。
+     - Safari 扩展页面（扩展已安装时）：让扩展页面自己请求检测服务（覆盖 `extension_page_fetch`）。Safari「设置」→「高级」勾选「显示网页开发者功能」；在同一场景点击扩展图标打开弹窗，在弹窗中右键 →「检查元素」，在检查器控制台运行 `fetch('https://api.ipify.org/?format=json')`，看到返回后关闭检查器。**不要用弹窗的「重新检测」代替**：它由本机服务执行检测（服务未进入受控状态时被拒绝），不是扩展页面请求，在这一步产生的服务进程记录会被误当作扩展页面的进程路径。未安装时输入 `skip`，之后补测。
      - Chrome：打开 `…/attr/chrome`，做同样的点击。
      - 其他 WebKit 应用：加载 `…/attr/other`。
   2. 工具在每步结束时读取 Surge 最近请求，按时间窗与测试主机归到对应应用，只保留测试主机（其他主机记为空，不保存浏览记录）。
 - **通过条件**：Safari 实际连接（含扩展页面请求）按完整进程路径命中，Chrome 与其他 WebKit 应用不命中；IPv4/IPv6、HTTP/1.1、HTTP/2、HTTP/3、WebSocket 逐项通过或写明限制；DNS、WebRTC、系统服务另列覆盖情况。
-- **判定细节**：候选路径 = 只在 Safari 步骤中命中测试主机、从未在 Chrome 与其他 WebKit 应用步骤中出现的路径；还必须通过服务的同一套校验（绝对路径、存在、无通配、非裸进程名、不是系统通用 WebKit 框架路径）。门槛协议（ipv4、ipv6、http1、http2、http3_quic、websocket、extension_page_fetch）每项必须是 pass，或写明 limitation（例如测试网络没有 IPv6）；DNS、WebRTC、系统服务只记录。
+- **判定细节**：候选路径 = 只在 Safari 步骤中命中测试主机、从未在 Chrome 与其他 WebKit 应用步骤中出现的路径；还必须通过服务的同一套校验（绝对路径、存在、无通配、非裸进程名、不是系统通用 WebKit 框架路径）。Chrome 与其他 WebKit 应用两项对照只以该应用**访问测试主机的记录**为证据：对照步骤里只有 Safari/WebKit 后台请求（主机记为空）、或对照应用没能访问测试主机（例如邮件屏蔽了远程内容）时，该项为“不完整”而不是通过，需要换一种方式让对照应用访问测试页后重测。门槛协议（ipv4、ipv6、http1、http2、http3_quic、websocket、extension_page_fetch）每项必须是 pass，或写明 limitation（例如测试网络没有 IPv6）；DNS、WebRTC、系统服务只记录。
 - **失败处理**：只有通用 WebKit 进程路径、或路径被 Chrome/其他应用共用时，记录为不支持并停止宣称“整个 Safari 可控”；**不扩成通用 WebKit 规则**。某个协议不归属 Safari 路径（例如 QUIC 由其他进程发出）时写成限制或不通过。
 - **证据**：`attribution/*-records.json`（每步的进程路径、协议、策略）、`attribution/analysis.json`、`servers/page.jsonl`（测试页上报，不含出口 IP）、`results/safari_process_attribution.json`；测试编号即测试页的 `t` 参数；场景代号（P0-测试）；对照应用结果（Chrome、其他 WebKit 应用的路径）。
 - **回退**：只读（Surge 中无写入）。
@@ -163,7 +163,10 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
   2. 依次做：Safari 退出重开；系统重启；菜单「停止后台服务」再「注册后台服务」；重新构建并替换 App（服务升级）。每次之后重复第 1 步。
   3. 后台休眠：让 Safari 闲置 5 分钟以上（或在「开发」菜单的扩展后台页确认后台已卸载），再点击扩展图标，确认往返成功。
   4. 全程注意是否出现「访问其他 App 的数据」等系统提示。
-  5. `checklist native_bridge_ipc`（签名身份自动读取 `/Applications/SafariProfileSurge.app` 的 Team ID，或用 `--signing-identity` 提供）。
+  5. 握手与令牌（结论写进 `roundtrip` 项备注）：传输令牌从不上线路，原生桥先验证服务的 HMAC 证明（docs/ARCHITECTURE.md §7.2）。
+     - 菜单「停止后台服务」后，在终端用 `nc -l 127.0.0.1 61848` 临时监听，再打开扩展弹窗：`nc` 只应收到一行 hello（只有 `v`、`type`、`clientNonce`），不含令牌、场景 ID 或消息；弹窗显示无法连接本机服务（10 秒超时，或结束 `nc` 时为「原生桥认证失败」）。之后重新「注册后台服务」，往返恢复。备注只写结论，不保存 `nc` 输出。
+     - 后台服务运行中退出 App，删除 App Group 容器中的 `bridge.token` 后重开 App（App 生成新令牌并覆盖数据目录中的副本），**不重启服务**，重复第 1 步：往返成功（服务每个连接重新读取令牌文件）。从终端删除容器内文件时若出现系统提示，备注写明提示来自终端，不计入 `no_tcc`。
+  6. `checklist native_bridge_ipc`（签名身份自动读取 `/Applications/SafariProfileSurge.app` 的 Team ID，或用 `--signing-identity` 提供）。
 - **通过条件**：扩展经原生桥与服务往返成功；Safari 重开、重启、服务重启、服务升级后仍成功；后台脚本休眠后被唤醒仍能完成往返；无 TCC 提示。
 - **失败处理**：记录不支持；场景绑定与激活门槛保持关闭。不改用无令牌的传输或数据目录之外的路径。
 - **证据**：`results/native_bridge_ipc.json`（逐项结论与脱敏备注）；时间；签名身份；`log show --predicate 'subsystem == "com.sfe.SafariProfileSurge.Extension"' --last 1h` 的结论（只记录是否出现消息内容，不保存原文到仓库）。
@@ -208,13 +211,13 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
   - `temp_rule`：每位一条临时规则逐条增删。先加 `--probe-insertion` 测量新临时规则插在前还是后（添加并删除两条永不命中的 `DOMAIN,p0-insert-N.invalid,REJECT`）。按服务的规划，插入位置不受控时 VERIFY_ONLY 无法到达（插在末尾时验证规则排在阻断之后；插在开头时新规则抢在 udp/block 之前形成放行窗口），工具会在写入前拒绝（CAPABILITY_UNVERIFIED），这本身就是需要记录的结论。
 - **步骤**：
   1. 优先级（必须做两项，才能得到“通过”）：
-     - `--precedence-test temp`：注入临时规则 `DOMAIN,<检测主机>,DIRECT`，尝试进入 VERIFY_ONLY 必须被拒绝（PRECEDENCE_VIOLATION），随后删除注入的规则。
+     - `--precedence-test temp`：注入临时规则 `DOMAIN,<检测主机>,DIRECT`，尝试进入 VERIFY_ONLY 必须被拒绝（PRECEDENCE_VIOLATION），随后删除注入的规则。注入前工具读取当前临时规则：已有相同（按规范化文本比较）的用户规则或读不到列表时不注入，该项记为“不完整”（工具按文本增删，注入会删掉或接管你自己的规则）；先在 Surge 中确认没有这条规则再重测。`--probe-insertion` 同样在已有相同规则时不探测。
      - `--precedence-test module`：按提示在 Surge「模块」中安装并启用测试配置目录下的 `SFE-P0-precedence.sgmodule`，同样必须被拒绝；之后按提示停用并移除模块。
   2. 主序列：`entry --strategy ruleset_resource --auto-reload-condition <on|off|any> --precedence-test temp,module`。工具先把 SFE-ROUTE 选为测试节点 A、布置 canary，然后依次切换 BLOCKED → VERIFY_ONLY → ACTIVE → NORMAL，每步写入后运行时读回，每个模式停留 `--dwell` 秒（默认 20）。
-  3. BLOCKED 之后工具按候选路径结束 Safari 的连接（逐条记录，不影响其他应用）；VERIFY_ONLY 时 Safari 页面中回显应失败、检测服务应成功；ACTIVE 时回显应经过 p0-a，并按提示在 Safari 打开 `https://cloudflare-quic.com/cdn-cgi/trace` 刷新 3 次、输入 `http=` 的值。
+  3. BLOCKED 之后工具按候选路径结束 Safari 的连接（逐条记录，不影响其他应用）；VERIFY_ONLY 时 Safari 页面中回显应失败、检测服务应成功；ACTIVE 时回显应经过 p0-a，并按提示在 Safari 打开 `https://cloudflare-quic.com/cdn-cgi/trace` 刷新 3 次、输入 `http=` 的值。入口运行不询问扩展弹窗的「重新检测」：它在 P0 中由服务执行（不经过 Safari 入口），BLOCKED 与 VERIFY_ONLY 下显示相同，不能证明扩展页面请求的处理；扩展页面请求的覆盖见 3.8。
   4. 结束后工具读取 Surge 最近请求，把每条 Safari 请求映射到当时生效的入口位组合，检查有没有超出该状态允许的结果（放行窗口）。
 - **通过条件**：所选策略下四种模式精确生效；每次切换位不发生配置重载、其他应用长连接与新请求不受影响；中间状态无放行窗口；本应用入口优先于启用的模块 DIRECT 规则与用户临时规则；AND(进程,域名) 与 AND(进程,UDP) 规则在该机制中可用；ruleset_resource 时 Safari 请求在 updateExternalResource(key) 后改变匹配。
-- **判定细节**：检查项包括四种模式精确生效（读回）、Surge 记录中没有放行窗口、Safari 测试页在各模式下的表现、Chrome 不受影响、其他应用长连接与新请求不受影响、没有重载（§1.4）、AND(进程,域名) 与 AND(进程,UDP) 规则实际命中、优先于临时规则与模块 DIRECT 规则。任何一项没有数据时结论为“不完整”。
+- **判定细节**：检查项包括四种模式精确生效（读回）、Surge 记录中没有放行窗口、Safari 测试页在各模式下的表现、Chrome 不受影响、其他应用长连接与新请求不受影响（流或 WebSocket 重置、WebSocket 重连失败、短请求失败都算影响）、没有重载（§1.4）、AND(进程,域名) 与 AND(进程,UDP) 规则实际命中、优先于临时规则与模块 DIRECT 规则。任何一项没有数据时结论为“不完整”。
 - **失败处理**：任一步失败时入口停在已确认的更严格状态（工具不会退回更宽松状态），按提示决定是否进入 NORMAL。两种策略都不通过时，记录不支持：NORMAL/BLOCKED/VERIFY_ONLY/ACTIVE 只是逻辑设计，激活门槛保持关闭；**不用后台反复重载主配置替代**。
 - **证据**：`entry/<策略>-<时间>.json`（步骤时间线、每个模式的读回与证据、Surge 请求中 Safari 与测试主机的记录、canary 与重载信号、结束连接结果、H3 观察）、`entry/old-connections-evidence.json`、`servers/page.jsonl`、`servers/exit.jsonl`、`actions.jsonl`、`results/runtime_entry_modes.json`。期望节点为 SFE-N-P0-A；配置身份为测试配置；对照应用为 Chrome。
 - **回退**：`entry --strategy <策略> --to NORMAL`；`rollback --execute`。
@@ -223,9 +226,15 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 
 - **用途**：SOCKS5 链不支持 UDP；Safari 的 QUIC 必须被拒绝并回落 TCP，从不直连。
 - **前置条件**：同 3.7。全局 `udp-policy-not-supported-behaviour` 只读取记录，不修改。
-- **步骤**：与 3.7 的主序列同一次运行：VERIFY_ONLY 与 ACTIVE 期间的 Safari UDP 记录必须全部被 udp 规则拒绝；ACTIVE 下 H3 测试页显示 `http=http/2`（回落 TCP），对应的 TCP 请求经 SFE-ROUTE。另在 3.2 的结果中查看 `http3_quic` 的归属覆盖。
+- **步骤**：与 3.7 的主序列同一次运行：VERIFY_ONLY 与 ACTIVE 期间的 Safari UDP 记录必须全部被 udp 规则拒绝；ACTIVE 下 H3 测试页显示 `http=http/2`（回落 TCP），对应的 TCP 请求经 SFE-ROUTE。逐协议覆盖全部来自测量：
+  - http3_quic、http2：本次运行中 Safari 的 UDP 记录与 H3 测试主机回落的 TCP 记录（只接受直接测量）；
+  - ipv4、http1：VERIFY_ONLY 下检测请求经 SFE-ROUTE；测试页回显在各模式下符合预期；
+  - ipv6：Safari 轮询页每 5 轮请求一次 `api6.ipify.org`，Surge 中的记录在 BLOCKED/VERIFY_ONLY 下必须被拒绝、ACTIVE 下必须经 SFE-ROUTE；NORMAL 下 IPv6 检测也全部失败时记为 limitation（测试网络没有 IPv6）；
+  - websocket：轮询页的 WebSocket 从 BLOCKED 确认后（留 2 秒稳定时间）到 VERIFY_ONLY 结束（含两者之间的切换）都不能建立；VERIFY_ONLY 结束之后到 ACTIVE 结束之间重新建立，且首条消息经过 p0-a。ACTIVE 一侧不加稳定时间：VERIFY_ONLY 下测试页每 2 秒重试，ACTIVE 生效后的第一次建立通常就在读回确认后 2 秒内，之后一直保持；切换途中建立的连接也计入，经过的节点不对同样不通过；
+  - extension_page_fetch：入口运行不直接测量。扩展页面请求与轮询页请求出自同一 Safari 进程、访问同一检测主机，Surge 记录无法区分；弹窗「重新检测」由服务执行，不算证据。这一项只能由 3.2 的扩展步骤（扩展页面自己请求检测服务、按进程路径归属）按下一条补足；
+  - 本次运行中没有直接观察到的非 UDP 项，只有当同一运行目录中有**同一进程路径、结论为“通过”**的 safari_process_attribution（3.2）且该项为 pass/limitation 时，记为 limitation 并注明“由 safari_process_attribution 覆盖”；否则为 not_tested 并写明缺什么，提议 supported 会被拒绝。
 - **通过条件**：VERIFY_ONLY 与 ACTIVE 下 Safari 的 UDP/QUIC（H3 测试主机）被拒绝且从不直连，页面回落 TCP 经 SFE-ROUTE，出口一致。
-- **失败处理**：UDP 有任何一条未被拒绝或被直连，记录不支持，激活门槛保持关闭。Safari 没有发起 QUIC 时写成“未测”，换一个支持 H3 的测试主机（`--h3-host`）重测。
+- **失败处理**：UDP 有任何一条未被拒绝或被直连，记录不支持，激活门槛保持关闭。Safari 没有发起 QUIC 时写成“未测”，换一个支持 H3 的测试主机（`--h3-host`）重测。其他门槛项为 not_tested 时按备注补测（保持轮询页打开，或先完成 3.2，包括扩展步骤），不手工改写覆盖。
 - **证据**：同 3.7；逐协议覆盖写在 `results/safari_udp_quic_handling.json`。
 - **回退**：同 3.7。
 
@@ -245,7 +254,8 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 - **前置条件**：测试配置；test-servers；在 Surge 设置中查看当前「自动重载」开关（工具读不到时由你声明）。
 - **步骤**：`refresh --auto-reload off`（与 Surge 设置一致），然后在 Surge 中**手动**切换自动重载开关，再运行 `refresh --auto-reload on`。每次工具原子替换未刷新的 canary 规则集，等待 `--wait` 秒后检查 Surge 是否重新读取。
 - **通过条件**：自动重载设置（开/关）下原子替换被引用文件的行为已实测：是否触发整份配置重载；记录验证时的设置值。
-- **失败处理**：这项是“测量”，两种结果都要记录。自动重载开启时原子替换会触发重载的，产品要求自动重载关闭，否则发布与 ruleset_resource 入口都停在待部署/拒绝。
+- **判定细节**：检查项“原子替换不触发重新读取”直接反映测量：canary 被重新读取时该次结论为“不通过”。`--auto-reload any` 只有开、关两种设置下都有“通过”（没有重新读取）、且任一设置下都没有“不通过”的测量时才可以提议：例如先用较短的 `--wait` 在“开”下得到通过、再用较长的等待观察到重新读取，较早的通过不能抵消较新的失败（反过来也一样），以更严格的结论为准。
+- **失败处理**：这项是“测量”，两种结果都要记录。自动重载开启时原子替换会触发重载的：该次结论为“不通过”，不能作为 `--auto-reload on` 或 `any` 的支持证据。产品因此要求自动重载关闭：在 Surge 中切回关、再运行一次 `refresh --auto-reload off`，提议 `supported --working-profile any --auto-reload off`（提议总是使用该能力最近一次的结果）；否则发布与 ruleset_resource 入口都停在待部署/拒绝。
 - **证据**：`results/auto_reload_atomic_replace.json`（声明的设置值）、`results/history/`、`snapshots/`、`refresh/traffic-*.json`。
 - **回退**：把自动重载开关恢复为测试前的值（手动）；测试节点资源由命令自动恢复。
 
@@ -289,6 +299,7 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
   2. 终端 B：运行 `refresh --auto-reload off`。终端 A 会自动合并资源刷新、选择等动作；也可以在终端 A 输入事件名标记。
   3. 在终端 A 输入 `q` 结束。
 - **通过条件**：发布节点资源期间，其他应用的长连接保持、新请求正常、出口不变，并与未执行变更的对照比较。
+- **判定细节**：对照时段本身出现重置、WebSocket 重连失败或短请求失败时结论为“不完整”（测试环境不稳定，不能比较）。WebSocket 打开失败（隧道或握手失败）按指数退避重连（2 秒起、最长 30 秒），每次失败只重连一次；握手没有成功的连接不算“重置”，但计为“重连失败”，同样算影响。提议摘要只逐行列出对照与有影响的时段，其余时段合并为一行。
 - **失败处理**：不能称无中断发布；发布门槛保持关闭，新节点保持待部署。
 - **证据**：`continuity/<时间>.json`（样本、标记、逐时段统计：成功率、延迟、最大间隔、重置、经过的节点）、`results/connection_continuity.json`。
 - **回退**：只读（本命令不写 Surge）。
@@ -297,9 +308,13 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 
 - **用途**：维护流程（remerge）可能需要重载同一配置；用户需要知道影响后选择时间。
 - **前置条件**：测试配置；test-servers；入口为 NORMAL。
-- **步骤**：终端 A 运行 `continuity`，对照 30 秒后在 Surge 菜单中**手动**「重新加载配置」，立即在终端 A 输入 `reload` 标记；等待恢复后再观察 30 秒，输入 `q`。
+- **步骤**：Surge 自动重载保持关闭。**单独**运行 `continuity --reload-test`（期间不要运行 refresh、entry 等命令）：工具先原子替换 canary 规则集（不刷新），作为“重载确实发生”的证据。对照至少 45 秒后，在终端 A 输入 `reload` 回车，再立即在 Surge 菜单中**手动**「重新加载配置」；等待恢复后再观察 30 秒，输入 `q`。
 - **通过条件**：同一配置维护重载对其他应用的影响（连接重置、恢复时间、接管与模式是否不变）已测量。
-- **失败处理**：这项是“测量”：无影响时提议支持；有影响时按“不支持（已测量影响）”提议，产品在维护预览中显示测得的影响，由用户选择时间。
+- **判定细节**：
+  - 影响按**整个观察窗口**统计（流与 WebSocket 重置、WebSocket 重连失败、短请求失败），不只统计标记之后：先点重载、后输入标记时，期间的中断同样计入；恢复时间从第一次中断算到各通道都恢复。
+  - 必须有重载确实发生的正面证据：未刷新的 canary 已被重新读取（或临时规则丢失等 §1.4 信号），或标记附近出现中断。没有证据（例如没有加 `--reload-test`、实际没有重载、canary 在重载前已被读取）时“其他应用不受影响”为“不完整”，**不会**判定无影响；检测到 Surge 进程重启时也不算同一配置重载。
+  - 第一次标记前 15 秒之前的对照必须至少 30 秒且没有任何中断；观察期间还有其他变更事件时同样为“不完整”。
+- **失败处理**：这项是“测量”：有证据且无影响时提议支持；有影响时按“不支持（已测量影响）”提议，产品在维护预览中显示测得的影响，由用户选择时间。结论为“不完整”时按检查项备注重测。
 - **证据**：`continuity/<时间>.json`、`results/same_profile_reload_impact.json`（重置数、失败数、恢复时间、接管与出站模式前后）。
 - **回退**：无写入；确认接管与出站模式未变。
 
@@ -382,7 +397,8 @@ npx tsx tools/p0/src/cli.ts propose <能力> supported              # 发送到 
 - 提议带：上下文（与服务运行时同一来源测得）、脱敏摘要、运行目录的带密钥证据摘要（`hmac-sha256:`，原始证据不离开本机）；safari_process_attribution 与 safari_udp_quic_handling 带全部门槛协议与 DNS/WebRTC/系统服务的覆盖；归属提议带进程完整路径；runtime_entry_modes 提议带入口策略。
 - `supported` 只接受“通过”的结果；测量后上下文（Surge/macOS/Safari 版本、进程路径、原语映射等依赖字段）变化时拒绝，需要重测。
 - 依赖工作配置身份的能力（fixed_profile_no_switch、targeted_resource_refresh、policy_path_reread、connection_continuity、auto_reload_atomic_replace、same_profile_reload_impact）是在测试配置上测得的，必须显式加 `--working-profile any`，摘要会注明“在 P0 测试配置（源配置副本）上测得”。
-- `--auto-reload any` 只在自动重载开、关两种设置下 refresh 都通过时允许。读不到的上下文字段记为 null，服务运行时同样读不到才会匹配；工具会提示。
+- 声明的 `--auto-reload`、`--takeover`、`--signing-identity` 必须有测量证据，对**每个**依赖该字段的能力都适用（不只是 auto_reload_atomic_replace）：具体值必须等于测量时的值（refresh 声明的自动重载设置，或测量时读到的值；测量时没有记录则不能声明）；`--auto-reload any` 需要本能力在自动重载开、关两种设置下的测量都得到与提议相同的结论，`--takeover any` 需要 enhanced、system_proxy、both 三种接管方式下都有，且这些测量的其余依赖上下文与当前一致；任一取值下另有相反结论的测量（不论先后）即拒绝，用作证据的测量次数与时间写入提议摘要。读不到的上下文字段记为 null，服务运行时同样读不到才会匹配；工具会提示。
+- 提议摘要不超过服务接受的 4000 字（超出部分截断并以“…”结尾）。
 - 原生相关能力需要签名身份：默认读取 `/Applications/SafariProfileSurge.app` 的 Team ID，也可用 `--signing-identity` 提供。
 - 发送后在网页后台「能力门槛」页核对上下文、摘要与覆盖，再确认。工具不能确认。确认新的进程路径或入口策略会让依赖它们的能力回到待验证，且入口必须是 NORMAL。
 

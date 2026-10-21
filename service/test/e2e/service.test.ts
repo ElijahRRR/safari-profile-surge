@@ -85,7 +85,7 @@ describe('startService --demo', () => {
     expect(forbidden.error?.code).toBe('BAD_REQUEST');
 
     // 原生消息（演示场景编号）：已绑定场景可以读到自己的状态
-    const state = await svc.app.handleNative({ v: 1, auth: 'demo', bridge: { profileId: DEMO_PROFILES.active, bridgeVersion: 'demo' }, message: { type: 'getCurrentState' } });
+    const state = await svc.app.handleNative({ v: 1, bridge: { profileId: DEMO_PROFILES.active, bridgeVersion: 'demo' }, message: { type: 'getCurrentState' } });
     expect(state.ok).toBe(true);
 
     // 停止：从不写 Surge（入口与选择保持）

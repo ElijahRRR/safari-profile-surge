@@ -1,6 +1,7 @@
 // 登录页条件填充（内容脚本逻辑）。
 // - 只在该站点 HTTPS 登录页（不含 /ap/mfa）运行；只识别表单内可见的账号与密码字段；
 // - 只向后台发送 { type, form_action, fields }，顶层地址、框架与路由序号由后台填写；
+// - 未识别到字段时先向后台确认本场景适用填充（checkLoginFill），不适用或无法确认时不显示任何东西；
 // - 写入每个值前重读 form.action，变化即丢弃；每页每字段最多填一次；
 // - 从不提交、不点击、不处理验证码或二次验证；从不保存或打印填充值。
 
@@ -112,6 +113,22 @@ const SILENT_REASONS = new Set(['unbound', 'autofill_off']);
 
 const MANUAL: PanelContent = { title: '可手动填充', detail: '未识别到可填充的登录字段。扩展不会猜测或提交表单。', tone: 'info' };
 
+/**
+ * 没有可填充字段时是否值得提示：只有后台确认本场景已绑定、开启自动填充且是使用中的环境时才提示。
+ * 未绑定、未识别、未开启填充，以及后台或本机服务没有应答（无法确认）时都保持安静。
+ */
+async function fillApplies(deps: AssistDeps): Promise<boolean> {
+  let reply: unknown;
+  try {
+    reply = await deps.sendMessage({ type: 'checkLoginFill' });
+  } catch {
+    return false;
+  }
+  if (typeof reply !== 'object' || reply === null) return false;
+  const r = reply as { ok?: unknown; data?: { eligible?: unknown } };
+  return r.ok === true && r.data?.eligible === true;
+}
+
 function waitForDetection(doc: Document, timeoutMs: number): Promise<Detection> {
   return new Promise((resolve) => {
     const view = doc.defaultView;
@@ -165,6 +182,7 @@ export async function runLoginAssist(deps: AssistDeps): Promise<AssistOutcome> {
   let detection = detectLoginForm(deps.doc);
   if (detection.kind === 'none') detection = await waitForDetection(deps.doc, deps.waitForFieldsMs ?? 5000);
   if (detection.kind !== 'form') {
+    if (!(await fillApplies(deps))) return 'silent';
     show(MANUAL);
     return 'manual';
   }

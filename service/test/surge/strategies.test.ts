@@ -220,16 +220,25 @@ describe('ruleset_resource strategy', () => {
     expect(observe(fake).mode).toBe('BLOCKED');
   });
 
-  test('an externally edited rule set file stops the transition and reads as UNKNOWN', async () => {
-    const { ctrl, fake } = await setupRuleset();
+  test('an externally edited rule set file reads as UNKNOWN: VERIFY_ONLY/ACTIVE (and an activation blocking first) stop, undoing the entry overwrites it', async () => {
+    const { ctrl, fake, files } = await setupRuleset();
     writeFileSync(join(dir, ENTRY_RULESET_FILES.block), entryRuleSetFileContent('block', true, CFG));
     expect((await ctrl.read()).mode).toBe('UNKNOWN');
     const adds = fake.calls.updateExternalResource;
-    const err = (await ctrl.transition('NORMAL').catch((e: unknown) => e)) as SfeError;
+    const err = (await ctrl.transition('ACTIVE').catch((e: unknown) => e)) as SfeError;
     expect(err.code).toBe('BASELINE_CHANGED');
     expect(err.details!.lastConfirmedBits).toBeNull();
     expect(fake.calls.updateExternalResource).toBe(adds);
     expect(observe(fake).mode).toBe('NORMAL');
+    await expect(ctrl.transition('BLOCKED')).rejects.toMatchObject({ code: 'BASELINE_CHANGED' });
+    expect(fake.calls.updateExternalResource).toBe(adds);
+    // 撤销本应用入口（undo）不能被一个被编辑的本应用文件卡住：按载入时的摘要比较后改写。
+    const rec = stepRecorder(fake);
+    expect((await ctrl.transition('NORMAL', rec.onStep, { undo: true })).mode).toBe('NORMAL');
+    assertNoWindow(rec.seen, 'NORMAL', 'NORMAL');
+    expect(observe(fake).mode).toBe('NORMAL');
+    expect(await files.digest(ENTRY_RULESET_FILES.block)).toBe(files.digestContent(entryRuleSetFileContent('block', false, CFG)));
+    expect((await ctrl.read()).mode).toBe('NORMAL');
   });
 
   test('a blocking module rule prevents VERIFY_ONLY/ACTIVE without writing, but NORMAL and BLOCKED still work', async () => {

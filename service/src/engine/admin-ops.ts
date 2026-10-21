@@ -36,7 +36,7 @@ import { validateSafariProcessPaths } from '../surge/generate.js';
 import { keyedRequestDigest } from '../util/keyed-digest.js';
 import { insertOperation, type AcceptDeps } from './accept.js';
 import type { Engine } from './context.js';
-import { acceptedOf, findDuplicateOperation, findLedger, recordLedger, requestDigest, requireRequestId } from './ledger.js';
+import { acceptedOf, commitOperation, findDuplicateOperation, findLedger, recordLedger, requestDigest, requireRequestId } from './ledger.js';
 import { expireSafariProbe } from './handlers/probes.js';
 
 function forbidden(message: string): SfeError {
@@ -386,7 +386,7 @@ export async function replaceFrontCommit(deps: AcceptDeps, fromId: string, req: 
     throw new SfeError('PREVIEW_STALE', '更换前置失败：环境或前置已变化，请重新预览');
   }
   const expected = req.expected_revisions ?? {};
-  const op = repos.tx(() => {
+  const { op, duplicate } = commitOperation(engine, requestId, digest, () => {
     const targets: Array<{ environmentId: string; proxyRevision: number }> = [];
     const items: Array<{ environment_id: string; status: 'replaced' | 'revision_conflict' | 'unchanged'; revision: number }> = [];
     for (const id of ids) {
@@ -437,6 +437,7 @@ export async function replaceFrontCommit(deps: AcceptDeps, fromId: string, req: 
     repos.operations.update(created.id, { result: { items } });
     return repos.operations.get(created.id)!;
   });
+  if (duplicate) return acceptedOf(op, true);
   if (op.status === 'queued') deps.kick();
   engine.emit({ operations: [op.id], environments: ids, fronts: true });
   return acceptedOf(op, false);

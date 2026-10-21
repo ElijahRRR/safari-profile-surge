@@ -257,6 +257,46 @@ describe('content scripts', () => {
   });
 });
 
+describe('content scripts: checkLoginFill (no recognisable fields on the page)', () => {
+  const CHECK = { type: 'checkLoginFill' };
+
+  it('answers eligible for a bound, autofill-enabled, active environment on its sign-in page without requesting values', async () => {
+    const { router, sent } = setup();
+    expect(await router({ ...CHECK, fields: ['password'], form_action: 'https://collector.example.invalid/' }, contentSender())).toEqual({ ok: true, data: { eligible: true } });
+    expect(sent.map((m) => m.type)).toEqual(['getCurrentState']);
+  });
+
+  it.each([
+    ['unbound', currentState({ environment: null, route: null, relation: 'none_active' })],
+    ['autofill_off', currentState({ environment: environment({ autoFillLogin: false }) })],
+    ['not_active', currentState({ route: null, relation: 'other_active' })],
+  ])('refuses with reason %s', async (reason, state) => {
+    const { router, sent } = setup(state);
+    const r = await router(CHECK, contentSender());
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.details?.reason).toBe(reason);
+    expect(sent.map((m) => m.type)).toEqual(['getCurrentState']);
+  });
+
+  it('refuses a non-signin page and sub-frames like requestLoginFill', async () => {
+    const { router, sent } = setup();
+    const page = await router(CHECK, contentSender('https://www.amazon.com/gp/css/order-history'));
+    expect(page.ok).toBe(false);
+    if (!page.ok) expect(page.error.details?.reason).toBe('not_signin');
+    const frame = await router(CHECK, contentSender(undefined, 3));
+    expect(frame.ok).toBe(false);
+    if (!frame.ok) expect(frame.error.details?.reason).toBe('not_top_frame');
+    expect(sent.map((m) => m.type)).toEqual(['getCurrentState']);
+  });
+
+  it('extension pages cannot use it as a native request', async () => {
+    const { router, sent } = setup();
+    const r = await router({ sfe: 'native', message: CHECK }, PAGE_SENDER);
+    expect(r.ok).toBe(false);
+    expect(sent).toHaveLength(0);
+  });
+});
+
 describe('foreign senders', () => {
   it('are refused for every message', async () => {
     const { router, sent } = setup();

@@ -2,12 +2,17 @@
 // Safari 测试页与 Chrome 测试页保持轮询。检查：每个模式读回精确、切换中无放行窗口（Surge 记录）、Chrome 不受影响、
 // 优先于注入的临时规则/模块 DIRECT 规则、UDP/QUIC 被拒绝并回落 TCP 经 SFE-ROUTE、没有配置重载、
 // BLOCKED 后结束 Safari 旧连接、（可选）Surge 重启后的规则去留。--to 只做一次切换（例如回到 NORMAL）。
+// UDP/QUIC 结果另带逐协议覆盖：IPv6、WebSocket 在本次运行中实测；扩展页面请求与测试页请求无法区分，
+// 由同一进程路径的归属结果补足（见 analysis/udp-coverage.ts）。
+// 临时规则一律按规范化文本比较（Surge 列出时可能改变逗号与括号周围的空格）；注入测试规则前确认没有相同的用户规则。
 
 import { existsSync } from 'node:fs';
 import { CAPABILITY_CRITERIA, ENTRY_RULESET_FILES, type EntryStrategy, type KillResult, type KnownEntryMode, type ProtocolCoverage } from '@sfe/contract';
 import { analyzeEntryWindow, outcomeOf, type ObservedRequest } from '../analysis/entry-window.js';
 import { compareSignals, type ReloadSignals } from '../analysis/reload.js';
-import { DEFAULT_H3_HOST } from '../constants.js';
+import { udpQuicCoverage, websocketEvidence, type ModeWindow } from '../analysis/udp-coverage.js';
+import { DEFAULT_H3_HOST, DEFAULT_IPV6_HOST } from '../constants.js';
+import { processPathsDigest } from '../context.js';
 import {
   ENTRY_BITS_IN_ORDER,
   createRulesetStrategy,
@@ -23,11 +28,11 @@ import {
 import { createFileEntryOwnership, loadEntryRecords } from '../entry-ownership.js';
 import { precedenceTest, probeTempInsertion, runEntrySequence, type ModeRecord } from '../entry-driver.js';
 import { refused, type ExitCode } from '../errors.js';
-import { check, writeResult, type CheckItem } from '../results.js';
+import { check, readResult, writeResult, type CheckItem } from '../results.js';
 import { markTempRule, recordTempRuleIntent, saveState } from '../state.js';
 import { surgeStartFingerprint } from '../system.js';
 import { CANARY_FILE, ECHO_HOST, PRECEDENCE_MODULE_FILE, TEST_NODES, TEST_USERS } from '../test-profile.js';
-import { startOtherAppTraffic, trafficImpact } from '../traffic.js';
+import { describeImpact, startOtherAppTraffic, trafficImpact, trafficUnaffected } from '../traffic.js';
 import { allowRefreshFor, confirmWrites, measureContext, openRun, openSession, printResult, printSnapshot, proxyOf, requireServers, takeSnapshot, tryRead, verifyHostOf, type Ctx } from './common.js';
 import { TestOps, chromeImpact, pageEvents } from './test-ops.js';
 
@@ -66,16 +71,16 @@ async function restartPhase(
   ctx.deps.out.line(`Surge 重启后入口读回：${rb?.mode ?? '读不到'}`);
   return {
     readback: rb?.mode ?? null,
-    ourRulesPresent: temps === null || ourTempRules.length === 0 ? null : ourTempRules.some((r) => temps.includes(r)),
+    ourRulesPresent: temps === null || ourTempRules.length === 0 ? null : ourTempRules.some((r) => hasRule(temps, r)),
     startChanged: startBefore === null || startAfter === null ? null : startBefore !== startAfter,
     normalAfter,
   };
 }
 
-interface ModeWindow {
-  mode: KnownEntryMode;
-  from: number;
-  to: number;
+/** 临时规则列表中是否有与 rule 规范化后相同的规则。 */
+function hasRule(list: readonly string[], rule: string): boolean {
+  const want = normalizeRuleText(rule);
+  return list.some((r) => normalizeRuleText(r) === want);
 }
 
 export async function runEntry(ctx: Ctx): Promise<ExitCode> {
@@ -91,12 +96,16 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   if (pathErrors.length > 0) throw refused(`前置条件不满足：Safari 进程路径不可用（${pathErrors.map((e) => e.message).join('；')}）。先完成 attribution 或用 --process-path 指定`);
   const verifyHost = verifyHostOf(ctx);
   const h3Host = ctx.args.strings['h3-host'] ?? servers.h3Host ?? DEFAULT_H3_HOST;
+  // 测试页轮询的 IPv6 检测主机（与 test-servers 允许的上游相同）。
+  const ipv6Host = DEFAULT_IPV6_HOST;
   const proxy = proxyOf(ctx);
   const dwellMs = (ctx.args.numbers.dwell ?? 20) * 1000;
   const cfg = { processPaths: [...processPaths], verifyHost, siteHosts: [ECHO_HOST, h3Host, 'www.amazon.com'] };
   const operationId = `p0-${dir.id}`;
   session.guard.killablePaths = new Set(processPaths);
 
+  // ruleset_resource 写入时按服务规则比较的自动重载条件（记入摘要；提议的自动重载上下文仍以测量时读到的设置为证据）。
+  const condition = strategy === 'ruleset_resource' ? ((ctx.args.strings['auto-reload-condition'] as 'on' | 'off' | 'any' | undefined) ?? null) : null;
   // 入口归属记录（运行目录中持久化）。ruleset：只有本工具创建且未被改动的规则集文件才登记为本应用所有。
   let controller: EntryController;
   if (strategy === 'ruleset_resource') {
@@ -112,7 +121,6 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
         if (!rec || rec.digest !== r.digest) throw refused(`前置条件不满足：${r.identity} 已被外部修改`);
       }
     }
-    const condition = (ctx.args.strings['auto-reload-condition'] as 'on' | 'off' | 'any' | undefined) ?? null;
     if (condition === null) out.warn('没有 --auto-reload-condition：ruleset_resource 策略会按服务规则拒绝写入（读不到或不一致即拒绝）');
     controller = createRulesetStrategy({
       adapter: session.adapter,
@@ -140,7 +148,7 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   const syncTempRules = async (): Promise<void> => {
     const list = await tryRead(() => session.adapter.listTempRules());
     if (list === null) return;
-    for (const r of session.guard.tempRules) ops.state = markTempRule(ops.state, r, list.includes(r) ? 'present' : 'removed', now());
+    for (const r of session.guard.tempRules) ops.state = markTempRule(ops.state, r, hasRule(list, r) ? 'present' : 'removed', now());
     saveState(dir, ops.state);
   };
   const syncEntryDigests = async (): Promise<void> => {
@@ -225,11 +233,18 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
         ops.state = { ...ops.state, tempRuleInsertion: p.insertion };
         saveState(dir, ops.state);
       }
-      insertionNote = `新临时规则插入位置：${p.insertion ?? '无法判断'}；临时规则${p.beforeProfileRules === null ? '与配置规则的先后无法判断' : p.beforeProfileRules ? '排在配置规则之前' : '没有排在全部配置规则之前'}`;
+      insertionNote = p.skipped
+        ? `新临时规则插入位置：${p.skipped}`
+        : `新临时规则插入位置：${p.insertion ?? '无法判断'}；临时规则${p.beforeProfileRules === null ? '与配置规则的先后无法判断' : p.beforeProfileRules ? '排在配置规则之前' : '没有排在全部配置规则之前'}`;
       out.line(insertionNote);
     }
 
-    if (precedenceTests.has('temp')) {
+    const tempPrecedenceName = '入口优先于用户临时规则（注入 DIRECT 规则时拒绝进入 VERIFY_ONLY）';
+    const existingTemps = precedenceTests.has('temp') ? await tryRead(() => session.adapter.listTempRules()) : null;
+    if (precedenceTests.has('temp') && (existingTemps === null || hasRule(existingTemps, `DOMAIN,${verifyHost},DIRECT`))) {
+      // 用户已有相同的临时规则（或读不到列表）时不注入：注入与清理都按文本，会删掉或接管用户自己的规则。
+      checksPrecedence.push(check(tempPrecedenceName, null, existingTemps === null ? '读不到当前临时规则，无法确认没有相同的用户规则，未注入' : '已存在相同的用户临时规则，未注入（不会删除用户自己的规则）'));
+    } else if (precedenceTests.has('temp')) {
       const rule = `DOMAIN,${verifyHost},DIRECT`;
       const r = await precedenceTest(
         controller,
@@ -242,7 +257,7 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
           await syncTempRules();
         },
       );
-      checksPrecedence.push(check('入口优先于用户临时规则（注入 DIRECT 规则时拒绝进入 VERIFY_ONLY）', r.refused && r.modeAfter === 'NORMAL', `错误 ${r.code ?? '无（未被拒绝）'}，阻断项 ${r.blockingIssues}，之后读回 ${r.modeAfter}`));
+      checksPrecedence.push(check(tempPrecedenceName, r.refused && r.modeAfter === 'NORMAL', `错误 ${r.code ?? '无（未被拒绝）'}，阻断项 ${r.blockingIssues}，之后读回 ${r.modeAfter}`));
     }
     if (precedenceTests.has('module')) {
       await prompt.pause(`在 Surge「模块」中安装并启用本地模块 ${ops.state.testDirectory}/${PRECEDENCE_MODULE_FILE}`);
@@ -320,7 +335,7 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   // ---------- 分析 ----------
   const safariSet = new Set(processPaths);
   const all = [...records.values()].filter((r) => r.startedAt !== null && r.startedAt.getTime() >= seqStart && r.startedAt.getTime() <= seqEnd);
-  const testHosts = new Set([ECHO_HOST, verifyHost, h3Host].map((h) => h.toLowerCase()));
+  const testHosts = new Set([ECHO_HOST, verifyHost, h3Host, ipv6Host].map((h) => h.toLowerCase()));
   const kept = all
     .filter((r) => (r.processPath !== null && safariSet.has(r.processPath)) || testHosts.has((r.remoteHost ?? '').toLowerCase()))
     .map((r) => ({ ...r, remoteHost: testHosts.has((r.remoteHost ?? '').toLowerCase()) ? r.remoteHost : null }));
@@ -357,6 +372,13 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
       echo(n).filter((e) => e.ok).every((e) => e.via === TEST_USERS.plain)
     );
   };
+  // HTTP/1.1 回显单独判断（不含检测服务）：BLOCKED/VERIFY_ONLY 下全部失败，ACTIVE 下成功且经过目标节点。
+  const echoExpect = (): boolean | null => {
+    const echo = (mode: KnownEntryMode) => safariPage(mode).filter((e) => e.kind === 'echo');
+    const [b, v, a] = [echo('BLOCKED'), echo('VERIFY_ONLY'), echo('ACTIVE')];
+    if (b.length + v.length + a.length === 0) return null;
+    return b.every((e) => !e.ok) && v.every((e) => !e.ok) && a.some((e) => e.ok) && a.filter((e) => e.ok).every((e) => e.via === TEST_USERS.a);
+  };
   const inMode = (mode: KnownEntryMode, r: ObservedRequest): boolean => {
     const w = windows.find((x) => x.mode === mode);
     return w !== undefined && r.at >= w.from && r.at <= w.to;
@@ -368,14 +390,14 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   const h3Tcp = safariObs.filter((r) => inMode('ACTIVE', r) && r.protocol !== 'udp' && (r.host ?? '').toLowerCase() === h3Host.toLowerCase());
   const context = await measureContext(ctx, session, ops.state, { entryStrategy: strategy, processPaths });
   const at = now().toISOString();
-  const common = [`入口策略：${strategy}`, `模式：${run?.modes.map((m) => `${m.target}→${m.readbackMode ?? m.error?.code ?? '?'}`).join('，') ?? '未运行'}`, ...(insertionNote ? [insertionNote] : [])];
+  const common = [`入口策略：${strategy}`, ...(strategy === 'ruleset_resource' ? [`自动重载条件（--auto-reload-condition）：${condition ?? '未提供'}；测量时读到的自动重载设置：${context.autoReload ?? '读不到'}`] : []), `模式：${run?.modes.map((m) => `${m.target}→${m.readbackMode ?? m.error?.code ?? '?'}`).join('，') ?? '未运行'}`, ...(insertionNote ? [insertionNote] : [])];
 
   const entryChecks: CheckItem[] = [
     check('四种模式依次精确生效（运行时读回）', modesOk),
     check('切换中无放行窗口（Surge 中的 Safari 请求）', window.checked === 0 ? null : window.violations.length === 0, `核对 ${window.checked} 条，违反 ${window.violations.length} 条，无法归类 ${window.unclassified} 条`),
     check('Safari 测试页在各模式下的结果符合预期', pageExpect(), 'BLOCKED 全部失败；VERIFY_ONLY 只有检测服务成功；ACTIVE 经过目标节点；NORMAL 按原规则'),
     check('Chrome 不受影响', chrome === null ? null : chrome.failures === 0 && chrome.wsCloses === 0, chrome === null ? 'Chrome 测试页没有上报' : `失败 ${chrome.failures}，WebSocket 断开 ${chrome.wsCloses}`),
-    check('其他应用长连接与新请求不受影响', imp.streamResets === 0 && imp.wsResets === 0 && imp.shortFailures === 0, `流重置 ${imp.streamResets}，WebSocket 重置 ${imp.wsResets}，短请求失败 ${imp.shortFailures}/${imp.shortTotal}`),
+    check('其他应用长连接与新请求不受影响', trafficUnaffected(imp), describeImpact(imp)),
     check('切换位不发生配置重载', reload.reloaded === null ? null : !reload.reloaded, reload.reasons.join('、')),
     check('AND(进程,域名) 规则可用（VERIFY_ONLY 下检测请求经 SFE-ROUTE）', verifyRouted.length > 0 ? true : null, `${verifyRouted.length} 条`),
     check('AND(进程,UDP) 规则可用（UDP 被拒绝）', udpActive.length === 0 ? null : udpRejected.length === udpActive.length, `${udpRejected.length}/${udpActive.length} 条`),
@@ -386,21 +408,30 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   const results = [
     writeResult(dir, { key: 'runtime_entry_modes', command: 'entry', at, checks: entryChecks, summary: [`通过条件：${CAPABILITY_CRITERIA.runtime_entry_modes}`, ...common], context, entryStrategy: strategy, processPaths: [...processPaths] }),
   ];
-  const coverage: ProtocolCoverage = {
-    http3_quic:
-      udpActive.length === 0
-        ? { result: 'not_tested', note: h3Observed === 'http/3' ? '页面显示 HTTP/3 但 Surge 没有 Safari 的 UDP 记录' : 'Safari 没有发起 QUIC' }
-        : { result: udpRejected.length === udpActive.length && h3Observed !== 'http/3' ? 'pass' : 'fail', note: `UDP ${udpRejected.length}/${udpActive.length} 条被拒绝；页面 ${h3Observed ?? '未记录'}` },
-    http2: h3Tcp.length === 0 ? { result: 'not_tested', note: 'ACTIVE 下没有 H3 测试主机的 TCP 记录' } : { result: h3Tcp.every((r) => outcomeOf(r.policy) === 'route') ? 'pass' : 'fail', note: `回落 TCP ${h3Tcp.length} 条经 SFE-ROUTE` },
-    ipv4: verifyRouted.length > 0 ? { result: 'pass', note: 'VERIFY_ONLY 下 IPv4 检测请求经 SFE-ROUTE，UDP 未放行' } : { result: 'not_tested', note: null },
-    ipv6: { result: 'not_tested', note: '本命令未测 IPv6' },
-    http1: pageExpect() === true ? { result: 'pass', note: 'HTTP/1.1 回显在 ACTIVE 下经 SFE-ROUTE，BLOCKED/VERIFY_ONLY 下被拒绝' } : { result: 'not_tested', note: null },
-    websocket: { result: 'not_tested', note: '见 first_request_and_old_connections 的 WebSocket 结束证据' },
-    extension_page_fetch: { result: 'not_tested', note: '本命令未测扩展页面' },
-    webrtc: { result: 'limitation', note: '本命令未测 WebRTC' },
-    dns: { result: 'limitation', note: 'DNS 由系统解析，不按 Safari 进程归属' },
-    system_services: { result: 'limitation', note: '系统服务不在 Safari 进程入口覆盖内' },
-  };
+  // 逐协议覆盖：每一项来自本次运行的测量（或同一进程路径、结论为通过的归属结果），不写死“未测”。
+  const modeOf = (at: number): KnownEntryMode | null => windows.find((w) => at >= w.from + SETTLE_MS && at <= w.to)?.mode ?? null;
+  const ipv6Records = safariObs
+    .filter((r) => (r.host ?? '').toLowerCase() === ipv6Host.toLowerCase() && r.protocol !== 'udp')
+    .flatMap((r) => {
+      const mode = modeOf(r.at);
+      return mode ? [{ mode, outcome: outcomeOf(r.policy) }] : [];
+    });
+  const normalIpv6 = safariPage('NORMAL').filter((e) => e.kind === 'ipv6_poll');
+  // WebSocket 按阻断期（BLOCKED 起到 VERIFY_ONLY 结束）与 VERIFY_ONLY 之后划分，ACTIVE 的首次建立不加稳定时间。
+  const websocket = websocketEvidence(windows, pageEvents(dir, 'safari', seqStart, seqEnd), SETTLE_MS);
+  const attribution = readResult(dir, 'safari_process_attribution');
+  const coverage: ProtocolCoverage = udpQuicCoverage({
+    udp: { total: udpActive.length, rejected: udpRejected.length },
+    h3Observed,
+    h3Tcp: { total: h3Tcp.length, routed: h3Tcp.filter((r) => outcomeOf(r.policy) === 'route').length },
+    verifyRouted: verifyRouted.length,
+    echoExpect: echoExpect(),
+    ipv6: { records: ipv6Records, normalPage: { total: normalIpv6.length, ok: normalIpv6.filter((e) => e.ok).length } },
+    websocket,
+    expectedVia: TEST_USERS.a,
+    processPathsDigest: processPathsDigest(processPaths),
+    attribution: attribution ? { verdict: attribution.verdict, processPathsDigest: processPathsDigest(attribution.processPaths ?? []), coverage: attribution.coverage } : null,
+  });
   results.push(
     writeResult(dir, {
       key: 'safari_udp_quic_handling',

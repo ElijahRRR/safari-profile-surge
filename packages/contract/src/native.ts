@@ -1,11 +1,13 @@
 // Safari 扩展 ↔ 原生桥 ↔ 本机服务 的消息契约。
 //
 // 扩展只发送 NativeEnvelope；原生桥（SafariWebExtensionHandler，签名的 App Extension）从
-// SFExtensionProfileKey 取得可信场景 ID，加上传输令牌包装成 BridgeEnvelope 转发给服务。
-// 扩展自己提供的任何身份字段都不被信任。请求/响应模式，不假定存在常驻推送通道。
+// SFExtensionProfileKey 取得可信场景 ID，与服务完成双向 HMAC 握手（传输令牌从不上线路）后，
+// 把 { bridge, message } 转发给服务。扩展自己提供的任何身份字段都不被信任。请求/响应模式，
+// 不假定存在常驻推送通道。
 //
 // 只有扩展页面（弹窗、准备页）与后台脚本可以发送原生消息；内容脚本只能向后台发送
-// requestLoginFill，由后台根据 runtime.MessageSender 填写 top_url 与 frame_is_top。
+// requestLoginFill（由后台根据 runtime.MessageSender 填写 top_url 与 frame_is_top）与只问是否适用填充的
+// checkLoginFill（extension/src/shared/messages.ts）。
 
 import type { ApiErrorBody } from './errors.js';
 import type {
@@ -101,10 +103,51 @@ export interface BridgeInfo {
   bridgeVersion: string;
 }
 
+/**
+ * 原生桥 ↔ 服务的一次连接（docs/ARCHITECTURE.md §7.2）：hello → challenge → request → NativeResponse，之后关闭。
+ * 每次安装随机的传输令牌（由宿主 App 分发，不是用户凭据）从不出现在线路上：双方用 HMAC-SHA256（以令牌的
+ * UTF-8 字节为密钥）互相证明持有令牌。原生桥先验证服务的证明，通过之前不发送场景 ID 或消息。
+ * 随机数为 32 字节的小写十六进制；证明与摘要均为小写十六进制。
+ */
+export const BRIDGE_NONCE_BYTES = 32;
+export const BRIDGE_SERVER_PROOF_LABEL = 'sfe-bridge-server';
+export const BRIDGE_CLIENT_PROOF_LABEL = 'sfe-bridge-client';
+
+/** 原生桥 → 服务。 */
+export interface BridgeHello {
+  v: typeof NATIVE_PROTOCOL_VERSION;
+  type: 'hello';
+  clientNonce: string;
+}
+
+/** 服务 → 原生桥。serverProof = HMAC(令牌, "sfe-bridge-server\n" + clientNonce + "\n" + serverNonce)。 */
+export interface BridgeChallenge {
+  v: typeof NATIVE_PROTOCOL_VERSION;
+  type: 'challenge';
+  serverNonce: string;
+  serverProof: string;
+}
+
+/**
+ * 原生桥 → 服务（验证 serverProof 之后）。payload 是 BridgePayload 的 JSON 文本，证明按它的原始 UTF-8 字节计算，
+ * 双方不需要对 JSON 做跨语言规范化：
+ * clientProof = HMAC(令牌, "sfe-bridge-client\n" + serverNonce + "\n" + clientNonce + "\n" + SHA-256(payload))。
+ */
+export interface BridgeRequest {
+  v: typeof NATIVE_PROTOCOL_VERSION;
+  type: 'request';
+  clientProof: string;
+  payload: string;
+}
+
+export interface BridgePayload {
+  bridge: BridgeInfo;
+  message: NativeRequest;
+}
+
+/** 握手与校验都通过后交给服务处理的请求（不含令牌或证明）。 */
 export interface BridgeEnvelope {
   v: typeof NATIVE_PROTOCOL_VERSION;
-  /** 原生桥与服务之间的每次安装随机令牌（由宿主 App 分发）；不是用户凭据。 */
-  auth: string;
   bridge: BridgeInfo;
   message: NativeRequest;
 }

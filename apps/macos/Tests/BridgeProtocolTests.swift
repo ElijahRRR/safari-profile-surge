@@ -65,45 +65,99 @@ final class EnvelopeValidationTests: XCTestCase {
     }
 }
 
-final class BridgeLineTests: XCTestCase {
-    func testWrapsMessageWithAuthAndProfile() throws {
-        let line = try NativeBridge.bridgeLine(
+final class BridgePayloadTests: XCTestCase {
+    private func decode(_ text: String) -> [String: Any] {
+        JSONLine.decodeObject(Data(text.utf8)) ?? [:]
+    }
+
+    func testWrapsMessageWithProfileAndVersionButNoToken() throws {
+        let text = try NativeBridge.bridgePayload(
             message: ["type": "getCurrentState"],
-            token: Fixtures.token,
             profileId: Fixtures.profileId,
-            bridgeVersion: "0.1.0 (1)"
+            bridgeVersion: "0.1.0+1"
         ).get()
-        let envelope = decodeLine(line)
-        XCTAssertEqual(JSONLine.integer(envelope["v"]), 1)
-        XCTAssertEqual(envelope["auth"] as? String, Fixtures.token)
-        let bridge = envelope["bridge"] as? [String: Any]
+        let payload = decode(text)
+        XCTAssertEqual(Set(payload.keys), ["bridge", "message"])
+        let bridge = payload["bridge"] as? [String: Any]
         XCTAssertEqual(bridge?["profileId"] as? String, Fixtures.profileId)
-        XCTAssertEqual(bridge?["bridgeVersion"] as? String, "0.1.0 (1)")
-        XCTAssertEqual((envelope["message"] as? [String: Any])?["type"] as? String, "getCurrentState")
+        XCTAssertEqual(bridge?["bridgeVersion"] as? String, "0.1.0+1")
+        XCTAssertEqual((payload["message"] as? [String: Any])?["type"] as? String, "getCurrentState")
+        // 令牌从不进入 payload（也不进入任何线路消息，见 BridgeHandshakeTests）
+        XCTAssertNil(payload["auth"])
+        XCTAssertFalse(text.contains(Fixtures.token))
     }
 
     func testMissingProfileIsExplicitNull() throws {
-        let line = try NativeBridge.bridgeLine(message: ["type": "getCurrentState"], token: Fixtures.token, profileId: nil, bridgeVersion: "x").get()
-        let bridge = decodeLine(line)["bridge"] as? [String: Any]
+        let text = try NativeBridge.bridgePayload(message: ["type": "getCurrentState"], profileId: nil, bridgeVersion: "x").get()
+        let bridge = decode(text)["bridge"] as? [String: Any]
         XCTAssertNotNil(bridge?["profileId"])
         XCTAssertTrue(bridge?["profileId"] is NSNull)
     }
 
     func testMessageStringsWithNewlinesStayOnOneLine() throws {
-        let line = try NativeBridge.bridgeLine(message: ["type": "x", "note": "a\nb\r\nc"], token: Fixtures.token, profileId: nil, bridgeVersion: "x").get()
+        let text = try NativeBridge.bridgePayload(message: ["type": "x", "note": "a\nb\r\nc"], profileId: nil, bridgeVersion: "x").get()
+        XCTAssertFalse(text.contains("\n"))
+        XCTAssertEqual((decode(text)["message"] as? [String: Any])?["note"] as? String, "a\nb\r\nc")
+        let line = try XCTUnwrap(BridgeHandshake.encodeRequest(clientProof: HandshakeVector.clientProof, payload: text))
         XCTAssertEqual(line.filter { $0 == 0x0A }.count, 1)
-        XCTAssertEqual((decodeLine(line)["message"] as? [String: Any])?["note"] as? String, "a\nb\r\nc")
     }
 
     func testRejectsOversizedMessage() {
         let big = String(repeating: "x", count: NativeBridge.maxMessageBytes)
-        let result = NativeBridge.bridgeLine(message: ["type": "reportProfileState", "pad": big], token: Fixtures.token, profileId: nil, bridgeVersion: "x")
+        let result = NativeBridge.bridgePayload(message: ["type": "reportProfileState", "pad": big], profileId: nil, bridgeVersion: "x")
+        XCTAssertEqual(result.failureValue, .messageTooLarge)
+    }
+
+    func testSizeLimitAppliesToTheFinalRequestLine() throws {
+        // 引号在 request 行中会被转义：payload 本身不到上限，但整行超过时也要拒绝
+        let quotes = String(repeating: "\"", count: NativeBridge.maxMessageBytes / 3)
+        let result = NativeBridge.bridgePayload(message: ["type": "reportProfileState", "pad": quotes], profileId: nil, bridgeVersion: "x")
         XCTAssertEqual(result.failureValue, .messageTooLarge)
     }
 
     func testRejectsNonJSONMessage() {
-        let result = NativeBridge.bridgeLine(message: ["type": "x", "when": Date()], token: Fixtures.token, profileId: nil, bridgeVersion: "x")
+        let result = NativeBridge.bridgePayload(message: ["type": "x", "when": Date()], profileId: nil, bridgeVersion: "x")
         XCTAssertEqual(result.failureValue, .badEnvelope)
+    }
+}
+
+/// bridgeVersion 必须能通过服务的 BRIDGE_VERSION_RE（/^[\x21-\x7e]{1,64}$/，不含空格）；
+/// 旧格式 "0.1.0 (1)" 含空格，服务拒绝了扩展的每一个请求。
+final class BridgeVersionTests: XCTestCase {
+    /// 与 service/src/ipc/bridge-server.ts 的 BRIDGE_VERSION_RE 相同的判断。
+    private func serviceAccepts(_ version: String) -> Bool {
+        let bytes = Array(version.utf8)
+        return (1...64).contains(bytes.count) && bytes.allSatisfy { (UInt8(0x21)...UInt8(0x7E)).contains($0) }
+    }
+
+    func testFormatIsShortVersionPlusBuild() {
+        let version = NativeBridge.bridgeVersion(infoDictionary: ["CFBundleShortVersionString": "0.1.0", "CFBundleVersion": "1"])
+        XCTAssertEqual(version, "0.1.0+1")
+        XCTAssertTrue(serviceAccepts(version))
+    }
+
+    func testMissingValuesFallBackToZero() {
+        XCTAssertEqual(NativeBridge.bridgeVersion(infoDictionary: nil), "0+0")
+        XCTAssertEqual(NativeBridge.bridgeVersion(infoDictionary: ["CFBundleShortVersionString": 1]), "0+0")
+        XCTAssertEqual(NativeBridge.bridgeVersion(infoDictionary: ["CFBundleShortVersionString": "", "CFBundleVersion": "  "]), "0+0")
+    }
+
+    func testNeverContainsSpacesOrNonASCIIAndStaysWithinTheLimit() {
+        let cases: [[String: Any]] = [
+            ["CFBundleShortVersionString": "0.1.0 beta", "CFBundleVersion": "1 (2)"],
+            ["CFBundleShortVersionString": "1.0\t", "CFBundleVersion": "版本 3"],
+            ["CFBundleShortVersionString": String(repeating: "9", count: 100), "CFBundleVersion": String(repeating: "8", count: 100)],
+        ]
+        for info in cases {
+            let version = NativeBridge.bridgeVersion(infoDictionary: info)
+            XCTAssertFalse(version.contains(" "), version)
+            XCTAssertTrue(serviceAccepts(version), version)
+        }
+        XCTAssertEqual(NativeBridge.bridgeVersion(infoDictionary: cases[0]), "0.1.0beta+1(2)")
+    }
+
+    func testTheOldFormatWouldHaveBeenRejected() {
+        XCTAssertFalse(serviceAccepts("0.1.0 (1)"))
     }
 }
 
@@ -160,13 +214,20 @@ final class ResponseParsingTests: XCTestCase {
     }
 
     func testUnreachableMessagesAreChineseAndCoded() {
-        let cases: [BridgeTransportError] = [.connectFailed, .sendFailed, .timeout, .closedWithoutResponse, .responseTooLarge]
+        let cases: [BridgeTransportError] = [.connectFailed, .sendFailed, .timeout, .closedWithoutResponse, .responseTooLarge, .handshakeFailed]
         for error in cases {
             let failure = NativeFailure.unreachable(error)
             XCTAssertEqual(failure.code, "SURGE_UNREACHABLE")
             XCTAssertTrue(failure.message.hasPrefix("无法连接本机服务："), failure.message)
             XCTAssertNotNil(failure.reason)
         }
+    }
+
+    func testHandshakeFailureSaysAuthenticationFailedWithoutDetails() {
+        let failure = NativeFailure.unreachable(.handshakeFailed)
+        XCTAssertEqual(failure.reason, "auth_failed")
+        XCTAssertTrue(failure.message.contains("认证失败"))
+        XCTAssertFalse(failure.message.contains(Fixtures.token))
     }
 
     func testNotConfiguredIsUnreachable() {

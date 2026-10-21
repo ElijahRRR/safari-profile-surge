@@ -11,6 +11,12 @@ const WRITE_PRIMITIVES = ['updateExternalResource', 'selectGroupPolicy', 'addTem
 const writes = () => Object.fromEntries(WRITE_PRIMITIVES.map((k) => [k, h.fake.calls[k] ?? 0]));
 const reconcileOps = () => h.repos.operations.listRecent(500).filter((o) => o.kind === 'maintenance.reconcile');
 
+async function until(cond: () => boolean): Promise<void> {
+  const end = Date.now() + 5000;
+  while (!cond() && Date.now() < end) await new Promise((r) => setTimeout(r, 2));
+  expect(cond()).toBe(true);
+}
+
 async function activeHarness(opts: Parameters<typeof createHarness>[0] = {}) {
   h = await createHarness(opts);
   return activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
@@ -197,6 +203,84 @@ describe('periodic reconcile is read-only and sticky', () => {
     const route = h.repos.routeState.get();
     expect(route.warnings).toContain('probe_expired');
     expect(route.phase).toBe('active_verified');
+  });
+
+  test('an orphaned switching/rolling_back phase (no running owner) → attention + entry_unverified, never written', async () => {
+    const { opId } = await activeHarness();
+    // 例如崩溃恢复失败后：路由停在切换中，负责它的操作已结束
+    h.repos.routeState.update({ phase: 'switching', operationId: opId });
+    const before = writes();
+    await h.app.runPeriodicReconcile();
+    let route = h.repos.routeState.get();
+    expect(route.phase).toBe('attention');
+    expect(route.warnings).toContain('entry_unverified');
+    expect(route.entryMode).toBe('ACTIVE'); // 读回与记录一致
+    expect(writes()).toEqual(before);
+    expect((await h.app.ensureInControl()).ok).toBe(false);
+    // 记录与读回不一致 → UNKNOWN
+    h.repos.routeState.update({ phase: 'rolling_back', entryMode: 'BLOCKED', operationId: opId });
+    await h.app.runPeriodicReconcile();
+    route = h.repos.routeState.get();
+    expect(route.phase).toBe('attention');
+    expect(route.entryMode).toBe('UNKNOWN');
+    expect(writes()).toEqual(before);
+  });
+
+  test('warnings written outside the executor while reconcile reads Surge are not lost', async () => {
+    const { envId } = await activeHarness();
+    expect((await h.app.ensureInControl()).ok).toBe(true);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered = false;
+    const orig = h.fake.listPolicies.bind(h.fake);
+    h.fake.listPolicies = async () => {
+      if (!entered) {
+        entered = true;
+        await gate;
+      }
+      return orig();
+    };
+    const run = h.app.runPeriodicReconcile();
+    await until(() => entered);
+    // 读取事实期间：预期出口被改成与实测不符（受理处理器直接加 exit_ip_mismatch）
+    const env = h.repos.environments.get(envId)!;
+    await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { expectedExitIp: '198.51.100.99' } } }, WEB);
+    expect(h.repos.routeState.get().warnings).toEqual(['exit_ip_mismatch']);
+    release();
+    await run;
+    expect(h.repos.routeState.get().warnings).toEqual(['exit_ip_mismatch']);
+    const control = await h.app.ensureInControl();
+    expect(control.ok).toBe(false);
+    expect(control.reason).toContain('exit_ip_mismatch');
+  });
+
+  test('acknowledgeWindows during a reconcile read is not undone', async () => {
+    h = await createHarness();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, 'profile-bbbb-0002', b);
+    const act = await h.app.activate(b, { request_id: rid(), old_session_policy: 'keep_open_acknowledged', confirmed_environment_id: a }, WEB);
+    await h.idle();
+    await verify(h, 'profile-bbbb-0002', act.operation_id);
+    expect(h.repos.routeState.get().warnings).toContain('old_windows_kept_open');
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered = false;
+    const orig = h.fake.listPolicies.bind(h.fake);
+    h.fake.listPolicies = async () => {
+      if (!entered) {
+        entered = true;
+        await gate;
+      }
+      return orig();
+    };
+    const run = h.app.runPeriodicReconcile();
+    await until(() => entered);
+    await h.app.acknowledgeWindows({ request_id: rid() }, WEB);
+    expect(h.repos.routeState.get().warnings).not.toContain('old_windows_kept_open');
+    release();
+    await run;
+    expect(h.repos.routeState.get().warnings).not.toContain('old_windows_kept_open');
   });
 
   test('ensureInControl refuses while the executor is writing', async () => {

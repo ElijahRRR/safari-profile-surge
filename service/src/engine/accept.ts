@@ -33,10 +33,10 @@ import { allocateEnvironmentNaming, labelOf, revisionNodeName } from '../domain/
 import { nodeLineChanged, type NodeLineFields } from '../domain/node-line.js';
 import { newRoutePayload, payloadOf, type OperationPayload } from '../domain/operations.js';
 import { LOSS_OF_CONTROL_WARNINGS, hasAny } from '../domain/route-rules.js';
-import { validateEnvironmentChanges, validateEnvironmentInput } from '../domain/validate.js';
+import { LIMITS, validateEnvironmentChanges, validateEnvironmentInput } from '../domain/validate.js';
 import { fingerprint } from '../secrets/pepper.js';
 import type { Engine } from './context.js';
-import { acceptedOf, findDuplicateOperation, findLedger, recordLedger, requestDigest, requireRequestId } from './ledger.js';
+import { acceptedOf, commitOperation, findDuplicateOperation, findLedger, recordLedger, requestDigest, requireRequestId } from './ledger.js';
 import { confirmationNeeded, needsConfirmationError, routeBusyError, routeOps, supersedeWaiting } from './route-control.js';
 import type { ViewService } from './view-service.js';
 
@@ -52,19 +52,36 @@ export function initiatorOf(actor: Actor): { initiatorKind: OperationRecord['ini
   return { initiatorKind: actor.kind, initiatorProfileId: actor.kind === 'bridge' ? actor.profileId : null };
 }
 
-/** 请求中出现的所有秘密值立即登记到脱敏器（日志、错误、步骤都不会回显）。 */
-export function registerRequestSecrets(engine: Engine, value: unknown, depth = 0): void {
-  if (depth > 12 || value === null || typeof value !== 'object') return;
-  if (Array.isArray(value)) {
-    for (const v of value) registerRequestSecrets(engine, v, depth + 1);
-    return;
-  }
-  const obj = value as Record<string, unknown>;
-  if (obj.action === 'replace' && typeof obj.value === 'string') engine.scrubber.register(obj.value);
-  for (const [k, v] of Object.entries(obj)) {
-    // 只登记秘密值：文件内容（content_base64）体积大且在解析后按行登记，登录账号不是秘密
-    if (typeof v === 'string' && /password|username/i.test(k)) engine.scrubber.register(v);
-    else registerRequestSecrets(engine, v, depth + 1);
+/** 代理用户名/密码的长度上限（与 SURGE_SAFE_CREDENTIAL_RE 一致）。 */
+const PROXY_CREDENTIAL_MAX = 128;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** 一个秘密字段的值：SecretChange 的替换值；格式不对的请求也可能把秘密直接写成字符串。 */
+function secretFieldValue(field: unknown): string | null {
+  if (typeof field === 'string') return field;
+  return isRecord(field) && field.action === 'replace' && typeof field.value === 'string' ? field.value : null;
+}
+
+/**
+ * 请求中的秘密值立即登记到脱敏器（日志、错误、步骤都不会回显）。登记在校验之前进行，因此只看已知的秘密
+ * 位置：新建的 environment、修改的 changes 下的代理用户名/密码与账号密码，每个请求至多 3 个值；只登记不超过
+ * 字段上限的值（更长的值必然被校验拒绝、从不进入钥匙串）。不遍历请求中的任意键：被拒绝的请求无法借此
+ * 往脱敏器里塞入大量值（登记表另有容量上限）。
+ */
+export function registerRequestSecrets(engine: Engine, req: unknown): void {
+  if (!isRecord(req)) return;
+  for (const holder of [req.environment, req.changes]) {
+    if (!isRecord(holder)) continue;
+    const fields: Array<[unknown, number]> = [];
+    if (isRecord(holder.proxy)) fields.push([holder.proxy.username, PROXY_CREDENTIAL_MAX], [holder.proxy.password, PROXY_CREDENTIAL_MAX]);
+    if (isRecord(holder.account)) fields.push([holder.account.password, LIMITS.accountPassword]);
+    for (const [field, max] of fields) {
+      const v = secretFieldValue(field);
+      if (v !== null && v.length <= max) engine.scrubber.register(v);
+    }
   }
 }
 
@@ -243,10 +260,10 @@ export async function acceptCreate(deps: AcceptDeps, req: CreateEnvironmentReque
   if (ap !== null) items.push({ key: 'account', value: ap, kind: 'account' });
   const secrets = await createSecrets(engine, items, { kind: 'environment', id: 'new' });
   void keys;
-  let op: OperationRecord;
-  let envId: string;
+  let committed: { op: OperationRecord; duplicate: boolean };
   try {
-    ({ op, envId } = engine.repos.tx(() => {
+    // 幂等在主事务内再核对一次：并发的同一请求可能在写钥匙串期间已提交
+    committed = commitOperation(engine, requestId, digest, () => {
       if (opts.bindProfileId) {
         if (engine.repos.profileBindings.byProfile(opts.bindProfileId)) throw new SfeError('PROFILE_ALREADY_BOUND', '新建并关联失败：当前场景已关联其他环境');
       }
@@ -295,7 +312,7 @@ export async function acceptCreate(deps: AcceptDeps, req: CreateEnvironmentReque
       if (opts.bindProfileId) {
         engine.repos.profileBindings.insert({ profileId: opts.bindProfileId, environmentId: id, state: opts.bindingState ?? 'bound_unverified_id' });
       }
-      const created = insertOperation(engine, {
+      return insertOperation(engine, {
         kind: 'environment.create',
         requestId,
         digest,
@@ -305,14 +322,18 @@ export async function acceptCreate(deps: AcceptDeps, req: CreateEnvironmentReque
         payload: { targets: [{ environmentId: id, proxyRevision: 1 }] },
         step: opts.bindProfileId ? '已保存环境并关联当前场景，等待同步到 Surge' : '已保存环境，等待同步到 Surge',
       });
-      return { op: created, envId: id };
-    }));
+    });
   } catch (err) {
     await discardSecrets(engine, secrets);
     throw err;
   }
+  const { op } = committed;
+  if (committed.duplicate) {
+    await discardSecrets(engine, secrets);
+    return acceptedOf(op, true);
+  }
   deps.kick();
-  engine.emit({ operations: [op.id], environments: [envId] });
+  engine.emit({ operations: [op.id], environments: [op.environmentId!] });
   return acceptedOf(op, false);
 }
 
@@ -410,10 +431,11 @@ export async function acceptUpdate(deps: AcceptDeps, id: string, req: UpdateEnvi
   if (ap !== null && fp(ap) !== (account?.passwordFp ?? null)) items.push({ key: 'account', value: ap, kind: 'account' });
   const secrets = await createSecrets(engine, items, { kind: 'environment', id: env.id });
 
-  let op: OperationRecord;
+  let committed: { op: OperationRecord; duplicate: boolean };
   const routeChanged = { value: false };
   try {
-    op = repos.tx(() => {
+    // 幂等在主事务内、版本检查之前再核对一次：并发的同一请求可能在写钥匙串期间已提交（否则会误报版本冲突）
+    committed = commitOperation(engine, requestId, digest, () => {
       env = getEnvironment(engine, id, '保存');
       if (env.revision !== expected) throw revisionConflict(engine, env, expected, requestedState());
       const newRevision = env.revision + 1;
@@ -519,6 +541,11 @@ export async function acceptUpdate(deps: AcceptDeps, id: string, req: UpdateEnvi
   } catch (err) {
     await discardSecrets(engine, secrets);
     throw err;
+  }
+  const { op } = committed;
+  if (committed.duplicate) {
+    await discardSecrets(engine, secrets);
+    return acceptedOf(op, true);
   }
   if (op.status === 'queued') deps.kick();
   engine.emit({ operations: [op.id], environments: [env.id], route: routeChanged.value });

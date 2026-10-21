@@ -17,7 +17,7 @@ const recent = computed(() => store.state.operations.filter((o) => o.kind !== 'm
 const description = computed(() => {
   const s = stats.value;
   if (!store.state.snapshot) return '正在读取状态';
-  return `共 ${formatCount(s.total)}环境，${formatCount(s.using)}使用中，最近对账于 ${formatRelative(store.route.value?.lastReconciledAt, store.state.now)}`;
+  return `共 ${formatCount(s.total)}环境，${formatCount(s.using)}使用中，最近对账于 ${formatRelative(store.lastReconciledAt.value, store.state.now)}`;
 });
 
 function opEnvLabel(id: string | null): string | null {

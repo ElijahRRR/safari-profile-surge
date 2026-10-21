@@ -194,7 +194,7 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
       return app;
     },
     async native(profileId, message) {
-      const r = await app.handleNative({ v: NATIVE_PROTOCOL_VERSION, auth: 'test', bridge: { profileId, bridgeVersion: 'test' }, message });
+      const r = await app.handleNative({ v: NATIVE_PROTOCOL_VERSION, bridge: { profileId, bridgeVersion: 'test' }, message });
       responses.push(r);
       return r;
     },

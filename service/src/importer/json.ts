@@ -1,5 +1,6 @@
-// JSON 导入（GPT/脚本使用）：记录数组，或 { "environments": [...] }。键名与表格表头使用同一套别名；
-// 值只能是文本、数字、布尔或 null，嵌套对象/数组一律无效（不递归解释）。
+// JSON 导入（GPT/脚本使用）：记录数组，或 { "environments": [...] }（也接受网页与 sfe 早先使用的
+// { "records": [...] }）。键名与表格表头使用同一套别名；值只能是文本、数字、布尔或 null，
+// 嵌套对象/数组一律无效（不递归解释）。网页、sfe 与 agent 都经这里解析，形状与 BOM 处理一致。
 
 import type { FieldError, ImportRecord } from '@sfe/contract';
 import { IMPORT_FIELD_LABELS, resolveHeader, type ImportField } from './columns.js';
@@ -28,8 +29,9 @@ export function extractJsonRecords(doc: unknown): unknown[] {
   if (Array.isArray(doc)) return doc;
   if (typeof doc === 'object' && doc !== null) {
     const keys = Object.keys(doc);
-    const envs = (doc as Record<string, unknown>)['environments'];
-    if (keys.length === 1 && keys[0] === 'environments' && Array.isArray(envs)) return envs;
+    const only = keys.length === 1 ? keys[0]! : null;
+    const list = only === 'environments' || only === 'records' ? (doc as Record<string, unknown>)[only] : undefined;
+    if (Array.isArray(list)) return list;
   }
   rejectImport(SHAPE_MESSAGE);
 }

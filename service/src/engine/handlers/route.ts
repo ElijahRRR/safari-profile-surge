@@ -10,6 +10,7 @@ import {
   buildVerifyUrl,
   type ActivationSnapshot,
   type ApiErrorBody,
+  type CapabilityKey,
   type EntryMode,
   type KillResult,
   type RollbackResult,
@@ -20,15 +21,19 @@ import type { OperationRecord, RouteStateRecord } from '../../db/index.js';
 import { newRoutePayload, payloadOf, type RoutePayload } from '../../domain/operations.js';
 import { LOSS_OF_CONTROL_WARNINGS, REUSE_BLOCKING_WARNINGS, hasAny, safariProbeCurrent } from '../../domain/route-rules.js';
 import { probeView } from '../../domain/views.js';
-import type { EntryController } from '../../ports.js';
+import type { EntryController, EntryReadback, EntryTransitionOptions } from '../../ports.js';
 import { findVerificationRequest } from '../../surge/correlate.js';
 import { knownModeOfBits } from '../../surge/entry/plan.js';
 import { killSafariConnections } from '../../surge/safari-connections.js';
 import type { Engine } from '../context.js';
+import { managedSegmentsChanged, reconcile } from '../reconcile.js';
 import { confirmationNeeded, needsConfirmationError } from '../route-control.js';
 import { currentPreflight, recordPreflight } from './probes.js';
 
 // ---------- 小工具 ----------
+
+/** 撤销本应用入口（普通模式、回滚）的入口切换选项：只有这些方向可以改写被外部修改的本应用入口文件（§5.5）。 */
+const UNDO: EntryTransitionOptions = { undo: true };
 
 function routePayload(op: OperationRecord): RoutePayload {
   const r = payloadOf(op).route;
@@ -89,6 +94,50 @@ function failBody(engine: Engine, err: unknown, fallback: string): ApiErrorBody 
   return engine.errorBody(err, fallback);
 }
 
+/** 激活门槛缺失（details.missing 列出缺失项与过期原因）。 */
+function capabilityFailure(engine: Engine, missing: readonly CapabilityKey[], prefix: string, suffix: string): ApiErrorBody {
+  const views = engine.capabilityViews();
+  return {
+    code: 'CAPABILITY_UNVERIFIED',
+    message: `${prefix}${views.filter((v) => missing.includes(v.key)).map((v) => v.label).join('、')}${suffix}`,
+    details: { missing: missing.map((k) => ({ key: k, staleReasons: views.find((v) => v.key === k)?.staleReasons ?? [] })) },
+  };
+}
+
+/** 本应用文件或受管理段是否被外部修改（撤销入口会改写被修改的入口文件，但保留 managed_segments_changed）。 */
+async function segmentsChangedBefore(engine: Engine, route: RouteStateRecord): Promise<boolean> {
+  if (route.warnings.includes('managed_segments_changed')) return true;
+  try {
+    return (await managedSegmentsChanged(engine)) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 写入之前失败（第 1–3 步）：本操作经 supersedeWaiting 接手了过渡中的路由（被取代的激活停在 VERIFY_ONLY 等待，
+ * 切换中或回滚中）时，没有其他操作负责它——按激活快照回滚（阻断并恢复切换前节点）；否则只标为失败，不碰路由。
+ */
+async function failBeforeSwitch(engine: Engine, opId: string, body: ApiErrorBody): Promise<void> {
+  const cur = engine.repos.operations.get(opId)!;
+  if (cur.status !== 'running' && cur.status !== 'queued') return;
+  const route = engine.repos.routeState.get();
+  if (ownsTransition(route, opId)) {
+    await rollbackActivation(engine, opId, body, engine.entryController(() => opId), route.entryMode);
+    return;
+  }
+  engine.updateOp(opId, { phase: 'FAILED', status: 'failed', error: body }, body.message, { route: true });
+}
+
+/** 本操作负责一个过渡中的路由（切换中、VERIFY_ONLY 等待、回滚中，且有激活快照）：失败或中断都只能按快照回滚。 */
+function ownsTransition(route: RouteStateRecord, opId: string): boolean {
+  return (
+    route.operationId === opId &&
+    (route.phase === 'switching' || route.phase === 'awaiting_safari_verify' || route.phase === 'rolling_back') &&
+    route.activationSnapshot !== null
+  );
+}
+
 // ---------- 活动环境发布 → WAITING_ROUTE ----------
 
 /** 活动环境的新版本已部署：同一操作停在 WAITING_ROUTE，等待绑定场景到达（不阻断 Safari）。 */
@@ -129,11 +178,7 @@ export async function runActivation(engine: Engine, op: OperationRecord): Promis
   try {
     await prepareAndSwitch(engine, op.id, { allowReuse: p.flow === 'activate' });
   } catch (err) {
-    const body = failBody(engine, err, '激活失败：内部错误');
-    const cur = engine.repos.operations.get(op.id)!;
-    if (cur.status === 'running' || cur.status === 'queued') {
-      engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message, { route: true });
-    }
+    await failBeforeSwitch(engine, op.id, failBody(engine, err, '激活失败：内部错误'));
   }
 }
 
@@ -147,14 +192,7 @@ async function prepareAndSwitch(engine: Engine, opId: string, opts: { allowReuse
   if (!env || env.deletedAt || !rev) throw new RouteFailure({ code: 'NOT_FOUND', message: '激活失败：环境或版本不存在' });
   await engine.readBasicFacts();
   const missing = engine.activationMissing();
-  if (missing.length > 0) {
-    const views = engine.capabilityViews();
-    throw new RouteFailure({
-      code: 'CAPABILITY_UNVERIFIED',
-      message: `激活失败：${views.filter((v) => missing.includes(v.key)).map((v) => v.label).join('、')}尚未通过实测`,
-      details: { missing: missing.map((k) => ({ key: k, staleReasons: views.find((v) => v.key === k)?.staleReasons ?? [] })) },
-    });
-  }
+  if (missing.length > 0) throw new RouteFailure(capabilityFailure(engine, missing, '激活失败：', '尚未通过实测'));
   const ctrl = engine.entryController(() => opId);
   if (!ctrl) throw new RouteFailure({ code: 'CAPABILITY_UNVERIFIED', message: '激活失败：入口策略或 Safari 进程路径尚未确认' });
 
@@ -248,6 +286,14 @@ async function checkSwitchPreconditions(engine: Engine, p: RoutePayload, ctrl: E
       code: 'PRECEDENCE_VIOLATION',
       message: '激活失败：有规则排在本应用入口之前，可能抢先匹配 Safari 流量',
       details: { precedenceIssues: readback.precedenceIssues },
+    });
+  }
+  // 被外部修改的本应用入口文件从不被激活采纳或悄悄改写（§5.5）：写入之前停止，由普通模式（会改写它们）或维护流程恢复
+  if (readback.changedOwnedFiles && readback.changedOwnedFiles.length > 0) {
+    throw new RouteFailure({
+      code: 'BASELINE_CHANGED',
+      message: '激活失败：本应用的入口文件已被外部修改，路由未改变；进入普通模式会改写这些文件',
+      details: { files: readback.changedOwnedFiles },
     });
   }
   const rev = repos.proxyRevisions.get(p.targetEnvironmentId, p.proxyRevision)!;
@@ -426,9 +472,7 @@ async function continueWaitingRoute(engine: Engine, op: OperationRecord): Promis
   try {
     await prepareAndSwitch(engine, op.id, { allowReuse: false });
   } catch (err) {
-    const body = failBody(engine, err, '切换到新版本失败：内部错误');
-    const cur = repos.operations.get(op.id)!;
-    if (cur.status === 'running') engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message, { route: true });
+    await failBeforeSwitch(engine, op.id, failBody(engine, err, '切换到新版本失败：内部错误'));
   }
 }
 
@@ -542,6 +586,13 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
     return;
   }
   // 13. 入口 → ACTIVE（读回）→ 提交
+  // 等待期间激活门槛可能已失效（能力被重置、Surge/Safari/macOS 更新使记录过期）：写入 ACTIVE 之前重新检查
+  await engine.readBasicFacts();
+  const missing = engine.activationMissing();
+  if (missing.length > 0) {
+    await rollbackFromWaitingRunning(engine, op.id, capabilityFailure(engine, missing, '切换失败：', '在等待期间已不再满足激活条件'));
+    return;
+  }
   const ctrl = engine.entryController(() => op.id);
   if (!ctrl) {
     await rollbackFromWaitingRunning(engine, op.id, { code: 'CAPABILITY_UNVERIFIED', message: '切换失败：入口策略已变化' });
@@ -554,6 +605,12 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
     return;
   }
   commitActive(engine, op.id, p, evidence);
+  // 提交清除了失控类警告（显式激活重新建立控制）：立即对账一次，让仍然成立的事实类警告马上重新出现
+  try {
+    await reconcile(engine, 'precheck');
+  } catch (err) {
+    engine.log('warn', 'reconcile.failed', { error: err instanceof Error ? err.name : 'unknown' });
+  }
 }
 
 async function rollbackFromWaitingRunning(engine: Engine, opId: string, failure: ApiErrorBody): Promise<void> {
@@ -694,14 +751,16 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
   const p = routePayload(op);
   const before = repos.routeState.get();
   const snapshot = before.activationSnapshot;
+  // 回到阻断会改写被外部修改的本应用入口文件（§5.5），但不清除这一事实
+  const segmentsChanged = await segmentsChangedBefore(engine, before);
   repos.routeState.update({ phase: 'rolling_back', entryMode: confirmed });
   engine.updateOp(opId, { phase: 'ROLLING_BACK', status: 'running' }, `${failure.message}；开始回滚：恢复切换前节点并保持阻断`, { route: true });
   try {
     if (!ctrl) throw new SfeError('UNKNOWN_STATE', '回滚失败：入口控制器不可用');
     let mode = confirmed;
     if (mode !== 'BLOCKED') {
-      // 从 VERIFY_ONLY/未知状态回到阻断；绝不走向 NORMAL
-      await ctrl.transition('BLOCKED');
+      // 从 VERIFY_ONLY/未知状态回到阻断（撤销入口：可改写被外部修改的本应用入口文件）；绝不走向 NORMAL
+      await ctrl.transition('BLOCKED', undefined, UNDO);
       mode = 'BLOCKED';
     }
     repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
@@ -727,7 +786,8 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
       failureError: failure,
       needsReverify: hasPrevious,
     };
-    const keep = before.warnings.filter((w) => w === 'managed_windows_on_original_rules' || w === 'takeover_unknown');
+    const keep: RouteWarning[] = before.warnings.filter((w) => w === 'managed_windows_on_original_rules' || w === 'takeover_unknown');
+    if (segmentsChanged) keep.push('managed_segments_changed');
     repos.tx(() => {
       repos.routeState.update({
         phase: 'failed',
@@ -793,29 +853,36 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
   }
   const ctrl = engine.entryController(() => op.id);
   let confirmed: EntryMode = route.entryMode;
-  let killResults: KillResult[] = [];
+  // 撤销入口会改写被外部修改的本应用入口文件（§5.5），但保留 managed_segments_changed
+  const segmentsChanged = await segmentsChangedBefore(engine, route);
   try {
     if (ctrl) {
       const readback = await ctrl.read();
       if (readback.mode !== 'NORMAL') {
         repos.routeState.update({ phase: 'switching', operationId: op.id });
-        await ctrl.transition('BLOCKED');
+        const changedFiles = readback.changedOwnedFiles ?? [];
+        if (changedFiles.length > 0) {
+          const cur = repos.operations.get(op.id)!;
+          repos.operations.update(op.id, { result: { ...(cur.result ?? {}), changedEntryFiles: changedFiles } });
+          engine.step(op.id, `本应用的入口文件已被外部修改（${changedFiles.join('、')}）：撤销入口时按读到的内容比较后改写`);
+        }
+        const precedenceIssues = await blockForNormal(ctrl);
         confirmed = 'BLOCKED';
         repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
-        engine.updateOp(op.id, { phase: 'SAFARI_BLOCKED' }, '已阻断 Safari 新请求（读回确认）', { route: true });
-        const cfg = engine.entryConfig();
-        const strict = engine.missing(CAPABILITY_GATES.killSafariConnections).length === 0;
-        try {
-          killResults = await killSafariConnections(engine.surge, { processPaths: cfg.processPaths, verifyHost: cfg.verifyHost, now: () => engine.now(), bestEffort: !strict });
-        } catch (err) {
-          if (err instanceof SfeError && Array.isArray(err.details?.killResults)) killResults = err.details.killResults as KillResult[];
-          throw err;
-        } finally {
+        if (precedenceIssues) {
           const cur = repos.operations.get(op.id)!;
-          repos.operations.update(op.id, { result: { ...(cur.result ?? {}), killResults, killBestEffort: !strict } });
+          repos.operations.update(op.id, { result: { ...(cur.result ?? {}), precedenceIssues: engine.scrubber.scrubDeep(precedenceIssues) } });
         }
-        engine.step(op.id, strict ? `已结束 Safari 连接 ${killResults.filter((k) => k.ok).length} 条` : `进程归属能力未通过：尽力结束 Safari 连接，结果 ${killResults.filter((k) => k.ok).length}/${killResults.length}`);
-        await ctrl.transition('NORMAL');
+        engine.updateOp(
+          op.id,
+          { phase: 'SAFARI_BLOCKED' },
+          precedenceIssues
+            ? `入口已切换到阻断，但有 ${precedenceIssues.filter((i) => i.severity === 'blocking').length} 条规则排在本应用入口之前、读回不能确认完全阻断：继续撤销本应用入口`
+            : '已阻断 Safari 新请求（读回确认）',
+          { route: true },
+        );
+        await killForNormal(engine, op.id);
+        await ctrl.transition('NORMAL', undefined, UNDO);
         confirmed = 'NORMAL';
       }
     } else if (route.entryMode !== 'NORMAL') {
@@ -835,6 +902,7 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
   const keepOpen = np?.oldSessionPolicy === 'keep_open_acknowledged' && np.hadManagedEnvironment;
   const warnings: RouteWarning[] = [];
   if (keepOpen || route.warnings.includes('managed_windows_on_original_rules')) warnings.push('managed_windows_on_original_rules');
+  if (segmentsChanged) warnings.push('managed_segments_changed');
   repos.tx(() => {
     repos.routeState.update({
       entryMode: 'NORMAL',
@@ -858,22 +926,72 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
   engine.emit({ operations: [op.id], route: true, environments: route.activeEnvironmentId ? [route.activeEnvironmentId] : [] });
 }
 
+/**
+ * 普通模式的中间阻断。优先级问题只阻止 VERIFY_ONLY/ACTIVE（§5.2、§5.5）：入口位已全部确认为 BLOCKED、
+ * 只因有规则排在入口之前而最终读回不能宣称受控时，返回这些规则并继续撤销入口；其他失败照常抛出。
+ */
+async function blockForNormal(ctrl: EntryController): Promise<EntryReadback['precedenceIssues'] | null> {
+  try {
+    await ctrl.transition('BLOCKED', undefined, UNDO);
+    return null;
+  } catch (err) {
+    if (err instanceof SfeError && err.code === 'PRECEDENCE_VIOLATION' && confirmedModeFrom(err, 'UNKNOWN') === 'BLOCKED') {
+      return Array.isArray(err.details?.precedenceIssues) ? (err.details.precedenceIssues as EntryReadback['precedenceIssues']) : [];
+    }
+    throw err;
+  }
+}
+
+/**
+ * 普通模式中结束 Safari 连接：门槛满足时严格核对，否则尽力而为；无论哪种，列出或结束连接失败都只记录并报告，
+ * 不中止普通模式（它只依赖入口写入与读回，§5.2、§6.5）。
+ */
+async function killForNormal(engine: Engine, opId: string): Promise<void> {
+  const { repos } = engine;
+  const cfg = engine.entryConfig();
+  const strict = engine.missing(CAPABILITY_GATES.killSafariConnections).length === 0;
+  let killResults: KillResult[] = [];
+  let killError: ApiErrorBody | null = null;
+  try {
+    killResults = await killSafariConnections(engine.surge, { processPaths: cfg.processPaths, verifyHost: cfg.verifyHost, now: () => engine.now(), bestEffort: !strict });
+  } catch (err) {
+    if (err instanceof SfeError && Array.isArray(err.details?.killResults)) killResults = err.details.killResults as KillResult[];
+    const body = engine.errorBody(err, '结束 Safari 连接失败：内部错误');
+    killError = { code: body.code, message: body.message };
+  }
+  const cur = repos.operations.get(opId)!;
+  repos.operations.update(opId, { result: { ...(cur.result ?? {}), killResults, killBestEffort: !strict, ...(killError ? { killError } : {}) } });
+  const ok = killResults.filter((k) => k.ok).length;
+  if (killError) engine.step(opId, `未能确认结束 Safari 连接（${killError.message}，已结束 ${ok}/${killResults.length} 条）：继续撤销本应用入口`);
+  else engine.step(opId, strict ? `已结束 Safari 连接 ${ok} 条` : `进程归属能力未通过：尽力结束 Safari 连接，结果 ${ok}/${killResults.length}`);
+}
+
 // ---------- 崩溃恢复 ----------
 
-/** 服务重启时仍在执行中的路由操作：写入前的阶段重新执行；写入已开始的按快照回滚（先读事实）。 */
+/**
+ * 服务重启时仍在执行中的路由操作：按路由阶段与 epoch 判断（操作阶段在切换中可能仍是 VALIDATING/PREFLIGHT_OK，
+ * 推迟的预检之后也会回到 PREFLIGHT_OK，不能用来判断）。尚未递增 epoch、也不负责过渡中路由的重新执行；其余按快照
+ * 回滚（先读事实）。经 supersedeWaiting 接手了过渡中路由的激活（路由 epoch 已递增，但它自己的 routeEpoch 仍为空、
+ * stage 仍是 pending）以及已开始回滚的操作也属于后者：从不把一次已开始的回滚重放成切换。
+ */
 export async function recoverRoute(engine: Engine, op: OperationRecord): Promise<void> {
   if (op.kind === 'route.normal') {
     await runNormal(engine, { ...op, status: 'queued' });
     return;
   }
   const p = routePayload(op);
-  if (p.stage === 'pending' || p.stage === 'arrived' || op.phase === 'SAVED' || op.phase === 'VALIDATING' || op.phase === 'PREFLIGHT_OK') {
-    if (p.flow === 'probe') await runProbeSafari(engine, op);
-    else if (p.stage === 'arrived') await continueAfterCrash(engine, op);
+  // Safari 重测从不写入：重新执行
+  if (p.flow === 'probe') {
+    await runProbeSafari(engine, op);
+    return;
+  }
+  const owns = op.phase === 'ROLLING_BACK' || ownsTransition(engine.repos.routeState.get(), op.id);
+  if (!owns && (p.stage === 'pending' || p.stage === 'arrived') && op.routeEpoch === null) {
+    if (p.stage === 'arrived') await continueAfterCrash(engine, op);
     else await runActivation(engine, op);
     return;
   }
-  // 已开始写入（epoch 已递增）：按激活快照回滚，不重放写入
+  // 已开始写入（epoch 已递增：切换中、VERIFY_ONLY 之后的核对或回滚）或负责过渡中的路由：按激活快照回滚，不重放写入
   const body: ApiErrorBody = { code: 'UNKNOWN_STATE', message: '切换中断：服务重启时切换未完成' };
   const ctrl = engine.entryController(() => op.id);
   let mode: EntryMode = 'UNKNOWN';
@@ -889,8 +1007,7 @@ async function continueAfterCrash(engine: Engine, op: OperationRecord): Promise<
   try {
     await prepareAndSwitch(engine, op.id, { allowReuse: false });
   } catch (err) {
-    const body = failBody(engine, err, '切换到新版本失败：内部错误');
-    engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message, { route: true });
+    await failBeforeSwitch(engine, op.id, failBody(engine, err, '切换到新版本失败：内部错误'));
   }
 }
 

@@ -9,7 +9,7 @@ import {
   warningText,
 } from '../src/lib/labels';
 import { formatHostPort, formatNumber, formatRelative, formatSeconds, isExpired } from '../src/lib/format';
-import { hasPendingDeploy, isCancellableRouteOperation, matchesFilter, needsAttention, probeDisplay, proxyAddress } from '../src/lib/environments';
+import { cancelActionLabel, hasPendingDeploy, isCancellableRouteOperation, matchesFilter, needsAttention, probeDisplay, proxyAddress } from '../src/lib/environments';
 import { environment, operation, revision } from './fixtures';
 
 const ALL_READINESS: EnvironmentReadiness[] = [
@@ -164,5 +164,11 @@ describe('environment helpers', () => {
     expect(isCancellableRouteOperation(operation({ kind: 'route.activate', status: 'running' }))).toBe(false);
     expect(isCancellableRouteOperation(operation({ kind: 'deploy.publish', phase: 'WAITING_ROUTE', status: 'waiting' }))).toBe(true);
     expect(isCancellableRouteOperation(operation({ kind: 'route.normal', status: 'waiting', phase: 'SAFARI_BLOCKED' }))).toBe(false);
+  });
+
+  it('names the cancel action by its effect (a bare 取消 only dismisses)', () => {
+    expect(cancelActionLabel(operation({ kind: 'route.activate', phase: 'VERIFY_ONLY' }))).toBe('取消切换');
+    expect(cancelActionLabel(operation({ kind: 'deploy.publish', phase: 'WAITING_ROUTE' }))).toBe('取消等待');
+    expect(cancelActionLabel(operation({ kind: 'probe.safari', phase: 'VERIFY_ONLY' }))).toBe('取消重测');
   });
 });

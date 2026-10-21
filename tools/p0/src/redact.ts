@@ -3,6 +3,7 @@
 // 摘要因此不含出口 IP、账号、浏览记录或原始请求头。
 
 import { isIP } from 'node:net';
+import { PROPOSAL_SUMMARY_MAX_CHARS } from './constants.js';
 import { redactFreeText } from './deps.js';
 
 export interface SummaryRedactOptions {
@@ -41,8 +42,8 @@ export function redactSummary(text: string, opts: SummaryRedactOptions = {}): st
   return out;
 }
 
-/** 多行摘要逐行脱敏并限制总长度（提议摘要上限 8000 字符）。 */
-export function redactSummaryLines(lines: readonly string[], opts: SummaryRedactOptions = {}, maxChars = 8000): string {
+/** 多行摘要逐行脱敏并限制总长度（默认为服务接受的提议摘要上限 PROPOSAL_SUMMARY_MAX_CHARS）。 */
+export function redactSummaryLines(lines: readonly string[], opts: SummaryRedactOptions = {}, maxChars = PROPOSAL_SUMMARY_MAX_CHARS): string {
   const text = lines.map((l) => redactSummary(l, opts)).join('\n');
   return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
 }

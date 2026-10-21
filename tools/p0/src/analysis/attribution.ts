@@ -128,13 +128,19 @@ export function analyzeAttribution(input: AttributionInput): AttributionResult {
   set('dns', 'limitation', 'DNS 由系统 mDNSResponder 解析，不按 Safari 进程归属');
   set('system_services', 'limitation', otherSafariRelated.length > 0 ? `Safari 步骤中另有 ${otherSafariRelated.length} 个 Safari/WebKit 相关系统进程，不在入口规则覆盖内` : '未观察到其他 Safari 相关系统进程');
 
-  const chromeSeen = input.records.some((r) => r.app === 'chrome');
-  const otherSeen = input.records.some((r) => r.app === 'other');
+  // 对照只看测试主机证据：对照应用自己访问测试主机的记录才能说明它走哪条路径。窗口内其他 Safari/WebKit
+  // 后台请求（主机记为 null）不是对照应用的证据；对照应用没有测试主机记录时结论为未完成，而不是通过。
+  const control = (app: 'chrome' | 'other', label: string): CheckItem => {
+    const name = `${label} 不命中候选路径`;
+    if (input.skipped.includes(app)) return check(name, null, `${label} 步骤已跳过`);
+    if (perApp[app].length === 0) return check(name, null, `${label} 步骤没有测试主机记录：无法证明候选路径不被 ${label} 共用`);
+    return check(name, !perApp[app].some((p) => safariPaths.includes(p)));
+  };
   const gating = coverageAllowsSupported(coverage);
   const checks: CheckItem[] = [
     check('找到 Safari 进程路径', candidates.length > 0, candidates.length > 0 ? `${candidates.length} 个候选` : '没有只属于 Safari 的路径'),
-    check('Chrome 不命中候选路径', input.skipped.includes('chrome') || !chromeSeen ? null : !perApp.chrome.some((p) => safariPaths.includes(p)), chromeSeen ? '' : 'Chrome 步骤没有记录'),
-    check('其他 WebKit 应用不命中候选路径', input.skipped.includes('other') || !otherSeen ? null : !perApp.other.some((p) => safariPaths.includes(p)), otherSeen ? '' : '其他 WebKit 应用步骤没有记录'),
+    control('chrome', 'Chrome'),
+    control('other', '其他 WebKit 应用'),
     check('候选路径通过服务校验', candidates.length === 0 ? null : invalid.length === 0, invalid.map((e) => e.message).join('；')),
     check('门槛协议逐项通过或写明限制', gating.ok ? true : GATING_COVERAGE_ITEMS.some((i) => coverage[i]?.result === 'fail') ? false : null, gating.ok ? '' : `未完成：${gating.missing.join('、')}`),
   ];

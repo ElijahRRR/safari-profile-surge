@@ -1,6 +1,6 @@
-// P0 测试页（由回显服务提供，地址 http://echo.p0.example.test:<端口>/）。poll 模式每秒请求回显与检测服务并保持
-// 一条 WebSocket；attr 模式提供逐项测试按钮。页面只上报结果（成功与否、耗时、经过的测试节点、IP 版本），
-// 不上报出口 IP、浏览记录或请求头。
+// P0 测试页（由回显服务提供，地址 http://echo.p0.example.test:<端口>/）。poll 模式每秒请求回显与检测服务、
+// 每 5 轮请求一次 IPv6 检测主机，并保持一条 WebSocket（每次建立后上报首条消息经过的节点）；attr 模式提供逐项
+// 测试按钮。页面只上报结果（成功与否、耗时、经过的测试节点、IP 版本），不上报出口 IP、浏览记录或请求头。
 
 export interface PageConfig {
   app: string;
@@ -59,7 +59,7 @@ function verifyOnce(label,url){seq++;return timed(withTest(url||cfg.verifyUrl,cf
 push(label||'verify',{seq:seq,ok:r.ok,status:r.status,ms:r.ms,ipVersion:ipVersion(r.body),error:r.error||null});});}
 function wsConnect(){try{ws=new WebSocket('ws://'+location.host+'/ws?app='+encodeURIComponent(cfg.app));}catch(e){push('ws_error',{ok:false});return;}
 var opened=false;ws.onopen=function(){opened=true;wsOpenedAt=Date.now();wsMsgs=0;document.getElementById('ws').textContent='已连接';push('ws_open',{ok:true});};
-ws.onmessage=function(m){wsMsgs++;try{var d=JSON.parse(m.data);if(d.via!==undefined)wsVia=d.via;}catch(e){}document.getElementById('ws').textContent='已连接（'+wsMsgs+' 条，经过 '+(wsVia||'未知')+'）';};
+ws.onmessage=function(m){wsMsgs++;try{var d=JSON.parse(m.data);if(d.via!==undefined)wsVia=d.via;}catch(e){}if(wsMsgs===1)push('ws_first',{ok:true,via:wsVia});document.getElementById('ws').textContent='已连接（'+wsMsgs+' 条，经过 '+(wsVia||'未知')+'）';};
 ws.onclose=function(){document.getElementById('ws').textContent='已断开';if(opened)push('ws_close',{ok:false,openMs:Date.now()-wsOpenedAt,messages:wsMsgs,via:wsVia});ws=null;if(cfg.mode==='poll')setTimeout(wsConnect,2000);};}
 function report(){if(events.length===0)return;var batch=events.splice(0,500);
 fetch('/report',{method:'POST',cache:'no-store',credentials:'omit',headers:{'Content-Type':'application/json'},body:JSON.stringify({app:cfg.app,events:batch})})
@@ -78,8 +78,8 @@ button('WebSocket',function(){if(ws){ws.close();}else{wsConnect();}});
 button('打开 HTTP/2 · HTTP/3 测试页',function(){window.open(cfg.h3Url,'_blank');});
 button('WebRTC（只计数候选）',webrtc);
 }else{
-var busy=false;
-setInterval(function(){if(busy)return;busy=true;echoOnce().then(function(){return verifyOnce();}).then(function(){busy=false;});},cfg.intervalMs);
+var busy=false,cycle=0;
+setInterval(function(){if(busy)return;busy=true;cycle++;echoOnce().then(function(){return verifyOnce();}).then(function(){return cycle%5===0?verifyOnce('ipv6_poll',cfg.ipv6Url):null;}).then(function(){busy=false;});},cfg.intervalMs);
 wsConnect();
 }
 setInterval(report,3000);

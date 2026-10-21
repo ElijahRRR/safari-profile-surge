@@ -19,12 +19,13 @@ import type { EnvironmentRecord, OperationRecord } from '../db/index.js';
 import { environmentDiff, sameEnvironmentState, type DiffEntry, type EnvironmentDiffState } from '../domain/diff.js';
 import { allocateEnvironmentNaming, labelOf, revisionNodeName } from '../domain/naming.js';
 import { nodeLineChanged } from '../domain/node-line.js';
+import { LIMITS } from '../domain/validate.js';
 import { displayNameKey, parseImport, type ParsedImportRow } from '../importer/index.js';
 import { fingerprint } from '../secrets/pepper.js';
 import { keyedRequestDigest } from '../util/keyed-digest.js';
-import { diffStateOf, insertOperation, type AcceptDeps } from './accept.js';
+import { diffStateOf, insertOperation, reevaluateExitIp, type AcceptDeps } from './accept.js';
 import type { Engine } from './context.js';
-import { acceptedOf, findDuplicateOperation, requestDigest, requireRequestId } from './ledger.js';
+import { acceptedOf, commitOperation, findDuplicateOperation, requestDigest, requireRequestId } from './ledger.js';
 
 interface RowPlan {
   parsed: ParsedImportRow;
@@ -161,14 +162,25 @@ function previewDigest(previewKey: Buffer, req: ImportPreviewRequest, rows: read
   });
 }
 
+/** 代理用户名/密码的长度上限（与 SURGE_SAFE_CREDENTIAL_RE 一致）。 */
+const PROXY_CREDENTIAL_MAX = 128;
+
+/**
+ * 解析后立即登记各行秘密（逐行校验之前）。只登记不超过字段上限的值：更长的值必然被逐行校验拒绝、
+ * 从不进入钥匙串，登记它们只会无界占用脱敏器内存。先收集再一次登记。
+ */
 function registerRowSecrets(engine: Engine, rows: readonly ParsedImportRow[]): void {
+  const values = new Set<string>();
   for (const r of rows) {
     const input = r.normalized.input;
-    for (const c of [input.proxy.username, input.proxy.password, input.account?.password]) {
+    for (const c of [input.proxy.username, input.proxy.password]) {
       const v = replaceOf(c);
-      if (v !== null) engine.scrubber.register(v);
+      if (v !== null && v.length <= PROXY_CREDENTIAL_MAX) values.add(v);
     }
+    const ap = replaceOf(input.account?.password);
+    if (ap !== null && [...ap].length <= LIMITS.accountPassword) values.add(ap);
   }
+  for (const v of values) engine.scrubber.register(v);
 }
 
 function parse(engine: Engine, req: ImportPreviewRequest) {
@@ -195,6 +207,11 @@ export async function importPreview(deps: AcceptDeps, req: ImportPreviewRequest,
   };
 }
 
+/** 同一请求的原结果（duplicate）。 */
+function storedCommit(op: OperationRecord): ImportCommitResult {
+  return (op.result as { commit?: ImportCommitResult } | null)?.commit ?? { batch_id: op.id, operation_id: op.id, items: [] };
+}
+
 interface RowSecrets {
   username?: { ref: string; fp: string };
   password?: { ref: string; fp: string };
@@ -208,11 +225,7 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
   const parsed = parse(engine, req);
   const digest = await requestDigest(engine, 'importCommit', null, req);
   const dup = findDuplicateOperation(engine, requestId, digest);
-  if (dup) {
-    const stored = (dup.result as { commit?: ImportCommitResult } | null)?.commit;
-    if (stored) return stored;
-    return { batch_id: dup.id, operation_id: dup.id, items: [] };
-  }
+  if (dup) return storedCommit(dup);
   const keys = await engine.keys();
   if (typeof req.preview_digest !== 'string' || previewDigest(keys.preview, req, parsed.rows, parsed.fileErrors) !== req.preview_digest) {
     throw new SfeError('PREVIEW_STALE', '导入失败：文件或选项与预览不一致，请重新预览');
@@ -276,9 +289,11 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
   const items: ImportCommitResult['items'] = [];
   const childIds: string[] = [];
   const touchedEnvs = new Set<string>();
-  let batchOp: OperationRecord;
+  let routeChanged = false;
+  let committed: { op: OperationRecord; duplicate: boolean };
   try {
-    batchOp = repos.tx(() => {
+    // 幂等在主事务内再核对一次：并发的同一请求可能在写钥匙串期间已提交
+    committed = commitOperation(engine, requestId, digest, () => {
       const batch = insertOperation(engine, {
         kind: 'import.batch',
         requestId,
@@ -332,6 +347,7 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
         const res = updateFromRow(engine, env, plan, after, rs, { requestId: childRequestId, digest, actor, parent: batch.id, expected: d.expected_revision });
         items.push({ row, environment_id: env.id, status: 'update', operation_id: res.opId });
         if (res.queued) childIds.push(res.opId);
+        if (res.routeChanged) routeChanged = true;
         touchedEnvs.add(env.id);
       }
       const result = { batchId, commit: { batch_id: batchId, operation_id: batch.id, items } };
@@ -349,12 +365,14 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
     for (const ref of created) await engine.secrets.discard(ref).catch(() => false);
     throw err;
   }
-  // 未被使用的钥匙串项（版本冲突的行）
+  // 未被使用的钥匙串项（版本冲突的行；并发的同一请求已先提交时为全部）
   for (const ref of created) {
     if (!repos.secretRefs.isReferenced(ref)) await engine.secrets.discard(ref).catch(() => false);
   }
+  const batchOp = committed.op;
+  if (committed.duplicate) return storedCommit(batchOp);
   if (childIds.length > 0) deps.kick();
-  engine.emit({ operations: [batchOp.id, ...items.map((i) => i.operation_id).filter((x): x is string => x !== null)], environments: touchedEnvs });
+  engine.emit({ operations: [batchOp.id, ...items.map((i) => i.operation_id).filter((x): x is string => x !== null)], environments: touchedEnvs, route: routeChanged });
   void acceptedOf;
   return { batch_id: batchId, operation_id: batchOp.id, items };
 }
@@ -427,7 +445,7 @@ function updateFromRow(
   after: EnvironmentDiffState,
   rs: RowSecrets,
   ctx: ChildContext & { expected: number },
-): { opId: string; queued: boolean } {
+): { opId: string; queued: boolean; routeChanged: boolean } {
   const { repos } = engine;
   const curRev = env.desiredProxyRevision !== null ? repos.proxyRevisions.get(env.id, env.desiredProxyRevision) : null;
   const frontId = plan.frontId ?? curRev?.frontProxyId ?? null;
@@ -491,6 +509,8 @@ function updateFromRow(
     queued = true;
   }
   repos.environments.update(env.id, patch);
+  // 活动环境的预期出口：与单项修改相同，立即与最近一次 ok 的 Safari 实测比较（不切换）
+  const routeChanged = after.expectedExitIp !== env.expectedExitIp ? reevaluateExitIp(engine, env.id, after.expectedExitIp) : false;
   const op = insertOperation(engine, {
     kind: 'environment.update',
     requestId: ctx.requestId,
@@ -505,5 +525,5 @@ function updateFromRow(
     enqueue: false,
     step: queued ? '导入：已保存代理新版本，等待批次发布' : '导入：已保存（不涉及 Surge 节点）',
   });
-  return { opId: op.id, queued };
+  return { opId: op.id, queued, routeChanged };
 }

@@ -150,13 +150,17 @@ export interface WsHandle {
   close(): void;
 }
 
-/** 在已建立的套接字上做 WebSocket 握手（客户端帧加掩码）。 */
+/**
+ * 在已建立的套接字上做 WebSocket 握手（客户端帧加掩码）。握手失败（非 101、超时、握手中断开）只 reject，
+ * 不调用 onClose；onClose 只用于握手成功之后的连接结束，且最多一次。调用方因此对每次失败只安排一次重连。
+ */
 export function websocketOverSocket(
   socket: Socket,
   hostHeader: string,
   path: string,
   onMessage: (text: string) => void,
   onClose: (reason: string) => void,
+  handshakeTimeoutMs = 8000,
 ): Promise<WsHandle> {
   return new Promise((resolve, reject) => {
     const key = newClientKey();
@@ -164,10 +168,18 @@ export function websocketOverSocket(
     let buf: Buffer = Buffer.alloc(0);
     let closed = false;
     const done = (reason: string): void => {
-      if (closed) return;
+      if (closed || handshake) return;
       closed = true;
       onClose(reason);
     };
+    const fail = (reason: string): void => {
+      clearTimeout(timer);
+      socket.destroy();
+      reject(new Error(reason));
+    };
+    const timer = setTimeout(() => {
+      if (handshake) fail('ws_handshake_timeout');
+    }, handshakeTimeoutMs);
     socket.write(`GET ${path} HTTP/1.1\r\nHost: ${hostHeader}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
     const handle: WsHandle = {
       send: (text) => {
@@ -184,21 +196,18 @@ export function websocketOverSocket(
       if (handshake) {
         const end = buf.indexOf('\r\n\r\n');
         if (end < 0) {
-          if (buf.length > 8192) {
-            socket.destroy();
-            reject(new Error('ws_handshake_too_large'));
-          }
+          if (buf.length > 8192) fail('ws_handshake_too_large');
           return;
         }
         const head = buf.subarray(0, end).toString('latin1');
         buf = buf.subarray(end + 4);
         const accept = /^sec-websocket-accept:\s*(\S+)\s*$/im.exec(head)?.[1];
         if (!/^HTTP\/1\.1 101/.test(head) || accept !== acceptKey(key)) {
-          socket.destroy();
-          reject(new Error('ws_handshake_failed'));
+          fail('ws_handshake_failed');
           return;
         }
         handshake = false;
+        clearTimeout(timer);
         resolve(handle);
       }
       try {
@@ -218,11 +227,17 @@ export function websocketOverSocket(
       }
     });
     socket.on('error', () => {
-      if (handshake) reject(new Error('ws_socket_error'));
+      if (handshake) {
+        fail('ws_socket_error');
+        return;
+      }
       done('reset');
     });
     socket.on('close', () => {
-      if (handshake) reject(new Error('ws_closed_during_handshake'));
+      if (handshake) {
+        fail('ws_closed_during_handshake');
+        return;
+      }
       done('closed');
     });
   });

@@ -127,13 +127,23 @@ export const INSERTION_PROBE_RULES = ['DOMAIN,p0-insert-1.invalid,REJECT', 'DOMA
 
 /**
  * 临时规则插入位置探测：依次添加两条永不命中的 REJECT 规则，按有效规则列表中的先后判断新规则插在前还是后，
- * 再逐条删除。register 在每次添加前登记意图（回退只删登记过的规则）。
+ * 再逐条删除。register 在每次添加前登记意图（回退只删登记过的规则）。当前临时规则中已有相同（规范化后）
+ * 的规则或读不到列表时不探测：添加与删除都按文本，会删掉或接管用户自己的规则。
  */
 export async function probeTempInsertion(
   adapter: SurgeAdapter,
   register: (rule: string) => Promise<void>,
   markRemoved: (rule: string) => Promise<void>,
-): Promise<{ insertion: 'head' | 'tail' | null; beforeProfileRules: boolean | null }> {
+): Promise<{ insertion: 'head' | 'tail' | null; beforeProfileRules: boolean | null; skipped?: string }> {
+  let existing: string[] | null;
+  try {
+    existing = await adapter.listTempRules();
+  } catch {
+    existing = null;
+  }
+  if (existing === null) return { insertion: null, beforeProfileRules: null, skipped: '读不到当前临时规则，未探测' };
+  const present = new Set(existing.map(normalizeRuleText));
+  if (INSERTION_PROBE_RULES.some((r) => present.has(normalizeRuleText(r)))) return { insertion: null, beforeProfileRules: null, skipped: '已存在相同的临时规则，未探测（不会删除它）' };
   const added: string[] = [];
   try {
     for (const r of INSERTION_PROBE_RULES) {

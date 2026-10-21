@@ -2,18 +2,12 @@ import Foundation
 import os
 import SafariServices
 
-/// Safari Web Extension 的原生桥：从系统取得可信场景 ID，加传输令牌转发给本机服务。
+/// Safari Web Extension 的原生桥：从系统取得可信场景 ID，与本机服务完成双向 HMAC 握手后转发
+/// （传输令牌从不上线路；服务不能证明持有令牌时不发送场景 ID 或消息）。
 /// 扩展自报的任何身份字段都不被信任。日志只记消息类型与结果码，从不记录消息、应答、令牌或密码
 /// （Xcode 模板中打印消息的 os_log 已去掉）。
 final class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
     private static let logger = Logger(subsystem: "com.sfe.SafariProfileSurge.Extension", category: "bridge")
-
-    private static var bridgeVersion: String {
-        let info = Bundle.main.infoDictionary
-        let short = info?["CFBundleShortVersionString"] as? String ?? "0"
-        let build = info?["CFBundleVersion"] as? String ?? "0"
-        return "\(short) (\(build))"
-    }
 
     func beginRequest(with context: NSExtensionContext) {
         let item = context.inputItems.first as? NSExtensionItem
@@ -24,11 +18,12 @@ final class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
 
         let forwarder = BridgeForwarder(
             loadCredentials: { BridgeFiles.load() },
-            transport: { endpoint, line, completion in
-                BridgeClient(endpoint: endpoint).roundTrip(line, completion: completion)
+            transport: { endpoint, handshake, completion in
+                BridgeClient(endpoint: endpoint).send(handshake, completion: completion)
             },
             readPassword: { ref in KeychainAccess.readAccountPassword(ref: ref) },
-            bridgeVersion: Self.bridgeVersion
+            // 与宿主 App 的 BridgeProbe 相同的格式（"0.1.0+1"，不含空格）
+            bridgeVersion: NativeBridge.bridgeVersion(bundle: .main)
         )
         forwarder.handle(message: message, profileId: profileId) { outcome in
             Self.logger.info("native \(outcome.logType, privacy: .public) -> \(outcome.logCode, privacy: .public)")

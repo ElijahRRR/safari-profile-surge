@@ -48,6 +48,7 @@ import {
 import { Engine, type AppServiceDeps } from './context.js';
 import { createDispatcher } from './dispatch.js';
 import { Executor } from './executor.js';
+import { failOrphanedOperations } from './handlers/publish.js';
 import { importCommit, importPreview } from './import.js';
 import { initCommit, initPreview, remergeCommit, remergePreview } from './maintenance.js';
 import { handleNative } from './native.js';
@@ -91,7 +92,8 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
           requestId: `remerge:${engine.ids.token(16)}`,
           digest: 'service',
           actor: { kind: 'admin' },
-          payload: { environmentIds: null },
+          // 恢复的资源名称与上次发布相同：强制写入、定向刷新并读回，不走“没有修改”的捷径
+          payload: { environmentIds: null, forceRefresh: true },
           step: '重新合并后发布节点资源',
         }),
       );
@@ -276,6 +278,7 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
       // 启动：放回上次未完成的领取，读 Surge 事实对账，再开始执行器（未完成操作由执行器按事实恢复）
       const released = engine.repos.outbox.releaseClaims();
       if (released > 0) engine.log('warn', 'startup.released_claims', { count: released });
+      failOrphanedOperations(engine);
       try {
         await reconcile(engine, 'startup');
       } catch (err) {

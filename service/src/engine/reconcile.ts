@@ -27,14 +27,48 @@ interface ExtraFacts {
   selection: string | null | undefined;
   entryMode: EntryMode | null;
   precedenceBlocking: boolean;
-  segmentsChanged: boolean;
+  /** null：未初始化或无法判断。 */
+  segmentsChanged: boolean | null;
   frontsMissing: Set<string>;
   frontsPresent: Set<string>;
 }
 
+/**
+ * 受管理段或本应用文件（以 managed_objects 为准）是否被外部修改；未初始化或 pepper 未加载时为 null。
+ * 对账与撤销本应用入口的路由操作（普通模式、回滚）共用：后者会改写被修改的入口文件，但保留警告
+ * （空闲且入口为 NORMAL 时，对账在检查不再成立后清除它）。
+ */
+export async function managedSegmentsChanged(engine: Engine): Promise<boolean | null> {
+  const { repos } = engine;
+  const wp = engine.workingProfile();
+  const files = engine.profileFiles();
+  if (!wp || !files) return null;
+  let changed = false;
+  try {
+    const text = await readFile(wp.path, 'utf8');
+    const parsed = parseProfile(text);
+    const segs = checkSegments(repos, parsed, files.digestContent);
+    if (segs.some((s) => s.state !== 'ok')) changed = true;
+    if (repos.settings.get('entryStrategy') === 'ruleset_resource' && repos.managedObjects.get('entry_segment', 'entry') && !entryBlockIsFirstRule(parsed)) changed = true;
+  } catch {
+    changed = true;
+  }
+  const rec = repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
+  if (rec && rec.state === 'present') {
+    const d = await files.digest(NODE_RESOURCE_FILE).catch(() => null);
+    if (d !== rec.contentDigest) changed = true;
+  }
+  for (const r of repos.managedObjects.listByKind('entry_ruleset_file')) {
+    if (r.state !== 'present') continue;
+    const d = await files.digest(r.identity).catch(() => null);
+    if (d !== r.contentDigest) changed = true;
+  }
+  return changed;
+}
+
 async function readExtraFacts(engine: Engine): Promise<ExtraFacts> {
   const { repos } = engine;
-  const out: ExtraFacts = { selection: undefined, entryMode: null, precedenceBlocking: false, segmentsChanged: false, frontsMissing: new Set(), frontsPresent: new Set() };
+  const out: ExtraFacts = { selection: undefined, entryMode: null, precedenceBlocking: false, segmentsChanged: null, frontsMissing: new Set(), frontsPresent: new Set() };
   try {
     out.selection = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
   } catch {
@@ -51,33 +85,9 @@ async function readExtraFacts(engine: Engine): Promise<ExtraFacts> {
       out.entryMode = 'UNKNOWN';
     }
   }
-  // 受管理段与本应用文件（以 managed_objects 为准）
-  const wp = engine.workingProfile();
-  const files = engine.profileFiles();
-  if (wp && files) {
-    let changed = false;
-    try {
-      const text = await readFile(wp.path, 'utf8');
-      const parsed = parseProfile(text);
-      const segs = checkSegments(repos, parsed, files.digestContent);
-      if (segs.some((s) => s.state !== 'ok')) changed = true;
-      if (repos.settings.get('entryStrategy') === 'ruleset_resource' && repos.managedObjects.get('entry_segment', 'entry') && !entryBlockIsFirstRule(parsed)) changed = true;
-    } catch {
-      changed = true;
-    }
-    const rec = repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
-    if (rec && rec.state === 'present') {
-      const d = await files.digest(NODE_RESOURCE_FILE).catch(() => null);
-      if (d !== rec.contentDigest) changed = true;
-    }
-    for (const r of repos.managedObjects.listByKind('entry_ruleset_file')) {
-      if (r.state !== 'present') continue;
-      const d = await files.digest(r.identity).catch(() => null);
-      if (d !== r.contentDigest) changed = true;
-    }
-    out.segmentsChanged = changed;
-    engine.facts.managedSectionsIntact = !changed;
-  }
+  const changed = await managedSegmentsChanged(engine);
+  out.segmentsChanged = changed;
+  if (changed !== null) engine.facts.managedSectionsIntact = !changed;
   // 已登记前置是否仍存在
   try {
     const policies = await engine.surge.listPolicies();
@@ -102,6 +112,7 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
 
   const warnings = new Set<RouteWarning>(before.warnings);
   const added: RouteWarning[] = [];
+  const removed: RouteWarning[] = [];
   const add = (w: RouteWarning) => {
     if (!warnings.has(w)) {
       warnings.add(w);
@@ -123,6 +134,18 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   }
 
   if (managed) {
+    // 切换或回滚中断：没有进行中的操作负责当前的过渡阶段（例如崩溃恢复失败）。入口按读回记录（不一致为 UNKNOWN），
+    // 要求处理；从不写 Surge，恢复需要用户显式激活或进入普通模式。
+    if (IN_PROGRESS.includes(before.phase)) {
+      const owner = before.operationId ? repos.operations.get(before.operationId) : null;
+      if (!owner || (owner.status !== 'running' && owner.status !== 'queued')) {
+        add('entry_unverified');
+        phase = 'attention';
+        if (!extra || extra.entryMode !== before.entryMode) entryMode = 'UNKNOWN';
+        expireActive = true;
+        notes.push('切换或回滚已中断：没有进行中的操作负责当前路由状态');
+      }
+    }
     if (!facts.reachable) {
       add('surge_unreachable');
       notes.push('无法连接 Surge');
@@ -197,19 +220,32 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
     }
     if (added.some((w) => ATTENTION_WARNINGS.includes(w))) phase = 'attention';
     else if (added.some((w) => w === 'external_selection_change' || w === 'external_profile_change') && phase !== 'attention') phase = 'external_change';
+  } else if (extra && extra.segmentsChanged === false && warnings.has('managed_segments_changed')) {
+    // 空闲且入口为 NORMAL：撤销入口时保留的 managed_segments_changed 在受管理段与本应用文件重新一致后清除
+    // （例如普通模式已改写入口文件、maintenance.remerge 已恢复受管理段）；托管状态下它是粘性的，由下一次激活清除。
+    warnings.delete('managed_segments_changed');
+    removed.push('managed_segments_changed');
+    notes.push('受管理段与本应用文件已恢复一致');
   }
 
   if (expireActive && before.activeEnvironmentId) {
     if (expireSafariProbe(engine, before.activeEnvironmentId)) add('probe_expired');
   }
-  const changed = added.length > 0 || phase !== before.phase || entryMode !== before.entryMode || frontChanges.length > 0;
-  repos.tx(() => {
+  // 读取事实期间，受理与原生桥处理器可能已在执行器之外改过路由警告（预期出口重新比较、确认窗口已关闭）：
+  // 在提交事务中重读路由，只合并本次新增的警告；阶段与入口（以及空闲时的清除）只在它们仍是读取开始时的值时才改。
+  const changed = repos.tx(() => {
+    const fresh = repos.routeState.get();
+    const sameState = fresh.phase === before.phase && fresh.entryMode === before.entryMode;
+    const nextPhase = sameState ? phase : fresh.phase;
+    const nextEntryMode = sameState ? entryMode : fresh.entryMode;
+    const dropped = sameState ? removed.filter((w) => fresh.warnings.includes(w)) : [];
+    const changed = added.length > 0 || dropped.length > 0 || nextPhase !== fresh.phase || nextEntryMode !== fresh.entryMode || frontChanges.length > 0;
     repos.routeState.update({
-      warnings: [...warnings],
-      phase,
-      entryMode,
+      warnings: [...new Set<RouteWarning>([...fresh.warnings.filter((w) => !dropped.includes(w)), ...added])],
+      phase: nextPhase,
+      entryMode: nextEntryMode,
       lastReconciledAt: now,
-      surgeStartedAt: facts.startedAt ?? before.surgeStartedAt,
+      surgeStartedAt: facts.startedAt ?? fresh.surgeStartedAt,
     });
     for (const fc of frontChanges) repos.frontProxies.update(fc.id, { state: fc.state, lastCheckedAt: now });
     if (changed) {
@@ -222,11 +258,12 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
         phase: 'COMPLETED',
         status: 'succeeded',
         routeEpoch: before.routeEpoch,
-        payload: { trigger: kind, added: [...added] },
+        payload: { trigger: kind, added: [...added], ...(dropped.length > 0 ? { removed: dropped } : {}) },
       });
       repos.operations.appendStep(op.id, 'COMPLETED', notes.length > 0 ? `对账发现变化：${notes.join('；')}` : '对账更新了路由状态');
       engine.emit({ operations: [op.id] });
     }
+    return changed;
   });
   const route = repos.routeState.get();
   const envs = before.activeEnvironmentId ? [before.activeEnvironmentId] : [];

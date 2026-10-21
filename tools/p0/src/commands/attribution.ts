@@ -37,7 +37,12 @@ function steps(port: number, h3Host: string): Step[] {
     {
       app: 'safari-extension',
       title: 'Safari 扩展页面请求（需要已安装并启用扩展）',
-      instructions: ['在同一测试场景点击扩展图标，在弹窗中点击「重新检测」，或打开准备页，让扩展页面请求检测服务。', '扩展尚未安装时输入 skip 跳过。'],
+      instructions: [
+        '让扩展页面自己请求检测服务：Safari「设置」→「高级」勾选「显示网页开发者功能」；在同一测试场景点击扩展图标打开弹窗，在弹窗中右键 →「检查元素」，',
+        `在检查器控制台运行 fetch('${VERIFY_ENDPOINTS[0]!.url}').then((r) => r.text()).then(console.log)，看到返回后关闭检查器。`,
+        '不要用弹窗的「重新检测」代替：它由本机服务执行检测（或在服务未进入受控状态时被拒绝），不是扩展页面请求。',
+        '扩展尚未安装时输入 skip 跳过。',
+      ],
     },
     {
       app: 'chrome',

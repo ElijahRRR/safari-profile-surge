@@ -56,6 +56,15 @@ export function readResult(dir: RunDir, key: CapabilityKey): CapabilityResult | 
   return dir.readJson<CapabilityResult>(`results/${key}.json`);
 }
 
+/** 本能力在本次运行中的全部历史结果（按写入时间）。 */
+export function readResultHistory(dir: RunDir, key: CapabilityKey): CapabilityResult[] {
+  return dir
+    .listFiles('results/history')
+    .filter((f) => (f.split('/').pop() ?? '').startsWith(`${key}-`))
+    .map((f) => dir.readJson<CapabilityResult>(f))
+    .filter((r): r is CapabilityResult => r !== null && r.key === key);
+}
+
 export interface ActionEntry {
   at: string;
   command: string;

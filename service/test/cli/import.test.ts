@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 import type { ImportPreview, ImportRowPreview } from '@sfe/contract';
 import { UsageError } from '../../src/cli/args.js';
 import { buildImportDecisions, describeUnresolved, parseResolve, parseResolves } from '../../src/cli/import-decisions.js';
+import { parseImport } from '../../src/importer/index.js';
 import { runCli } from '../../src/cli/sfe.js';
 import { fakeCli } from './helpers.js';
 
@@ -181,13 +182,31 @@ describe('sfe import', () => {
     expect(cli.requests).toHaveLength(1);
   });
 
-  test('json files are sent as records (array or { records })', async () => {
+  test('json files are uploaded as content in every shape the importer accepts (array, { environments }, { records }, UTF-8 BOM)', async () => {
     const records = [{ display_name: 'US-Buyer-01', proxy_host: '198.51.100.7', proxy_port: 1080 }];
-    for (const body of [records, { records }]) {
-      const cli = fakeCli({ argv: ['import', 'in.json'], files: { '/work/in.json': JSON.stringify(body) }, responses: { importPreview: preview([]) } });
+    const texts = [JSON.stringify(records), JSON.stringify({ environments: records }), JSON.stringify({ records }), `\uFEFF${JSON.stringify({ environments: records })}`];
+    for (const text of texts) {
+      const cli = fakeCli({ argv: ['import', 'in.json'], files: { '/work/in.json': text }, responses: { importPreview: preview([]) } });
       expect(await runCli(cli.deps)).toBe(0);
-      expect(cli.requests[0]!.envelope.args).toEqual({ format: 'json', records });
+      expect(cli.requests[0]!.envelope.args).toEqual({ format: 'json', content_base64: Buffer.from(text, 'utf8').toString('base64') });
     }
+  });
+
+  test('json file with a BOM and the environments shape round-trips through the service importer', async () => {
+    const text = `\uFEFF${JSON.stringify({ environments: [{ display_name: 'US-Buyer-01', proxy_host: '198.51.100.7', proxy_port: 1080 }] })}`;
+    const cli = fakeCli({ argv: ['import', 'in.json'], files: { '/work/in.json': text }, responses: { importPreview: preview([]) } });
+    expect(await runCli(cli.deps)).toBe(0);
+    const args = cli.requests[0]!.envelope.args as { format: 'json'; content_base64: string };
+    const parsed = parseImport({ format: args.format, content_base64: args.content_base64, default_site: null });
+    expect(parsed.fileErrors ?? []).toEqual([]);
+    expect(parsed.rows).toHaveLength(1);
+  });
+
+  test('json with an unsupported shape → 2 without contacting the service', async () => {
+    const cli = fakeCli({ argv: ['import', 'in.json'], files: { '/work/in.json': JSON.stringify({ items: [] }) } });
+    expect(await runCli(cli.deps)).toBe(2);
+    expect(cli.requests).toHaveLength(0);
+    expect(cli.stderr()).toContain('environments');
   });
 
   test('xlsx is detected by extension and sent as base64', async () => {

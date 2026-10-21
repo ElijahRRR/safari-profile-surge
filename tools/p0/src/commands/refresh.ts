@@ -14,7 +14,7 @@ import { refused, type ExitCode } from '../errors.js';
 import { check, writeResult, type CheckItem } from '../results.js';
 import { saveState } from '../state.js';
 import { CANARY_FILE, TEST_NODES, TEST_USERS, testNodeResource, type TestPorts } from '../test-profile.js';
-import { startOtherAppTraffic, trafficImpact } from '../traffic.js';
+import { describeImpact, startOtherAppTraffic, trafficImpact, trafficUnaffected } from '../traffic.js';
 import { resourcesForPath } from '../surge-access.js';
 import { allowRefreshFor, confirmWrites, loadCredentials, measureContext, openRun, openSession, printResult, printSnapshot, proxyOf, requireServers, takeSnapshot, tryRead, type Ctx } from './common.js';
 import { TestOps, chromeImpact, requestViaRoute } from './test-ops.js';
@@ -85,7 +85,11 @@ export async function runRefresh(ctx: Ctx): Promise<ExitCode> {
     const reloadOnReplace = sigA.canaryLoaded;
     const cmpA = compareSignals(sigBefore, sigA);
     const detectorUsable = reloadOnReplace === false;
-    checks.auto!.push(check('原子替换被引用文件后的行为已测得', reloadOnReplace !== null, reloadOnReplace === null ? 'canary 请求未返回可判断的结果' : reloadOnReplace ? '触发了重新读取' : '未触发重新读取'));
+    // 结论反映实测行为：原子替换触发重新读取时为“不通过”，该设置下只能提议 unsupported（产品据此要求另一种设置）。
+    checks.auto!.push(
+      check('原子替换被引用文件后的行为已测得', reloadOnReplace !== null, reloadOnReplace === null ? 'canary 请求未返回可判断的结果' : reloadOnReplace ? '触发了重新读取' : '未触发重新读取'),
+      check('原子替换不触发重新读取', reloadOnReplace === null ? null : !reloadOnReplace, reloadOnReplace ? `自动重载${declared === 'on' ? '开' : '关'}时原子替换会触发重新读取：该设置下发布与 ruleset_resource 入口必须拒绝` : ''),
+    );
     notes.push(`自动重载设置（声明）=${declared === 'on' ? '开' : '关'}：原子替换被引用的规则集后 Surge ${reloadOnReplace === null ? '结果未知' : reloadOnReplace ? '重新读取了该文件（整体或文件监视）' : '没有重新读取'}${cmpA.reasons.length ? `；其他信号：${cmpA.reasons.join('、')}` : ''}`);
     if (!detectorUsable) notes.push('canary 不能作为后续重载检测（原子替换本身会触发读取或结果未知），后续只用连接重置、启动时间与临时规则判断');
 
@@ -107,7 +111,7 @@ export async function runRefresh(ctx: Ctx): Promise<ExitCode> {
       check('请求实际经过所选节点', viaA1.via === TEST_USERS.a && viaB.via === TEST_USERS.b && viaA2.via === TEST_USERS.a, `经过 ${viaA1.via ?? '无'} → ${viaB.via ?? '无'} → ${viaA2.via ?? '无'}`),
       check('工作配置身份不变', sigB0.profileName !== null && sigB0.profileName === sigB1.profileName ? true : sigB0.profileName === null ? null : false),
       check('没有发生配置重载', cmpB.reloaded === null ? null : !cmpB.reloaded, cmpB.reasons.join('、')),
-      check('其他应用长连接与新请求不受影响', impB.streamResets === 0 && impB.wsResets === 0 && impB.shortFailures === 0, `流重置 ${impB.streamResets}，WebSocket 重置 ${impB.wsResets}，短请求失败 ${impB.shortFailures}/${impB.shortTotal}`),
+      check('其他应用长连接与新请求不受影响', trafficUnaffected(impB), describeImpact(impB)),
       check('Chrome 长连接与新请求不受影响', chromeB === null ? null : chromeB.failures === 0 && chromeB.wsCloses === 0, chromeB === null ? 'Chrome 测试页没有上报（请保持 Chrome 轮询页打开）' : `Chrome 失败 ${chromeB.failures}，WebSocket 断开 ${chromeB.wsCloses}`),
     );
 
@@ -155,7 +159,7 @@ export async function runRefresh(ctx: Ctx): Promise<ExitCode> {
       check('旧成员与选择保留', sameList(members, expectedMembers) && selection === TEST_NODES.a),
     );
     const impC = trafficImpact(traffic.samples, tC, now().getTime());
-    checks.targeted!.push(check('其他应用连接不受影响', impC.streamResets === 0 && impC.wsResets === 0 && impC.shortFailures === 0, `流重置 ${impC.streamResets}，WebSocket 重置 ${impC.wsResets}，短请求失败 ${impC.shortFailures}/${impC.shortTotal}`));
+    checks.targeted!.push(check('其他应用连接不受影响', trafficUnaffected(impC), describeImpact(impC)));
 
     // D. 移除回落
     if (!ctx.args.booleans['skip-removal-fallback']) {

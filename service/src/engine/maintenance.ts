@@ -45,9 +45,10 @@ import { hmacHex, keyedRequestDigest } from '../util/keyed-digest.js';
 import { insertOperation, type AcceptDeps } from './accept.js';
 import { checkCandidate } from './candidate.js';
 import type { Engine } from './context.js';
-import { acceptedOf, findDuplicateOperation, requestDigest, requireRequestId } from './ledger.js';
+import { acceptedOf, commitOperation, findDuplicateOperation, requestDigest, requireRequestId } from './ledger.js';
 import { registerInitialObjects, segmentDigest, SEGMENT_KIND, type SegmentName } from './ownership.js';
 import { generateResource, type ResourceEntry } from './resource.js';
+import { requireResourceRefresh } from './handlers/publish.js';
 import { unmeasuredFrom } from './capabilities.js';
 
 const MAX_REMERGE_BACKUPS = 5;
@@ -235,9 +236,10 @@ export async function initCommit(deps: AcceptDeps, req: InitCommitRequest, actor
   const plan = await buildInitPlan(engine, {});
   if (plan.response.preview_digest !== req.preview_digest) throw new SfeError('PREVIEW_STALE', '初始化失败：配置或引用文件已变化，请重新预览');
   if (plan.blocking) throw new SfeError(plan.blocking.code, plan.blocking.message);
-  const op = engine.repos.tx(() =>
+  const { op, duplicate } = commitOperation(engine, requestId, digest, () =>
     insertOperation(engine, { kind: 'maintenance.init', requestId, digest, actor, payload: { previewDigest: req.preview_digest }, step: '已受理初始化固定工作配置' }),
   );
+  if (duplicate) return acceptedOf(op, true);
   deps.kick();
   engine.emit({ operations: [op.id] });
   return acceptedOf(op, false);
@@ -501,9 +503,10 @@ export async function remergeCommit(deps: AcceptDeps, req: RemergeCommitRequest,
   if (plan.blocking?.code === 'ENVIRONMENT_ACTIVE') throw new SfeError('ENVIRONMENT_ACTIVE', plan.blocking.message);
   if (plan.response.preview_digest !== req.preview_digest) throw new SfeError('PREVIEW_STALE', '重新合并失败：工作配置或本应用文件已变化，请重新预览');
   if (plan.blocking) throw new SfeError(plan.blocking.code, plan.blocking.message);
-  const op = engine.repos.tx(() =>
+  const { op, duplicate } = commitOperation(engine, requestId, digest, () =>
     insertOperation(engine, { kind: 'maintenance.remerge', requestId, digest, actor, payload: { previewDigest: req.preview_digest }, step: '已受理重新合并' }),
   );
+  if (duplicate) return acceptedOf(op, true);
   deps.kick();
   engine.emit({ operations: [op.id] });
   return acceptedOf(op, false);
@@ -562,6 +565,8 @@ export async function runRemerge(engine: Engine, op: OperationRecord, enqueuePub
       if (engine.missing(CAPABILITY_GATES.publish).length > 0) {
         engine.step(op.id, '节点资源与上次发布不一致：恢复需要发布能力，已跳过');
       } else {
+        // 先持久记录刷新要求：跟随的发布失败或写入后崩溃，下一次发布仍会定向刷新并读回
+        requireResourceRefresh(engine, op.id);
         const cur = await files.digest(NODE_RESOURCE_FILE);
         if (cur === null) await createExclusivePrivateFile(join(plan.directory, NODE_RESOURCE_FILE), plan.restoreResource);
         else await files.writeAtomic(NODE_RESOURCE_FILE, plan.restoreResource, cur);

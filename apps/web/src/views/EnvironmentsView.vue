@@ -50,6 +50,12 @@ const paged = computed(() => filtered.value.slice((page.value - 1) * pageSize.va
 watch([search, filter, pageSize], () => {
   page.value = 1;
 });
+// 事件让行离开当前筛选（关联完成、删除、部署结束）时页数会变少：当前页超出就退回最后一页，
+// 否则表格显示为空且分页被隐藏，无法翻回。
+watch(() => filtered.value.length, (n) => {
+  const last = Math.max(1, Math.ceil(n / pageSize.value));
+  if (page.value > last) page.value = last;
+});
 
 const description = computed(() => {
   if (!store.state.snapshot) return '正在读取环境';

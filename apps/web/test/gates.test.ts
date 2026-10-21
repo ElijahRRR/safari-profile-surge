@@ -3,7 +3,7 @@ import { CAPABILITY_GATES, GATING_COVERAGE_ITEMS, type CapabilityProposalView, t
 import PendingDeployCard from '../src/components/PendingDeployCard.vue';
 import CapabilitiesView from '../src/views/CapabilitiesView.vue';
 import { coverageBlockReason, evaluateGate } from '../src/lib/gates';
-import { allSupported, capabilities, click, environment, flush, mountWith, revision, snapshot, testContext, type Call } from './fixtures';
+import { allSupported, byText, capabilities, click, environment, flush, mountWith, revision, snapshot, testContext, type Call } from './fixtures';
 
 afterEach(() => {
   document.body.innerHTML = '';
@@ -70,6 +70,84 @@ describe('publish button', () => {
     const call = calls.find((c) => c.url === '/api/deployments/publish');
     expect(call?.method).toBe('POST');
     expect(call?.body).toEqual({ request_id: expect.stringMatching(/^web-/) });
+    m.unmount();
+  });
+});
+
+describe('publishing a selection', () => {
+  // A 保存后正在部署（部署完成会自行离开列表），B 被有意留在待部署
+  const envA = environment({
+    proxy: { desired: revision(2), deployed: revision(1), active: null, lastVerified: null },
+    facets: { input: 'valid', binding: 'bound', deployment: 'deploying', preflight: 'none', route: 'inactive' },
+  });
+  const envB = environment({
+    id: 'env_2',
+    code: 'E0002',
+    displayName: 'US-买家02',
+    proxy: { desired: revision(2), deployed: revision(1), active: null, lastVerified: null },
+    facets: { input: 'valid', binding: 'bound', deployment: 'pending', preflight: 'none', route: 'inactive' },
+  });
+  const deployedA = environment({ proxy: { desired: revision(2), deployed: revision(2), active: null, lastVerified: null } });
+  const accepted = { status: 202, body: { operation_id: 'op_7', environment_id: null, revision: null, duplicate: false } };
+
+  async function mountCard() {
+    const { ctx, calls } = testContext(
+      (c: Call) => (c.url === '/api/deployments/publish' ? accepted : { status: 404 }),
+      snapshot({ environments: [envA, envB], capabilities: capabilities(allSupported()) }),
+    );
+    const m = await mountWith(PendingDeployCard, ctx);
+    const button = document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!;
+    return { ctx, calls, m, button };
+  }
+
+  it('never falls back to publishing everything when the selected environments leave the list', async () => {
+    const { ctx, calls, m, button } = await mountCard();
+    click(document.body.querySelector('input[aria-label="选择 US-买家01 · E0001"]'));
+    await flush();
+    expect(button.textContent).toContain('发布所选（1）');
+    ctx.store.applyEvent({ type: 'environment.updated', sequence: 11, environment: deployedA });
+    await flush();
+    expect(button.textContent).toContain('发布所选（0）');
+    expect(button.disabled).toBe(true);
+    expect(document.body.querySelector('[data-test="selection-dropped"]')?.textContent).toContain('US-买家01 · E0001');
+    click(button);
+    await flush();
+    expect(calls.some((c) => c.url === '/api/deployments/publish')).toBe(false);
+    // 清除选择后才回到“发布全部待部署”，且需要再点一次
+    click(document.body.querySelector('[data-test="clear-selection"]'));
+    await flush();
+    expect(button.textContent).toContain('发布全部待部署');
+    expect(button.disabled).toBe(false);
+    expect(calls.some((c) => c.url === '/api/deployments/publish')).toBe(false);
+    m.unmount();
+  });
+
+  it('a click racing the list update asks again instead of sending', async () => {
+    const { ctx, calls, m, button } = await mountCard();
+    click(document.body.querySelector('input[aria-label="选择 US-买家01 · E0001"]'));
+    await flush();
+    // 同一轮里列表先变化、按钮随即被点击（界面还没来得及更新）
+    ctx.store.applyEvent({ type: 'environment.updated', sequence: 11, environment: deployedA });
+    click(button);
+    await flush();
+    expect(calls.some((c) => c.url === '/api/deployments/publish')).toBe(false);
+    expect(ctx.toasts.items.map((t) => t.message)).toContain('所选环境中有的已不再待部署，已更新选择，请确认后重新发布');
+    expect(button.textContent).toContain('发布所选（0）');
+    m.unmount();
+  });
+
+  it('publishes only what is still selected when part of the selection leaves', async () => {
+    const { ctx, calls, m, button } = await mountCard();
+    click(document.body.querySelector('input[aria-label="全选"]'));
+    await flush();
+    expect(button.textContent).toContain('发布所选（2）');
+    ctx.store.applyEvent({ type: 'environment.updated', sequence: 11, environment: deployedA });
+    await flush();
+    expect(button.textContent).toContain('发布所选（1）');
+    click(button);
+    await flush();
+    expect(calls.find((c) => c.url === '/api/deployments/publish')?.body).toEqual({ request_id: expect.any(String), environment_ids: ['env_2'] });
+    expect(byText('button', '发布全部待部署')).not.toBeNull();
     m.unmount();
   });
 });

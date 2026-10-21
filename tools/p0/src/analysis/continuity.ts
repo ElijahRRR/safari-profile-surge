@@ -1,6 +1,7 @@
 // 连接连续性时间线分析（纯函数）：按标记事件把运行切成若干时段，逐段统计短请求成功率与延迟、
-// 长连接流的最大间隔与重置、WebSocket 重置、经过的测试节点；对每个事件给出影响（重置、失败数、恢复时间）。
-// 第一个事件之前的时段是未执行变更的对照。
+// 长连接流的最大间隔与重置、WebSocket 重置与重连失败、经过的测试节点；对每个事件给出影响（重置、失败数、恢复时间）。
+// 第一个事件之前的时段是未执行变更的对照。同一配置重载另有整窗口评估（assessReload）：操作员的标记可能晚于
+// 实际重载，因此整个观察窗口内的中断都计入，并且必须有重载确实发生的正面证据。
 
 export interface Sample {
   t: number;
@@ -31,6 +32,8 @@ export interface PeriodMetrics {
   maxStreamGapMs: number | null;
   streamResets: number;
   wsResets: number;
+  /** WebSocket 打开失败（隧道或握手失败）的次数。 */
+  wsOpenFailures: number;
   vias: string[];
   publicTotal: number;
   publicOk: number;
@@ -42,6 +45,7 @@ export interface EventImpact {
   failedShorts: number;
   streamResets: number;
   wsResets: number;
+  wsOpenFailures: number;
   /** 事件后第一次短请求失败到之后第一次成功的时间；没有失败为 0。 */
   recoveryMs: number | null;
 }
@@ -78,6 +82,7 @@ function metrics(label: string, from: number, to: number, samples: readonly Samp
     maxStreamGapMs: maxGap,
     streamResets: inRange.filter((s) => s.kind === 'stream_end' && !s.expected).length,
     wsResets: inRange.filter((s) => s.kind === 'ws_close' && !s.expected).length,
+    wsOpenFailures: inRange.filter((s) => s.kind === 'ws_open' && !s.ok).length,
     vias,
     publicTotal: publics.length,
     publicOk: publics.filter((s) => s.ok).length,
@@ -103,12 +108,151 @@ export function analyzeContinuity(
       const after = shorts.slice(lastFailIdx + 1).find((s) => s.ok);
       recoveryMs = after ? after.t - e.t : null;
     }
-    return { label: e.label, t: e.t, failedShorts: shorts.filter((s) => !s.ok).length, streamResets: p.streamResets, wsResets: p.wsResets, recoveryMs };
+    return { label: e.label, t: e.t, failedShorts: shorts.filter((s) => !s.ok).length, streamResets: p.streamResets, wsResets: p.wsResets, wsOpenFailures: p.wsOpenFailures, recoveryMs };
   });
   return { periods, impacts };
 }
 
 export function formatPeriod(p: PeriodMetrics): string {
   const rate = p.shortTotal === 0 ? '无' : `${p.shortOk}/${p.shortTotal}`;
-  return `${p.label}：短请求 ${rate}，延迟 p50 ${p.p50 ?? '-'} ms / p95 ${p.p95 ?? '-'} ms，流最大间隔 ${p.maxStreamGapMs ?? '-'} ms，流重置 ${p.streamResets}，WebSocket 重置 ${p.wsResets}，经过 ${p.vias.join('、') || '-'}`;
+  const wsFail = p.wsOpenFailures > 0 ? `，WebSocket 重连失败 ${p.wsOpenFailures}` : '';
+  return `${p.label}：短请求 ${rate}，延迟 p50 ${p.p50 ?? '-'} ms / p95 ${p.p95 ?? '-'} ms，流最大间隔 ${p.maxStreamGapMs ?? '-'} ms，流重置 ${p.streamResets}，WebSocket 重置 ${p.wsResets}${wsFail}，经过 ${p.vias.join('、') || '-'}`;
+}
+
+/** 时段是否有任何中断（重置、重连失败、短请求失败）。 */
+export function periodImpacted(p: PeriodMetrics): boolean {
+  return p.streamResets > 0 || p.wsResets > 0 || p.wsOpenFailures > 0 || p.shortOk < p.shortTotal;
+}
+
+/**
+ * 提议摘要用的紧凑时段列表：对照时段与每个有中断的时段逐行列出，其余时段合并为一行，
+ * 避免长时间运行（几十个动作）时被摘要长度上限截掉有影响的时段。
+ */
+export function summarizePeriods(periods: readonly PeriodMetrics[]): string[] {
+  if (periods.length === 0) return [];
+  const [baseline, ...rest] = periods;
+  const impacted = rest.filter(periodImpacted);
+  const clean = rest.filter((p) => !periodImpacted(p));
+  const shorts = clean.reduce((n, p) => n + p.shortTotal, 0);
+  return [
+    formatPeriod(baseline!),
+    ...impacted.map(formatPeriod),
+    ...(clean.length > 0 ? [`其余 ${clean.length} 个时段没有重置、重连失败或短请求失败（短请求 ${shorts} 次）`] : []),
+  ];
+}
+
+/** 中断样本：意外结束的流与 WebSocket、WebSocket 打开失败、失败的短请求。 */
+function isImpact(s: Sample): boolean {
+  return (s.kind === 'stream_end' && !s.expected) || (s.kind === 'ws_close' && !s.expected) || (s.kind === 'ws_open' && !s.ok) || (s.kind === 'short' && !s.ok);
+}
+
+/** 从第一次中断到各通道都恢复的时间：没有中断为 0；任一通道在窗口结束前未恢复为 null。 */
+function recoveryAfter(samples: readonly Sample[], firstImpactAt: number | null): number | null {
+  if (firstImpactAt === null) return 0;
+  const channels: Array<{ fail: (s: Sample) => boolean; ok: (s: Sample) => boolean }> = [
+    { fail: (s) => s.kind === 'short' && !s.ok, ok: (s) => s.kind === 'short' && s.ok },
+    { fail: (s) => s.kind === 'stream_end' && !s.expected, ok: (s) => s.kind === 'stream' },
+    { fail: (s) => (s.kind === 'ws_close' && !s.expected) || (s.kind === 'ws_open' && !s.ok), ok: (s) => s.kind === 'ws_open' && s.ok },
+  ];
+  let recoveredAt = firstImpactAt;
+  for (const c of channels) {
+    const fails = samples.filter(c.fail);
+    if (fails.length === 0) continue;
+    const lastFail = Math.max(...fails.map((s) => s.t));
+    const back = samples.filter((s) => c.ok(s) && s.t > lastFail).map((s) => s.t);
+    if (back.length === 0) return null;
+    recoveredAt = Math.max(recoveredAt, Math.min(...back));
+  }
+  return recoveredAt - firstImpactAt;
+}
+
+export interface ReloadSignalEvidence {
+  /** canary、临时规则或配置名信号判定发生了重新读取。 */
+  reloaded: boolean | null;
+  /** Surge 进程启动时间变化：这是重启，不是同一配置重载。 */
+  restarted: boolean;
+  reasons: string[];
+}
+
+export interface ReloadAssessment {
+  marks: number[];
+  /** 对照：观察开始到第一次重载标记前 leadMs。 */
+  baseline: { from: number; to: number; shortTotal: number; issues: number };
+  /** 整个观察窗口内的中断计数。 */
+  window: { from: number; to: number; shortTotal: number; failedShorts: number; streamResets: number; wsResets: number; wsOpenFailures: number };
+  firstImpactAt: number | null;
+  recoveryMs: number | null;
+  /** 观察期间除重载外的其他变更事件。 */
+  otherEvents: string[];
+  /** 对照至少 baselineMinMs 且没有任何中断；否则 null（无法归属）。 */
+  baselineOk: boolean | null;
+  /** 确实发生了同一配置重载：信号判定重新读取，或第一次标记前 leadMs 之后出现中断；没有证据或检测到重启为 null。 */
+  evidence: boolean | null;
+  evidenceNote: string;
+  /** 观察期间只有重载；有其他变更为 null。 */
+  onlyReload: boolean | null;
+  /** 其他应用不受影响；对照不干净、没有重载证据或混有其他变更时为 null（不能把“没有观察到”当作通过，也不能归属）。 */
+  unaffected: boolean | null;
+}
+
+/**
+ * 同一配置重载影响的整窗口评估。操作员在 Surge 菜单中重载与在终端输入标记之间有延迟，
+ * 因此不按标记切段，而是把整个观察窗口内的中断都计入；第一次标记前 leadMs 之前必须是干净的对照。
+ */
+export function assessReload(
+  samples: readonly Sample[],
+  events: readonly MarkedEvent[],
+  range: { start: number; end: number },
+  opts: { leadMs: number; baselineMinMs: number; isReload: (label: string) => boolean; signals: ReloadSignalEvidence | null },
+): ReloadAssessment {
+  const inWindow = samples.filter((s) => s.t >= range.start && s.t <= range.end);
+  const evs = events.filter((e) => e.t >= range.start && e.t <= range.end);
+  const marks = evs.filter((e) => opts.isReload(e.label)).map((e) => e.t).sort((a, b) => a - b);
+  const otherEvents = evs.filter((e) => !opts.isReload(e.label)).map((e) => e.label);
+  const firstMark = marks[0] ?? null;
+  const baselineTo = firstMark === null ? range.end : Math.max(range.start, firstMark - opts.leadMs);
+  const base = inWindow.filter((s) => s.t < baselineTo);
+  const baseShorts = base.filter((s) => s.kind === 'short').length;
+  const baseIssues = base.filter(isImpact).length;
+  const shorts = inWindow.filter((s) => s.kind === 'short');
+  const impacts = inWindow.filter(isImpact);
+  const firstImpactAt = impacts.length > 0 ? Math.min(...impacts.map((s) => s.t)) : null;
+  const window = {
+    from: range.start,
+    to: range.end,
+    shortTotal: shorts.length,
+    failedShorts: shorts.filter((s) => !s.ok).length,
+    streamResets: inWindow.filter((s) => s.kind === 'stream_end' && !s.expected).length,
+    wsResets: inWindow.filter((s) => s.kind === 'ws_close' && !s.expected).length,
+    wsOpenFailures: inWindow.filter((s) => s.kind === 'ws_open' && !s.ok).length,
+  };
+  const baselineOk = firstMark !== null && baselineTo - range.start >= opts.baselineMinMs && baseShorts > 0 && baseIssues === 0 ? true : null;
+  const impactNearMark = firstMark !== null && impacts.some((s) => s.t >= baselineTo);
+  const sig = opts.signals;
+  let evidence: boolean | null = null;
+  let evidenceNote: string;
+  if (firstMark === null) evidenceNote = '没有重载标记';
+  else if (sig?.restarted) evidenceNote = 'Surge 进程启动时间变化：这是重启，不是同一配置重载';
+  else if (sig?.reloaded === true) {
+    evidence = true;
+    evidenceNote = `重载信号：${sig.reasons.join('、')}`;
+  } else if (impactNearMark) {
+    evidence = true;
+    evidenceNote = '标记附近出现连接中断';
+  } else evidenceNote = sig === null ? '没有重载信号（未使用 --reload-test 布置 canary），也没有观察到中断：无法确认重载确实发生' : '重载信号未变化且没有观察到中断：无法确认重载确实发生';
+  const impacted = impacts.length > 0;
+  const onlyReload = otherEvents.length === 0 ? true : null;
+  return {
+    marks,
+    baseline: { from: range.start, to: baselineTo, shortTotal: baseShorts, issues: baseIssues },
+    window,
+    firstImpactAt,
+    recoveryMs: recoveryAfter(inWindow, firstImpactAt),
+    otherEvents,
+    baselineOk,
+    evidence,
+    evidenceNote,
+    onlyReload,
+    unaffected: baselineOk === true && evidence === true && onlyReload === true ? !impacted : null,
+  };
 }

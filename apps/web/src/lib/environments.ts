@@ -96,6 +96,16 @@ export function isCancellableRouteOperation(op: Pick<OperationView, 'status' | '
   return op.kind === 'route.activate' || op.kind === 'probe.safari' || op.phase === 'WAITING_ROUTE';
 }
 
+/**
+ * 取消等待中路由操作的按钮与确认文案：按效果命名（取消等待、取消重测、取消切换）。
+ * 单独的「取消」在设计系统中只表示关闭弹窗、不做操作。
+ */
+export function cancelActionLabel(op: Pick<OperationView, 'kind' | 'phase'>): string {
+  if (op.phase === 'WAITING_ROUTE') return '取消等待';
+  if (op.kind === 'probe.safari') return '取消重测';
+  return '取消切换';
+}
+
 export function sortByCode(list: EnvironmentView[]): EnvironmentView[] {
   return [...list].sort((a, b) => a.code.localeCompare(b.code, 'en', { numeric: true }));
 }

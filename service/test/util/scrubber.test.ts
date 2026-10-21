@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { createScrubber, SCRUB_MASK, scrubText } from '../../src/util/scrubber.js';
+import { createScrubber, MAX_REGISTERED_CHARS, MAX_REGISTERED_SECRET_LENGTH, MAX_REGISTERED_VALUES, SCRUB_MASK, scrubText } from '../../src/util/scrubber.js';
 
 const M = SCRUB_MASK;
 // 测试夹具中的“秘密”用插值拼接，避免仓库秘密扫描把测试文本当作真实凭据
@@ -145,6 +145,18 @@ describe('JSON text', () => {
   });
 });
 
+/** 确定性的伪随机数（0 ≤ 结果 < n）。 */
+function mulberry32(seed: number): (n: number) => number {
+  let a = seed >>> 0;
+  return (n) => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return Math.floor((((t ^ (t >>> 14)) >>> 0) / 4294967296) * n);
+  };
+}
+
 describe('createScrubber: value registry', () => {
   test('replaces registered values anywhere in free text', () => {
     const s = createScrubber();
@@ -208,6 +220,147 @@ describe('createScrubber: value registry', () => {
     const s = createScrubber();
     const text = '发布失败：节点 SFE-N-E0001-US01-v003 读回不一致（READBACK_MISMATCH），代理 203.0.113.10:1080';
     expect(s.scrub(text)).toBe(text);
+  });
+
+  test('oversized values (only possible from rejected requests) are ignored and never break later scrubbing', () => {
+    const s = createScrubber();
+    s.register('Tr1cky-Value');
+    const count = s.registeredCount();
+    s.register('u'.repeat(80_000));
+    s.register('p'.repeat(80_000));
+    s.register('x'.repeat(MAX_REGISTERED_SECRET_LENGTH + 1));
+    expect(s.registeredCount()).toBe(count);
+    expect(() => s.scrub('still works')).not.toThrow();
+    expect(s.scrub('error: auth rejected (Tr1cky-Value)')).toBe(`error: auth rejected (${M})`);
+    expect(s.scrubDeep({ message: 'Tr1cky-Value' })).toEqual({ message: M });
+  });
+
+  test('secrets of every accepted length are masked, including URL-encoded and JSON-escaped forms', () => {
+    const s = createScrubber();
+    // 账号密码最长 256 个字符（含非 ASCII）；URL 编码形式远长于原值，不受登记上限影响
+    const account = '密钥Ab1-'.repeat(43).slice(0, 256);
+    const proxy = 'Aa0._~-'.repeat(19).slice(0, 128);
+    s.register(account);
+    s.register(proxy);
+    expect(s.scrub(`a ${account} b`)).toBe(`a ${M} b`);
+    expect(s.scrub(`a ${encodeURIComponent(account)} b`)).toBe(`a ${M} b`);
+    expect(s.scrub(`a ${JSON.stringify(account)} b`)).toBe(`a "${M}" b`);
+    expect(s.scrub(`a ${proxy} b`)).toBe(`a ${M} b`);
+    const longest = 'q'.repeat(MAX_REGISTERED_SECRET_LENGTH);
+    s.register(longest);
+    expect(s.scrub(`<${longest}>`)).toBe(`<${M}>`);
+  });
+
+  test('registering thousands of values (a 2000-row import) stays fast and every value is still masked', () => {
+    const s = createScrubber();
+    const secrets = Array.from({ length: 6000 }, (_, i) => `Imp0rt-${i}-${(i * 7919).toString(36)}`);
+    const started = Date.now();
+    for (const v of secrets) s.register(v);
+    expect(Date.now() - started).toBeLessThan(2000);
+    for (const v of [secrets[0]!, secrets[2999]!, secrets[5999]!]) expect(s.scrub(`row: ${v};`)).toBe(`row: ${M};`);
+  });
+
+  test('100 000 values sharing a prefix: registration and later scrubbing stay fast, the registry is bounded', () => {
+    const s = createScrubber();
+    // 与操作编号同前缀的随机值（被拒绝的请求可以反复送来）：不能让之后每条含 op_ 的日志都变慢
+    const rnd = mulberry32(42);
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const junk = Array.from({ length: 100_000 }, () => `op_${Array.from({ length: 20 }, () => alphabet[rnd(alphabet.length)]).join('')}`);
+    expect(new Set(junk).size).toBe(junk.length);
+    const registerStarted = Date.now();
+    for (const v of junk) s.register(v);
+    expect(Date.now() - registerStarted).toBeLessThan(3000);
+    expect(s.registeredCount()).toBeLessThanOrEqual(MAX_REGISTERED_VALUES);
+
+    const lines = Array.from({ length: 500 }, (_, i) => `operation op_${String(i).padStart(12, '0')}xyz phase=DEPLOYING step ${i} op_${i}`);
+    const scrubStarted = Date.now();
+    for (const line of lines) expect(s.scrub(line)).toBe(line);
+    expect(Date.now() - scrubStarted).toBeLessThan(1000);
+    // 最近登记的值仍被遮盖；最早的值在超出容量后被淘汰
+    expect(s.scrub(`x ${junk.at(-1)!} y`)).toBe(`x ${M} y`);
+    expect(s.scrub(`x ${junk[0]!} y`)).toBe(`x ${junk[0]!} y`);
+  });
+
+  test('a value registered again is kept while older, unused values are evicted', () => {
+    const s = createScrubber();
+    const keep = 'Still-In-Use-Secret';
+    s.register(keep);
+    for (let i = 0; i <= MAX_REGISTERED_VALUES; i++) {
+      s.register(`Fill-${i}-value`);
+      // 仍在使用的秘密每次读取都会再次登记
+      if (i % 10_000 === 0) s.register(keep);
+    }
+    expect(s.registeredCount()).toBe(MAX_REGISTERED_VALUES);
+    expect(s.scrub(`auth rejected (${keep})`)).toBe(`auth rejected (${M})`);
+    expect(s.scrub('<Fill-0-value>')).toBe('<Fill-0-value>');
+    expect(s.scrub(`<Fill-${MAX_REGISTERED_VALUES}-value>`)).toBe(`<${M}>`);
+  });
+
+  test('the registry is bounded by total characters as well', () => {
+    const s = createScrubber();
+    const per = MAX_REGISTERED_SECRET_LENGTH;
+    const n = Math.ceil(MAX_REGISTERED_CHARS / per) + 100;
+    for (let i = 0; i < n; i++) s.register(`${String(i).padStart(8, '0')}${'k'.repeat(per - 8)}`);
+    expect(s.registeredCount()).toBeLessThanOrEqual(Math.floor(MAX_REGISTERED_CHARS / per));
+    const newest = `${String(n - 1).padStart(8, '0')}${'k'.repeat(per - 8)}`;
+    expect(s.scrub(`[${newest}]`)).toBe(`[${M}]`);
+  });
+
+  test('insert, evict and match agree with a naive reference on overlapping values', () => {
+    // 小容量 + 两字母表：大量共享前缀、拆分与合并边
+    const s = createScrubber({ maxValues: 12 });
+    const live: string[] = [];
+    const rnd = mulberry32(7);
+    const word = (min: number, max: number) => Array.from({ length: min + rnd(max - min + 1) }, () => 'ab'[rnd(2)]).join('');
+    const reference = (text: string): string => {
+      let out = '';
+      let i = 0;
+      while (i < text.length) {
+        const hit = live.filter((v) => text.startsWith(v, i)).sort((a, b) => b.length - a.length)[0];
+        if (hit === undefined) {
+          out += text[i];
+          i++;
+        } else {
+          out += M;
+          i += hit.length;
+        }
+      }
+      return out;
+    };
+    for (let step = 0; step < 3000; step++) {
+      const v = word(3, 9);
+      const at = live.indexOf(v);
+      if (at !== -1) live.splice(at, 1);
+      live.push(v);
+      if (live.length > 12) live.shift();
+      s.register(v);
+      expect(s.registeredCount()).toBe(live.length);
+      const text = word(0, 40);
+      expect(s.scrub(text)).toBe(reference(text));
+    }
+  });
+
+  test('values sharing a prefix: the longest match at each position wins', () => {
+    const s = createScrubber();
+    for (const v of ['abc', 'abcdef', 'abcd', 'zzabc']) s.register(v);
+    expect(s.scrub('abcdefg abcdx abcz zzabcdef')).toBe(`${M}g ${M}x ${M}z ${M}def`);
+  });
+
+  test('a lone surrogate in a secret does not throw and is still masked', () => {
+    const s = createScrubber();
+    const odd = 'ab\ud800cd';
+    expect(() => s.register(odd)).not.toThrow();
+    expect(s.scrub(`x ${odd} y`)).toBe(`x ${M} y`);
+  });
+
+  test('fails closed: an unconvertible input yields the mask instead of throwing', () => {
+    const s = createScrubber();
+    const hostile = {
+      toString(): string {
+        throw new Error('boom');
+      },
+    };
+    expect(s.scrub(hostile as unknown as string)).toBe(M);
   });
 });
 

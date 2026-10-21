@@ -96,10 +96,14 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.sfe.SafariProfileSurge.Extension
         INFOPLIST_FILE: Config/Extension-Info.plist
         GENERATE_INFOPLIST_FILE: NO
+        # 默认（首选的登录钥匙串方案）不声明 keychain-access-groups：它是受限权限，会让扩展依赖描述文件
+        # （免费 Personal Team 约 7 天过期）。
         CODE_SIGN_ENTITLEMENTS: Config/Extension.entitlements
         ENABLE_APP_SANDBOX: YES
         SKIP_INSTALL: YES
-        # 打开备选钥匙串方案（数据保护钥匙串 + 共享访问组）时改为：SWIFT_ACTIVE_COMPILATION_CONDITIONS: SFE_DATA_PROTECTION_KEYCHAIN
+        # 打开备选钥匙串方案（数据保护钥匙串 + 共享访问组）时两项必须同时改（embed-extension-resources.sh 会检查）：
+        #   SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) SFE_DATA_PROTECTION_KEYCHAIN
+        #   CODE_SIGN_ENTITLEMENTS: Config/Extension-DataProtection.entitlements
     postBuildScripts:
       - name: Embed web extension resources
         path: Scripts/embed-extension-resources.sh
@@ -147,6 +151,7 @@ targets:
       - path: Tests
       - path: Shared/NDJSON.swift
       - path: Shared/BridgeProtocol.swift
+      - path: Shared/BridgeHandshake.swift
       - path: Shared/BridgeConfig.swift
       - path: Shared/BridgeForwarder.swift
       - path: Shared/KeychainStatus.swift

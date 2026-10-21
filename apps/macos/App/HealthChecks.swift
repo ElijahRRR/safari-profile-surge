@@ -20,19 +20,21 @@ enum ExtensionStatus {
     }
 }
 
-/// 原生桥是否可达：用 App Group 中的令牌发一次未识别场景的 getCurrentState（只读）。
+/// 原生桥是否可达：用 App Group 中的令牌与扩展完全相同的握手（BridgeConversation）与原生桥版本格式，
+/// 发一次未识别场景的 getCurrentState（只读）。服务不能证明持有令牌时视为不可达。
 enum BridgeProbe {
     static func isReachable(bundle: Bundle = .main) async -> Bool {
         guard case .success(let credentials) = BridgeFiles.load(bundle: bundle),
-              case .success(let line) = NativeBridge.bridgeLine(
+              case .success(let payload) = NativeBridge.bridgePayload(
                   message: ["type": "getCurrentState"],
-                  token: credentials.token,
                   profileId: nil,
-                  bridgeVersion: "host-app"
-              )
+                  bridgeVersion: NativeBridge.bridgeVersion(bundle: bundle)
+              ),
+              let nonce = BridgeHandshake.randomNonce()
         else { return false }
+        let handshake = BridgeHandshake(token: credentials.token, payload: payload, clientNonce: nonce)
         return await withCheckedContinuation { continuation in
-            BridgeClient(endpoint: credentials.endpoint).roundTrip(line) { result in
+            BridgeClient(endpoint: credentials.endpoint).send(handshake) { result in
                 guard case .success(let data) = result, case .success(let response) = NativeBridge.parseResponse(data) else {
                     continuation.resume(returning: false)
                     return

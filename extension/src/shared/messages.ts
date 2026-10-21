@@ -1,5 +1,5 @@
 // 扩展内部消息（runtime.sendMessage）。扩展页面经后台转发原生请求；内容脚本只能发送
-// ContentFillMessage，由后台根据 sender 重建完整的 requestLoginFill。
+// ContentFillMessage：requestLoginFill 由后台根据 sender 重建完整请求；checkLoginFill 只问本场景是否适用填充。
 
 import type { NativeRequest, NativeRequestType, NativeResponse } from '@sfe/contract';
 import type { WebExtBrowser } from './browser';
@@ -19,11 +19,18 @@ export type PageMessage =
   | { sfe: 'profileState'; report: boolean };
 
 /** 内容脚本 → 后台：只有这些字段，其余由后台从 sender 与新的 getCurrentState 填写。 */
-export interface ContentFillMessage {
-  type: 'requestLoginFill';
-  form_action: string | null;
-  fields: Array<'identifier' | 'password'>;
-}
+export type ContentFillMessage =
+  | {
+      type: 'requestLoginFill';
+      form_action: string | null;
+      fields: Array<'identifier' | 'password'>;
+    }
+  /**
+   * 页面上没有可填充字段时，内容脚本显示任何提示之前先问：本场景是否已绑定、在该站点登录页、开启了自动填充、
+   * 是使用中的环境。适用时应答 { ok: true, data: { eligible: true } }；否则与 requestLoginFill 相同的拒绝原因。
+   * 从不请求填充值。
+   */
+  | { type: 'checkLoginFill' };
 
 export interface PageClient {
   call<K extends NativeRequestType>(message: RequestOf<K>): Promise<NativeResponse<ExtensionResponseMap[K]>>;

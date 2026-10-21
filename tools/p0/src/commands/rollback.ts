@@ -1,6 +1,8 @@
 // rollback：打印回退计划；--execute 时确认后只删除本工具在运行状态中登记过的临时规则（逐条按原文、读回确认），
-// 从不 flush、不删除用户自己的临时规则。切回原配置与删除测试文件由用户手动完成（打印具体步骤与文件清单）。
+// 从不 flush、不删除用户自己的临时规则。读回确认与回退计划使用同一规范化比较（Surge 列出时可能改变空格），
+// 仍能看到规范化后相同的规则即判定未删除。切回原配置与删除测试文件由用户手动完成（打印具体步骤与文件清单）。
 
+import { normalizeRuleText } from '../deps.js';
 import type { ExitCode } from '../errors.js';
 import { refused } from '../errors.js';
 import { logAction } from '../results.js';
@@ -36,7 +38,7 @@ export async function runRollback(ctx: Ctx): Promise<ExitCode> {
       out.warn(`删除临时规则失败：${(e as { code?: string }).code ?? 'ERROR'}`);
     }
     const after = await tryRead(() => session.adapter.listTempRules());
-    if (after !== null && !after.includes(rule)) {
+    if (after !== null && !after.some((r) => normalizeRuleText(r) === normalizeRuleText(rule))) {
       state = markTempRule(state, rule, 'removed', now());
       out.line(`已删除：${rule}`);
     } else {

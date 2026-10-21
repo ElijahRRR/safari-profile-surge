@@ -85,7 +85,9 @@ export function createConsoleContext(opts: ConsoleContextOptions = {}): ConsoleC
         await reloadSnapshot();
       } catch (e) {
         if (!isApiError(e) || e.status !== 401) toasts.error(e instanceof Error ? e.message : '读取状态失败');
+        return;
       }
+      await refreshOperationsAfterGap();
     },
     onUnauthorized,
     onStateChange: (s) => {
@@ -109,6 +111,25 @@ export function createConsoleContext(opts: ConsoleContextOptions = {}): ConsoleC
   async function loadOperations(limit = 100): Promise<void> {
     const list = await api.listOperations(limit);
     store.setOperations(list);
+  }
+
+  /**
+   * 事件中断后重新读取快照时补齐操作：快照只带进行中的操作，中断期间结束的操作不会再收到事件。
+   * 先重新读取操作列表，再逐个补读仍显示为进行中、但快照里已不在进行中的操作（可能不在列表范围内）。
+   */
+  async function refreshOperationsAfterGap(): Promise<void> {
+    await loadOperations().catch(() => {
+      // 列表读取失败时仍逐个补读下面的操作；操作记录页会提示重试。
+    });
+    await Promise.all(
+      store.staleActiveOperationIds().map(async (id) => {
+        try {
+          store.upsertOperation(await api.getOperation(id));
+        } catch {
+          // 读取失败不打扰用户：打开操作详情或操作记录页时会再读取。
+        }
+      }),
+    );
   }
 
   async function bootstrap(): Promise<void> {

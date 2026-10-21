@@ -19,6 +19,15 @@ import type {
 import { hasPendingDeploy, isUsing, needsAttention, sortByCode } from '../lib/environments';
 import type { StreamState } from '../api/event-stream';
 
+/** 两个时间中较晚的一个；无法解析的忽略。 */
+function laterIso(a: string | null | undefined, b: string | null | undefined): string | null {
+  const ta = a ? Date.parse(a) : Number.NaN;
+  const tb = b ? Date.parse(b) : Number.NaN;
+  if (Number.isNaN(ta)) return Number.isNaN(tb) ? null : b!;
+  if (Number.isNaN(tb)) return a!;
+  return tb > ta ? b! : a!;
+}
+
 export type SessionStatus = 'checking' | 'none' | 'expired' | 'error' | 'authenticated';
 
 export interface ConsoleState {
@@ -52,6 +61,10 @@ export function createConsoleStore(now: () => number = () => Date.now()) {
   let buffered: ServiceEvent[] = [];
 
   function upsertOperation(op: OperationView) {
+    // 单个读取的结果可能比已应用的事件旧（请求先算好、事件之后才到）：保留更新时间更晚的那份，
+    // 否则已结束的操作会退回进行中，而结束的事件不会再来纠正。
+    const existing = state.operations.find((o) => o.id === op.id) ?? state.snapshot?.pendingOperations.find((o) => o.id === op.id);
+    if (existing && existing.updatedAt > op.updatedAt) return;
     const list = state.operations;
     const i = list.findIndex((o) => o.id === op.id);
     if (i >= 0) list.splice(i, 1, op);
@@ -210,12 +223,28 @@ export function createConsoleStore(now: () => number = () => Date.now()) {
   const pendingDeploy = computed(() => environments.value.filter(hasPendingDeploy));
   const attention = computed(() => environments.value.filter(needsAttention));
   const unbound = computed(() => environments.value.filter((e) => e.binding.state === 'unbound'));
+  /**
+   * 最近一次对账（核对 Surge 状态）的时间：对账没有改动时服务端不发 route.updated，路由里的
+   * lastReconciledAt 会停在上次改动；每次对账都会发 surge.status，取两者中较晚的一个。
+   */
+  const lastReconciledAt = computed<string | null>(() => laterIso(route.value?.lastReconciledAt, surge.value?.lastCheckedAt));
   const stats = computed(() => ({
     total: environments.value.length,
     using: environments.value.filter(isUsing).length,
     pending: pendingDeploy.value.length,
     attention: attention.value.length,
   }));
+
+  /**
+   * 本地仍显示为进行中、但权威快照里已不在进行中的操作：它们在事件中断期间结束，结束的事件不会补发，
+   * 需要重新读取。
+   */
+  function staleActiveOperationIds(): string[] {
+    const snap = state.snapshot;
+    if (!snap) return [];
+    const pending = new Set(snap.pendingOperations.map((o) => o.id));
+    return state.operations.filter((o) => ACTIVE_STATUSES.has(o.status) && !pending.has(o.id)).map((o) => o.id);
+  }
 
   function operationById(id: string | null | undefined): OperationView | null {
     if (!id) return null;
@@ -250,7 +279,9 @@ export function createConsoleStore(now: () => number = () => Date.now()) {
     attention,
     unbound,
     stats,
+    lastReconciledAt,
     operationById,
+    staleActiveOperationIds,
   };
 }
 

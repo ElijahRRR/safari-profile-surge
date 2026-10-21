@@ -18,6 +18,7 @@ import {
   type ImportFormat,
   type ImportPreview,
   type ImportPreviewRequest,
+  SfeError,
   type LoginCodeResponse,
   type NeedsConfirmationDetails,
   type OperationView,
@@ -55,6 +56,8 @@ import {
   formatSettings,
   formatStatus,
 } from './format.js';
+import { decodeUtf8Text } from '../importer/csv.js';
+import { parseJsonText } from '../importer/json.js';
 import { buildImportDecisions, describeUnresolved, parseResolves } from './import-decisions.js';
 import { OPEN_BINARY, OpenError, WEBLOC_DELETE_AFTER_MS, assertPrivateDataDir, cleanupStaleWeblocs, safeUnlink, writeWebloc } from './open.js';
 
@@ -369,18 +372,16 @@ const importCmd: Handler = async (ctx, pos) => {
   if (front !== undefined) request.default_front_proxy_id = front;
   if (site !== undefined) request.default_site = site;
   if (format === 'json') {
-    let parsed: unknown;
+    // 先用服务导入器的同一解析函数在本地检查（UTF-8 BOM、记录数组或 { "environments": [...] }），
+    // 不合格时直接报错、不回显内容；文件本身与 CSV/XLSX 一样原样上传，由服务统一解析。
     try {
-      parsed = JSON.parse(content.toString('utf8'));
-    } catch {
-      throw new UsageError('导入失败：文件不是有效的 JSON');
+      parseJsonText(decodeUtf8Text(content, 'JSON'));
+    } catch (err) {
+      if (err instanceof SfeError) throw new UsageError(err.message);
+      throw err;
     }
-    const records = Array.isArray(parsed) ? parsed : parsed && typeof parsed === 'object' ? (parsed as { records?: unknown }).records : undefined;
-    if (!Array.isArray(records)) throw new UsageError('导入失败：JSON 必须是记录数组，或含 records 数组的对象');
-    request.records = records;
-  } else {
-    request.content_base64 = content.toString('base64');
   }
+  request.content_base64 = content.toString('base64');
 
   const preview = await call<ImportPreview>(ctx, 'importPreview', request as unknown as Record<string, unknown>);
   if (!commit) {

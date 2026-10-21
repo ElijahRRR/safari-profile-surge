@@ -164,6 +164,20 @@ describe('probeTempInsertion', () => {
     });
   }
 
+  it('does not probe (or remove) when the user already has an identical temp rule', async () => {
+    const { surge } = await setup({ tempRuleInsertion: 'tail' });
+    const userRule = INSERTION_PROBE_RULES[0].replace(',', ', ');
+    await surge.addTempRule(userRule);
+    const registered: string[] = [];
+    const removed: string[] = [];
+    const r = await probeTempInsertion(surge, async (x) => void registered.push(x), async (x) => void removed.push(x));
+    expect(r.insertion).toBeNull();
+    expect(r.skipped).toContain('已存在相同的临时规则');
+    expect(registered).toEqual([]);
+    expect(removed).toEqual([]);
+    expect(surge.tempRules).toEqual([userRule]);
+  });
+
   it('the temp_rule strategy refuses transitions it cannot make safely', async () => {
     const { temp, surge } = await setup({ tempRuleInsertion: 'tail' });
     const run = await runEntrySequence({ controller: temp, now: () => Date.now() }, ['BLOCKED', 'VERIFY_ONLY']);

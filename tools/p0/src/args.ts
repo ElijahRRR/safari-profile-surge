@@ -93,12 +93,13 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: 'continuity',
     summary: '经 Surge HTTP 代理端口模拟“其他应用”的长连接、WebSocket 与短请求，记录时间线',
-    usage: 'continuity [--duration 300] [--interval 1] [--public-url <https 地址>] [--no-prompt]',
+    usage: 'continuity [--duration 300] [--interval 1] [--public-url <https 地址>] [--reload-test] [--no-prompt]',
     positionals: { min: 0, max: 0 },
     flags: {
       duration: { kind: 'number', min: 10, max: 86400 },
       interval: { kind: 'number', min: 0.2, max: 60 },
       'public-url': { kind: 'string' },
+      'reload-test': { kind: 'boolean' },
       'no-prompt': { kind: 'boolean' },
     },
   },

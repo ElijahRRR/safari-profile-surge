@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import type { ServiceEvent } from '@sfe/contract';
+import type { OperationView, ServiceEvent } from '@sfe/contract';
+import { createMemoryTokenStore } from '../src/api/session-token';
 import { createConsoleStore } from '../src/store/console';
+import { createConsoleContext } from '../src/store/context';
 import { createToastQueue } from '../src/store/toasts';
-import { environment, manualTimers, operation, route, snapshot } from './fixtures';
+import { T0, TOKEN, environment, flush, jsonResponse, manualTimers, operation, route, snapshot } from './fixtures';
 
 function storeWith(seq = 10) {
   const store = createConsoleStore(() => 0);
@@ -79,6 +81,40 @@ describe('console store', () => {
     expect(store.operationById('op_1')?.phase).toBe('ACTIVE_VERIFIED');
   });
 
+  it('a fetched operation older than the applied event never rolls the store back', () => {
+    const store = storeWith();
+    store.applyEvent({ type: 'operation.updated', sequence: 11, operation: operation({ status: 'waiting', updatedAt: '2026-10-21T08:00:00.000Z' }) });
+    // 轮询请求在事件之前算好、之后才返回
+    const inFlight = operation({ status: 'waiting', updatedAt: '2026-10-21T08:01:00.000Z' });
+    store.applyEvent({ type: 'operation.updated', sequence: 12, operation: operation({ status: 'succeeded', phase: 'ACTIVE_VERIFIED', updatedAt: '2026-10-21T08:02:00.000Z' }) });
+    store.upsertOperation(inFlight);
+    expect(store.operationById('op_1')?.status).toBe('succeeded');
+    expect(store.state.snapshot?.pendingOperations).toEqual([]);
+    // 更新的读取结果照常生效
+    store.upsertOperation(operation({ status: 'succeeded', phase: 'ACTIVE_VERIFIED', updatedAt: '2026-10-21T08:03:00.000Z', resultRevision: 2 }));
+    expect(store.operationById('op_1')?.resultRevision).toBe(2);
+  });
+
+  it('lists operations still active locally that a reloaded snapshot no longer has pending', () => {
+    const store = storeWith(10);
+    store.applyEvent({ type: 'operation.updated', sequence: 11, operation: operation({ status: 'waiting' }) });
+    store.applyEvent({ type: 'operation.updated', sequence: 12, operation: operation({ id: 'op_2', status: 'running' }) });
+    store.beginReload();
+    store.finishReload(snapshot({ sequence: 3, pendingOperations: [operation({ id: 'op_2', status: 'running' })] }));
+    expect(store.staleActiveOperationIds()).toEqual(['op_1']);
+  });
+
+  it('the reconcile time follows surge.status when route.updated is not re-sent', () => {
+    const store = createConsoleStore(() => 0);
+    const snap = snapshot({ route: route({ lastReconciledAt: '2026-10-21T07:20:00.000Z' }) });
+    store.setSnapshot(snap);
+    expect(store.lastReconciledAt.value).toBe(T0);
+    store.applyEvent({ type: 'surge.status', sequence: 11, surge: { ...snap.surge, lastCheckedAt: '2026-10-21T08:00:30.000Z' } });
+    expect(store.lastReconciledAt.value).toBe('2026-10-21T08:00:30.000Z');
+    store.applyEvent({ type: 'route.updated', sequence: 12, route: route({ lastReconciledAt: '2026-10-21T08:01:00.000Z' }) });
+    expect(store.lastReconciledAt.value).toBe('2026-10-21T08:01:00.000Z');
+  });
+
   it('a new snapshot is authoritative, even with a smaller sequence (service restart)', () => {
     const store = storeWith(50);
     store.setSnapshot(snapshot({ sequence: 3 }));
@@ -108,6 +144,46 @@ describe('console store', () => {
       }),
     );
     expect(store.stats.value).toEqual({ total: 3, using: 1, pending: 1, attention: 1 });
+  });
+});
+
+describe('snapshot.required', () => {
+  /** 事件流先送出一条消息，然后保持打开。 */
+  function sseOnce(text: string): Response {
+    let sent = false;
+    const reader = {
+      read: () => {
+        if (sent) return new Promise<ReadableStreamReadResult<Uint8Array>>(() => {});
+        sent = true;
+        return Promise.resolve({ done: false as const, value: new TextEncoder().encode(text) });
+      },
+    };
+    return { status: 200, ok: true, body: { getReader: () => reader } } as unknown as Response;
+  }
+
+  it('after reloading the snapshot, refreshes operations that ended while events were missed', async () => {
+    const urls: string[] = [];
+    const ended = (id: string): OperationView => operation({ id, status: 'failed', phase: 'FAILED', updatedAt: '2026-10-21T08:05:00.000Z', error: { code: 'UNKNOWN_STATE', message: '服务重启，已回滚' } });
+    const fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      urls.push(url);
+      if (url === '/api/events') return sseOnce(`event: snapshot.required\ndata: ${JSON.stringify({ type: 'snapshot.required', reason: 'events_expired' })}\n\n`);
+      if (url === '/api/snapshot') return jsonResponse(200, snapshot({ sequence: 3, pendingOperations: [] }));
+      // 列表只覆盖最近的操作：op_2 不在其中，需要单独读取
+      if (url.startsWith('/api/operations?')) return jsonResponse(200, [ended('op_1')]);
+      if (url === '/api/operations/op_2') return jsonResponse(200, ended('op_2'));
+      return jsonResponse(404, { error: { code: 'NOT_FOUND', message: '找不到' } });
+    }) as typeof globalThis.fetch;
+    const ctx = createConsoleContext({ tokens: createMemoryTokenStore(TOKEN), fetch, timers: manualTimers(), now: () => Date.parse(T0) });
+    ctx.store.setSnapshot(snapshot({ pendingOperations: [operation({ status: 'waiting' }), operation({ id: 'op_2', status: 'waiting' })] }));
+    ctx.stream.start('10');
+    await flush(10);
+    expect(urls).toContain('/api/snapshot');
+    expect(ctx.store.operationById('op_1')?.status).toBe('failed');
+    expect(ctx.store.operationById('op_2')?.status).toBe('failed');
+    expect(urls).not.toContain('/api/operations/op_1');
+    expect(ctx.store.staleActiveOperationIds()).toEqual([]);
+    ctx.dispose();
   });
 });
 

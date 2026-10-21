@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME } from '@sfe/contract';
-import { PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
+import { FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
+import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -87,6 +88,126 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
     await h.idle();
     await verify(h, PROFILE_A, again.operation_id);
     expect(h.repos.operations.get(again.operation_id)!.phase).toBe('ACTIVE_VERIFIED');
+  });
+
+  /** A 使用中，B 已部署并关联；B 的激活挂在某次规则集刷新上时崩溃。 */
+  async function crashMidSwitchToB(when: (key: string) => boolean, opts: { deferPreflight?: boolean } = {}) {
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    if (opts.deferPreflight) h.revoke(['independent_node_preflight']);
+    const epoch = h.repos.routeState.get().routeEpoch;
+    const stuck = hang('updateExternalResource', when);
+    const act = await h.app.activate(b, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await until(stuck.entered);
+    const op = h.repos.operations.get(act.operation_id)!;
+    stuck.restore();
+    return { a, b, epoch, opId: act.operation_id, phaseAtCrash: op.phase, stageAtCrash: (op.payload as { route: { stage: string } }).route.stage };
+  }
+
+  test('crash during the BLOCKED write while the op phase is still PREFLIGHT_OK → rolled back, writes not replayed', async () => {
+    h = await createHarness({ dbFile: true });
+    const { a, epoch, opId, phaseAtCrash, stageAtCrash } = await crashMidSwitchToB(() => true);
+    // 操作阶段还停在写入前的值，但 epoch 已递增、切换已开始
+    expect(phaseAtCrash).toBe('PREFLIGHT_OK');
+    expect(stageAtCrash).toBe('switching');
+    await h.crash();
+    await h.idle();
+    const op = h.repos.operations.get(opId)!;
+    expect(op.phase).toBe('FAILED');
+    expect(op.error?.code).toBe('UNKNOWN_STATE');
+    expect(h.repos.operations.listSteps(opId).some((s) => s.phase === 'VERIFY_ONLY')).toBe(false);
+    const route = h.repos.routeState.get();
+    expect(route.routeEpoch).toBe(epoch + 1);
+    expect(route).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: h.repos.proxyRevisions.get(a, 1)!.nodeName });
+    expect(route.warnings).toContain('rollback_needs_reverify');
+    expect(safariOutcome(h).failed).toBe(true);
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+  });
+
+  test('crash after the deferred preflight (op phase back at PREFLIGHT_OK, target node selected) → rolled back to the previous node', async () => {
+    h = await createHarness({ dbFile: true });
+    const { a, b, epoch, opId, phaseAtCrash } = await crashMidSwitchToB((key) => key.includes('verify'), { deferPreflight: true });
+    expect(phaseAtCrash).toBe('PREFLIGHT_OK');
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe(h.repos.proxyRevisions.get(b, 1)!.nodeName);
+    await h.crash();
+    await h.idle();
+    const op = h.repos.operations.get(opId)!;
+    expect(op.phase).toBe('FAILED');
+    expect(h.repos.operations.listSteps(opId).filter((s) => s.message.includes('开始检查激活条件'))).toHaveLength(1);
+    const route = h.repos.routeState.get();
+    expect(route.routeEpoch).toBe(epoch + 1);
+    const nodeA = h.repos.proxyRevisions.get(a, 1)!.nodeName;
+    expect(route).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeA });
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe(nodeA);
+    expect(safariOutcome(h, FAKE_VERIFY_HOST).failed).toBe(true);
+  });
+
+  /**
+   * A 使用中，B 停在 VERIFY_ONLY 等待；C 取代 B 后在写入前失败，按快照回滚时挂在回滚的阻断写入上崩溃。
+   * C 的 stage 仍是 pending、routeEpoch 仍为空（epoch 是 supersedeWaiting 递增的路由 epoch）。
+   */
+  async function crashDuringSupersedingRollback() {
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const c = (await createEnv(h, 'US-Buyer-C', '203.0.113.12')).environment_id!;
+    await bind(h, PROFILE_C, c);
+    const first = await h.app.activate(b, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(first.operation_id)!.phase).toBe('VERIFY_ONLY');
+    const stuck = hang('updateExternalResource');
+    h.fake.failNext('getGroupMembers');
+    const second = await h.app.activate(c, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await until(stuck.entered);
+    const op = h.repos.operations.get(second.operation_id)!;
+    expect(op.phase).toBe('ROLLING_BACK');
+    expect(op.routeEpoch).toBeNull();
+    expect((op.payload as { route: { stage: string } }).route.stage).toBe('pending');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'rolling_back', operationId: second.operation_id });
+    stuck.restore();
+    return { a, b, c, opId: second.operation_id };
+  }
+
+  test('crash during the rollback of a superseding activation that failed before writing → rollback resumed, switch never replayed', async () => {
+    h = await createHarness({ dbFile: true });
+    const { a, c, opId } = await crashDuringSupersedingRollback();
+    const nodeA = h.repos.proxyRevisions.get(a, 1)!.nodeName;
+    const nodeC = h.repos.proxyRevisions.get(c, 1)!.nodeName;
+    const selects = h.fake.calls.selectGroupPolicy ?? 0;
+    await h.crash();
+    await h.idle();
+    const op = h.repos.operations.get(opId)!;
+    expect(op.phase).toBe('FAILED');
+    expect(op.error?.code).toBe('UNKNOWN_STATE');
+    const steps = h.repos.operations.listSteps(opId);
+    expect(steps.filter((s) => s.message.includes('开始检查激活条件'))).toHaveLength(1);
+    expect(steps.some((s) => s.phase === 'SAFARI_BLOCKED' || s.phase === 'VERIFY_ONLY')).toBe(false);
+    // 只恢复切换前的节点，从不选择 C 的节点
+    expect((h.fake.calls.selectGroupPolicy ?? 0) - selects).toBe(1);
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe(nodeA);
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).not.toBe(nodeC);
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeA, operationId: opId });
+    expect(route.warnings).toContain('rollback_needs_reverify');
+    expect(safariOutcome(h, FAKE_VERIFY_HOST).failed).toBe(true);
+    expect(safariOutcome(h).failed).toBe(true);
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+  });
+
+  test('…and when the resumed rollback cannot restore the previous node, the entry still ends BLOCKED (never VERIFY_ONLY on an unverified exit)', async () => {
+    h = await createHarness({ dbFile: true });
+    const { opId } = await crashDuringSupersedingRollback();
+    h.fake.failNext('getGroupMembers');
+    await h.crash();
+    await h.idle();
+    const op = h.repos.operations.get(opId)!;
+    expect(op.phase).toBe('BLOCKED_NEEDS_ATTENTION');
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ phase: 'attention', entryMode: 'BLOCKED', operationId: opId });
+    expect(route.warnings).toContain('entry_unverified');
+    expect(safariOutcome(h, FAKE_VERIFY_HOST).failed).toBe(true);
+    expect(safariOutcome(h).failed).toBe(true);
   });
 
   test('VERIFY_ONLY waiting operation survives a restart and completes', async () => {

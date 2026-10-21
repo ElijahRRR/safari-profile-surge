@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 操作详情与实时进度：阶段徽章、步骤时间线、各版本、结束连接结果、回滚结果与错误。
-// 等待中的路由操作可「取消」（服务端回滚，从不进入普通模式）。激活等待场景时给出受控入口引导，
-// 不称一键完成。
+// 等待中的路由操作可按效果取消（取消切换/取消等待/取消重测；服务端回滚，从不进入普通模式），
+// 「关闭」只收起弹窗。激活等待场景时给出受控入口引导，不称一键完成。
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import type { OperationView } from '@sfe/contract';
 import { Badge, BaseDialog, DataTable, Spinner, StatusBadge, type TableColumn } from '@sfe/easyquick';
@@ -9,7 +9,7 @@ import KeyValueList from './KeyValueList.vue';
 import NoticeBox from './NoticeBox.vue';
 import { formatClock, formatDateTime, formatRelative, formatRevision } from '../lib/format';
 import { ENTRY_MODE_LABELS, OPERATION_KIND_LABELS, OPERATION_PHASE_LABELS, OPERATION_STATUS_LABELS, PROBE_OUTCOME_LABELS, operationStatusDot } from '../lib/labels';
-import { envLabel, isCancellableRouteOperation } from '../lib/environments';
+import { cancelActionLabel, envLabel, isCancellableRouteOperation } from '../lib/environments';
 import { useConsole } from '../store/context';
 
 const { api, store, viewer } = useConsole();
@@ -218,7 +218,7 @@ const rollbackItems = computed(() => {
     <template #footer>
       <button type="button" class="btn btn-secondary" @click="viewer.close()">关闭</button>
       <button v-if="windowsWarning" type="button" class="btn btn-secondary" data-test="op-ack-windows" @click="viewer.requestAcknowledgeWindows()">我已关闭旧窗口</button>
-      <button v-if="op && cancellable" type="button" class="btn btn-danger" data-test="cancel-operation" @click="viewer.requestCancel(op.id)">取消</button>
+      <button v-if="op && cancellable" type="button" class="btn btn-danger" data-test="cancel-operation" @click="viewer.requestCancel(op.id)">{{ cancelActionLabel(op) }}</button>
     </template>
   </BaseDialog>
 </template>

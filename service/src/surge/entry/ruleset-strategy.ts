@@ -140,6 +140,24 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
     return { cfg, files: fileStates, resources, rules, bits, anomalies };
   }
 
+  /** 只看文件与资源（不看优先级）得到的模式。 */
+  function baseModeOf(s: RulesetState): EntryReadback['mode'] {
+    const known = s.bits ? knownModeOfBits(s.bits) : null;
+    return s.anomalies.length === 0 && known !== null ? known : 'UNKNOWN';
+  }
+
+  /**
+   * 撤销本应用入口的方向（BLOCKED/NORMAL）可以改写的文件：本应用记录拥有、但被外部修改、无法识别或缺失。
+   * 不属于本应用记录的文件从不改写。
+   */
+  function overwritableBits(s: RulesetState): EntryBit[] {
+    return ENTRY_BITS_IN_ORDER.filter(
+      (b) =>
+        !s.anomalies.includes(`not_owned_${b}`) &&
+        (s.anomalies.includes(`file_changed_${b}`) || s.anomalies.includes(`file_unrecognized_${b}`) || s.anomalies.includes(`file_missing_${b}`)),
+    );
+  }
+
   function readbackOf(s: RulesetState): EntryReadback {
     const issues = classifyPrecedence(s.rules, {
       isOurRule,
@@ -147,7 +165,6 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       siteHosts: s.cfg.siteHosts,
       verifyHost: s.cfg.verifyHost,
     });
-    const known = s.bits ? knownModeOfBits(s.bits) : null;
     const evidence = [
       `规则集文件：${s.bits ? ENTRY_BITS_IN_ORDER.filter((b) => s.bits![b]).join('、') || '全部为占位规则' : '无法识别'}`,
       ...ENTRY_BITS_IN_ORDER.map((b) => {
@@ -157,12 +174,12 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       '已加载的规则集内容无法直接读取，以定向刷新后的资源状态为准',
       ...s.anomalies.map((a) => `异常：${a}`),
     ];
-    let mode: EntryReadback['mode'] = s.anomalies.length === 0 && known !== null ? known : 'UNKNOWN';
+    let mode = baseModeOf(s);
     if (mode !== 'NORMAL' && mode !== 'UNKNOWN' && hasBlockingIssue(issues)) {
       mode = 'UNKNOWN';
       evidence.push('有规则排在入口之前');
     }
-    return { mode, bits: s.bits, evidence, precedenceIssues: issues };
+    return { mode, bits: s.bits, evidence, precedenceIssues: issues, changedOwnedFiles: overwritableBits(s).map((b) => s.files[b].name) };
   }
 
   async function checkAutoReload(lastConfirmed: EntryBits | null, step: EntryStep): Promise<void> {
@@ -204,7 +221,11 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
     return rec.digest;
   }
 
-  async function runStep(step: EntryStep, s: RulesetState, lastConfirmed: EntryBits): Promise<void> {
+  /**
+   * overwrite：本次切换中第一次改写一个被外部修改、无法识别或缺失的本应用文件——只与载入时读到的摘要比较
+   * （比较并替换），失败或恢复时从不把外部内容确认为记录（之后仍按外部修改处理）。
+   */
+  async function runStep(step: EntryStep, s: RulesetState, lastConfirmed: EntryBits | null, overwrite: boolean): Promise<void> {
     const f = s.files[step.bit];
     await checkAutoReload(lastConfirmed, step);
     // 写入前先确认 Surge 中恰好有一个资源指向该文件；否则不写。
@@ -212,14 +233,14 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
     const content = entryRuleSetFileContent(step.bit, step.value, s.cfg);
     const previousContent = await files.read(f.name);
     const currentDigest = await files.digest(f.name);
-    const expected = await expectedPrevious(f.name, currentDigest);
+    const expected = overwrite ? f.digest : await expectedPrevious(f.name, currentDigest);
     const newDigest = files.digestContent ? files.digestContent(content) : null;
     await deps.ownership.recordIntent('entry_ruleset_file', f.name, newDigest, deps.operationId(), 'add');
     try {
       await files.writeAtomic(f.name, content, expected);
     } catch (e) {
-      // 原子替换失败时文件未变：恢复记录为写前状态。
-      if (currentDigest !== null && expected === currentDigest) {
+      // 原子替换失败时文件未变：恢复记录为写前状态（外部修改的文件保持未确认的意图，仍读作外部修改）。
+      if (!overwrite && currentDigest !== null && expected === currentDigest) {
         await deps.ownership.confirm('entry_ruleset_file', f.name, 'present', currentDigest).catch(() => undefined);
       }
       throw e;
@@ -248,7 +269,7 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
         if (notApplied && previousContent !== null && writtenDigest !== null && currentDigest !== null) {
           try {
             await files.writeAtomic(f.name, previousContent, writtenDigest);
-            await deps.ownership.confirm('entry_ruleset_file', f.name, 'present', currentDigest);
+            if (!overwrite) await deps.ownership.confirm('entry_ruleset_file', f.name, 'present', currentDigest);
             restored = true;
           } catch {
             /* 保持 pending，由对账处理 */
@@ -272,15 +293,15 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
   }
 
   /**
-   * 意图未确认（例如崩溃在写入与刷新之间）的文件，其已加载内容未知：按更宽松的一侧规划
-   * （需要变化时第一步总是开 block）；规划没有写到的未确认位在最后一个 block 步骤之前按目标值重写一次。
+   * 意图未确认（例如崩溃在写入与刷新之间）的文件与要改写的外部修改文件，其已加载内容未知：按更宽松的一侧规划
+   * （block 未确认时按关闭规划，需要变化时第一步总是开 block；block 已确认时按其实际值，已开着则不必再开）；
+   * 规划没有写到的未确认位在最后一个 block 步骤之前按目标值重写一次。
    */
-  function planWithPending(s: RulesetState, to: KnownEntryMode): EntryStep[] {
-    const pending = ENTRY_BITS_IN_ORDER.filter((b) => s.anomalies.includes(`pending_${b}`));
+  function planWithPending(s: RulesetState, to: KnownEntryMode, overwrite: readonly EntryBit[]): EntryStep[] {
+    const pending = ENTRY_BITS_IN_ORDER.filter((b) => s.anomalies.includes(`pending_${b}`) || overwrite.includes(b));
     if (pending.length === 0) return planFromBits(s.bits!, to);
-    const start: EntryBits = { ...s.bits! };
-    for (const b of pending) start[b] = PERMISSIVE_SIDE[b];
-    start.block = false;
+    const bitOf = (b: EntryBit): boolean => (pending.includes(b) ? PERMISSIVE_SIDE[b] : s.files[b].value!);
+    const start: EntryBits = { udp: bitOf('udp'), verify: bitOf('verify'), block: bitOf('block'), active: bitOf('active') };
     const steps = planFromBits(start, to);
     const written = new Set(steps.map((st) => st.bit));
     const target = ENTRY_MODE_BITS[to];
@@ -300,25 +321,33 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       return readbackOf(await load());
     },
 
-    async transition(to, onStep) {
+    async transition(to, onStep, opts) {
       let s: RulesetState;
       try {
         s = await load();
       } catch (e) {
         throw withLastConfirmed(e, null, null);
       }
-      if (!s.bits) {
+      // 撤销本应用入口（opts.undo：普通模式、回滚；目标 BLOCKED/NORMAL）：本应用拥有、但被外部修改、无法识别或缺失的
+      // 规则集文件按载入时读到的摘要比较后改写（已加载内容未知，按更宽松的一侧规划）；否则一个被编辑的文件会让普通模式
+      // 永远无法完成。激活中的阻断步骤不改写（照常拒绝），从不悄悄覆盖用户的修改后继续走向 VERIFY_ONLY/ACTIVE。
+      const overwrite = opts?.undo === true && (to === 'NORMAL' || to === 'BLOCKED') ? overwritableBits(s) : [];
+      if (ENTRY_BITS_IN_ORDER.some((b) => s.files[b].value === null && !overwrite.includes(b))) {
         throw stepFailure('UNKNOWN_STATE', '切换入口失败：入口规则集文件无法识别', null, { anomalies: s.anomalies });
       }
-      // 被外部修改或不属于本应用记录的规则集文件从不被采纳：停止，等待维护流程恢复。
-      const foreign = s.anomalies.filter((a) => a.startsWith('file_changed_') || a.startsWith('not_owned_'));
+      // 被外部修改或不属于本应用记录的规则集文件从不被采纳为基线：撤销入口以外的切换（激活）停止
+      // （先进入普通模式或经维护流程恢复）；不属于本应用的文件任何方向都不改写。
+      const foreign = s.anomalies.filter(
+        (a) => a.startsWith('not_owned_') || (a.startsWith('file_changed_') && !overwrite.includes(a.slice('file_changed_'.length) as EntryBit)),
+      );
       if (foreign.length > 0) {
         throw stepFailure('BASELINE_CHANGED', '切换入口失败：入口规则集文件已被外部修改或不属于本应用', null, { anomalies: foreign });
       }
       if (s.anomalies.includes('ruleset_order')) {
         throw stepFailure('UNKNOWN_STATE', '切换入口失败：入口规则集不在有效规则中或顺序不对', s.bits, { anomalies: s.anomalies });
       }
-      let lastConfirmed: EntryBits = { ...s.bits };
+      // 要改写的文件已加载的内容未知：第一步确认之前不声称任何已确认状态。
+      let lastConfirmed: EntryBits | null = overwrite.length > 0 ? null : { ...s.bits! };
       if (to === 'VERIFY_ONLY' || to === 'ACTIVE') {
         const pre = readbackOf(s);
         if (hasBlockingIssue(pre.precedenceIssues)) {
@@ -327,24 +356,31 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
           });
         }
       }
-      for (const step of planWithPending(s, to)) {
+      const toOverwrite = new Set<EntryBit>(overwrite);
+      for (const step of planWithPending(s, to, overwrite)) {
         try {
-          await runStep(step, s, lastConfirmed);
+          await runStep(step, s, lastConfirmed, toOverwrite.has(step.bit));
         } catch (e) {
           if (e instanceof SfeError && e.details && 'lastConfirmedBits' in e.details) throw e;
           throw withLastConfirmed(e, lastConfirmed, step);
         }
+        // 第一次改写成功后记录已确认，同一位之后的步骤按记录的摘要比较。
+        toOverwrite.delete(step.bit);
         lastConfirmed = { ...step.bits };
         onStep?.(step);
       }
+      let finalState: RulesetState;
       let final: EntryReadback;
       try {
-        final = readbackOf(await load());
+        finalState = await load();
+        final = readbackOf(finalState);
       } catch (e) {
         throw withLastConfirmed(e, lastConfirmed, null);
       }
+      if (overwrite.length > 0) final.evidence.push(`已改写被外部修改的本应用入口规则集文件：${overwrite.join('、')}`);
       if (final.mode !== to) {
-        const code = hasBlockingIssue(final.precedenceIssues) && to !== 'NORMAL' ? 'PRECEDENCE_VIOLATION' : 'READBACK_MISMATCH';
+        // 只有文件与资源都已是目标模式、仅因有规则排在入口之前而不能宣称受控时，才是 PRECEDENCE_VIOLATION。
+        const code = baseModeOf(finalState) === to && hasBlockingIssue(final.precedenceIssues) ? 'PRECEDENCE_VIOLATION' : 'READBACK_MISMATCH';
         throw new SfeError(code, '切换入口失败：最终读回不是目标模式', {
           details: { lastConfirmedBits: lastConfirmed, observedMode: final.mode, precedenceIssues: final.precedenceIssues },
         });

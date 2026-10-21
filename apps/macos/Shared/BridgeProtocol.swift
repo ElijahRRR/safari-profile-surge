@@ -74,19 +74,43 @@ enum NativeBridge {
         return nil
     }
 
-    /// 包装为 BridgeEnvelope 的一行 NDJSON（含结尾换行）。
-    static func bridgeLine(message: [String: Any], token: String, profileId: String?, bridgeVersion: String) -> Result<Data, NativeFailure> {
+    /// BridgePayload（`{ bridge: { profileId, bridgeVersion }, message }`）的 JSON 文本，原样放进握手的 request.payload，
+    /// 客户端证明按它的 UTF-8 字节计算（BridgeHandshake）。不含令牌。按最终 request 行的大小检查 256 KiB 上限。
+    static func bridgePayload(message: [String: Any], profileId: String?, bridgeVersion: String) -> Result<String, NativeFailure> {
         let profileValue: Any
         if let profileId { profileValue = profileId } else { profileValue = NSNull() }
-        let envelope: [String: Any] = [
-            "v": protocolVersion,
-            "auth": token,
+        let payload: [String: Any] = [
             "bridge": ["profileId": profileValue, "bridgeVersion": bridgeVersion] as [String: Any],
             "message": message,
         ]
-        guard let line = JSONLine.encode(envelope) else { return .failure(.badEnvelope) }
+        guard var data = JSONLine.encode(payload) else { return .failure(.badEnvelope) }
+        data.removeLast() // 去掉 JSONLine 加的换行
+        let text = String(decoding: data, as: UTF8.self)
+        // 证明是定长十六进制，用同样长度的占位符就能得到实际 request 行的长度
+        guard let line = BridgeHandshake.encodeRequest(clientProof: String(repeating: "0", count: BridgeHandshake.proofHexLength), payload: text) else {
+            return .failure(.badEnvelope)
+        }
         guard line.count - 1 <= maxMessageBytes else { return .failure(.messageTooLarge) }
-        return .success(line)
+        return .success(text)
+    }
+
+    // MARK: 原生桥版本
+
+    /// BridgeInfo.bridgeVersion：`<CFBundleShortVersionString>+<CFBundleVersion>`，例如 "0.1.0+1"。
+    /// 服务只接受 0x21–0x7E 的可见 ASCII、≤ 64（service/src/ipc/bridge-server.ts 的 BRIDGE_VERSION_RE，不含空格），
+    /// 因此两段都只保留可见 ASCII、各截到 31 个字符，缺失时为 "0"。扩展与宿主 App 的探测共用这一格式。
+    static func bridgeVersion(infoDictionary info: [String: Any]?) -> String {
+        "\(versionComponent(info?["CFBundleShortVersionString"]))+\(versionComponent(info?["CFBundleVersion"]))"
+    }
+
+    static func bridgeVersion(bundle: Bundle) -> String {
+        bridgeVersion(infoDictionary: bundle.infoDictionary)
+    }
+
+    private static func versionComponent(_ value: Any?) -> String {
+        guard let text = value as? String else { return "0" }
+        let visible = text.utf8.filter { (UInt8(0x21)...UInt8(0x7E)).contains($0) }.prefix(31)
+        return visible.isEmpty ? "0" : String(decoding: visible, as: UTF8.self)
     }
 
     // MARK: 应答
@@ -190,6 +214,8 @@ enum BridgeTransportError: Error, Equatable {
     case timeout
     case closedWithoutResponse
     case responseTooLarge
+    /// 对端没有证明持有同一令牌（或握手阶段就断开）：请求内容从未发出。
+    case handshakeFailed
 }
 
 /// 原生桥自己产生的错误应答。消息为简体中文，从不包含令牌、消息内容或钥匙串值。
@@ -222,6 +248,8 @@ struct NativeFailure: Error, Equatable {
     static let malformedFill = NativeFailure(code: "FILL_NOT_ALLOWED", message: "登录填充失败：本机服务应答格式不正确", reason: "malformed")
     static let fillRefExpired = NativeFailure(code: "FILL_NOT_ALLOWED", message: "登录填充失败：钥匙串引用已过期，请重新填充", reason: "expired")
 
+    static let nonceUnavailable = NativeFailure(code: "INTERNAL", message: "处理请求失败：无法生成随机数")
+
     static func keychainRead(_ reason: KeychainFailureReason) -> NativeFailure {
         NativeFailure(code: "FILL_NOT_ALLOWED", message: "无法读取钥匙串中的登录密码：\(reason.displayText)", reason: reason.rawValue)
     }
@@ -238,6 +266,12 @@ struct NativeFailure: Error, Equatable {
             return NativeFailure(code: "SURGE_UNREACHABLE", message: "无法连接本机服务：服务没有返回结果", reason: "no_response")
         case .responseTooLarge:
             return NativeFailure(code: "SURGE_UNREACHABLE", message: "无法连接本机服务：应答超过 256 KiB", reason: "too_large")
+        case .handshakeFailed:
+            return NativeFailure(
+                code: "SURGE_UNREACHABLE",
+                message: "无法连接本机服务：原生桥认证失败，请打开 SafariProfileSurge 后重试",
+                reason: "auth_failed"
+            )
         }
     }
 }

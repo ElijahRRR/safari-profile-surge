@@ -1,10 +1,11 @@
-import { ENTRY_MODE_BITS } from '@sfe/contract';
+import { ENTRY_MODE_BITS, type ProtocolCoverage } from '@sfe/contract';
 import { describe, expect, it } from 'vitest';
 import { analyzeAttribution, type AttributionInput, type AttributionRecord } from '../src/analysis/attribution.js';
-import { analyzeContinuity, formatPeriod, percentile, type Sample } from '../src/analysis/continuity.js';
+import { analyzeContinuity, formatPeriod, percentile, summarizePeriods, type Sample } from '../src/analysis/continuity.js';
 import { analyzeEntryWindow, candidateBits, expectedOutcome, outcomeOf, type EntryTimeline } from '../src/analysis/entry-window.js';
 import { compareSignals, type ReloadSignals } from '../src/analysis/reload.js';
-import { planEntryTransition } from '../src/deps.js';
+import { udpQuicCoverage, websocketEvidence, type ModeWindow, type UdpCoverageInput } from '../src/analysis/udp-coverage.js';
+import { coverageAllowsSupported, planEntryTransition } from '../src/deps.js';
 
 const SAFARI = '/Applications/Safari.app/Contents/MacOS/Safari';
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -187,6 +188,18 @@ describe('attribution analysis', () => {
     expect(r.checks.find((c) => c.name.includes('Chrome'))?.ok).toBeNull();
   });
 
+  it('control checks need test-host records from the control app, not background WebKit traffic', () => {
+    // 其他 WebKit 应用没有访问测试主机，只有同一时间窗内的 Safari/WebKit 后台请求（主机记为 null）。
+    const webkitBg = '/System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking';
+    const r = analyzeAttribution(base([...full.filter((x) => x.app !== 'other'), rec('other', webkitBg, null)]));
+    const other = r.checks.find((c) => c.name.includes('其他 WebKit'))!;
+    expect(other.ok).toBeNull();
+    expect(other.note).toContain('没有测试主机记录');
+    expect(r.checks.find((c) => c.name.includes('Chrome'))?.ok).toBe(true);
+    const chromeOnlyBg = analyzeAttribution(base([...full.filter((x) => x.app !== 'chrome'), rec('chrome', SAFARI, null)]));
+    expect(chromeOnlyBg.checks.find((c) => c.name.includes('Chrome'))?.ok).toBeNull();
+  });
+
   it('ignores non-test hosts but reports other Safari-related processes', () => {
     const svc = '/System/Library/PrivateFrameworks/SafariSafeBrowsing.framework/com.apple.Safari.SafeBrowsing.Service';
     const r = analyzeAttribution(base([...full, rec('safari', svc, null)]));
@@ -240,5 +253,147 @@ describe('reload signals', () => {
     expect(compareSignals(s(), s({ surgeStart: 'S@2' })).reasons[0]).toContain('重启');
     expect(compareSignals(s(), s({ tempRules: [] })).reasons[0]).toContain('临时规则');
     expect(compareSignals(s(), s({ profileName: '其他' })).reloaded).toBe(true);
+  });
+});
+
+describe('UDP/QUIC coverage', () => {
+  const DIGEST = 'sha256:aaaa';
+  const measured = (over: Partial<UdpCoverageInput> = {}): UdpCoverageInput => ({
+    udp: { total: 3, rejected: 3 },
+    h3Observed: 'http/2',
+    h3Tcp: { total: 2, routed: 2 },
+    verifyRouted: 4,
+    echoExpect: true,
+    ipv6: { records: [{ mode: 'BLOCKED', outcome: 'reject' }, { mode: 'ACTIVE', outcome: 'route' }], normalPage: { total: 3, ok: 3 } },
+    websocket: { opensWhileBlocked: 0, activeVias: ['p0-a'] },
+    expectedVia: 'p0-a',
+    processPathsDigest: DIGEST,
+    attribution: null,
+    ...over,
+  });
+  const attrPass = (coverage: ProtocolCoverage): UdpCoverageInput['attribution'] => ({ verdict: 'pass', processPathsDigest: DIGEST, coverage });
+
+  it('measures every gating item it can observe from the entry run (nothing is hard-coded as not tested)', () => {
+    const c = udpQuicCoverage(measured());
+    for (const item of ['ipv4', 'ipv6', 'http1', 'http2', 'http3_quic', 'websocket'] as const) expect(c[item]?.result).toBe('pass');
+    // 扩展页面请求在入口运行中与测试页请求无法区分：没有归属结果时如实为 not_tested，并写明缺什么。
+    expect(c.extension_page_fetch).toEqual({ result: 'not_tested', note: expect.stringContaining('入口运行不直接测量扩展页面请求') });
+    const withAttr = udpQuicCoverage(measured({ attribution: attrPass({ extension_page_fetch: { result: 'pass', note: null } }) }));
+    expect(withAttr.extension_page_fetch?.result).toBe('limitation');
+    expect(coverageAllowsSupported(withAttr).ok).toBe(true);
+  });
+
+  it('takes extension page fetch only from the attribution measurement, never from an operator reading of the popup', () => {
+    // 弹窗「重新检测」在 P0 中由服务执行，BLOCKED 与 VERIFY_ONLY 下显示相同：它不是扩展页面请求，输入里不再有这一项。
+    expect(Object.keys(measured())).not.toContain('extension');
+    const failedAttr = udpQuicCoverage(measured({ attribution: attrPass({ extension_page_fetch: { result: 'fail', note: '有记录来自非候选进程' } }) }));
+    expect(failedAttr.extension_page_fetch).toEqual({ result: 'not_tested', note: expect.stringContaining('归属测试中该项为 fail') });
+    const ok = udpQuicCoverage(measured({ attribution: attrPass({ extension_page_fetch: { result: 'pass', note: null } }) }));
+    expect(ok.extension_page_fetch?.note).toContain('由 safari_process_attribution 覆盖');
+  });
+
+  it('fails items whose measurement contradicts the mode', () => {
+    const c = udpQuicCoverage(
+      measured({
+        ipv6: { records: [{ mode: 'VERIFY_ONLY', outcome: 'pass' }], normalPage: { total: 1, ok: 1 } },
+        websocket: { opensWhileBlocked: 1, activeVias: [] },
+      }),
+    );
+    expect(c.ipv6?.result).toBe('fail');
+    expect(c.websocket?.result).toBe('fail');
+    expect(udpQuicCoverage(measured({ websocket: { opensWhileBlocked: 0, activeVias: ['p0-plain'] } })).websocket?.result).toBe('fail');
+  });
+
+  it('records missing IPv6 connectivity as a measured limitation', () => {
+    const c = udpQuicCoverage(measured({ ipv6: { records: [], normalPage: { total: 4, ok: 0 } } }));
+    expect(c.ipv6).toEqual({ result: 'limitation', note: expect.stringContaining('没有 IPv6 连通') });
+  });
+
+  it('falls back only to a passed attribution with the same process paths, as a sourced limitation', () => {
+    const unobserved = { ipv6: { records: [], normalPage: { total: 0, ok: 0 } }, websocket: { opensWhileBlocked: 0, activeVias: [] } };
+    const attrCoverage = { ipv6: { result: 'pass' as const, note: null }, websocket: { result: 'pass' as const, note: null }, extension_page_fetch: { result: 'limitation' as const, note: '扩展步骤只测了准备页' } };
+    const none = udpQuicCoverage(measured(unobserved));
+    for (const item of ['ipv6', 'websocket', 'extension_page_fetch'] as const) {
+      expect(none[item]?.result).toBe('not_tested');
+      expect(none[item]?.note).toBeTruthy();
+    }
+    const other = udpQuicCoverage(measured({ ...unobserved, attribution: { verdict: 'pass', processPathsDigest: 'sha256:bbbb', coverage: attrCoverage } }));
+    expect(other.websocket?.result).toBe('not_tested');
+    const failed = udpQuicCoverage(measured({ ...unobserved, attribution: { verdict: 'incomplete', processPathsDigest: DIGEST, coverage: attrCoverage } }));
+    expect(failed.websocket?.result).toBe('not_tested');
+    const same = udpQuicCoverage(measured({ ...unobserved, attribution: { verdict: 'pass', processPathsDigest: DIGEST, coverage: attrCoverage } }));
+    for (const item of ['ipv6', 'websocket', 'extension_page_fetch'] as const) {
+      expect(same[item]?.result).toBe('limitation');
+      expect(same[item]?.note).toContain('由 safari_process_attribution 覆盖');
+    }
+    expect(same.extension_page_fetch?.note).toContain('扩展步骤只测了准备页');
+    expect(coverageAllowsSupported(same).ok).toBe(true);
+  });
+
+  it('never borrows the UDP/QUIC items themselves from attribution', () => {
+    const attrCoverage = { http3_quic: { result: 'pass' as const, note: null }, http2: { result: 'pass' as const, note: null } };
+    const c = udpQuicCoverage(measured({ udp: { total: 0, rejected: 0 }, h3Tcp: { total: 0, routed: 0 }, attribution: { verdict: 'pass', processPathsDigest: DIGEST, coverage: attrCoverage } }));
+    expect(c.http3_quic?.result).toBe('not_tested');
+    expect(c.http2?.result).toBe('not_tested');
+  });
+
+  describe('WebSocket windows', () => {
+    // 真实时序：读回确认（from）在切换生效之后；VERIFY_ONLY 下 REJECT 让测试页每 2 秒重试，ACTIVE 生效后的第一次重试
+    // 就在确认后 2 秒内建立，并一直保持到 ACTIVE 结束。
+    const windows: ModeWindow[] = [
+      { mode: 'BLOCKED', from: 10_000, to: 30_000 },
+      { mode: 'VERIFY_ONLY', from: 31_000, to: 51_000 },
+      { mode: 'ACTIVE', from: 52_000, to: 72_000 },
+      { mode: 'NORMAL', from: 73_000, to: 93_000 },
+    ];
+    const SETTLE = 2000;
+
+    it('counts the first ACTIVE open even when it lands right after the readback confirmation', () => {
+      const events = [
+        { t: 52_300, kind: 'ws_open', ok: true },
+        { t: 52_350, kind: 'ws_first', ok: true, via: 'p0-a' },
+      ];
+      const ev = websocketEvidence(windows, events, SETTLE);
+      expect(ev).toEqual({ opensWhileBlocked: 0, activeVias: ['p0-a'] });
+      expect(udpQuicCoverage(measured({ websocket: ev })).websocket?.result).toBe('pass');
+      // 切换到 ACTIVE 途中（确认之前）建立、经过错误节点的连接同样被发现。
+      const during = [
+        { t: 51_900, kind: 'ws_open', ok: true },
+        { t: 51_950, kind: 'ws_first', ok: true, via: 'p0-plain' },
+      ];
+      const bad = websocketEvidence(windows, during, SETTLE);
+      expect(bad.activeVias).toEqual(['p0-plain']);
+      expect(udpQuicCoverage(measured({ websocket: bad })).websocket?.result).toBe('fail');
+    });
+
+    it('treats every successful open from BLOCKED (after settling) through the end of VERIFY_ONLY as a violation', () => {
+      const events = [
+        { t: 10_500, kind: 'ws_open', ok: true }, // 切换前已开始握手：留稳定时间
+        { t: 30_500, kind: 'ws_open', ok: true }, // BLOCKED → VERIFY_ONLY 切换途中
+        { t: 40_000, kind: 'ws_open', ok: false },
+        { t: 80_000, kind: 'ws_open', ok: true }, // NORMAL 下按原规则
+        { t: 80_050, kind: 'ws_first', ok: true, via: 'p0-plain' },
+      ];
+      expect(websocketEvidence(windows, events, SETTLE)).toEqual({ opensWhileBlocked: 1, activeVias: [] });
+    });
+
+    it('has no ACTIVE measurement when the sequence stopped before ACTIVE', () => {
+      const events = [{ t: 51_950, kind: 'ws_first', ok: true, via: 'p0-a' }];
+      expect(websocketEvidence(windows.slice(0, 2), events, SETTLE)).toEqual({ opensWhileBlocked: 0, activeVias: [] });
+    });
+  });
+});
+
+describe('continuity summary', () => {
+  it('keeps the baseline and every impacted period, and folds clean periods into one line', () => {
+    const samples: Sample[] = [];
+    for (let t = 0; t < 400; t++) samples.push({ t: t * 1000, kind: 'short', ok: t !== 205, ms: 10, via: 'p0-plain' });
+    const events = Array.from({ length: 36 }, (_, i) => ({ t: 40_000 + i * 10_000, label: `refresh:resource_refresh`, source: 'action' as const }));
+    const { periods } = analyzeContinuity(samples, events, { start: 0, end: 400_000 });
+    const lines = summarizePeriods(periods);
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain('对照');
+    expect(lines[1]).toContain('短请求 9/10');
+    expect(lines[2]).toContain('其余 35 个时段');
   });
 });

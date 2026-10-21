@@ -177,6 +177,7 @@ describe('activation from the environments page', () => {
     }, snapshot({ route: route({ operationId: 'op_1', phase: 'awaiting_safari_verify', entryMode: 'VERIFY_ONLY' }), pendingOperations: [operation()] }));
     const Page = defineComponent({ render: () => [h(RouteCard), h(RouteActionHost)] });
     const m = await mountWith(Page, ctx);
+    expect(document.body.querySelector('[data-test="route-cancel"]')?.textContent?.trim()).toBe('取消切换');
     click(document.body.querySelector('[data-test="route-cancel"]'));
     await flush();
     expect(document.body.textContent).toContain('确定要取消此次切换吗？');

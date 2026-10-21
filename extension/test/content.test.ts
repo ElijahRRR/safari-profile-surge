@@ -6,6 +6,7 @@ import { createPanel } from '../src/content/panel';
 const SIGNIN = 'https://www.amazon.com/ap/signin?openid.return_to=x';
 const ACTION = 'https://www.amazon.com/ap/signin';
 const SYN_PASSWORD = 'syn-login-pass-9';
+const ELIGIBLE = { ok: true, data: { eligible: true } };
 
 function page(html: string) {
   document.body.innerHTML = html;
@@ -197,20 +198,66 @@ describe('runLoginAssist', () => {
     expect((document.getElementById('stray') as HTMLInputElement).value).toBe('');
   });
 
-  it('shows the manual hint and sends nothing when fields are not recognised', async () => {
+  it('shows the manual hint when fields are not recognised and the profile is eligible (only the eligibility check is sent)', async () => {
     page(`<form action="${ACTION}"><input type="text" name="otp"></form>`);
-    const { d, sent, shown } = deps();
+    const { d, sent, shown } = deps({ reply: ELIGIBLE });
     expect(await runLoginAssist(d)).toBe('manual');
-    expect(sent).toHaveLength(0);
+    expect(sent).toEqual([{ type: 'checkLoginFill' }]);
     expect(shown[0]?.title).toBe('可手动填充');
   });
 
-  it('shows the manual hint and sends nothing when fields are outside a form', async () => {
+  it('shows the manual hint when fields are outside a form and the profile is eligible (no fill request)', async () => {
     page(`<input type="email" id="ap_email"><input type="password" id="ap_password">`);
-    const { d, sent, shown } = deps();
+    const { d, sent, shown } = deps({ reply: ELIGIBLE });
     expect(await runLoginAssist(d)).toBe('manual');
-    expect(sent).toHaveLength(0);
+    expect(sent).toEqual([{ type: 'checkLoginFill' }]);
     expect(shown[0]?.title).toBe('可手动填充');
+  });
+
+  describe('no recognisable fields in a profile where fill does not apply', () => {
+    const NO_FIELDS = `<form action="${ACTION}"><input type="text" name="otp"></form>`;
+    const OUTSIDE_FORM = `<input type="email" id="ap_email"><input type="password" id="ap_password">`;
+    const refusal = (reason: string) => ({ ok: false, error: { code: 'FILL_NOT_ALLOWED', message: '登录填充失败', details: { reason } } });
+
+    it.each([
+      // 未识别场景时 getCurrentState 没有环境，后台同样回答 unbound
+      ['unbound or unidentified profile', refusal('unbound')],
+      ['autofill turned off', refusal('autofill_off')],
+      ['not the active environment', refusal('not_active')],
+      ['native bridge unreachable (cannot confirm)', { ok: false, error: { code: 'SURGE_UNREACHABLE', message: '无法连接本机服务', details: { reason: 'connect_failed' } } }],
+      ['background returned nothing', undefined],
+    ])('stays silent: %s', async (_label, reply) => {
+      for (const html of [NO_FIELDS, OUTSIDE_FORM, '']) {
+        page(html);
+        const sent: unknown[] = [];
+        const { d, shown } = deps();
+        d.sendMessage = vi.fn(async (m) => {
+          sent.push(structuredClone(m));
+          return reply;
+        });
+        expect(await runLoginAssist(d)).toBe('silent');
+        expect(shown).toHaveLength(0);
+        expect(sent).toEqual([{ type: 'checkLoginFill' }]);
+      }
+    });
+
+    it('stays silent when the background does not answer at all', async () => {
+      page(NO_FIELDS);
+      const { d, shown } = deps();
+      d.sendMessage = vi.fn(async () => {
+        throw new Error('Could not establish connection');
+      });
+      expect(await runLoginAssist(d)).toBe('silent');
+      expect(shown).toHaveLength(0);
+    });
+
+    it('never mounts any panel in the page', async () => {
+      page(NO_FIELDS);
+      const { d } = deps({ reply: refusal('unbound') });
+      delete d.panel;
+      expect(await runLoginAssist(d)).toBe('silent');
+      expect(document.querySelector('[data-sfe-login-assist]')).toBeNull();
+    });
   });
 
   it('does nothing at all on MFA pages', async () => {
