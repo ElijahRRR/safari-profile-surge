@@ -1,0 +1,10 @@
+// 复制为 apps/macos/Local.xcconfig（已在 .gitignore 中，不提交）后填写。
+// 不要在这里写任何密码、令牌或证书内容。
+
+// Xcode → Settings → Accounts 中个人团队（Personal Team）的 Team ID，10 位字母数字。
+DEVELOPMENT_TEAM = ABCDE12345
+
+// 固定版本 Node 的绝对路径与版本号（构建时会运行 node --version 核对，不一致即失败；从不下载）。
+// 需要 22.13 或更高（node:sqlite）。建议从 nodejs.org 下载对应版本的 macOS 压缩包，解压到仓库之外的固定位置。
+SFE_NODE_BINARY = /Users/you/Tools/node-v22.13.1-darwin-arm64/bin/node
+SFE_NODE_VERSION = 22.13.1
