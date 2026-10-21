@@ -1,0 +1,14 @@
+{
+  "name": "@sfe/extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "vue-tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@sfe/contract": "0.1.0",
+    "vue": "3.5.43"
+  }
+}

@@ -1,0 +1,34 @@
+<!-- @dsCard group="基础控件" height=260 width=560 subtitle="Toggle.vue · role=switch" -->
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Toggle</title></head>
+<body class="p-6">
+<div class="card max-w-md divide-y divide-gray-100 dark:divide-dark-700">
+  <div class="flex items-center justify-between gap-4 px-5 py-4">
+    <div>
+      <p class="text-sm font-medium text-gray-900 dark:text-white">自动同步库存</p>
+      <p class="text-xs text-gray-500 dark:text-dark-400">每 15 分钟从海外仓拉取一次</p>
+    </div>
+    <button type="button" role="switch" aria-checked="true" class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 dark:focus:ring-offset-dark-800 bg-primary-600">
+      <span class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out translate-x-5"></span>
+    </button>
+  </div>
+  <div class="flex items-center justify-between gap-4 px-5 py-4">
+    <div>
+      <p class="text-sm font-medium text-gray-900 dark:text-white">低库存提醒</p>
+      <p class="text-xs text-gray-500 dark:text-dark-400">可售数量低于 20 时通知</p>
+    </div>
+    <button type="button" role="switch" aria-checked="false" class="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 dark:focus:ring-offset-dark-800 bg-gray-200 dark:bg-dark-600">
+      <span class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out translate-x-0"></span>
+    </button>
+  </div>
+  <div class="flex items-center justify-between gap-4 px-5 py-4">
+    <div>
+      <p class="text-sm font-medium text-gray-900 dark:text-white">价格跟随</p>
+      <p class="text-xs text-gray-500 dark:text-dark-400">.switch 样式类版本</p>
+    </div>
+    <div class="switch switch-active" role="switch" aria-checked="true"><span class="switch-thumb"></span></div>
+  </div>
+</div>
+</body>
+</html>
