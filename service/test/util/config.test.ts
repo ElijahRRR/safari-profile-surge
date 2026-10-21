@@ -7,7 +7,9 @@ import { ALL_SURGE_PRIMITIVES, DEFAULT_BRIDGE_PORT, loadConfig, readInstallConfi
 const isRoot = process.getuid?.() === 0;
 
 function base(overrides: Partial<LoadConfigOptions> = {}): LoadConfigOptions {
-  const home = mkdtempSync(join(tmpdir(), 'sfe-home-'));
+  // macOS TMPDIR is already long; adding a synthetic home and app directory
+  // otherwise tests the socket length guard instead of configuration defaults.
+  const home = mkdtempSync(join(process.platform === 'darwin' ? '/private/tmp' : tmpdir(), 'sfe-home-'));
   return { argv: [], env: {}, platform: 'linux', homedir: home, cwd: home, ...overrides };
 }
 

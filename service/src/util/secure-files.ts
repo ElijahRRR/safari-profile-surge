@@ -4,7 +4,7 @@
 import { constants as fsConstants, existsSync, lstatSync, mkdirSync, chmodSync, realpathSync } from 'node:fs';
 import { chmod, lstat, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { SfeError } from '@sfe/contract';
 
 /** macOS sockaddr_un.sun_path 为 104 字节（含结尾 NUL），可用 103 字节。 */
@@ -156,20 +156,32 @@ function isUnder(path: string, base: string): boolean {
   return p === b || p.startsWith(b + sep) || p.startsWith(`${b}/`);
 }
 
+/** Resolve existing ancestors too: the directory being validated may not exist yet. */
+function canonicalLocation(path: string): string {
+  let current = resolve(path);
+  const suffix: string[] = [];
+  for (;;) {
+    try {
+      return join(realpathSync(current), ...suffix);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      const parent = dirname(current);
+      if (parent === current) throw err;
+      suffix.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
 /**
  * 目录风险：iCloud/云盘同步位置为 synced；文稿、桌面、下载（TCC 保护）为 protected。
- * 同时检查给定路径与其真实路径（存在时），并按 macOS 默认的大小写不敏感比较。
+ * 路径与 home 都检查别名及真实位置，包括尚未创建的子目录。
  */
 export function classifyDirectoryRisk(path: string, home: string): 'none' | 'synced' | 'protected' {
-  const candidates = [resolve(path)];
-  try {
-    candidates.push(realpathSync(path));
-  } catch {
-    // 不存在时只看给定路径
-  }
-  const h = resolve(home);
-  const synced = [join(h, 'Library', 'Mobile Documents'), join(h, 'Library', 'CloudStorage')];
-  const protectedDirs = [join(h, 'Documents'), join(h, 'Desktop'), join(h, 'Downloads')];
+  const candidates = [resolve(path), canonicalLocation(path)];
+  const homes = [resolve(home), canonicalLocation(home)];
+  const synced = homes.flatMap((h) => [join(h, 'Library', 'Mobile Documents'), join(h, 'Library', 'CloudStorage')]);
+  const protectedDirs = homes.flatMap((h) => [join(h, 'Documents'), join(h, 'Desktop'), join(h, 'Downloads')]);
   if (candidates.some((c) => synced.some((s) => isUnder(c, s)))) return 'synced';
   if (candidates.some((c) => protectedDirs.some((s) => isUnder(c, s)))) return 'protected';
   return 'none';
