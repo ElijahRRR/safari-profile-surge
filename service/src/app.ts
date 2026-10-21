@@ -5,8 +5,10 @@ import type {
   AccountDetail,
   Accepted,
   AcknowledgeAccountRequest,
+  AcknowledgeWindowsRequest,
   ActivateRequest,
   BridgeEnvelope,
+  CancelOperationRequest,
   CapabilityView,
   ConfirmCapabilityRequest,
   CreateEnvironmentRequest,
@@ -40,6 +42,7 @@ import type {
   UpdateEnvironmentRequest,
   UpdateFrontProxyRequest,
   UpdateSettingsRequest,
+  VerifyFrontProxyRequest,
 } from '@sfe/contract';
 import type { EventBus } from './ports.js';
 
@@ -77,6 +80,10 @@ export interface AppService {
   publishPending(req: PublishPendingRequest, actor: Actor): Promise<Accepted>;
 
   getOperation(id: string, actor: Actor): Promise<OperationView>;
+  /** 只取消等待中的路由操作（按回滚处理，从不进入 NORMAL）。 */
+  cancelOperation(id: string, req: CancelOperationRequest, actor: Actor): Promise<Accepted>;
+  /** 用户声明旧窗口已关闭：只清除对应警告，不改变路由。 */
+  acknowledgeWindows(req: AcknowledgeWindowsRequest, actor: Actor): Promise<Accepted>;
   listOperations(limit: number, actor: Actor): Promise<OperationView[]>;
 
   importPreview(req: ImportPreviewRequest, actor: Actor): Promise<ImportPreview>;
@@ -84,7 +91,7 @@ export interface AppService {
   importTemplateCsv(): string;
 
   listCapabilities(): Promise<CapabilityView[]>;
-  /** agent/admin/web 都可以提议；只有 web 可以确认（confirmCapability）。 */
+  /** agent 与 admin（maintenance）可以提议；只有 web 可以确认或重置（confirmCapability）。 */
   proposeCapability(req: ProposeCapabilityRequest, actor: Actor): Promise<{ proposal_id: string }>;
   confirmCapability(req: ConfirmCapabilityRequest, actor: Actor): Promise<CapabilityView>;
 
@@ -94,7 +101,7 @@ export interface AppService {
   listFrontProxies(): Promise<FrontProxyView[]>;
   registerFrontProxy(req: RegisterFrontProxyRequest, actor: Actor): Promise<FrontProxyView>;
   updateFrontProxy(id: string, req: UpdateFrontProxyRequest, actor: Actor): Promise<FrontProxyView>;
-  verifyFrontProxy(id: string, requestId: string, actor: Actor): Promise<Accepted>;
+  verifyFrontProxy(id: string, req: VerifyFrontProxyRequest, actor: Actor): Promise<Accepted>;
   replaceFrontPreview(id: string, req: ReplaceFrontPreviewRequest, actor: Actor): Promise<ReplaceFrontPreview>;
   replaceFrontCommit(id: string, req: ReplaceFrontCommitRequest, actor: Actor): Promise<Accepted>;
   surgePolicies(): Promise<SurgePolicyCandidates>;

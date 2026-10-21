@@ -17,7 +17,8 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "vitest run",
     "build": "npm run build --workspaces --if-present",
-    "check": "npm run typecheck && npm test && npm run build"
+    "check": "npm run typecheck && npm test && npm run build && npm run scan",
+    "scan": "node tools/check/repo-scan.mjs"
   },
   "devDependencies": {
     "@types/node": "22.20.5",

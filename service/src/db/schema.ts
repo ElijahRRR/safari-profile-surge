@@ -32,6 +32,8 @@ export const MIGRATIONS: readonly string[] = [
     desired_proxy_revision INTEGER,
     deployed_proxy_revision INTEGER,
     last_verified_proxy_revision INTEGER,
+    -- 预期出口不是节点参数：存放在环境上，可直接修改
+    expected_exit_ip TEXT,
     binding_stage TEXT CHECK (binding_stage IS NULL OR binding_stage IN ('awaiting_profile','awaiting_extension','awaiting_association')),
     deleted_at TEXT,
     created_at TEXT NOT NULL,
@@ -50,8 +52,6 @@ export const MIGRATIONS: readonly string[] = [
     password_ref TEXT,
     password_fp TEXT,
     front_proxy_id TEXT NOT NULL REFERENCES front_proxies(id),
-    -- 预期出口不是节点参数，可原地修改
-    expected_exit_ip TEXT,
     node_name TEXT NOT NULL UNIQUE,
     state TEXT NOT NULL CHECK (state IN ('desired','deployed','superseded','retired')),
     created_at TEXT NOT NULL,
@@ -222,7 +222,7 @@ export const MIGRATIONS: readonly string[] = [
     environment_id TEXT NOT NULL REFERENCES environments(id),
     profile_id TEXT NOT NULL,
     route_epoch INTEGER NOT NULL,
-    purpose TEXT NOT NULL CHECK (purpose IN ('activate','reverify','probe_safari')),
+    purpose TEXT NOT NULL CHECK (purpose IN ('activate','apply_new_revision','reverify','probe_safari')),
     issued_at TEXT NOT NULL,
     deadline TEXT NOT NULL,
     consumed_at TEXT
@@ -232,6 +232,7 @@ export const MIGRATIONS: readonly string[] = [
     key TEXT PRIMARY KEY,
     status TEXT NOT NULL CHECK (status IN ('supported','unsupported','unverified')),
     context TEXT,
+    protocol_coverage TEXT,
     proposal_id TEXT,
     verified_at TEXT,
     note TEXT
@@ -244,9 +245,10 @@ export const MIGRATIONS: readonly string[] = [
     context TEXT NOT NULL,
     summary TEXT NOT NULL,
     evidence_digest TEXT NOT NULL,
+    protocol_coverage TEXT,
     safari_process_paths TEXT,
     entry_strategy TEXT,
-    submitted_by TEXT NOT NULL CHECK (submitted_by IN ('agent','admin','web')),
+    submitted_by TEXT NOT NULL CHECK (submitted_by IN ('agent','admin')),
     submitted_at TEXT NOT NULL,
     confirmed_at TEXT,
     rejected_at TEXT

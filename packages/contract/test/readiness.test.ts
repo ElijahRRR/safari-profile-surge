@@ -72,6 +72,11 @@ describe('deriveReadiness precedence', () => {
     expect(r.readiness).toBe('ready');
     expect(r.nextActions.map((a) => a.kind)).toContain('publish_pending');
   });
+  test('unaccepted partial readback is not usable', () => {
+    const r = deriveReadiness(input({ deployment: 'readback_partial' }, { hasDeployedRevision: false }));
+    expect(r.readiness).toBe('sync_failed');
+    expect(readinessAllowsActivation(r.readiness)).toBe(false);
+  });
   test('rolled back requires reverify', () => {
     expect(deriveReadiness(input({ route: 'rolled_back' })).readiness).toBe('needs_reverify');
   });

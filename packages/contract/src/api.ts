@@ -3,6 +3,7 @@
 // 认证：每个 /api 请求（含 GET 与事件流）都带 `Authorization: Bearer <会话令牌>`；不用 Cookie，
 // 因为浏览器对 127.0.0.1 的不同端口共享 Cookie。
 
+import type { ApiErrorBody } from './errors.js';
 import type {
   CapabilityContext,
   CapabilityView,
@@ -15,6 +16,7 @@ import type {
   OperationId,
   OperationView,
   ProbeKind,
+  ProtocolCoverage,
   RequestId,
   Snapshot,
   TakeoverState,
@@ -57,7 +59,7 @@ export interface UpdateEnvironmentRequest {
   changes: EnvironmentChanges;
 }
 
-/** 删除、解除绑定：正在使用的环境返回 409 NEEDS_CONFIRMATION（先进入普通模式）。 */
+/** 删除、解除绑定：正在使用或正在验证的环境返回 409 ENVIRONMENT_ACTIVE（请先进入普通模式），没有请求内确认。 */
 export interface DeleteEnvironmentRequest {
   request_id: RequestId;
   expected_revision: number;
@@ -72,7 +74,7 @@ export interface ActivateRequest {
   request_id: RequestId;
   /** 有其他环境使用中或其他场景有打开的窗口时必须明确选择；缺省返回 409 NEEDS_CONFIRMATION。 */
   old_session_policy?: OldSessionPolicy;
-  /** 用户确认时看到的“当前使用环境”（没有则 null）；执行时不一致则失败并要求重新确认。 */
+  /** 用户确认时看到的“当前使用环境”；缺省等同 null（期望没有其他环境在用）。执行时不一致则失败并要求重新确认。 */
   confirmed_environment_id?: EnvironmentId | null;
   /** 目标版本：只能是该环境的 deployed 或 last_verified 版本，缺省为 deployed。 */
   proxy_revision?: number;
@@ -85,11 +87,7 @@ export interface NormalModeRequest {
   confirmed_environment_id?: EnvironmentId | null;
 }
 
-export type NeedsConfirmationReason =
-  | 'other_environment_active'
-  | 'managed_environment_active'
-  | 'other_profiles_open'
-  | 'environment_active';
+export type NeedsConfirmationReason = 'other_environment_active' | 'managed_environment_active' | 'other_profiles_open';
 
 export interface NeedsConfirmationDetails {
   reason: NeedsConfirmationReason;
@@ -114,6 +112,20 @@ export interface ProbeRequest {
   kind: ProbeKind;
 }
 
+/** 取消等待中的路由操作：按 §6.3 回滚（恢复原选择并保持阻断），从不进入 NORMAL。 */
+export interface CancelOperationRequest {
+  request_id: RequestId;
+}
+
+/** 用户确认旧环境窗口已关闭：只清除 old_windows_kept_open / managed_windows_on_original_rules 警告并记录声明，不改变路由。 */
+export interface AcknowledgeWindowsRequest {
+  request_id: RequestId;
+}
+
+export interface VerifyFrontProxyRequest {
+  request_id: RequestId;
+}
+
 export interface AccountDetail {
   environment_id: EnvironmentId;
   label: string | null;
@@ -131,9 +143,14 @@ export interface AcknowledgeAccountRequest {
 export type ImportFormat = 'csv' | 'xlsx' | 'json';
 
 /**
- * 导入统一记录。environment_id 是去重与更新键；名称不是身份。front_proxy 是已登记前置的
- * Surge 节点名或 id；空则用请求的 default_front_proxy_id，再空用全局默认。
- * 更新时空的秘密字段表示保留；导入从不清除秘密。
+ * 导入统一记录。匹配规则：
+ * - environment_id 存在且对应未删除的环境 → 更新（内容与秘密指纹都相同则为 unchanged）；
+ * - environment_id 存在但不存在或已删除 → invalid；
+ * - 没有 environment_id、但已有同名环境，或批次内同名 → conflict，必须逐行选择，从不按名称更新；
+ * - 没有 environment_id 也没有同名 → create。
+ * front_proxy 是已登记前置的 Surge 节点名或 id；未登记 → invalid（不隐式登记）；空则用请求的
+ * default_front_proxy_id，再空用全局默认。更新时空的秘密字段表示保留；导入从不清除秘密。
+ * 模板只含合成示例值。
  */
 export interface ImportRecord {
   environment_id?: EnvironmentId | null;
@@ -191,6 +208,7 @@ export type ImportRowDecision =
   | { row: number; action: 'update'; environment_id: EnvironmentId; expected_revision: number }
   | { row: number; action: 'skip' };
 
+/** preview_digest 与重新解析的结果不一致时整体拒绝（409 PREVIEW_STALE），需要重新预览。 */
 export interface ImportCommitRequest extends ImportPreviewRequest {
   request_id: RequestId;
   preview_digest: string;
@@ -206,6 +224,9 @@ export interface ImportCommitResult {
     environment_id: EnvironmentId | null;
     status: ImportRowStatus | 'skipped' | 'revision_conflict';
     operation_id: OperationId | null;
+    error?: ApiErrorBody;
+    /** 版本冲突时的脱敏差异。 */
+    diff?: Array<{ field: string; before: string | null; after: string | null }>;
   }>;
 }
 
@@ -221,8 +242,11 @@ export interface ProposeCapabilityRequest {
   summary: string;
   /** 测试 Mac 上原始证据文件的摘要；原始证据不离开本机限权目录。 */
   evidence_digest: string;
+  /** safari_process_attribution 与 safari_udp_quic_handling 的提议必须带逐协议覆盖。 */
+  protocol_coverage?: ProtocolCoverage;
   /** safari_process_attribution 的提议必须携带经证据确认的进程完整路径。 */
   safari_process_paths?: string[];
+  /** runtime_entry_modes 的提议必须携带所验证的入口策略；确认后成为设置中唯一的入口策略来源。 */
   entry_strategy?: EntryStrategy;
 }
 
@@ -233,11 +257,13 @@ export type ConfirmCapabilityRequest =
 
 // ---------- 设置 ----------
 
-/** Surge CLI 路径与工作配置路径不在此处：前者只来自安装配置，后者只由维护初始化设置。 */
+/**
+ * Surge CLI 路径、工作配置路径、Safari 进程路径与入口策略都不在此处：分别只来自安装配置、
+ * 维护初始化、已确认的能力证据。
+ */
 export interface UpdateSettingsRequest {
   request_id: RequestId;
-  /** 修改会让依赖它的能力回到待验证；入口不是 NORMAL 时拒绝。 */
-  entryStrategy?: EntryStrategy | null;
+  /** 只在入口为 NORMAL 时允许修改；修改后 Safari 实测全部视为过期。 */
   verifyEndpointId?: string;
   defaultFrontProxyId?: FrontProxyId | null;
   profileArrivalTimeoutSec?: number;
@@ -299,16 +325,27 @@ export interface InitPreviewResponse {
   autoReloadEnabled: boolean | null;
   takeover: TakeoverState;
   httpApi: { configured: boolean; loopbackOnly: boolean | null };
+  /** 远端托管头之外的远端引用（#!include URL、远端规则集等），只给主机名。 */
+  remoteSources: string[];
+  /** 存在远端来源时的提示：源配置的远端更新不再自动应用，需要之后的重新合并。 */
+  remoteUpdatesNotice: string | null;
   checks: Array<{ name: string; ok: boolean; message: string }>;
   nameCollisions: string[];
 }
 
+/** 提交时重新计算摘要（源配置、引用文件、受管理差异、目标路径），不一致返回 409 PREVIEW_STALE。 */
 export interface InitCommitRequest {
   request_id: RequestId;
   preview_digest: string;
 }
 
-export type RemergePreviewResponse = Omit<InitPreviewResponse, 'sourceProfileName' | 'sourceProfilePath' | 'managedConfigDetected'>;
+export interface RemergePreviewResponse extends Omit<InitPreviewResponse, 'sourceProfileName' | 'sourceProfilePath' | 'managedConfigDetected'> {
+  /** 本应用文件（sfe-nodes.list、入口规则集）与上次发布内容的脱敏差异；提交时恢复上次发布内容（受发布门槛约束）。 */
+  managedFilesDiff: string;
+  /** 写入工作配置后是否需要重载同一配置，以及 P0 测得的影响（用户据此选择维护时间）。 */
+  requiresReload: boolean;
+  measuredReloadImpact: string | null;
+}
 
 export interface RemergeCommitRequest {
   request_id: RequestId;
@@ -337,6 +374,8 @@ export const API_ROUTES = {
   normal: { method: 'POST', path: '/api/routing/normal' },
   publishPending: { method: 'POST', path: '/api/deployments/publish' },
   getOperation: { method: 'GET', path: '/api/operations/:id' },
+  cancelOperation: { method: 'POST', path: '/api/operations/:id/cancel' },
+  acknowledgeWindows: { method: 'POST', path: '/api/routing/acknowledge-windows' },
   listOperations: { method: 'GET', path: '/api/operations' },
   importPreview: { method: 'POST', path: '/api/imports/preview' },
   importCommit: { method: 'POST', path: '/api/imports/commit' },

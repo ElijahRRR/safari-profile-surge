@@ -28,4 +28,5 @@ backups/
 candidates/
 tools/p0/out/
 *.webloc
-!**/test/fixtures/**
+!**/test/fixtures/**/*.conf
+!**/test/fixtures/**/sfe-*.list

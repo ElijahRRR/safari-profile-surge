@@ -36,8 +36,9 @@ export interface ProxyInput {
   /** null 表示使用当前默认前置；保存时解析成具体 id 存储，之后修改默认值不影响已有环境。 */
   frontProxyId: FrontProxyId | null;
   /**
-   * 用户提供的预期出口 IP；代理连接地址不能自动当作预期出口。它不是 Surge 节点参数：
-   * 只改它不会产生新节点版本，也不触发发布或切换。
+   * 用户提供的预期出口 IP；代理连接地址不能自动当作预期出口。它不是 Surge 节点参数，存放在
+   * 环境上：只改它不会产生新节点版本，也不触发发布或切换；对正在使用的环境会立即与最近一次
+   * Safari 实测比较，不符则停止自动打开与填充并告警。
    */
   expectedExitIp?: string | null;
 }
@@ -67,6 +68,8 @@ export interface EnvironmentChanges {
   autoFillLogin?: boolean;
   proxy?: Partial<ProxyInput>;
   account?: AccountInput;
+  /** 首次关联向导中用户确认的步骤（纯数据修改）。 */
+  bindingStage?: 'awaiting_profile' | 'awaiting_extension' | 'awaiting_association' | null;
 }
 
 export interface ProxyRevisionView {
@@ -78,7 +81,6 @@ export interface ProxyRevisionView {
   hasPassword: boolean;
   frontProxyId: FrontProxyId;
   frontProxyName: string;
-  expectedExitIp: string | null;
   /** Surge 中的实际节点名，例如 SFE-N-E0001-US01-v003。 */
   nodeName: string;
   createdAt: IsoTime;
@@ -213,6 +215,7 @@ export interface EnvironmentView {
   site: SiteCode;
   autoOpenOrders: boolean;
   autoFillLogin: boolean;
+  expectedExitIp: string | null;
   revision: number;
   binding: BindingView;
   proxy: {
@@ -309,6 +312,7 @@ export type RouteWarning =
   | 'managed_windows_on_original_rules'
   | 'old_session_unproven'
   | 'launch_unverified'
+  | 'launch_order_unverified'
   | 'external_selection_change'
   | 'external_profile_change'
   | 'surge_unreachable'
@@ -318,6 +322,8 @@ export type RouteWarning =
   | 'outbound_mode_changed'
   | 'entry_unverified'
   | 'precedence_violation'
+  | 'front_missing'
+  | 'managed_segments_changed'
   | 'rollback_needs_reverify'
   | 'probe_expired'
   | 'probe_failed'
@@ -343,6 +349,17 @@ export interface RouteStateView {
   updatedAt: IsoTime;
 }
 
+/** 激活前写入的切换前状态快照，崩溃后用于回滚。 */
+export interface ActivationSnapshot {
+  previousEnvironmentId: EnvironmentId | null;
+  previousProxyRevision: number | null;
+  previousSelectedNode: string | null;
+  previousEntryMode: EntryMode;
+  previousSafariProbeId: string | null;
+  previousRouteEpoch: number;
+  previousPhase: RoutePhase;
+}
+
 /** 对非当前环境绑定场景返回的受限路由信息。 */
 export interface RouteSummaryView {
   routeEpoch: number;
@@ -359,10 +376,27 @@ export interface CapabilityContext {
   processPathsDigest: string | null;
   workingProfileId: string | null;
   autoReload: 'on' | 'off' | 'any' | null;
-  takeoverMode: 'enhanced' | 'system_proxy' | 'both' | null;
+  takeoverMode: 'enhanced' | 'system_proxy' | 'both' | 'any' | null;
   signingIdentity: string | null;
   adapterMechanism: string | null;
 }
+
+export type ProtocolCoverageItem =
+  | 'ipv4'
+  | 'ipv6'
+  | 'http1'
+  | 'http2'
+  | 'http3_quic'
+  | 'websocket'
+  | 'extension_page_fetch'
+  | 'webrtc'
+  | 'dns'
+  | 'system_services';
+
+/** 逐协议的实测覆盖。gating 项（除 webrtc/dns/system_services）必须 pass 或写明 limitation 才能确认 supported。 */
+export type ProtocolCoverage = Partial<Record<ProtocolCoverageItem, { result: 'pass' | 'fail' | 'limitation' | 'not_tested'; note: string | null }>>;
+
+export const GATING_COVERAGE_ITEMS: readonly ProtocolCoverageItem[] = ['ipv4', 'ipv6', 'http1', 'http2', 'http3_quic', 'websocket', 'extension_page_fetch'];
 
 export interface CapabilityView {
   key: CapabilityKey;
@@ -373,8 +407,9 @@ export interface CapabilityView {
   effectiveStatus: CapabilityStatus;
   staleReasons: CapabilityContextField[];
   context: CapabilityContext | null;
+  protocolCoverage: ProtocolCoverage | null;
   verifiedAt: IsoTime | null;
-  evidenceId: string | null;
+  proposalId: string | null;
   /** P0 记录的限制说明（例如“协议覆盖：H3 已拒绝并回落 TCP；IPv6 未验证”）。 */
   note: string | null;
 }
@@ -384,10 +419,12 @@ export interface CapabilityProposalView {
   key: CapabilityKey;
   proposedStatus: Exclude<CapabilityStatus, 'unverified'>;
   context: CapabilityContext;
+  protocolCoverage: ProtocolCoverage | null;
   summary: string;
   evidenceDigest: string;
   submittedAt: IsoTime;
-  submittedBy: 'agent' | 'admin' | 'web';
+  /** 提议只来自 P0 工具/agent 或维护通道；网页只确认。 */
+  submittedBy: 'agent' | 'admin';
 }
 
 export interface TakeoverState {

@@ -55,6 +55,10 @@ export function deriveReadiness(input: ReadinessInput): ReadinessResult {
 
   if (!input.hasDeployedRevision) {
     if (facets.deployment === 'failed') return done('sync_failed', { kind: 'publish_pending', message: '同步到 Surge 失败，请查看错误后重试' });
+    // 读回不完整且未被 P0 记录覆盖：不能当作可用版本。
+    if (facets.deployment === 'readback_partial') {
+      return done('sync_failed', { kind: 'verify_capability', message: '已部署，读回不完整：需要相应能力的实测记录覆盖未核对字段' });
+    }
   }
   if (facets.preflight === 'failed') return done('proxy_unavailable', { kind: 'fix_input', message: '代理预检失败：前置或 SOCKS5 不可用' });
   if (facets.binding === 'unbound') return done('needs_binding', { kind: 'bind_profile', message: '尚未关联 Safari 场景' });

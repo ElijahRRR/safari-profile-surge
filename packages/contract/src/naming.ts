@@ -47,7 +47,7 @@ export function exitNodeName(envCode: string, tag: string, proxyRevision: number
   return name;
 }
 
-/** 专用前置节点（确实需要新建时）：SFE-F-F0001。 */
+/** 专用前置节点命名（保留：首版不开放创建，前置只允许用户已有的固定节点）。 */
 export function frontNodeName(sequence: number): string {
   if (sequence < 1) throw new RangeError('front sequence starts at 1');
   return `SFE-F-F${pad(sequence, 4)}`;

@@ -166,6 +166,7 @@ export const CAPABILITY_KEYS = [
   'takeover_state_readable',
   'same_profile_reload_impact',
   'open_profile_by_id',
+  'profile_batch_create',
 ] as const;
 export type CapabilityKey = (typeof CAPABILITY_KEYS)[number];
 export type CapabilityStatus = 'supported' | 'unsupported' | 'unverified';
@@ -190,6 +191,7 @@ export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
   takeover_state_readable: '接管与出站模式读取',
   same_profile_reload_impact: '同一配置维护重载影响',
   open_profile_by_id: '按场景 ID 打开 Safari',
+  profile_batch_create: '批量创建 Safari 场景',
 };
 
 /** 能力验证时记录的上下文字段。 */
@@ -229,6 +231,7 @@ export const CAPABILITY_CONTEXT_DEPS: Record<CapabilityKey, readonly CapabilityC
   takeover_state_readable: ['surgeVersion', 'surgeBuild', 'adapterMechanism'],
   same_profile_reload_impact: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'takeoverMode'],
   open_profile_by_id: ['macosBuild', 'safariVersion'],
+  profile_batch_create: ['macosBuild', 'safariVersion'],
 };
 
 /** 动作 → 必需能力（全部 supported 且上下文匹配）。见 docs/ARCHITECTURE.md §5.2。 */
@@ -244,14 +247,18 @@ export const CAPABILITY_GATES = {
   /** 激活与活动环境切换（改变 SFE-ROUTE 选择与入口模式）。 */
   activate: [
     'native_bridge_ipc',
+    'external_node_underlying_proxy',
     'safari_process_attribution',
     'runtime_entry_modes',
     'entry_rules_after_restart',
     'safari_udp_quic_handling',
     'fixed_profile_no_switch',
   ],
-  /** ruleset_resource 策略额外要求。 */
-  activateRulesetStrategy: ['auto_reload_atomic_replace', 'targeted_resource_refresh'],
+  /**
+   * ruleset_resource 策略额外要求。规则集文件的定向刷新不同于节点资源刷新，由
+   * runtime_entry_modes（策略为 ruleset_resource 时）本身证明，这里只追加自动重载行为。
+   */
+  activateRulesetStrategy: ['auto_reload_atomic_replace'],
   /** 结束 Safari 旧连接。普通模式下不满足时按“尽力而为”执行并报告。 */
   killSafariConnections: ['safari_process_attribution'],
   /** 场景绑定需要能收到原生桥消息。 */
@@ -259,6 +266,54 @@ export const CAPABILITY_GATES = {
   /** 登录页填充与自动打开订单（P4：绑定、出口和启动顺序均可验证后）。 */
   fillAndAutoOpen: ['native_profile_id', 'first_request_and_old_connections', 'bridge_keychain_access'],
   preflight: ['independent_node_preflight'],
-  /** 维护流程写入工作配置并重载同一配置；same_profile_reload_impact 需已测量（supported 或带影响记录的 unsupported）。 */
+  /** 维护流程写入工作配置并重载同一配置（另需 CAPABILITY_MEASURED_GATES.maintenanceWrite）。 */
   maintenanceWrite: ['auto_reload_atomic_replace'],
 } as const satisfies Record<string, readonly CapabilityKey[]>;
+
+/**
+ * “已测量”门槛：有效状态必须不是 unverified（supported，或带影响记录的 unsupported 均可），
+ * 用于需要展示实测影响、由用户选择时机的维护动作。
+ */
+export const CAPABILITY_MEASURED_GATES = {
+  maintenanceWrite: ['same_profile_reload_impact'],
+} as const satisfies Record<string, readonly CapabilityKey[]>;
+
+/**
+ * 每项能力依赖的 Surge 原语；验证上下文中的 adapterMechanism 记录这些原语当时由哪种实现提供
+ * （规范 JSON：{"原语":"cli|http"}），比较时只比较这些原语。
+ */
+export const CAPABILITY_PRIMITIVES: Partial<Record<CapabilityKey, readonly string[]>> = {
+  fixed_profile_no_switch: ['selectGroupPolicy', 'getGroupSelection', 'getCurrentProfile'],
+  runtime_entry_modes: ['listRules', 'listTempRules', 'addTempRule', 'removeTempRule', 'listExternalResources', 'updateExternalResource'],
+  targeted_resource_refresh: ['listExternalResources', 'updateExternalResource', 'getGroupMembers', 'getGroupSelection'],
+  policy_path_reread: ['listExternalResources', 'updateExternalResource', 'getGroupMembers'],
+  connection_continuity: ['updateExternalResource', 'selectGroupPolicy'],
+  independent_node_preflight: ['testPolicy'],
+  takeover_state_readable: ['getTakeoverState'],
+};
+
+/** P0 通过条件（网页能力页与 P0 手册共用的唯一文字来源）。 */
+export const CAPABILITY_CRITERIA: Record<CapabilityKey, string> = {
+  safari_process_attribution:
+    'Safari 实际连接（含扩展页面请求）按完整进程路径命中，Chrome 与其他 WebKit 应用不命中；IPv4/IPv6、HTTP/1.1、HTTP/2、HTTP/3、WebSocket 逐项通过或写明限制；DNS、WebRTC、系统服务另列覆盖情况。',
+  native_profile_id: '各场景（含默认场景）提供不同的 SFExtensionProfileKey，Safari 退出重开、扩展重装、App 重签后保持不变或变化行为已记录。',
+  native_bridge_ipc: '扩展经原生桥与服务往返成功；Safari 重开、重启、服务重启、服务升级后仍成功；后台脚本休眠后被唤醒仍能完成往返；无 TCC 提示。',
+  bridge_keychain_access: '签名的原生桥能读取由指定写入方写入的账号密码钥匙串项，无额外提示；重建/重签后的提示次数已记录。',
+  extension_install_persistence: '不开启“允许未签名扩展”，扩展在 Safari 退出重开、重启、8 天以上与重新构建后仍保持启用；证书与描述文件有效期已记录。',
+  fixed_profile_no_switch: '切换 SFE-ROUTE 选择时工作配置身份不变、不发生配置重载、Chrome 长连接与新请求不受影响。',
+  runtime_entry_modes:
+    '所选策略下四种模式精确生效；每次切换位不发生配置重载、其他应用长连接与新请求不受影响；中间状态无放行窗口；本应用入口优先于启用的模块 DIRECT 规则与用户临时规则；AND(进程,域名) 与 AND(进程,UDP) 规则在该机制中可用；ruleset_resource 时 Safari 请求在 updateExternalResource(key) 后改变匹配。',
+  entry_rules_after_restart: 'Surge 重启后入口规则的去留已记录，且控制器在一个对账周期内检测到丢失（入口记为 UNKNOWN 并暂停填充与自动打开）。',
+  safari_udp_quic_handling: 'VERIFY_ONLY 与 ACTIVE 下 Safari 的 UDP/QUIC（H3 测试主机）被拒绝且从不直连，页面回落 TCP 经 SFE-ROUTE，出口一致。',
+  targeted_resource_refresh: '按 key 定向刷新本应用节点资源后，经固定原语能读到组成员、资源错误与选择；不影响其他资源；执行器从不写入它无法读回的内容。',
+  policy_path_reread: '本地 policy-path 文件修改后经定向刷新被重新读取，新增成员可选、旧成员与选择保留。',
+  external_node_underlying_proxy: '外部资源中的节点经 underlying-proxy 引用主配置前置时确实经过前置；前置不可达时连接失败而非直连；前置名缺失时节点被跳过或失败而非直连。',
+  connection_continuity: '发布节点资源期间，其他应用的长连接保持、新请求正常、出口不变，并与未执行变更的对照比较。',
+  auto_reload_atomic_replace: '自动重载设置（开/关）下原子替换被引用文件的行为已实测：是否触发整份配置重载；记录验证时的设置值。',
+  first_request_and_old_connections: '受控入口下首个业务请求已走新出口；旧环境的长连接、后台请求、恢复的标签页与扩展休眠场景不会继续使用旧出口；限制已写明。',
+  independent_node_preflight: '不改变当前选择即可对未选中的候选节点做连通性测试。',
+  takeover_state_readable: '能经固定原语只读获取增强模式、系统代理与出站模式。',
+  same_profile_reload_impact: '同一配置维护重载对其他应用的影响（连接重置、恢复时间、接管与模式是否不变）已测量。',
+  open_profile_by_id: '存在可用的公开方式按场景 ID 打开 Safari 指定场景。',
+  profile_batch_create: '存在可用的公开方式批量创建 Safari 场景。',
+};

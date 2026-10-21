@@ -32,7 +32,11 @@ export const NATIVE_MAX_MESSAGE_BYTES = 256 * 1024;
 
 export type NativeRequest =
   | { type: 'getCurrentState' }
-  /** 场景状态提示：窗口数、是否有 www.amazon.com 标签页、站点权限。只作提示，从不改变路由。 */
+  /**
+   * 场景状态提示：窗口数、是否有 www.amazon.com 标签页、站点权限。在弹窗打开、窗口与标签页
+   * 创建/关闭时由后台发送；超过 PROFILE_REPORT_FRESH_SEC 的上报不再计入“有打开的窗口”。
+   * 只作提示，从不改变路由。
+   */
   | { type: 'reportProfileState'; windows_open: number; amazon_tabs_open: boolean; site_permission_granted: boolean }
   | { type: 'bindCurrentProfile'; request_id: RequestId; environment_id: EnvironmentId; expected_revision: number }
   | { type: 'createAndBindEnvironment'; request_id: RequestId; environment: EnvironmentInput }
@@ -51,6 +55,10 @@ export type NativeRequest =
   | { type: 'probeCurrentEnvironment'; request_id: RequestId; environment_id: EnvironmentId; kind: 'preflight' | 'safari' }
   | { type: 'acknowledgeAccountChange'; request_id: RequestId; environment_id: EnvironmentId; expected_revision: number }
   | { type: 'getOperation'; operation_id: OperationId }
+  /** 取消自己环境的等待中路由操作（按回滚处理，从不进入 NORMAL）。 */
+  | { type: 'cancelOperation'; request_id: RequestId; operation_id: OperationId }
+  /** 用户确认旧环境窗口已关闭：只清除对应警告。 */
+  | { type: 'acknowledgeWindowsClosed'; request_id: RequestId }
   /**
    * 准备页在目标场景中调用：表示“绑定场景已到达，可以检测”。等待切换的操作由此继续；
    * 入口到达 VERIFY_ONLY（或当前环境重测时的 ACTIVE）后返回一次性检测编号。
@@ -159,6 +167,8 @@ export interface NativeResponseMap {
   probeCurrentEnvironment: Accepted;
   acknowledgeAccountChange: Accepted;
   getOperation: OperationView;
+  cancelOperation: Accepted;
+  acknowledgeWindowsClosed: { cleared: boolean };
   beginSafariVerification: BeginVerificationResponse;
   submitSafariVerification: { accepted: boolean };
   requestLoginFill: LoginFillServiceResponse;
@@ -186,10 +196,15 @@ export const NATIVE_PERMISSIONS: Record<NativeRequestType, ReadonlyArray<'uniden
   probeCurrentEnvironment: ['bound'],
   acknowledgeAccountChange: ['bound'],
   getOperation: ['unbound', 'bound'],
+  cancelOperation: ['bound'],
+  acknowledgeWindowsClosed: ['unbound', 'bound'],
   beginSafariVerification: ['bound'],
   submitSafariVerification: ['bound'],
   requestLoginFill: ['bound'],
 };
+
+/** 场景状态上报的有效期。 */
+export const PROFILE_REPORT_FRESH_SEC = 600;
 
 /** 内容脚本经后台可以发起的唯一请求类型。 */
 export const CONTENT_SCRIPT_ALLOWED: readonly NativeRequestType[] = ['requestLoginFill'];

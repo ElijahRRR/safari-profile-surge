@@ -10,7 +10,7 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "build": "node scripts/build.mjs",
-    "dev": "tsx src/main.ts --dev"
+    "demo": "tsx src/main.ts --demo"
   },
   "dependencies": {
     "@sfe/contract": "0.1.0"
