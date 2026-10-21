@@ -63,6 +63,7 @@ function jsonOrThrow(text: string, what: string): unknown {
   return json;
 }
 
+// JSON reads require --raw; the default CLI renderer is intended for humans.
 export const CLI_COMMANDS: CliCommandTable = {
   checkProfile: {
     evidence: 'seen_in_6.5_help',
@@ -72,7 +73,7 @@ export const CLI_COMMANDS: CliCommandTable = {
   },
   listExternalResources: {
     evidence: 'seen_in_6.5_help',
-    argv: () => ['external-resource', 'list'],
+    argv: () => ['--raw', 'external-resource', 'list'],
     parse: (out) => parseExternalResources(jsonOrThrow(out.stdout, '外部资源')),
   },
   updateExternalResource: {
@@ -82,7 +83,7 @@ export const CLI_COMMANDS: CliCommandTable = {
   },
   listTempRules: {
     evidence: 'seen_in_6.5_help',
-    argv: () => ['dump', 'temp-rule'],
+    argv: () => ['--raw', 'dump', 'temp-rule'],
     parse: (out) => parseTempRuleList(out.stdout),
   },
   // TODO(P0)：旧式临时规则的新增/删除动词以随包技能列出的命令为准；6.9+ 的 rule temp 形式不能用于 6.5。
@@ -111,22 +112,22 @@ export const CLI_COMMANDS: CliCommandTable = {
   },
   listRules: {
     evidence: 'unverified',
-    argv: () => ['dump', 'rule'],
+    argv: () => ['--raw', 'dump', 'rule'],
     parse: (out, ctx) => parseRuleList(out.stdout, ctx.scrub),
   },
   listActiveRequests: {
     evidence: 'unverified',
-    argv: () => ['dump', 'active'],
+    argv: () => ['--raw', 'dump', 'active'],
     parse: (out) => parseRequestRecords(jsonOrThrow(out.stdout, '活动请求')),
   },
   listRecentRequests: {
     evidence: 'unverified',
-    argv: () => ['dump', 'request'],
+    argv: () => ['--raw', 'dump', 'request'],
     parse: (out) => parseRequestRecords(jsonOrThrow(out.stdout, '最近请求')),
   },
   listPolicies: {
     evidence: 'unverified',
-    argv: () => ['dump', 'policy'],
+    argv: () => ['--raw', 'dump', 'policy'],
     // 只取名称；输出中可能出现的节点参数不保留。
     parse: (out) => parsePolicyNames(jsonOrThrow(out.stdout, '策略列表')),
   },

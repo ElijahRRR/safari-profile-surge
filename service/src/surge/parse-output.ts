@@ -99,7 +99,7 @@ export function parseRequestRecords(json: unknown): SurgeRequestRecord[] {
 }
 
 export function parseExternalResources(json: unknown): SurgeExternalResource[] {
-  let items = arrayFrom(json, ['resources', 'external-resources', 'externalResources', 'items']);
+  let items = arrayFrom(json, ['defines', 'resources', 'external-resources', 'externalResources', 'items']);
   if (!items && isObject(json)) {
     // 也接受 { key: { … } } 形式。
     items = Object.entries(json).map(([key, v]) => (isObject(v) ? { key, ...v } : null)).filter((v) => v !== null);
