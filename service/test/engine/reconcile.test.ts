@@ -34,6 +34,14 @@ describe('periodic reconcile is read-only and sticky', () => {
     expect(h.events.some((e) => e.type === 'surge.status')).toBe(true);
   });
 
+  test('a successful read clears the "not read yet" placeholder message', async () => {
+    await activeHarness();
+    await h.app.refreshSurge(WEB);
+    const status = (await h.app.snapshot(WEB)).surge;
+    expect(status.reachable).toBe(true);
+    expect(status.message).toBeNull();
+  });
+
   test('nothing changed → no operation recorded', async () => {
     await activeHarness();
     await h.app.runPeriodicReconcile();

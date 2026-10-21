@@ -273,7 +273,13 @@ export class Engine {
 
   /** 只读 Surge 基础事实（版本、启动时间、当前配置、接管、自动重载）；从不写。 */
   async readBasicFacts(): Promise<SurgeFacts> {
-    const facts: SurgeFacts = { ...emptySurgeFacts(), precedenceIssues: this.facts.precedenceIssues, managedSectionsIntact: this.facts.managedSectionsIntact };
+    // 从空事实开始，但清掉“尚未读取”的占位提示：本次读取的结论会重新填写 message。
+    const facts: SurgeFacts = {
+      ...emptySurgeFacts(),
+      message: null,
+      precedenceIssues: this.facts.precedenceIssues,
+      managedSectionsIntact: this.facts.managedSectionsIntact,
+    };
     facts.checkedAt = this.nowIso();
     try {
       const v = await this.surge.getVersion();

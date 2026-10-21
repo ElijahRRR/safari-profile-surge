@@ -311,7 +311,12 @@ function activationBlocked(env: EnvironmentView): string | null {
         <div class="flex flex-col gap-1">
           <Badge :variant="READINESS_LABELS[row.readiness].variant" :data-readiness="row.readiness">{{ READINESS_LABELS[row.readiness].label }}</Badge>
           <span v-if="row.nextActions[0]" class="max-w-[14rem] truncate text-xs text-gray-500 dark:text-dark-400" :title="row.nextActions[0].message">{{ row.nextActions[0].message }}</span>
-          <span v-if="row.lastError" class="max-w-[14rem] truncate text-xs text-red-600 dark:text-red-400" :title="row.lastError.message">{{ row.lastError.message }}</span>
+          <span
+            v-if="row.lastError && row.lastError.message !== row.nextActions[0]?.message"
+            class="max-w-[14rem] truncate text-xs text-red-600 dark:text-red-400"
+            :title="row.lastError.message"
+            >{{ row.lastError.message }}</span
+          >
         </div>
       </template>
       <template #cell-actions="{ row }">
