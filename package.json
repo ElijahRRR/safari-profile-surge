@@ -6,15 +6,15 @@
   "workspaces": [
     "packages/contract",
     "packages/easyquick",
-    "service",
     "apps/web",
-    "extension"
+    "extension",
+    "service"
   ],
   "engines": {
     "node": ">=22.13"
   },
   "scripts": {
-    "typecheck": "npm run typecheck --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present && tsc -p tools/p0/tsconfig.json",
     "test": "vitest run",
     "build": "npm run build --workspaces --if-present",
     "check": "npm run typecheck && npm test && npm run build && npm run scan",

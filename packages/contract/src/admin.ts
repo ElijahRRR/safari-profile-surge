@@ -128,6 +128,6 @@ export interface LoginCodeResponse {
 }
 
 export function adminOpAllowed(op: string, role: AdminRole): op is AdminOp {
-  const def = (ADMIN_OPS as Record<string, { roles: readonly AdminRole[] } | undefined>)[op];
+  const def = Object.hasOwn(ADMIN_OPS, op) ? (ADMIN_OPS as Record<string, { roles: readonly AdminRole[] }>)[op] : undefined;
   return def !== undefined && def.roles.includes(role);
 }

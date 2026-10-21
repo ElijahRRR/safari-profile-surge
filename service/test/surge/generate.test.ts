@@ -138,6 +138,13 @@ describe('validateSafariProcessPaths', () => {
     expect(errors[0]!.field).toBe(field);
   });
 
+  test('allows a Safari-specific WebKit copy (decided by P0 evidence, not by the validator)', () => {
+    const appCryptex =
+      '/System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking';
+    expect(validateSafariProcessPaths([appCryptex])).toEqual([]);
+    expect(validateSafariProcessPaths(['/System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/x'])).toHaveLength(1);
+  });
+
   test('existence check is injectable', () => {
     expect(validateSafariProcessPaths([SAFARI], { exists: () => false })[0]!.message).toBe('进程路径不存在');
     expect(validateSafariProcessPaths([SAFARI], { exists: () => true })).toEqual([]);

@@ -95,7 +95,18 @@ export function groupBlockLines(): string[] {
 const PATH_FORBIDDEN_RE = /[,()#;"'*?[\]{}=\u0000-\u001f\u007f]/;
 
 /**
- * Safari 进程路径：绝对路径、不含通配与规则分隔符、不是裸进程名、不是系统通用 WebKit 框架路径；
+ * 所有 WebKit 应用共用的系统级位置。Safari 自带的 WebKit 副本（例如 App 加密卷宗中的路径）
+ * 不在此列：它是否只属于 Safari 由 P0 证据（Chrome 与其他 WebKit 应用不命中）决定。
+ */
+const GENERIC_WEBKIT_PREFIXES = [
+  '/System/Library/Frameworks/WebKit.framework/',
+  '/System/Library/PrivateFrameworks/WebKit',
+  '/System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/',
+  '/System/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/',
+];
+
+/**
+ * Safari 进程路径：绝对路径、不含通配与规则分隔符、不是裸进程名、不是系统级通用 WebKit 路径；
  * 存在性检查可注入（测试与非 macOS 环境）。
  */
 export function validateSafariProcessPaths(paths: unknown, opts: { exists?: (path: string) => boolean } = {}): FieldError[] {
@@ -113,7 +124,7 @@ export function validateSafariProcessPaths(paths: unknown, opts: { exists?: (pat
     else if (PATH_FORBIDDEN_RE.test(p)) errors.push({ field, message: '不能包含通配符、逗号、括号或换行' });
     else if (p.endsWith('/') || p.split('/').some((seg, k) => k > 0 && (seg === '' || seg === '.' || seg === '..'))) {
       errors.push({ field, message: '路径不规范' });
-    } else if (/\/WebKit\.framework\//i.test(p)) {
+    } else if (GENERIC_WEBKIT_PREFIXES.some((prefix) => p.toLowerCase().startsWith(prefix.toLowerCase()))) {
       errors.push({ field, message: '不能使用系统通用 WebKit 组件路径：其他 WebKit 应用也会命中' });
     } else if (seen.has(p)) errors.push({ field, message: '进程路径重复' });
     else if (opts.exists && !opts.exists(p)) errors.push({ field, message: '进程路径不存在' });

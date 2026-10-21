@@ -1,0 +1,328 @@
+// sfe-service 组装根（docs/ARCHITECTURE.md §3、§10、§11）：版本断言 → 配置 → 迁移 → 日志与脱敏 → 秘密存储 →
+// Surge 适配（按原语固定实现；演示模式为 FakeSurge）→ AppService 启动（对账、恢复、执行器）→ HTTP、原生桥、
+// agent/maintenance 套接字。收到 SIGINT/SIGTERM 时只关闭监听与执行器，从不改变 Surge 的入口或选择。
+
+import { randomBytes } from 'node:crypto';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
+import { realpath } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { SfeError } from '@sfe/contract';
+import { loadConfig, type ServiceConfig } from './config.js';
+import { openRepositories, type Repositories } from './db/index.js';
+import { createAppService, type EngineAppService } from './engine/app-service.js';
+import type { HostInfo } from './engine/context.js';
+import { createHttpServer, type HttpServerHandle } from './http/server.js';
+import { issueLoginUrl } from './http/login.js';
+import { createSessionStore } from './http/sessions.js';
+import { createAdminServer, type AdminServerHandle } from './ipc/admin-server.js';
+import { createBridgeServer, type BridgeServerHandle } from './ipc/bridge-server.js';
+import type { Logger, MaintenanceSurge, SecretStore, SurgeAdapter } from './ports.js';
+import { KeychainHelperStore } from './secrets/keychain-helper-store.js';
+import { MemorySecretStore } from './secrets/memory-store.js';
+import { secretStoreError } from './secrets/errors.js';
+import { createCliAdapter, defaultCodesignRunner, verifyCliPath } from './surge/cli-adapter.js';
+import { createCompositeAdapter } from './surge/composite.js';
+import { createHttpAdapter, parseHttpApiLine } from './surge/http-adapter.js';
+import { capabilityUnverified, SURGE_PRIMITIVES, type MechanismMap } from './surge/primitives.js';
+import { createDemoSurge, prepareDemoState, seedDemoData } from './demo/index.js';
+import { systemClock } from './util/clock.js';
+import { createIdGenerator } from './util/ids.js';
+import { createLogger, fileSink, type FileSink } from './util/logger.js';
+import { createScrubber } from './util/scrubber.js';
+import { createExclusivePrivateFile, ensurePrivateDirSync } from './util/secure-files.js';
+import { loadPepper } from './secrets/pepper.js';
+
+export const SERVICE_VERSION = '0.1.0';
+
+export interface StartOptions {
+  argv: string[];
+  env: NodeJS.ProcessEnv;
+  platform: NodeJS.Platform;
+  homedir: string;
+  cwd: string;
+  /** 日志额外输出（测试用）；缺省只写日志文件。 */
+  extraLogSink?: (line: string) => void;
+  /** 演示模式是否写入合成数据（默认 true）。 */
+  seedDemo?: boolean;
+  /** 是否启动原生桥（默认非演示模式启动；演示模式使用 /dev/native）。 */
+  bridge?: boolean;
+}
+
+export interface RunningService {
+  config: ServiceConfig;
+  app: EngineAppService;
+  repos: Repositories;
+  http: HttpServerHandle;
+  url: string;
+  bridge: BridgeServerHandle | null;
+  admin: AdminServerHandle[];
+  stop(): Promise<void>;
+}
+
+/** 断言 Node 版本等于打包版本（安装配置中有记录时）以及 node:sqlite 可用。 */
+export function assertRuntime(pin: string | null, version = process.version): void {
+  if (pin) {
+    const want = pin.startsWith('v') ? pin : `v${pin}`;
+    if (version !== want) throw new SfeError('INTERNAL', `启动失败：Node 版本 ${version} 与打包版本 ${want} 不一致`);
+  }
+  const [major, minor] = version.replace(/^v/, '').split('.').map(Number);
+  if ((major ?? 0) < 22 || ((major ?? 0) === 22 && (minor ?? 0) < 13)) throw new SfeError('INTERNAL', '启动失败：需要 Node 22.13 或更新版本（node:sqlite）');
+}
+
+function unavailableStore(): SecretStore {
+  return {
+    put: async () => {
+      throw secretStoreError('put', 'other', '没有配置钥匙串工具');
+    },
+    get: async () => {
+      throw secretStoreError('get', 'other', '没有配置钥匙串工具');
+    },
+    delete: async () => {
+      throw secretStoreError('delete', 'other', '没有配置钥匙串工具');
+    },
+  };
+}
+
+const unavailableMaintenance: MaintenanceSurge = {
+  // 本仓库的 CLI/HTTP 实现都没有提供重载原语：维护重载保持不可用，直到 P0 确认并实现
+  reloadProfile: async () => {
+    throw capabilityUnverified('reloadProfile');
+  },
+};
+
+function execText(file: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { timeout: 10_000, shell: false, encoding: 'utf8' }, (err, stdout) => (err ? reject(err) : resolve(String(stdout).trim())));
+  });
+}
+
+function macHost(platform: NodeJS.Platform): Partial<HostInfo> {
+  if (platform !== 'darwin') {
+    return { macosBuild: async () => 'unknown', safariVersion: async () => 'unknown' };
+  }
+  return {
+    macosBuild: async () => (await execText('/usr/bin/sw_vers', ['-buildVersion'])) || null,
+    safariVersion: async () => (await execText('/usr/bin/defaults', ['read', '/Applications/Safari.app/Contents/Info', 'CFBundleShortVersionString'])) || null,
+    processPathExists: (p) => {
+      try {
+        realpathSync(p);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+async function buildRealSurge(config: ServiceConfig, repos: Repositories, logger: Logger, scrub: (s: string) => string): Promise<SurgeAdapter> {
+  const mechanism: MechanismMap = {};
+  for (const p of SURGE_PRIMITIVES) mechanism[p] = config.adapterMechanism[p] ?? 'unavailable';
+  let cli: SurgeAdapter | undefined;
+  if (config.surgeCliPath && Object.values(mechanism).includes('cli')) {
+    const v = await verifyCliPath(config.surgeCliPath, { realpath, runCodesign: defaultCodesignRunner, teamId: null, platform: config.platform });
+    if (v.ok) cli = createCliAdapter({ cliPath: config.surgeCliPath, mechanism, scrub });
+    else logger.log('error', 'surge.cli_unverified', { reason: v.reason });
+  }
+  let http: SurgeAdapter | undefined;
+  const workingProfile = repos.settings.get('workingProfilePath');
+  if (workingProfile && Object.values(mechanism).includes('http')) {
+    try {
+      const api = parseHttpApiLine(readFileSync(workingProfile, 'utf8'));
+      if (api && api.loopbackOnly) {
+        http = createHttpAdapter({
+          baseUrl: `http://127.0.0.1:${api.port}`,
+          // 密钥在每次调用时从工作配置读取，不落库
+          getKey: async () => {
+            const cur = parseHttpApiLine(readFileSync(workingProfile, 'utf8'));
+            if (!cur || !cur.loopbackOnly) throw new SfeError('CAPABILITY_UNVERIFIED', '调用 Surge 失败：工作配置中的 HTTP API 不是只监听回环地址');
+            return cur.key;
+          },
+          mechanism,
+          scrub,
+        });
+      } else if (api) logger.log('error', 'surge.http_not_loopback');
+    } catch {
+      logger.log('warn', 'surge.http_unavailable');
+    }
+  }
+  const parts: Parameters<typeof createCompositeAdapter>[0] = { mechanism };
+  if (cli) parts.cli = cli;
+  if (http) parts.http = http;
+  return createCompositeAdapter(parts);
+}
+
+function readOrCreateToken(path: string, generate: () => string): string {
+  try {
+    const fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+      const st = fstatSync(fd);
+      const uid = process.getuid?.();
+      if (!st.isFile() || (uid !== undefined && st.uid !== uid) || (st.mode & 0o077) !== 0) {
+        throw new SfeError('UNSAFE_LOCATION', '启动失败：原生桥令牌文件权限不是 0600 或不属于当前用户');
+      }
+      return readFileSync(fd, 'utf8').trim();
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  return '';
+}
+
+export async function startService(opts: StartOptions): Promise<RunningService> {
+  const config = loadConfig({ argv: opts.argv, env: opts.env, platform: opts.platform, homedir: opts.homedir, cwd: opts.cwd });
+  assertRuntime(config.nodeVersionPin);
+  ensurePrivateDirSync(config.dataDir);
+  ensurePrivateDirSync(config.tmpDir);
+  ensurePrivateDirSync(config.backupsDir);
+
+  const scrubber = createScrubber();
+  const sink: FileSink = fileSink(config.logFile);
+  const logger = createLogger({
+    sink: (line) => {
+      sink(line);
+      opts.extraLogSink?.(line);
+    },
+    scrubber,
+  });
+  for (const issue of config.installConfigIssues) logger.log('warn', 'config.install_issue', { issue });
+  const ids = createIdGenerator();
+  const clock = systemClock;
+  const repos = openRepositories(config.databasePath, { clock, ids, scrubber });
+
+  let store: SecretStore;
+  let surge: SurgeAdapter;
+  let maintenance: MaintenanceSurge = unavailableMaintenance;
+  let demoSurge: ReturnType<typeof createDemoSurge> | null = null;
+  if (config.demo) {
+    demoSurge = createDemoSurge(config.dataDir);
+    store = demoSurge.store;
+    surge = demoSurge.fake;
+    maintenance = demoSurge.fake;
+    const pepper = await loadPepper(store, repos.meta, ids);
+    await prepareDemoState(repos, demoSurge, pepper);
+  } else {
+    store = config.keychainHelperPath
+      ? new KeychainHelperStore({ helperPath: config.keychainHelperPath, kindOf: (ref) => repos.secretRefs.get(ref)?.kind ?? null })
+      : unavailableStore();
+    surge = await buildRealSurge(config, repos, logger, (s) => scrubber.scrub(s));
+  }
+
+  const sessions = createSessionStore(repos.db.raw, { now: () => clock.now(), random: (n) => randomBytes(n) });
+  let http: HttpServerHandle | null = null;
+  const app = createAppService({
+    repos,
+    clock,
+    ids,
+    logger,
+    scrubber,
+    secretStore: store,
+    surge,
+    maintenanceSurge: maintenance,
+    paths: { dataDir: config.dataDir, tmpDir: config.tmpDir, backupsDir: config.backupsDir, homedir: config.homedir },
+    surgeCliPath: config.surgeCliPath,
+    demo: config.demo,
+    host: config.demo ? { macosBuild: async () => 'demo', safariVersion: async () => 'demo', processPathExists: () => true } : macHost(config.platform),
+    loginUrl: () => {
+      if (!http) throw new SfeError('INTERNAL', '签发登录链接失败：网页服务尚未启动');
+      return issueLoginUrl(sessions, http);
+    },
+    serviceVersion: SERVICE_VERSION,
+    ...(demoSurge ? { demoHooks: demoSurge.hooks } : {}),
+  });
+  await app.start();
+  if (demoSurge && opts.seedDemo !== false) {
+    try {
+      await seedDemoData(app, demoSurge);
+    } catch (err) {
+      logger.log('error', 'demo.seed_failed', { error: err instanceof Error ? err.message : 'unknown' });
+    }
+  }
+
+  http = createHttpServer({
+    app,
+    sessions,
+    port: config.httpPort,
+    webRoot: config.webRoot,
+    demo: config.demo,
+    extensionHarnessRoot: config.extensionHarnessRoot,
+    logger,
+    serviceVersion: SERVICE_VERSION,
+  });
+  const { url } = await http.listen();
+
+  let bridge: BridgeServerHandle | null = null;
+  if (opts.bridge ?? !config.demo) {
+    let token = readOrCreateToken(config.bridge.tokenFile, () => ids.token(32));
+    if (token === '') {
+      token = ids.token(32);
+      await createExclusivePrivateFile(config.bridge.tokenFile, `${token}\n`);
+    }
+    const t = token;
+    bridge = createBridgeServer({
+      app,
+      transport: config.bridge.transport === 'unix' ? { kind: 'unix', path: config.bridge.path } : { kind: 'tcp', host: '127.0.0.1', port: config.bridge.port },
+      token: () => t,
+      logger,
+    });
+    await bridge.listen();
+  }
+
+  const admin = [
+    createAdminServer({ app, path: config.agentSocketPath, role: 'agent', logger }),
+    createAdminServer({ app, path: config.maintenanceSocketPath, role: 'maintenance', logger }),
+  ];
+  for (const a of admin) await a.listen();
+  logger.log('info', 'service.started', { demo: config.demo, url });
+
+  let stopping: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    stopping ??= (async () => {
+      // 只关闭监听与执行器：从不改变 Surge 的入口状态或 SFE-ROUTE 选择
+      for (const a of admin) await a.close().catch(() => undefined);
+      await bridge?.close().catch(() => undefined);
+      await http?.close().catch(() => undefined);
+      await app.stop();
+      logger.log('info', 'service.stopped');
+      repos.db.close();
+      sink.close();
+    })();
+    return stopping;
+  };
+  return { config, app, repos, http, url, bridge, admin, stop };
+}
+
+async function main(): Promise<void> {
+  let service: RunningService;
+  try {
+    service = await startService({ argv: process.argv.slice(2), env: process.env, platform: process.platform, homedir: homedir(), cwd: process.cwd() });
+  } catch (err) {
+    const message = err instanceof SfeError ? err.message : '启动失败：内部错误';
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  process.stdout.write(`${service.config.demo ? '演示模式：' : ''}本机管理服务已启动 ${service.url}\n`);
+  if (service.config.demo) process.stdout.write(`演示数据目录：${join(service.config.dataDir)}\n`);
+  const shutdown = () => {
+    void service.stop().then(() => process.exit(0));
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+}
+
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) void main();

@@ -1,0 +1,186 @@
+// 准备页的到达与实测提交（docs/ARCHITECTURE.md §6.3 第 10–12 步、§6.4）。到达与签发检测编号是同步的
+// （只读 SFE-ROUTE 选择）；提交只做编号、epoch、场景、截止时间的同步核对并消费编号，Surge 侧核对与入口写入
+// 交给执行器（verify_submitted）。检测编号 ≥128 位随机、单次使用、绑定操作/环境/场景/epoch/截止时间。
+
+import { isIP } from 'node:net';
+import { SfeError, buildVerifyUrl, type BeginVerificationResponse, type NativeRequest } from '@sfe/contract';
+import type { OperationRecord } from '../db/index.js';
+import { payloadOf, type RoutePayload, type VerificationSubmission } from '../domain/operations.js';
+import type { Engine } from './context.js';
+import { currentSelection } from './handlers/route.js';
+
+type SubmitMessage = Extract<NativeRequest, { type: 'submitSafariVerification' }>;
+
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+/** 浏览器与服务时钟的容差。 */
+const CLOCK_GRACE_MS = 60_000;
+
+function savePayload(engine: Engine, op: OperationRecord, patch: Partial<RoutePayload>): RoutePayload {
+  const route = { ...payloadOf(op).route!, ...patch };
+  engine.repos.operations.update(op.id, { payload: { ...payloadOf(op), route } });
+  return route;
+}
+
+function opError(op: OperationRecord): SfeError {
+  if (op.error) return new SfeError(op.error.code, op.error.message);
+  return new SfeError('SUPERSEDED', '检测已结束：该操作不再等待检测');
+}
+
+export interface ArrivalContext {
+  profileId: string;
+  amazonTabsOpen: boolean;
+  /** 执行器唤醒（新的 outbox 条目）。 */
+  kick: () => void;
+}
+
+export async function beginVerification(engine: Engine, op: OperationRecord, ctx: ArrivalContext): Promise<BeginVerificationResponse> {
+  const { repos } = engine;
+  const p = payloadOf(op).route!;
+  switch (op.phase) {
+    case 'ACTIVE_VERIFIED':
+    case 'NORMAL_RESTORED':
+    case 'COMPLETED':
+      return { status: 'not_needed', message: '已完成，不需要再次检测' };
+    case 'READY_FOR_NEXT_OPEN':
+      return { status: 'not_needed', message: '等待已结束：新版本已部署，请重新使用此环境以切换' };
+    default:
+      break;
+  }
+  if (op.status === 'failed' || op.status === 'superseded' || op.status === 'needs_attention' || op.status === 'succeeded' || op.status === 'parked') {
+    throw opError(op);
+  }
+  if (op.status === 'queued' || op.status === 'running') {
+    return { status: 'pending', phase: op.phase, message: '正在切换出口，请稍候' };
+  }
+  // waiting
+  if (op.phase === 'WAITING_ROUTE') {
+    if (p.arrivedAt === null) {
+      repos.tx(() => {
+        savePayload(engine, op, { arrivedAt: engine.nowIso(), arrivedProfileId: ctx.profileId, amazonTabsAtVerify: ctx.amazonTabsOpen });
+        repos.operations.appendStep(op.id, op.phase, '绑定场景已到达');
+      });
+    }
+    if (!repos.outbox.pendingForOperation(op.id).some((r) => r.resumeReason === 'profile_arrived')) {
+      repos.outbox.enqueue(op.id, 'profile_arrived', engine.now());
+    }
+    ctx.kick();
+    engine.emit({ operations: [op.id] });
+    return { status: 'pending', phase: op.phase, message: '已到达，正在切换到新版本' };
+  }
+  if (p.stage !== 'verify_only' && p.stage !== 'probe_waiting') {
+    return { status: 'pending', phase: op.phase, message: '正在切换出口，请稍候' };
+  }
+  const route = repos.routeState.get();
+  if (op.routeEpoch !== route.routeEpoch) throw new SfeError('STALE_ROUTE_EPOCH', '检测失败：路由已变化，请重新开始');
+  if (p.stage === 'probe_waiting' && (route.entryMode !== 'ACTIVE' || route.phase !== 'active_verified')) {
+    return { status: 'pending', phase: op.phase, message: '等待路由恢复到使用中状态' };
+  }
+  const now = engine.now();
+  if (p.verifyDeadline !== null && Date.parse(p.verifyDeadline) <= now.getTime()) {
+    throw new SfeError('SAFARI_VERIFY_TIMEOUT', 'Safari 实测超时：请重新开始');
+  }
+  // 签发前重读选择：必须仍是目标节点
+  const sel = await currentSelection(engine);
+  if (sel !== p.nodeName) throw new SfeError('SAFARI_VERIFY_FAILED', '检测失败：SFE-ROUTE 选择已不是目标节点');
+
+  const existing = repos.verificationTests
+    .listForOperation(op.id)
+    .find((t) => t.consumedAt === null && t.profileId === ctx.profileId && t.routeEpoch === route.routeEpoch && Date.parse(t.deadline) > now.getTime());
+  const endpoint = engine.verifyEndpoint();
+  if (existing) {
+    return { status: 'ready', test_id: existing.testId, route_epoch: existing.routeEpoch, verify_url: buildVerifyUrl(endpoint, existing.testId), deadline: existing.deadline };
+  }
+  const deadline = p.verifyDeadline ?? new Date(now.getTime() + repos.settings.get('safariVerifyTimeoutSec') * 1000).toISOString();
+  const testId = engine.ids.token(24);
+  const first = p.verifyDeadline === null;
+  repos.tx(() => {
+    repos.verificationTests.insert({
+      testId,
+      operationId: op.id,
+      environmentId: p.targetEnvironmentId,
+      profileId: ctx.profileId,
+      routeEpoch: route.routeEpoch,
+      purpose: p.purpose,
+      deadline,
+    });
+    const fresh = repos.operations.get(op.id)!;
+    savePayload(engine, fresh, {
+      verifyDeadline: deadline,
+      arrivedAt: p.arrivedAt ?? now.toISOString(),
+      arrivedProfileId: ctx.profileId,
+      amazonTabsAtVerify: p.amazonTabsAtVerify ?? ctx.amazonTabsOpen,
+    });
+    if (first) {
+      repos.routeState.update({ awaitingDeadline: deadline });
+      repos.operations.appendStep(op.id, op.phase, ctx.amazonTabsOpen ? '绑定场景已到达（已有 Amazon 标签页：本次打开记为未经启动验证）' : '绑定场景已到达，开始出口检测');
+      repos.outbox.enqueue(op.id, 'verify_timeout', deadline);
+    }
+  });
+  if (first) {
+    ctx.kick();
+    engine.emit({ operations: [op.id], route: true });
+  }
+  return { status: 'ready', test_id: testId, route_epoch: route.routeEpoch, verify_url: buildVerifyUrl(endpoint, testId), deadline };
+}
+
+function parseIso(v: unknown): string | null {
+  if (typeof v !== 'string' || !ISO_RE.test(v)) return null;
+  const t = Date.parse(v);
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
+
+export function submitVerification(engine: Engine, msg: SubmitMessage, ctx: { profileId: string; environmentId: string; kick: () => void }): { accepted: boolean } {
+  const { repos } = engine;
+  const test = typeof msg.test_id === 'string' ? repos.verificationTests.get(msg.test_id) : null;
+  if (!test || test.operationId !== msg.operation_id || test.profileId !== ctx.profileId || test.environmentId !== ctx.environmentId) {
+    throw new SfeError('SAFARI_VERIFY_FAILED', '提交检测结果失败：检测编号无效');
+  }
+  if (test.consumedAt !== null) throw new SfeError('SAFARI_VERIFY_FAILED', '提交检测结果失败：检测编号已使用');
+  const op = repos.operations.get(test.operationId);
+  const p = op ? payloadOf(op).route : undefined;
+  if (!op || !p || op.status !== 'waiting' || (p.stage !== 'verify_only' && p.stage !== 'probe_waiting')) {
+    throw new SfeError('SUPERSEDED', '提交检测结果失败：该检测已结束或已被取代');
+  }
+  const route = repos.routeState.get();
+  if (msg.route_epoch !== test.routeEpoch || test.routeEpoch !== route.routeEpoch || op.routeEpoch !== route.routeEpoch) {
+    throw new SfeError('STALE_ROUTE_EPOCH', '提交检测结果失败：路由已变化，结果不能用于当前切换');
+  }
+  const now = engine.now();
+  if (Date.parse(test.deadline) <= now.getTime()) throw new SfeError('SAFARI_VERIFY_TIMEOUT', '提交检测结果失败：已超过检测截止时间');
+  const startedAt = parseIso(msg.started_at);
+  const finishedAt = parseIso(msg.finished_at);
+  const fieldErrors: Array<{ field: string; message: string }> = [];
+  if (!startedAt) fieldErrors.push({ field: 'started_at', message: '时间格式不正确' });
+  if (!finishedAt) fieldErrors.push({ field: 'finished_at', message: '时间格式不正确' });
+  if (startedAt && finishedAt) {
+    const s = Date.parse(startedAt);
+    const f = Date.parse(finishedAt);
+    if (f < s) fieldErrors.push({ field: 'finished_at', message: '结束时间早于开始时间' });
+    if (s < Date.parse(test.issuedAt) - CLOCK_GRACE_MS || f > now.getTime() + CLOCK_GRACE_MS) fieldErrors.push({ field: 'started_at', message: '检测时间不在本次检测的时间范围内' });
+  }
+  if (msg.observed_ip !== null && (typeof msg.observed_ip !== 'string' || isIP(msg.observed_ip) === 0)) fieldErrors.push({ field: 'observed_ip', message: '不是有效的 IP 地址' });
+  if (msg.http_status !== null && (typeof msg.http_status !== 'number' || !Number.isInteger(msg.http_status) || msg.http_status < 100 || msg.http_status > 599)) {
+    fieldErrors.push({ field: 'http_status', message: 'HTTP 状态码不正确' });
+  }
+  if (msg.error !== null && typeof msg.error !== 'string') fieldErrors.push({ field: 'error', message: '错误说明格式不正确' });
+  if (fieldErrors.length > 0) throw new SfeError('VALIDATION_FAILED', '提交检测结果失败：字段不正确', { fieldErrors });
+  if (!repos.verificationTests.consume(test.testId, now)) throw new SfeError('SAFARI_VERIFY_FAILED', '提交检测结果失败：检测编号已使用');
+  const submission: VerificationSubmission = {
+    testId: test.testId,
+    observedIp: msg.observed_ip,
+    httpStatus: msg.http_status,
+    error: msg.error === null ? null : engine.scrubber.scrub(String(msg.error).slice(0, 300)),
+    startedAt: startedAt!,
+    finishedAt: finishedAt!,
+    submittedAt: now.toISOString(),
+  };
+  repos.tx(() => {
+    const fresh = repos.operations.get(op.id)!;
+    repos.operations.update(op.id, { payload: { ...payloadOf(fresh), route: { ...payloadOf(fresh).route!, submission } } });
+    repos.operations.appendStep(op.id, op.phase, '已收到出口检测结果');
+    repos.outbox.enqueue(op.id, 'verify_submitted', now);
+  });
+  ctx.kick();
+  engine.emit({ operations: [op.id] });
+  return { accepted: true };
+}

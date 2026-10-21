@@ -1,0 +1,302 @@
+// AppService 实现：HTTP、agent/maintenance 套接字与原生桥共用的业务入口。受理在请求内同步完成并返回 202；
+// Surge 写入只在唯一执行器中发生。启动顺序：pepper → 主机事实 → 对账 → 恢复未完成操作 → 执行器 → 周期任务。
+// 停止只停执行器与计时器，从不改变入口状态或 SFE-ROUTE 选择。
+
+import {
+  SfeError,
+  type AccountDetail,
+  type CapabilityView,
+  type ImportCommitResult,
+  type ImportPreview,
+  type LoginCodeResponse,
+  type NativeResponse,
+  type OperationView,
+  type SettingsView,
+  type Snapshot,
+  type SurgeStatusView,
+} from '@sfe/contract';
+import type { Actor, AppService, SurgePolicyCandidates } from '../app.js';
+import { importTemplateCsv } from '../importer/index.js';
+import { BUILTIN_POLICIES } from '../surge/rules.js';
+import { sweepTempFiles } from '../util/secure-files.js';
+import {
+  acceptAcknowledgeAccount,
+  acceptAcknowledgeWindows,
+  acceptActivate,
+  acceptCancel,
+  acceptCreate,
+  acceptDelete,
+  acceptNormal,
+  acceptProbe,
+  acceptPublishPending,
+  acceptUnbind,
+  acceptUpdate,
+  getEnvironment,
+  insertOperation,
+  type AcceptDeps,
+} from './accept.js';
+import {
+  confirmCapability,
+  proposeCapability,
+  registerFrontProxy,
+  replaceFrontCommit,
+  replaceFrontPreview,
+  updateFrontProxy,
+  updateSettings,
+  verifyFrontProxy,
+} from './admin-ops.js';
+import { Engine, type AppServiceDeps } from './context.js';
+import { createDispatcher } from './dispatch.js';
+import { Executor } from './executor.js';
+import { importCommit, importPreview } from './import.js';
+import { initCommit, initPreview, remergeCommit, remergePreview } from './maintenance.js';
+import { handleNative } from './native.js';
+import { controlAfterReconcile, reconcile, surgeStatus } from './reconcile.js';
+import { createViewService, type ViewService } from './view-service.js';
+import type { ControlEvaluation } from '../domain/route-rules.js';
+
+export type { AppServiceDeps } from './context.js';
+
+const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+const DEFAULT_PRECHECK_TIMEOUT_MS = 5_000;
+
+export interface EngineAppService extends AppService {
+  /** 测试与组装用：引擎内部（只读访问）。 */
+  readonly engine: Engine;
+  readonly executor: Executor;
+  readonly views: ViewService;
+  /** 等待执行器处理完所有到期任务。 */
+  idle(): Promise<void>;
+  /** 立即运行一次周期对账（测试用）。 */
+  runPeriodicReconcile(): Promise<void>;
+  ensureInControl(opts?: { maxAgeMs?: number }): Promise<ControlEvaluation>;
+}
+
+function requireWebOrAdmin(actor: Actor, action: string): void {
+  if (actor.kind !== 'web' && actor.kind !== 'admin') throw new SfeError('BAD_REQUEST', `${action}失败：该通道无权执行此操作`);
+}
+
+export function createAppService(deps: AppServiceDeps): EngineAppService {
+  const engine = new Engine(deps);
+  const views = createViewService(engine);
+  engine.views = views;
+  let executor: Executor;
+  const kick = () => executor.kick();
+  const acceptDeps: AcceptDeps = { engine, views, kick };
+  const dispatch = createDispatcher(engine, {
+    enqueuePublish: () => {
+      const op = engine.repos.tx(() =>
+        insertOperation(engine, {
+          kind: 'deploy.publish',
+          requestId: `remerge:${engine.ids.token(16)}`,
+          digest: 'service',
+          actor: { kind: 'admin' },
+          payload: { environmentIds: null },
+          step: '重新合并后发布节点资源',
+        }),
+      );
+      engine.emit({ operations: [op.id] });
+      kick();
+    },
+  });
+  executor = new Executor(engine, dispatch);
+  const serviceVersion = deps.serviceVersion ?? '0.0.0-dev';
+
+  // ---------- 受控判定（动作前短超时对账） ----------
+
+  let controlCache: { at: number; value: ControlEvaluation } | null = null;
+  async function ensureInControl(opts: { maxAgeMs?: number } = {}): Promise<ControlEvaluation> {
+    const maxAge = opts.maxAgeMs ?? 0;
+    const nowMs = engine.now().getTime();
+    if (controlCache && maxAge > 0 && nowMs - controlCache.at <= maxAge) return controlCache.value;
+    const timeoutMs = deps.precheckTimeoutMs ?? DEFAULT_PRECHECK_TIMEOUT_MS;
+    let cancelTimer: () => void = () => undefined;
+    const timeout = new Promise<ControlEvaluation>((resolve) => {
+      cancelTimer = engine.clock.setTimeout(() => resolve({ ok: false, reason: '读取 Surge 状态超时' }), timeoutMs);
+    });
+    const run = executor
+      .tryRunExclusive(async () => {
+        await reconcile(engine, 'precheck');
+        return controlAfterReconcile(engine);
+      })
+      .then((r) => r ?? { ok: false, reason: '正在切换出口，请稍后再试' })
+      .catch(() => ({ ok: false, reason: '读取 Surge 状态失败' }));
+    const value = await Promise.race([run, timeout]);
+    cancelTimer();
+    controlCache = { at: engine.now().getTime(), value };
+    return value;
+  }
+
+  // ---------- 周期任务 ----------
+
+  let reconcileTimer: (() => void) | null = null;
+  let sweepTimer: (() => void) | null = null;
+  let stopped = true;
+
+  function scheduleReconcile(): void {
+    reconcileTimer?.();
+    if (stopped) return;
+    const sec = engine.repos.settings.get('reconcileIntervalSec');
+    reconcileTimer = engine.clock.setTimeout(() => {
+      void runPeriodicReconcile().finally(() => scheduleReconcile());
+    }, sec * 1000);
+  }
+
+  async function runPeriodicReconcile(): Promise<void> {
+    const route = engine.repos.routeState.get();
+    // 只在路由阶段不是 idle 或入口不是 NORMAL 时对账；作为执行器内部任务，写入进行中时自动延后
+    if (route.phase === 'idle' && route.entryMode === 'NORMAL') return;
+    try {
+      await executor.runInternal('reconcile', () => reconcile(engine, 'periodic'));
+    } catch (err) {
+      engine.log('warn', 'reconcile.failed', { error: err instanceof Error ? err.name : 'unknown' });
+    }
+  }
+
+  function scheduleSweep(): void {
+    sweepTimer?.();
+    if (stopped) return;
+    sweepTimer = engine.clock.setTimeout(() => {
+      void runSweep().finally(() => scheduleSweep());
+    }, SWEEP_INTERVAL_MS);
+  }
+
+  async function runSweep(): Promise<void> {
+    try {
+      const r = await executor.runInternal('secret-sweep', () => engine.secrets.sweep());
+      if (r.deleted.length + r.failed.length > 0) engine.log('info', 'secrets.swept', { deleted: r.deleted.length, kept: r.kept.length, failed: r.failed.length });
+    } catch (err) {
+      engine.log('warn', 'secrets.sweep_failed', { error: err instanceof Error ? err.name : 'unknown' });
+    }
+  }
+
+  // ---------- 服务 ----------
+
+  const service: EngineAppService = {
+    engine,
+    get executor() {
+      return executor;
+    },
+    views,
+    events: engine.events,
+
+    async snapshot(_actor) {
+      return views.snapshot(serviceVersion, deps.demo) satisfies Snapshot;
+    },
+    async listEnvironments(_actor) {
+      return views.environmentViews();
+    },
+    async getEnvironment(id, _actor) {
+      const v = typeof id === 'string' ? views.environmentView(id) : null;
+      if (!v) throw new SfeError('NOT_FOUND', '读取环境失败：环境不存在');
+      return v;
+    },
+    createEnvironment: (req, actor) => acceptCreate(acceptDeps, req, actor),
+    updateEnvironment: (id, req, actor) => acceptUpdate(acceptDeps, id, req, actor),
+    deleteEnvironment: (id, req, actor) => acceptDelete(acceptDeps, id, req, actor),
+    async accountDetail(id, actor): Promise<AccountDetail> {
+      requireWebOrAdmin(actor, '读取账号');
+      const env = getEnvironment(engine, id, '读取账号');
+      const acc = engine.repos.accounts.get(env.id);
+      return { environment_id: env.id, label: acc?.label ?? null, loginIdentifier: acc?.loginIdentifier ?? null, hasPassword: Boolean(acc?.passwordRef) };
+    },
+    acknowledgeAccount: (id, req, actor) => acceptAcknowledgeAccount(acceptDeps, id, req, actor),
+    unbind: (id, req, actor) => acceptUnbind(acceptDeps, id, req, actor),
+    activate: (id, req, actor) => acceptActivate(acceptDeps, id, req, actor),
+    enterNormal: (req, actor) => acceptNormal(acceptDeps, req, actor),
+    probe: (id, req, actor) => acceptProbe(acceptDeps, id, req, actor),
+    publishPending: (req, actor) => acceptPublishPending(acceptDeps, req, actor),
+    async getOperation(id, _actor): Promise<OperationView> {
+      const v = typeof id === 'string' ? views.operationView(id) : null;
+      if (!v) throw new SfeError('NOT_FOUND', '读取操作失败：操作不存在');
+      return v;
+    },
+    cancelOperation: (id, req, actor) => acceptCancel(acceptDeps, id, req, actor),
+    async acknowledgeWindows(req, actor) {
+      return (await acceptAcknowledgeWindows(acceptDeps, req, actor)).accepted;
+    },
+    async listOperations(limit, _actor) {
+      const n = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 50;
+      return views.operationViews(engine.repos.operations.listRecent(n));
+    },
+    importPreview: (req, actor): Promise<ImportPreview> => importPreview(acceptDeps, req, actor),
+    importCommit: (req, actor): Promise<ImportCommitResult> => importCommit(acceptDeps, req, actor),
+    importTemplateCsv: () => importTemplateCsv(),
+    async listCapabilities(): Promise<CapabilityView[]> {
+      return engine.capabilityViews();
+    },
+    proposeCapability: (req, actor) => proposeCapability(acceptDeps, req, actor),
+    confirmCapability: (req, actor) => confirmCapability(acceptDeps, req, actor),
+    async getSettings(): Promise<SettingsView> {
+      return views.settingsView();
+    },
+    updateSettings: (req, actor) => updateSettings(acceptDeps, req, actor),
+    async listFrontProxies() {
+      return views.frontProxyViews();
+    },
+    registerFrontProxy: (req, actor) => registerFrontProxy(acceptDeps, req, actor),
+    updateFrontProxy: (id, req, actor) => updateFrontProxy(acceptDeps, id, req, actor),
+    verifyFrontProxy: (id, req, actor) => verifyFrontProxy(acceptDeps, id, req, actor),
+    replaceFrontPreview: (id, req, actor) => replaceFrontPreview(acceptDeps, id, req, actor),
+    replaceFrontCommit: (id, req, actor) => replaceFrontCommit(acceptDeps, id, req, actor),
+    async surgePolicies(): Promise<SurgePolicyCandidates> {
+      const p = await engine.surge.listPolicies();
+      const groups = new Set(p.groups);
+      return {
+        proxies: p.proxies.filter((n) => !/^SFE-/i.test(n) && !BUILTIN_POLICIES.has(n.toUpperCase()) && !groups.has(n)),
+        groups: p.groups.filter((n) => !/^SFE-/i.test(n)),
+      };
+    },
+    async refreshSurge(_actor): Promise<SurgeStatusView> {
+      await executor.runInternal('refresh', () => reconcile(engine, 'refresh'));
+      return surgeStatus(engine);
+    },
+    initPreview: (req, actor) => initPreview(acceptDeps, req, actor),
+    initCommit: (req, actor) => initCommit(acceptDeps, req, actor),
+    remergePreview: (actor) => remergePreview(acceptDeps, actor),
+    remergeCommit: (req, actor) => remergeCommit(acceptDeps, req, actor),
+    async issueLoginCode(actor): Promise<LoginCodeResponse> {
+      if (actor.kind !== 'admin') throw new SfeError('BAD_REQUEST', '签发登录链接失败：只能由维护通道签发');
+      if (!deps.loginUrl) throw new SfeError('INTERNAL', '签发登录链接失败：网页服务尚未启动');
+      return deps.loginUrl();
+    },
+    async handleNative(envelope): Promise<NativeResponse> {
+      return handleNative({ ...acceptDeps, ensureInControl: (o) => ensureInControl(o) }, envelope);
+    },
+    async start() {
+      if (!stopped) return;
+      stopped = false;
+      try {
+        await engine.keys();
+      } catch {
+        engine.log('error', 'pepper.unavailable');
+      }
+      await sweepTempFiles(deps.paths.tmpDir).catch(() => []);
+      await engine.refreshHostFacts();
+      // 启动：放回上次未完成的领取，读 Surge 事实对账，再开始执行器（未完成操作由执行器按事实恢复）
+      const released = engine.repos.outbox.releaseClaims();
+      if (released > 0) engine.log('warn', 'startup.released_claims', { count: released });
+      try {
+        await reconcile(engine, 'startup');
+      } catch (err) {
+        engine.log('warn', 'startup.reconcile_failed', { error: err instanceof Error ? err.name : 'unknown' });
+      }
+      executor.start();
+      void runSweep();
+      scheduleReconcile();
+      scheduleSweep();
+    },
+    async stop() {
+      stopped = true;
+      reconcileTimer?.();
+      sweepTimer?.();
+      reconcileTimer = null;
+      sweepTimer = null;
+      await executor.stop();
+    },
+    idle: () => executor.idle(),
+    runPeriodicReconcile,
+    ensureInControl,
+  };
+  return service;
+}

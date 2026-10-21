@@ -1,0 +1,330 @@
+// inventory（只读）：系统与 Safari/Surge 版本、CLI 签名与帮助、各读原语经 CLI/HTTP 是否可用、外部资源、
+// 当前配置名、临时规则、接管与出站、自动重载、Safari/WebKit 进程候选、配置目录是否在同步位置。
+// 写入 inventory.json，打印表格与建议的 adapterMechanism。盘点从不调用任何写原语（写入守卫全部拒绝）。
+
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
+import { CAPABILITY_CRITERIA, type TakeoverState } from '@sfe/contract';
+import { CALLS_LOG } from '../constants.js';
+import {
+  detectManagedConfigHeader,
+  findForeignSfeObjects,
+  listRelativeReferences,
+  listRemoteSourceHosts,
+  parseHttpApiLine,
+  type SurgeAdapter,
+} from '../deps.js';
+import { refused, type ExitCode } from '../errors.js';
+import { check, writeResult } from '../results.js';
+import { classifyLocationRisk, findGitWorkTree } from '../run-dir.js';
+import { saveState, type InventorySummary } from '../state.js';
+import {
+  ACTIVE_PRIMITIVES,
+  HTTP_NOT_IMPLEMENTED,
+  READ_PRIMITIVES,
+  allMechanism,
+  cliAvailability,
+  createGuardedAdapter,
+  createP0Adapter,
+  describeLocation,
+  emptyGuard,
+  errorCode,
+  helpWords,
+  proposeMechanism,
+  type CliAvailability,
+  type Primitive,
+  type ProbeOutcome,
+  type ReadPrimitive,
+} from '../surge-access.js';
+import { SAFARI_APP, SURGE_APP, appVersion, listProcesses, surgeProcesses, swVers, webkitSafariCandidates } from '../system.js';
+import { TEST_PROFILE_NAME } from '../test-profile.js';
+import { createRun, fmtBool, measureContext, openRun, printResult, profileNameOf, resolveCli, tryRead, type Ctx } from './common.js';
+
+const HELP_LINE_RE = /temp|rule|resource|policy|polic|request|dump|version|check|select|kill|profile|group|test/i;
+
+interface ProbeContext {
+  group: string | null;
+  policy: string | null;
+  profilePath: string | null;
+}
+
+async function probe(adapter: SurgeAdapter, p: ReadPrimitive, c: ProbeContext): Promise<{ outcome: ProbeOutcome; value: unknown }> {
+  const call = async (): Promise<unknown> => {
+    switch (p) {
+      case 'getGroupMembers':
+        return adapter.getGroupMembers(c.group!);
+      case 'getGroupSelection':
+        return adapter.getGroupSelection(c.group!);
+      case 'getPolicyDetail':
+        return adapter.getPolicyDetail(c.policy!);
+      case 'checkProfile':
+        return adapter.checkProfile(c.profilePath!);
+      default:
+        return (adapter[p] as () => Promise<unknown>)();
+    }
+  };
+  if ((p === 'getGroupMembers' || p === 'getGroupSelection') && !c.group) return { outcome: { status: 'skipped', code: null }, value: null };
+  if (p === 'getPolicyDetail' && !c.policy) return { outcome: { status: 'skipped', code: null }, value: null };
+  if (p === 'checkProfile' && !c.profilePath) return { outcome: { status: 'skipped', code: null }, value: null };
+  try {
+    return { outcome: { status: 'ok', code: null }, value: await call() };
+  } catch (e) {
+    const code = errorCode(e);
+    return { outcome: { status: code === 'CAPABILITY_UNVERIFIED' ? 'not_implemented' : 'error', code }, value: null };
+  }
+}
+
+/** 盘点结果中只保留识别所需的信息（不保存策略详情原文、规则全文与请求主机）。 */
+function summarizeValue(p: ReadPrimitive, v: unknown): unknown {
+  if (v === null || v === undefined) return null;
+  switch (p) {
+    case 'listRules':
+    case 'listActiveRequests':
+    case 'listRecentRequests':
+      return { count: Array.isArray(v) ? v.length : null };
+    case 'listPolicies': {
+      const x = v as { proxies: string[]; groups: string[] };
+      return { proxies: x.proxies.length, groups: x.groups.length };
+    }
+    case 'getPolicyDetail': {
+      const d = v as { type: string | null; underlyingProxy: string | null };
+      return { type: d.type, hasUnderlyingProxy: d.underlyingProxy !== null };
+    }
+    case 'listExternalResources':
+      return (v as Array<{ key: string; type: string; location: string; lastUpdatedAt: Date | null; error: string | null }>).map((r) => ({
+        key: r.key,
+        type: r.type,
+        location: describeLocation(r.location),
+        lastUpdatedAtAvailable: r.lastUpdatedAt !== null,
+        error: r.error !== null,
+      }));
+    case 'checkProfile':
+      return { ok: (v as { ok: boolean }).ok };
+    default:
+      return v;
+  }
+}
+
+function candidateProfileDirs(home: string): string[] {
+  return [join(home, 'Library', 'Application Support', 'Surge', 'Profiles'), join(home, 'Library', 'Mobile Documents', 'iCloud~com~nssurge~inc', 'Documents')];
+}
+
+export async function runInventory(ctx: Ctx): Promise<ExitCode> {
+  const { out, exec, now, home } = ctx.deps;
+  const { dir, state: initial } = ctx.args.strings.run ? openRun(ctx) : createRun(ctx);
+  let state = initial;
+  out.heading(`P0 盘点（只读） · 运行 ${dir.id}`);
+  out.line(`原始证据目录：${dir.path}（0700，文件 0600，不在仓库内）`);
+
+  const macos = await swVers(exec);
+  const safari = await appVersion(exec, SAFARI_APP);
+  const surgeApp = await appVersion(exec, SURGE_APP);
+  const procs = await listProcesses(exec);
+  const webkit = webkitSafariCandidates(procs);
+  dir.writeJson('inventory/processes.json', { at: now().toISOString(), webkitSafariCandidates: webkit, surge: surgeProcesses(procs) });
+
+  // CLI：签名校验通过才执行；帮助原文存运行目录。
+  const cli = await resolveCli(ctx, state);
+  let words = new Set<string>();
+  if (cli.ok) {
+    const r = await exec(cli.path, ['--help'], { timeoutMs: 15_000 });
+    const help = `${r.stdout}\n${r.stderr}`;
+    dir.writeAtomic('inventory/surge-cli-help.txt', help);
+    words = helpWords(help);
+    const relevant = help.split(/\r?\n/).filter((l) => HELP_LINE_RE.test(l)).slice(0, 40);
+    dir.writeAtomic('inventory/surge-cli-help-relevant.txt', `${relevant.join('\n')}\n`);
+  }
+
+  // 当前配置文件（只读）。
+  const profilePath = ctx.args.strings.profile ?? state.sourceProfilePath;
+  let profileInfo: Record<string, unknown> | null = null;
+  let httpApi: { key: string; port: number } | null = null;
+  let httpApiInfo = { configured: false, loopbackOnly: null as boolean | null };
+  if (profilePath) {
+    if (!isAbsolute(profilePath) || !existsSync(profilePath) || !statSync(profilePath).isFile()) throw refused('盘点失败：--profile 必须是存在的配置文件绝对路径');
+    const text = readFileSync(profilePath, 'utf8');
+    const api = parseHttpApiLine(text);
+    httpApiInfo = { configured: api !== null, loopbackOnly: api?.loopbackOnly ?? null };
+    if (api?.loopbackOnly) httpApi = { key: api.key, port: api.port };
+    const profileDir = dirname(profilePath);
+    let sfeFiles: string[] = [];
+    try {
+      sfeFiles = readdirSync(profileDir).filter((n) => /^sfe-/i.test(n));
+    } catch {
+      /* 目录不可读 */
+    }
+    profileInfo = {
+      name: profileNameOf(profilePath),
+      directoryRisk: classifyLocationRisk(profileDir, home),
+      inGitWorkTree: findGitWorkTree(profileDir) !== null,
+      managedConfigHeader: detectManagedConfigHeader(text) !== null,
+      sfeObjects: findForeignSfeObjects(text, { names: [], files: [] }).length,
+      sfeFilesInDirectory: sfeFiles,
+      relativeReferences: listRelativeReferences(text).map((r) => ({ kind: r.kind, file: r.value.slice(r.value.lastIndexOf('/') + 1) })),
+      remoteSourceHosts: listRemoteSourceHosts(text),
+      httpApi: httpApiInfo,
+    };
+    dir.writeJson('inventory/profile-structure.json', profileInfo);
+    // 切换到测试配置后重新盘点（更新原语映射）时，不把测试配置记成“原配置”。
+    if (profileNameOf(profilePath) !== TEST_PROFILE_NAME) state = { ...state, sourceProfilePath: profilePath, sourceProfileName: profileNameOf(profilePath) };
+  } else {
+    const names: Record<string, string[]> = {};
+    for (const d of candidateProfileDirs(home)) {
+      try {
+        names[d] = readdirSync(d).filter((n) => n.endsWith('.conf'));
+      } catch {
+        /* 不存在 */
+      }
+    }
+    dir.writeJson('inventory/profile-candidates.json', names);
+  }
+
+  // 读原语逐个探测：CLI 只执行帮助中出现的命令；HTTP 只在 http-api 绑定回环时使用。
+  const log = (e: unknown): void => dir.appendJsonl(CALLS_LOG, e);
+  const cliAdapter = cli.ok ? createGuardedAdapter(createP0Adapter({ cliPath: cli.path, httpApi: null, mechanism: allMechanism('cli') }), emptyGuard(), log, now) : null;
+  const httpAdapter = httpApi ? createGuardedAdapter(createP0Adapter({ cliPath: null, httpApi, mechanism: allMechanism('http') }), emptyGuard(), log, now) : null;
+  const cliHelp: Partial<Record<Primitive, CliAvailability>> = {};
+  for (const p of [...READ_PRIMITIVES, ...ACTIVE_PRIMITIVES]) cliHelp[p] = cliAvailability(p, words);
+
+  const cliProbes: Partial<Record<Primitive, ProbeOutcome>> = {};
+  const httpProbes: Partial<Record<Primitive, ProbeOutcome>> = {};
+  const values: Record<string, unknown> = {};
+  const pc: ProbeContext = { group: null, policy: null, profilePath: profilePath ?? null };
+  // listPolicies 先测，为组与策略详情提供参数。
+  const order: ReadPrimitive[] = ['listPolicies', ...READ_PRIMITIVES.filter((p) => p !== 'listPolicies')];
+  for (const p of order) {
+    if (!cliAdapter) cliProbes[p] = { status: 'unavailable', code: null };
+    else if (cliHelp[p] !== 'in_help') cliProbes[p] = { status: cliHelp[p] === 'not_in_table' ? 'not_in_table' : 'not_in_help', code: null };
+    else {
+      const r = await probe(cliAdapter, p, pc);
+      cliProbes[p] = r.outcome;
+      if (r.outcome.status === 'ok') values[p] = r.value;
+    }
+    if (!httpAdapter) httpProbes[p] = { status: 'unavailable', code: null };
+    else if (HTTP_NOT_IMPLEMENTED.includes(p)) httpProbes[p] = { status: 'not_implemented', code: null };
+    else {
+      const r = await probe(httpAdapter, p, pc);
+      httpProbes[p] = r.outcome;
+      if (r.outcome.status === 'ok' && values[p] === undefined) values[p] = r.value;
+    }
+    if (p === 'listPolicies' && values.listPolicies) {
+      const pol = values.listPolicies as { proxies: string[]; groups: string[] };
+      pc.group = pol.groups[0] ?? null;
+      pc.policy = pol.proxies[0] ?? null;
+    }
+  }
+  const httpUsable = httpProbes.getCurrentProfile?.status === 'ok' || httpProbes.listPolicies?.status === 'ok';
+  const proposal = proposeMechanism(cliProbes, httpProbes, cliHelp, httpUsable);
+
+  const takeover = (values.getTakeoverState as TakeoverState | undefined) ?? null;
+  const version = (values.getVersion as { version: string; build: string | null } | undefined) ?? null;
+  const currentProfile = (values.getCurrentProfile as { name: string } | undefined)?.name ?? null;
+  const summary: InventorySummary = {
+    at: now().toISOString(),
+    macos,
+    safari,
+    surgeApp,
+    surgeVersion: { version: version?.version ?? null, build: version?.build ?? null },
+    cliVerified: { ok: cli.ok, reason: cli.reason },
+    httpApi: httpApiInfo,
+    currentProfileName: currentProfile,
+    profileDirectoryRisk: (profileInfo?.directoryRisk as InventorySummary['profileDirectoryRisk']) ?? null,
+    autoReload: (values.getAutoReloadSetting as boolean | undefined) ?? null,
+    takeover: takeover ? { enhancedMode: takeover.enhancedMode, systemProxy: takeover.systemProxy, outboundMode: takeover.outboundMode } : null,
+    webkitSafariProcesses: webkit,
+  };
+  const inventory = {
+    runId: dir.id,
+    summary,
+    profile: profileInfo,
+    cliHelp,
+    probes: { cli: cliProbes, http: httpProbes },
+    values: Object.fromEntries(Object.entries(values).map(([k, v]) => [k, summarizeValue(k as ReadPrimitive, v)])),
+    proposedMechanism: proposal.mechanism,
+    mechanismNotes: proposal.notes,
+    unproven: proposal.unproven,
+  };
+  dir.writeJson('inventory.json', inventory);
+  state = { ...state, surgeCliPath: cli.path, mechanism: proposal.mechanism, inventory: summary };
+  saveState(dir, state);
+
+  out.heading('系统与版本');
+  out.table([
+    ['项目', '结果'],
+    ['macOS', `${macos.productVersion ?? '读不到'}（${macos.buildVersion ?? '读不到'}）`],
+    ['Safari', `${safari.version ?? '读不到'}（${safari.build ?? '读不到'}）`],
+    ['Surge.app', `${surgeApp.version ?? '读不到'}（${surgeApp.build ?? '读不到'}）`],
+    ['Surge getVersion', version ? `${version.version}（${version.build ?? '无构建号'}）` : '不可用（能力上下文中的版本将为空）'],
+    ['Surge CLI', cli.ok ? `签名校验通过（${cli.reason}）` : `不可用（${cli.reason}）`],
+    ['http-api', httpApiInfo.configured ? (httpApiInfo.loopbackOnly ? '已配置，只监听回环' : '已配置，绑定非回环地址（不使用）') : profilePath ? '未配置' : '未提供 --profile'],
+    ['当前配置', currentProfile ?? '读不到'],
+    ['配置目录', profileInfo ? String(profileInfo.directoryRisk) : '未提供 --profile'],
+    ['自动重载设置', summary.autoReload === null ? '读不到（需在 Surge 设置中查看并在 refresh 中声明）' : summary.autoReload ? '开' : '关'],
+    ['接管', takeover ? `增强模式 ${fmtBool(takeover.enhancedMode)}，系统代理 ${fmtBool(takeover.systemProxy)}，出站 ${takeover.outboundMode ?? '读不到'}` : '读不到'],
+    ['临时规则', Array.isArray(values.listTempRules) ? `${(values.listTempRules as unknown[]).length} 条` : '读不到'],
+    ['外部资源', Array.isArray(values.listExternalResources) ? `${(values.listExternalResources as unknown[]).length} 个` : '读不到'],
+  ]);
+  if (profileInfo) {
+    const sfe = profileInfo.sfeFilesInDirectory as string[];
+    if (sfe.length > 0) out.warn(`配置目录中已有 ${sfe.length} 个 sfe-* 文件（可能已初始化过）：make-test-profile 需要用 --target-dir 指定单独目录`);
+    if (profileInfo.directoryRisk !== 'none') out.warn('配置目录位于同步或受保护位置：正式产品不会在此写入，测试配置也不会写入');
+    if (profileInfo.managedConfigHeader) out.warn('源配置带 #!MANAGED-CONFIG 远端托管头');
+  } else {
+    out.warn('没有提供 --profile：http-api 与配置结构未检查。请在 Surge「配置」中「在访达中显示」找到当前配置文件路径后重新运行');
+  }
+
+  out.heading('Safari / WebKit 进程候选（只是候选，归属以 attribution 实测为准）');
+  for (const p of webkit) out.line(`  ${p}`);
+  if (webkit.length === 0) out.line('  （没有找到；先打开 Safari 再运行）');
+
+  out.heading('原语可用性');
+  out.table([
+    ['原语', 'CLI', 'HTTP', '建议'],
+    ...[...READ_PRIMITIVES, ...ACTIVE_PRIMITIVES].map((p) => [
+      p,
+      (cliProbes[p]?.status ?? cliHelp[p] ?? '-') + (cliProbes[p]?.code ? `(${cliProbes[p]!.code})` : ''),
+      (httpProbes[p]?.status ?? (HTTP_NOT_IMPLEMENTED.includes(p) ? 'not_implemented' : httpUsable ? 'write_untested' : 'unavailable')) + (httpProbes[p]?.code ? `(${httpProbes[p]!.code})` : ''),
+      proposal.mechanism[p],
+    ]),
+  ]);
+  out.heading('建议的 adapterMechanism（写入 install.json 前先完成各测试命令；未证明的主动原语不能当作已通过）');
+  out.json(proposal.mechanism);
+  if (proposal.unproven.length > 0) out.line(`待证明的主动原语：${proposal.unproven.join('、')}`);
+
+  // takeover_state_readable：按建议的固定映射只读获取三项（与服务运行时同一来源）。
+  const fixedAdapter = createGuardedAdapter(createP0Adapter({ cliPath: cli.ok ? cli.path : null, httpApi, mechanism: proposal.mechanism }), emptyGuard(), log, now);
+  const fixedSource = { adapter: fixedAdapter, mechanism: proposal.mechanism };
+  const context = await measureContext(ctx, fixedSource, state);
+  const fixedTakeover = await tryRead(() => fixedAdapter.getTakeoverState());
+  const fixed = proposal.mechanism.getTakeoverState !== 'unavailable';
+  const takeoverResult = writeResult(dir, {
+    key: 'takeover_state_readable',
+    command: 'inventory',
+    at: now().toISOString(),
+    checks: [
+      check('getTakeoverState 有固定实现', fixed, fixed ? `经 ${proposal.mechanism.getTakeoverState}` : '没有可用实现'),
+      check('增强模式可读', fixedTakeover !== null && fixedTakeover.enhancedMode !== null),
+      check('系统代理可读', fixedTakeover !== null && fixedTakeover.systemProxy !== null),
+      check('出站模式可读', fixedTakeover !== null && fixedTakeover.outboundMode !== null),
+    ],
+    summary: [
+      `通过条件：${CAPABILITY_CRITERIA.takeover_state_readable}`,
+      `增强模式 ${fmtBool(fixedTakeover?.enhancedMode)}，系统代理 ${fmtBool(fixedTakeover?.systemProxy)}，出站模式 ${fixedTakeover?.outboundMode ?? '读不到'}`,
+    ],
+    context,
+  });
+  state = { ...state, lastContext: context };
+  saveState(dir, state);
+  out.heading('接管与出站模式读取');
+  printResult(out, takeoverResult);
+  out.heading('下一步');
+  if (state.testProfilePath) {
+    out.line('已按测试配置更新原语映射；继续 attribution。');
+  } else {
+    out.line('1. 在另一个终端运行 test-servers 并保持运行。');
+    out.line('2. 运行 make-test-profile 生成测试配置，然后在 Surge 中手动切换到「SFE-P0-测试」。');
+    out.line('3. 切换后运行 inventory --run <运行编号> --profile <测试配置路径>，按测试配置（含回环 http-api）更新原语映射。');
+  }
+  out.line(`运行编号：${dir.id}（之后的命令默认使用最近一次运行）`);
+  return 0;
+}
