@@ -49,6 +49,7 @@ describe('CLI help analysis', () => {
     expect(cliAvailability('listTempRules', w)).toBe('in_help');
     expect(cliAvailability('selectGroupPolicy', w)).toBe('not_in_table');
     expect(cliAvailability('killRequest', w)).toBe('not_in_table');
+    expect(cliAvailability('getVersion', w)).toBe('not_in_table');
     expect(cliAvailability('removeTempRule', w)).toBe('not_in_help');
   });
 
