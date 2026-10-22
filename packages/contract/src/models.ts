@@ -327,7 +327,9 @@ export type RouteWarning =
   | 'rollback_needs_reverify'
   | 'probe_expired'
   | 'probe_failed'
-  | 'exit_ip_mismatch';
+  | 'exit_ip_mismatch'
+  /** 普通模式未能确认 Safari 已没有经买家出口的连接（结束连接失败，或入口未经运行时确认）：下一次普通模式再结束。 */
+  | 'buyer_exit_connections_unconfirmed';
 
 export interface RouteStateView {
   routeEpoch: number;

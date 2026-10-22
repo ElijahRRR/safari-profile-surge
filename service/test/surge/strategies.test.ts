@@ -869,6 +869,15 @@ describe('ruleset_resource strategy: undo when rule match is unavailable', () =>
     expect(sleeps).toEqual([]);
   });
 
+  test('fallback with a blocking rule ahead of the entry: the PRECEDENCE_VIOLATION of the blocking step says it was not runtime-confirmed', async () => {
+    const { ctrl, fake, files, ownership } = await setupRuleset({ adapter: (f) => throwingMatch(f, unmapped) });
+    await writeConfirmedMode(files, ownership, fake, 'ACTIVE');
+    fake.setModuleRules([{ text: 'PROCESS-NAME,Safari,DIRECT', moduleName: 'Mod' }]);
+    const err = (await ctrl.transition('BLOCKED', undefined, { undo: true, towardNormal: true }).catch((e: unknown) => e)) as SfeError;
+    expect(err.code).toBe('PRECEDENCE_VIOLATION');
+    expect(err.details).toMatchObject({ lastConfirmedBits: ENTRY_MODE_BITS.BLOCKED, runtimeConfirmed: false });
+  });
+
   test('activation (not undo) never uses the fallback: VERIFY_ONLY/ACTIVE need rule match', async () => {
     const { ctrl, fake } = await setupRuleset({ adapter: (f) => throwingMatch(f, unmapped) });
     const err = (await ctrl.transition('ACTIVE').catch((e: unknown) => e)) as SfeError;

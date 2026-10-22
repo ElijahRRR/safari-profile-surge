@@ -185,6 +185,7 @@ export const WARNING_TEXT: Record<RouteWarning, string> = {
   probe_expired: 'Safari 实测已过期，显示的是上次结果',
   probe_failed: '最近一次 Safari 实测失败，已停止自动打开订单与填充',
   exit_ip_mismatch: '实测出口与预期出口不一致，已停止自动打开订单与填充',
+  buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，再次进入普通模式会再结束 Safari 连接',
 };
 
 export const CAPABILITY_STATUS_TEXT: Record<CapabilityStatus, string> = {

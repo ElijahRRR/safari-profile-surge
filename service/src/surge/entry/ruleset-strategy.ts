@@ -788,7 +788,15 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
         const code = atTarget && hasBlockingIssue(final.precedenceIssues) ? 'PRECEDENCE_VIOLATION' : 'READBACK_MISMATCH';
         const confirmedBits = code === 'PRECEDENCE_VIOLATION' && unwitnessed.active ? { ...ENTRY_MODE_BITS[to] } : lastConfirmed;
         throw new SfeError(code, '切换入口失败：最终读回不是目标模式', {
-          details: { lastConfirmedBits: confirmedBits, observedMode: final.mode, precedenceIssues: final.precedenceIssues, evidence: final.evidence },
+          details: {
+            lastConfirmedBits: confirmedBits,
+            observedMode: final.mode,
+            precedenceIssues: final.precedenceIssues,
+            evidence: final.evidence,
+            // 退路的 PRECEDENCE_VIOLATION 未经运行时确认：普通模式据此不把这一次阻断当作已确认（EntryReadback.runtimeConfirmed）
+            ...(final.runtimeConfirmed === false ? { runtimeConfirmed: false } : {}),
+            ...(final.witnessConfirmed === false ? { witnessConfirmed: false } : {}),
+          },
         });
       }
       return final;

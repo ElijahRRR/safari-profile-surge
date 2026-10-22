@@ -721,7 +721,14 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
       const onlyPrecedence =
         baseModeOf(finalState) === to && hasBlockingIssue(final.precedenceIssues) && (judgement === null || judgement.ok || (undo && judgement.readFailed === true && !judgement.controlHit));
       throw new SfeError(onlyPrecedence ? 'PRECEDENCE_VIOLATION' : 'READBACK_MISMATCH', '切换入口失败：最终读回不是目标模式', {
-        details: { lastConfirmedBits: lastConfirmed, observedMode: final.mode, precedenceIssues: final.precedenceIssues, evidence: final.evidence },
+        details: {
+          lastConfirmedBits: lastConfirmed,
+          observedMode: final.mode,
+          precedenceIssues: final.precedenceIssues,
+          evidence: final.evidence,
+          // 未经运行时确认的读回（EntryReadback.runtimeConfirmed）：普通模式据此不把这一次阻断当作已确认
+          ...(final.runtimeConfirmed === false ? { runtimeConfirmed: false } : {}),
+        },
       });
     }
     return final;

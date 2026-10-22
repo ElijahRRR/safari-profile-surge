@@ -98,6 +98,51 @@ describe('killSafariConnections', () => {
     expect((err.details!.killResults as unknown[]).length).toBe(2);
   });
 
+  test('retired process paths: only their connections that may use a buyer exit are ended; Chrome and their other connections are untouched', async () => {
+    const stp = '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview';
+    const rec = (id: string, processPath: string, policyName: string | null, leafPolicyName: string | null = null): SurgeRequestRecord => ({
+      id,
+      processPath,
+      remoteHost: 'www.example.test',
+      policyName,
+      leafPolicyName,
+      rule: null,
+      protocol: 'tcp',
+      startedAt: null,
+      completed: false,
+      failed: false,
+    });
+    const active = new Map(
+      [
+        rec('1', FAKE_SAFARI_PATH, 'SFE-ROUTE', 'SFE-N-E0001-US01-v001'),
+        rec('2', FAKE_SAFARI_PATH, 'DIRECT'),
+        rec('3', FAKE_SAFARI_PATH, null, null),
+        rec('4', stp, 'DIRECT'),
+        rec('5', FAKE_CHROME_PATH, 'SFE-ROUTE', 'SFE-N-E0001-US01-v001'),
+      ].map((r) => [r.id, r] as const),
+    );
+    const killed: string[] = [];
+    const adapter = {
+      listActiveRequests: async () => [...active.values()],
+      killRequest: async (id: string) => {
+        killed.push(id);
+        active.delete(id);
+      },
+    } as unknown as SurgeAdapter;
+    const results = await killSafariConnections(adapter, {
+      processPaths: [stp],
+      retiredProcessPaths: [FAKE_SAFARI_PATH, stp],
+      verifyHost: 'verify.example.test',
+      now,
+      bestEffort: false,
+      entryBlocksSafari: false,
+    });
+    // 当前路径的连接照常结束；被换掉的路径只结束经 SFE-ROUTE/出口节点或读不到策略的连接
+    expect(killed.sort()).toEqual(['1', '3', '4']);
+    expect(results.every((r) => r.ok)).toBe(true);
+    expect([...active.keys()].sort()).toEqual(['2', '5']);
+  });
+
   test('entry not known to block Safari: a new connection on the original rules is expected; one that may use the buyer exit is not', async () => {
     const rec = (id: string, policyName: string | null, leafPolicyName: string | null = null): SurgeRequestRecord => ({
       id,

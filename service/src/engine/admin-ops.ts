@@ -38,6 +38,7 @@ import { insertOperation, type AcceptDeps } from './accept.js';
 import type { Engine } from './context.js';
 import { acceptedOf, commitOperation, findDuplicateOperation, findLedger, recordLedger, requestDigest, requireRequestId } from './ledger.js';
 import { expireSafariProbe } from './handlers/probes.js';
+import { markSafariMayUseRoute, safariMayUseRoute } from './safari-route-marker.js';
 
 function forbidden(message: string): SfeError {
   return new SfeError('BAD_REQUEST', message);
@@ -197,6 +198,9 @@ export async function confirmCapability(deps: AcceptDeps, req: ConfirmCapability
         note: proposal.summary,
       });
       if (pathsChange) {
+        // Safari 可能仍有经 SFE-ROUTE 的连接（普通模式尚未确认结束）：把被换掉的路径记入持久标记，下一次普通模式另按它们结束
+        // 其中可能经买家出口的连接，再清除标记
+        if (safariMayUseRoute(engine, route)) markSafariMayUseRoute(engine, null, s.safariProcessPaths);
         repos.settings.set('safariProcessPaths', [...newPaths!]);
         resetDependents(engine, 'processPathsDigest', key);
         settingsChanged = true;

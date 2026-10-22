@@ -17,6 +17,11 @@ export interface KillOptions {
    * SFE-ROUTE、出口节点），或两者都读不到（无法判断，按失败处理）。
    */
   entryBlocksSafari?: boolean;
+  /**
+   * 普通模式：Safari 可能经 SFE-ROUTE 期间配置过、之后被确认的进程归属提议换掉的进程路径（不在 processPaths 中）。按新的
+   * 确认它们不再是配置的 Safari 进程：只结束其中可能经买家出口的连接（与重新列出时的新连接同一判断），其余不碰。
+   */
+  retiredProcessPaths?: readonly string[];
 }
 
 /** 新连接可能经买家出口：策略或叶节点是本应用的对象（SFE-ROUTE、出口节点），或两者都读不到。 */
@@ -32,7 +37,9 @@ function errorText(e: unknown): string {
 
 export async function killSafariConnections(adapter: SurgeAdapter, opts: KillOptions): Promise<KillResult[]> {
   const paths = new Set(opts.processPaths);
-  const isSafari = (r: SurgeRequestRecord): boolean => !r.completed && r.processPath !== null && paths.has(r.processPath);
+  const retired = new Set((opts.retiredProcessPaths ?? []).filter((p) => !paths.has(p)));
+  const isSafari = (r: SurgeRequestRecord): boolean =>
+    !r.completed && r.processPath !== null && (paths.has(r.processPath) || (retired.has(r.processPath) && mayUseBuyerExit(r)));
   const toVerify = (r: SurgeRequestRecord): boolean => (r.remoteHost ?? '').toLowerCase() === opts.verifyHost.toLowerCase();
   const targets = (await adapter.listActiveRequests()).filter(isSafari);
   const results: KillResult[] = [];

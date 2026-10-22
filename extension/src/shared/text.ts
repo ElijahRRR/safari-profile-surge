@@ -33,6 +33,7 @@ export const WARNING_TEXT: Record<RouteWarning, string> = {
   probe_expired: '实测出口已过期，请重新检测',
   probe_failed: 'Safari 实测失败，已停止自动打开与填充',
   exit_ip_mismatch: '实测出口与预期出口不一致，已停止自动打开与填充',
+  buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，请再次进入普通模式',
 };
 
 export const PHASE_TEXT: Record<OperationPhase, string> = {

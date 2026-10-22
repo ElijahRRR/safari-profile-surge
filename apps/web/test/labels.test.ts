@@ -47,6 +47,7 @@ const ALL_WARNINGS: RouteWarning[] = [
   'probe_expired',
   'probe_failed',
   'exit_ip_mismatch',
+  'buyer_exit_connections_unconfirmed',
 ];
 
 describe('readiness labels', () => {

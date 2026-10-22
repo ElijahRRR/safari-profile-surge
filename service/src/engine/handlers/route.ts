@@ -29,6 +29,7 @@ import { killSafariConnections } from '../../surge/safari-connections.js';
 import type { Engine } from '../context.js';
 import { managedSegmentsChanged, reconcile } from '../reconcile.js';
 import { confirmationNeeded, needsConfirmationError } from '../route-control.js';
+import { clearSafariMayUseRoute, markSafariMayUseRoute, retiredSafariPaths, safariMayUseRoute } from '../safari-route-marker.js';
 import { currentPreflight, recordPreflight } from './probes.js';
 
 // ---------- 小工具 ----------
@@ -57,33 +58,6 @@ function undoOptions(engine: Engine, opId: string): EntryTransitionOptions {
 
 /** 撤销入口时 rule match 读不到或不可用（EntryReadback.runtimeConfirmed 为 false）的步骤说明。 */
 const UNCONFIRMED_ENTRY_TEXT = 'rule match 读不到或当前 Surge 不支持，入口按结构读回或写入并等待完成，未经运行时求值确认';
-
-/**
- * 持久标记（引擎键值，跨服务重启）：入口可能已让 Safari 经 SFE-ROUTE 发出——激活写入 VERIFY_ONLY/ACTIVE 之前设置，只在一次
- * 普通模式确认结束了 Safari 连接（没有失败、没有未能确认结束的连接）并完成之后清除。路由记录不能代替它：失败的回滚可能按
- * 入口切换报告的最后确认状态把入口记为 NORMAL（§6.3 第 14 步，例如本应用临时规则被移除之后回滚的第一次加入失败），普通模式
- * 未能结束连接之后路由记录也已是空闲的普通模式，而之前经 SFE-ROUTE 建立的 Safari 长连接仍在买家出口上（§6.5）。
- */
-const SAFARI_MAY_USE_ROUTE_KEY = 'route:safariMayUseRoute';
-
-function markSafariMayUseRoute(engine: Engine, opId: string): void {
-  engine.kv.set(SAFARI_MAY_USE_ROUTE_KEY, { operationId: opId, at: engine.nowIso() });
-}
-
-/**
- * 普通模式中入口已不确定阻断 Safari（入口已是普通模式、保留的 block 关闭尚未加载）时是否仍要结束 Safari 连接：路由记录不是
- * 空闲的普通模式、仍有使用中的环境或激活快照（上一次切换没有回到已确认的状态），或持久标记仍在。都不成立时 Safari 的连接
- * 已按原规则发出，不结束。
- */
-function safariMayUseRoute(engine: Engine, route: RouteStateRecord): boolean {
-  return (
-    route.entryMode !== 'NORMAL' ||
-    route.phase !== 'idle' ||
-    route.activeEnvironmentId !== null ||
-    route.activationSnapshot !== null ||
-    engine.kv.get(SAFARI_MAY_USE_ROUTE_KEY) !== null
-  );
-}
 
 function routePayload(op: OperationRecord): RoutePayload {
   const r = payloadOf(op).route;
@@ -416,7 +390,7 @@ async function executeSwitch(engine: Engine, opId: string, ctrl: EntryController
       engine.updateOp(opId, { phase: 'PREFLIGHT_OK' }, '经 SFE-ROUTE 的预检通过（Safari 已阻断，Chrome 不命中 SFE-ROUTE）', { environments: [p.targetEnvironmentId] });
     }
     // 9. 只开放检测服务（写入之前记下：从此 Safari 可能经 SFE-ROUTE 发出，直到普通模式确认结束连接）
-    markSafariMayUseRoute(engine, opId);
+    markSafariMayUseRoute(engine, opId, engine.entryConfig().processPaths);
     await ctrl.transition('VERIFY_ONLY');
     confirmed = 'VERIFY_ONLY';
     const deadline = addSeconds(engine, repos.settings.get('profileArrivalTimeoutSec'));
@@ -664,7 +638,7 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
     return;
   }
   try {
-    markSafariMayUseRoute(engine, op.id);
+    markSafariMayUseRoute(engine, op.id, engine.entryConfig().processPaths);
     await ctrl.transition('ACTIVE');
   } catch (err) {
     await rollbackActivation(engine, op.id, engine.errorBody(err, '切换失败：进入使用中模式失败'), ctrl, confirmedModeFrom(err, 'VERIFY_ONLY'));
@@ -864,7 +838,10 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
       failureError: failure,
       needsReverify: hasPrevious,
     };
-    const keep: RouteWarning[] = before.warnings.filter((w) => w === 'managed_windows_on_original_rules' || w === 'takeover_unknown');
+    // 普通模式未能确认 Safari 已离开买家出口的警告随持久标记保留（激活第 7 步只按当前进程路径结束连接）
+    const keep: RouteWarning[] = before.warnings.filter(
+      (w) => w === 'managed_windows_on_original_rules' || w === 'takeover_unknown' || w === 'buyer_exit_connections_unconfirmed',
+    );
     if (segmentsChanged) keep.push('managed_segments_changed');
     if (entryUnconfirmed) keep.push('entry_unverified');
     repos.tx(() => {
@@ -938,8 +915,17 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
   let normalUnconfirmed = false;
   /** 入口已不确定阻断 Safari 时是否仍要结束 Safari 连接（safariMayUseRoute）。 */
   const mayUseRoute = safariMayUseRoute(engine, route);
-  /** 本次普通模式确认结束了 Safari 连接：完成时清除持久标记。 */
+  /** 本次普通模式结束过 Safari 连接（killForNormal 已执行）。 */
+  let killAttempted = false;
+  /** 结束连接确认完成：没有失败、没有未能确认结束的连接。 */
   let killsEnded = false;
+  /** 结束连接时本应用入口经运行时求值确认（阻断，或已是普通模式）：否则 Surge 可能仍加载着写前的入口。 */
+  let entryConfirmedAtKill = false;
+  const kill = async (entryBlocksSafari: boolean, entryConfirmed: boolean): Promise<void> => {
+    killAttempted = true;
+    entryConfirmedAtKill = entryConfirmed;
+    killsEnded = await killForNormal(engine, op.id, entryBlocksSafari);
+  };
   // 撤销入口会改写被外部修改的本应用入口文件（§5.5），但保留 managed_segments_changed
   const segmentsChanged = await segmentsChangedBefore(engine, route);
   try {
@@ -972,14 +958,14 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
               ? `中间阻断不再写入：本应用入口的 verify/active 已确认关闭，上一次保留的 block 关闭尚未确认加载（Surge 已加载的是阻断或已是普通模式），不重新打开 block；但有 ${blockingCount(precedenceIssues)} 条规则排在本应用入口之前、读回不能确认 Safari 新请求不经这些规则发出（可能经 SFE-ROUTE）；仍结束 Safari 的旧连接，继续撤销本应用入口`
               : '中间阻断不再写入：verify/active 已确认关闭（Safari 新请求不会经 SFE-ROUTE），上一次保留的 block 关闭尚未确认加载（Surge 已加载的是阻断或已是普通模式），不重新打开 block；仍结束 Safari 的旧连接',
           );
-          killsEnded = await killForNormal(engine, op.id, false);
+          await kill(false, blockConfirmed);
         } else if (alreadyNormal) {
           // 本应用入口已不在 Surge 中：不需要阻断、不写入。但“没有本应用规则”不等于 Surge 重启过：临时规则也可能在 Surge
           // 运行中被移除（`rule temp remove`、`rule temp flush`——随包技能把后者列为常规操作，别的工具或代理可能执行），
           // 之前经 SFE-ROUTE 建立的 Safari 长连接仍在买家出口上。路由记录或持久标记表明 Safari 可能经过 SFE-ROUTE 时照常结束
           // Safari 连接（门槛不满足时尽力而为；新连接已按原规则发出，不算失败）；否则不结束按原规则发出的连接。
           engine.step(op.id, alreadyNormalStep(ctrl.strategy, blocked, mayUseRoute));
-          if (mayUseRoute) killsEnded = await killForNormal(engine, op.id, false);
+          if (mayUseRoute) await kill(false, blockConfirmed);
         } else {
           confirmed = 'BLOCKED';
           repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
@@ -988,14 +974,14 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
             op.id,
             { phase: 'SAFARI_BLOCKED' },
             precedenceIssues
-              ? `入口已切换到阻断，但有 ${blockingCount(precedenceIssues)} 条规则排在本应用入口之前、读回不能确认完全阻断：继续撤销本应用入口`
+              ? `入口已切换到阻断${blockConfirmed ? '' : `（${UNCONFIRMED_ENTRY_TEXT}）`}，但有 ${blockingCount(precedenceIssues)} 条规则排在本应用入口之前、读回不能确认完全阻断：继续撤销本应用入口`
               : blockConfirmed
                 ? '已阻断 Safari 新请求（读回确认）'
                 : `已阻断 Safari 新请求：${UNCONFIRMED_ENTRY_TEXT}`,
             { route: true },
           );
           // 有规则排在入口之前时入口不确定阻断 Safari：经这些规则按原规则重连是预期的
-          killsEnded = await killForNormal(engine, op.id, !precedenceIssues);
+          await kill(!precedenceIssues, blockConfirmed);
         }
         const normal = await ctrl.transition('NORMAL', undefined, undoOptions(engine, op.id));
         normalUnconfirmed = normal.runtimeConfirmed === false;
@@ -1007,7 +993,7 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
         // 而没有结束连接，或上一次普通模式未能确认结束连接；控制器已看不到本应用记录，不能靠它判断。照常结束（门槛不满足时尽力
         // 而为；新连接已按原规则发出，不算失败）。路由记录已是空闲的普通模式、持久标记已清除时不结束——Safari 的连接已按原规则发出。
         engine.step(op.id, alreadyNormalStep(ctrl.strategy, readback, true));
-        killsEnded = await killForNormal(engine, op.id, false);
+        await kill(false, readback.runtimeConfirmed !== false);
       }
     } else if (route.entryMode !== 'NORMAL') {
       throw new SfeError('CAPABILITY_UNVERIFIED', '进入普通模式失败：入口策略或 Safari 进程路径不可用，无法撤销入口');
@@ -1028,9 +1014,21 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
   if (keepOpen || route.warnings.includes('managed_windows_on_original_rules')) warnings.push('managed_windows_on_original_rules');
   if (segmentsChanged) warnings.push('managed_segments_changed');
   if (normalUnconfirmed) warnings.push('entry_unverified');
+  // 持久标记：确认结束了全部 Safari 连接、且结束前后的入口（阻断或已是普通模式，以及 NORMAL）都经运行时求值确认时清除——
+  // 之后再进入普通模式不必结束按原规则发出的连接。否则 Safari 可能仍有（或在 Surge 加载撤销之前又建立了）经买家出口的连接：
+  // 保留标记（路由记录表明 Safari 可能经过 SFE-ROUTE 而还没有标记时补上），路由状态带警告，完成说明写明，下一次普通模式再结束。
+  const clearMarker = killAttempted && killsEnded && entryConfirmedAtKill && !normalUnconfirmed;
+  const unconfirmedReason = clearMarker || !(killAttempted || mayUseRoute)
+    ? null
+    : !killAttempted
+      ? '入口策略或 Safari 进程路径不可用，未结束 Safari 连接'
+      : !killsEnded
+        ? '未能确认结束 Safari 连接'
+        : '入口未经运行时求值确认，Surge 可能仍加载着写前的入口，Safari 在结束之后可能又经 SFE-ROUTE 建立连接';
+  if (unconfirmedReason) warnings.push('buyer_exit_connections_unconfirmed');
   repos.tx(() => {
-    // 已确认结束 Safari 连接：之后再进入普通模式不必结束按原规则发出的连接（未能确认时保留，下一次普通模式再结束）
-    if (killsEnded) engine.kv.delete(SAFARI_MAY_USE_ROUTE_KEY);
+    if (clearMarker) clearSafariMayUseRoute(engine);
+    else if (unconfirmedReason) markSafariMayUseRoute(engine, op.id, engine.entryConfig().processPaths);
     repos.routeState.update({
       entryMode: 'NORMAL',
       entryModeVerifiedAt: engine.nowIso(),
@@ -1047,7 +1045,11 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
     repos.operations.appendStep(
       op.id,
       'NORMAL_RESTORED',
-      keepOpen ? '已进入普通模式：旧环境窗口未关闭，其后续请求将按 Surge 原规则发出（可能直连）' : '已进入普通模式：Safari 按 Surge 原规则发出请求',
+      unconfirmedReason
+        ? `已进入普通模式，但未能确认 Safari 已没有经买家出口的连接（${unconfirmedReason}）：路由状态带警告，再次进入普通模式会再结束 Safari 连接${keepOpen ? '；旧环境窗口未关闭，其后续请求将按 Surge 原规则发出（可能直连）' : ''}`
+        : keepOpen
+          ? '已进入普通模式：旧环境窗口未关闭，其后续请求将按 Surge 原规则发出（可能直连）'
+          : '已进入普通模式：Safari 按 Surge 原规则发出请求',
     );
   });
   engine.emit({ operations: [op.id], route: true, environments: route.activeEnvironmentId ? [route.activeEnvironmentId] : [] });
@@ -1086,7 +1088,14 @@ async function blockForNormal(
   } catch (err) {
     if (err instanceof SfeError && err.code === 'PRECEDENCE_VIOLATION' && confirmedModeFrom(err, 'UNKNOWN') === 'BLOCKED') {
       const issues = Array.isArray(err.details?.precedenceIssues) ? (err.details.precedenceIssues as EntryReadback['precedenceIssues']) : [];
-      return { precedenceIssues: issues, runtimeConfirmed: true, witnessConfirmed: true, alreadyNormal: false, blockKeptOff: false };
+      // 退路（rule match 不可用）中同样以 PRECEDENCE_VIOLATION 报告：确认程度随错误返回，不当作已确认
+      return {
+        precedenceIssues: issues,
+        runtimeConfirmed: err.details?.runtimeConfirmed !== false,
+        witnessConfirmed: err.details?.witnessConfirmed !== false,
+        alreadyNormal: false,
+        blockKeptOff: false,
+      };
     }
     throw err;
   }
@@ -1116,7 +1125,9 @@ function alreadyNormalStep(
         : rb.witnessConfirmed === false
           ? `${files}，有文件没有见证规则（旧格式）：只由 Safari 与对照的运行时探测读回确认，未经见证确认 Surge 已加载的是文件中的这一版`
           : `${files}，见证与运行时探测读回确认 Surge 已加载`;
-  const tail = kill ? '仍结束 Safari 的旧连接' : '路由记录已是普通模式、之前的 Safari 连接已确认结束：不结束 Safari 连接';
+  const tail = kill
+    ? '仍结束 Safari 的旧连接'
+    : '路由记录是空闲的普通模式，且没有 Safari 可能经 SFE-ROUTE 的记录（从未激活，或上一次确认结束 Safari 连接、入口经运行时求值确认的普通模式之后本应用没有写入检测或使用中入口）：不结束 Safari 连接';
   return `入口已是普通模式（${cause}）：不需要阻断，未写入；${tail}`;
 }
 
@@ -1135,6 +1146,8 @@ async function killForNormal(engine: Engine, opId: string, entryBlocksSafari: bo
   try {
     killResults = await killSafariConnections(engine.surge, {
       processPaths: cfg.processPaths,
+      // Safari 可能经 SFE-ROUTE 期间被换掉的进程路径：只结束其中可能经买家出口的连接
+      retiredProcessPaths: retiredSafariPaths(engine, cfg.processPaths),
       verifyHost: cfg.verifyHost,
       now: () => engine.now(),
       bestEffort: !strict,
