@@ -1,8 +1,10 @@
 // 能力验证上下文（CapabilityContext）的构造。字段来源与服务运行时一致（ARCHITECTURE §5.2）：
-// sw_vers 构建号、Safari.app Info.plist、运行中的 Surge 实例（surge/running-instance.ts，与服务同一读取器，
+// sw_vers 构建号与补充版本（-productVersionExtra）、后台安全改进的暂存位置（是否待重启；两者与服务同一读取规则，
+// 见 system.ts）、Safari.app Info.plist、运行中的 Surge 实例（surge/running-instance.ts，与服务同一读取器，
 // 并与 getVersion 即 `surge-cli --raw version` 交叉核对，见 commands/common.ts）、getTakeoverState、getAutoReloadSetting、
 // 已确认的进程路径与入口策略、原语实现映射。读不到的字段记 null（服务运行时同样读不到才会匹配）；
-// 例外：Surge 版本与构建读不到时永远不匹配（NEVER_NULL_FIELDS），依赖它们的能力不能提议。
+// 例外：Surge 版本与构建读不到时永远不匹配（NEVER_NULL_FIELDS），依赖它们的能力不能提议；后台安全改进待重启状态只有
+// 'no' 与 'no' 匹配，依赖进程归属的能力在待重启或无法确认时不能提议（hostContextErrors）。
 
 import type { CapabilityContext, CapabilityContextField, CapabilityKey, EntryStrategy, TakeoverState } from '@sfe/contract';
 import { staleReasonsFor } from './deps.js';
@@ -32,6 +34,10 @@ export function canonicalMechanism(map: Record<string, string> | null): string |
 export interface ContextInputs {
   surgeVersion: { version: string | null; build: string | null } | null;
   macosBuild: string | null;
+  /** sw_vers -productVersionExtra（versionExtraFromSwVers）。 */
+  macosVersionExtra: string | null;
+  /** 后台安全改进是否待重启（system.ts 的 restartPending）。 */
+  macosRestartPending: CapabilityContext['macosRestartPending'];
   safariVersion: string | null;
   entryStrategy: EntryStrategy | null;
   processPaths: readonly string[];
@@ -54,6 +60,8 @@ export function buildContext(inputs: ContextInputs, overrides: ContextOverrides 
     surgeVersion: inputs.surgeVersion?.version ?? null,
     surgeBuild: inputs.surgeVersion?.build ?? null,
     macosBuild: inputs.macosBuild,
+    macosVersionExtra: inputs.macosVersionExtra,
+    macosRestartPending: inputs.macosRestartPending,
     safariVersion: inputs.safariVersion,
     entryStrategy: inputs.entryStrategy,
     processPathsDigest: processPathsDigest(inputs.processPaths),

@@ -2,8 +2,9 @@
 // 另有 `surge-cli version`（App、Core、Controller 协议），但它只是旁证——只有与这里读到的版本与构建号相同才接受
 // （crossCheckSurgeVersion），Controller 协议号只能从它得到。定位当前用户唯一的 Surge 主进程 → 它的 .app 包 →
 // Info.plist 的 CFBundleShortVersionString 与 CFBundleVersion；只有能证明磁盘上的包就是正在运行的那一份时才接受：
-// 1. ps（C 语言环境、UTC）中当前用户、可执行文件在 <包>/Contents/MacOS/ 下、包的真实路径等于 /Applications/Surge.app
-//    的进程；先按 Info.plist 的 CFBundleExecutable 过滤，再要求恰好一个（其他位置的 Surge.app 同时在运行也不接受）；
+// 1. ps（C 语言环境、UTC）中当前用户、argv[0]（ps 的 comm，由进程自己提供，只作候选，由第 5 条核对）在 <包>/Contents/MacOS/
+//    下、包的真实路径等于 /Applications/Surge.app 的进程；先按 Info.plist 的 CFBundleExecutable 过滤，再要求恰好一个
+//    （其他位置的 Surge.app 同时在运行也不接受）；
 // 2. 启动时间严格按 "%a %b %e %H:%M:%S %Y"（UTC）解析到秒；
 // 3. 先 stat Info.plist 与主可执行文件，再用 plutil 读取包标识（必须是实测确认过的）、版本与构建号（A0 的格式）；
 // 4. 两个文件的 ctime 与 birthtime 都严格早于启动秒（同一秒内按已修改处理；解包与 cp -p 会保留旧 mtime，不用 mtime）；
@@ -328,7 +329,11 @@ export interface PsInstanceLine {
   path: string;
 }
 
-/** `ps -ww -axo pid=,uid=,lstart=,comm=` 的输出：comm 是最后一列（允许含空格）；只保留可执行文件为绝对路径的行。 */
+/**
+ * `ps -ww -axo pid=,uid=,lstart=,comm=` 的输出：comm 是最后一列（允许含空格）。comm 是进程自己提供的 argv[0]（ps(1)：
+ * “a process is entitled to destroy this information”，可被进程改写），只作候选；是否为运行中的那份文件由 lsof txt 的
+ * inode 与路径核对（docs/ARCHITECTURE.md §5.2 规则 ⑥，即文件头第 5 条）决定。只保留 argv[0] 为绝对路径的行。
+ */
 export function parsePsInstanceLines(text: string): PsInstanceLine[] {
   const out: PsInstanceLine[] = [];
   for (const line of text.split(/\r?\n/)) {
@@ -490,7 +495,7 @@ export function createRunningInstanceReader(deps: RunningInstanceDeps, opts: Run
     if (expectedReal === null || inBundle.length === 0) return fail('process', noneFound(), processDetail);
     step('process', 'pass', processDetail);
 
-    // 2. 先读 CFBundleExecutable，只保留可执行文件名与之相同的进程，再要求恰好一个
+    // 2. 先读 CFBundleExecutable，只保留 argv[0]（comm）的程序名与之相同的进程，再要求恰好一个（仍只是候选，由 lsof 核对）
     const bundlePath = expectedReal;
     const exeName = await plistValue(`${bundlePath}/Contents/Info.plist`, 'CFBundleExecutable');
     if (exeName === null || exeName.includes('/')) return fail('bundle_executable', 'plist_unreadable', { missing: ['CFBundleExecutable'] });

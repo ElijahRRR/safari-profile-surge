@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { processPathsDigest as serviceProcessPathsDigest } from '../../../service/src/engine/capabilities.js';
+import { STAGED_CRYPTEX_PATH, processPathsDigest as serviceProcessPathsDigest } from '../../../service/src/engine/capabilities.js';
+import { measureContextWithInstance, type Ctx, type Deps } from '../src/commands/common.js';
 import { autoReloadOf, buildContext, canonicalMechanism, contextDrift, processPathsDigest, takeoverModeOf } from '../src/context.js';
+import { parseArgs } from '../src/args.js';
+import { emptyState } from '../src/state.js';
 import {
   appVersion,
   parsePsOutput,
   parseTeamIdentifier,
+  restartPending,
   surgeProcesses,
   surgeStartFingerprint,
   swVers,
@@ -41,6 +45,8 @@ describe('buildContext', () => {
   const inputs = {
     surgeVersion: { version: '6.5.0', build: '10960' },
     macosBuild: '24A335',
+    macosVersionExtra: 'none',
+    macosRestartPending: 'no' as const,
     safariVersion: '18.0',
     entryStrategy: 'ruleset_resource' as const,
     processPaths: ['/Applications/Safari.app/Contents/MacOS/Safari'],
@@ -78,6 +84,17 @@ describe('buildContext', () => {
     expect(contextDrift('safari_process_attribution', measured, upgraded)).toEqual(['safariVersion']);
     expect(contextDrift('external_node_underlying_proxy', measured, upgraded)).toEqual([]);
   });
+
+  it('carries the Background Security Improvement fields; a staged improvement or a new supplemental version is drift for attribution only', () => {
+    const measured = buildContext(inputs);
+    expect(measured).toMatchObject({ macosVersionExtra: 'none', macosRestartPending: 'no' });
+    expect(contextDrift('safari_process_attribution', measured, buildContext({ ...inputs, macosRestartPending: 'yes' }))).toEqual(['macosRestartPending']);
+    expect(contextDrift('safari_udp_quic_handling', measured, buildContext({ ...inputs, macosVersionExtra: '(a)' }))).toEqual(['macosVersionExtra']);
+    expect(contextDrift('native_bridge_ipc', measured, buildContext({ ...inputs, macosVersionExtra: '(a)', macosRestartPending: 'yes' }))).toEqual([]);
+    // 待重启状态没有 any：两次都待重启也不算“一致”
+    const pending = buildContext({ ...inputs, macosRestartPending: 'yes' });
+    expect(contextDrift('safari_process_attribution', pending, pending)).toEqual(['macosRestartPending']);
+  });
 });
 
 describe('system parsing', () => {
@@ -101,11 +118,12 @@ describe('system parsing', () => {
     const calls: string[][] = [];
     const exec: ExecFn = async (file, args) => {
       calls.push([file, ...args]);
-      if (file === '/usr/bin/sw_vers') return { stdout: args[0] === '-buildVersion' ? '24A335\n' : '15.0\n', stderr: '', code: 0 };
+      if (file === '/usr/bin/sw_vers') return { stdout: args[0] === '-buildVersion' ? '24A335\n' : args[0] === '-productVersionExtra' ? '(a)\n' : '15.0\n', stderr: '', code: 0 };
       if (file === '/usr/bin/defaults') return { stdout: args[2] === 'CFBundleVersion' ? '20619.1.26\n' : 'bad;value`\n', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: 1 };
     };
-    expect(await swVers(exec)).toEqual({ productVersion: '15.0', buildVersion: '24A335' });
+    expect(await swVers(exec)).toEqual({ productVersion: '15.0', buildVersion: '24A335', productVersionExtra: '(a)' });
+    expect(calls).toContainEqual(['/usr/bin/sw_vers', '-productVersionExtra']);
     expect(await appVersion(exec, '/Applications/Safari.app')).toEqual({ version: null, build: '20619.1.26' });
     expect(calls.every((c) => c[0]!.startsWith('/'))).toBe(true);
     expect(calls).toContainEqual(['/usr/bin/defaults', 'read', '/Applications/Safari.app/Contents/Info', 'CFBundleShortVersionString']);
@@ -120,5 +138,51 @@ describe('system parsing', () => {
     expect(await surgeStartFingerprint(exec)).toBe('/Applications/Surge.app/Contents/MacOS/Surge@Wed Oct 21 09:00:00 2026');
     const none: ExecFn = async () => ({ stdout: '', stderr: '', code: 0 });
     expect(await surgeStartFingerprint(none)).toBeNull();
+  });
+});
+
+describe('Background Security Improvement facts (same rules as the service)', () => {
+  const swVersExec = (extra: { stdout: string; code: number }): ExecFn => async (file, args) => {
+    if (file === '/usr/bin/sw_vers') return args[0] === '-productVersionExtra' ? { ...extra, stderr: '' } : { stdout: args[0] === '-buildVersion' ? '25B78\n' : '26.1\n', stderr: '', code: 0 };
+    return { stdout: '', stderr: '', code: 1 };
+  };
+
+  it('reads the supplemental version: empty is "none", failure or unknown output is null', async () => {
+    expect((await swVers(swVersExec({ stdout: '\n', code: 0 }))).productVersionExtra).toBe('none');
+    expect((await swVers(swVersExec({ stdout: '(b)\n', code: 0 }))).productVersionExtra).toBe('(b)');
+    expect((await swVers(swVersExec({ stdout: '', code: 1 }))).productVersionExtra).toBeNull();
+    expect((await swVers(swVersExec({ stdout: 'usage: sw_vers\n', code: 0 }))).productVersionExtra).toBeNull();
+  });
+
+  it('checks only the staged cryptex path for a pending restart', async () => {
+    const seen: string[] = [];
+    const presence = (r: 'present' | 'absent' | 'unknown') => async (p: string) => {
+      seen.push(p);
+      return r;
+    };
+    expect(await restartPending(presence('present'))).toBe('yes');
+    expect(await restartPending(presence('absent'))).toBe('no');
+    expect(await restartPending(presence('unknown'))).toBeNull();
+    expect(new Set(seen)).toEqual(new Set([STAGED_CRYPTEX_PATH]));
+  });
+
+  it('measured contexts record both fields from the same sources as the service', async () => {
+    const deps = (presence: 'present' | 'absent' | 'unknown'): Deps =>
+      ({
+        exec: swVersExec({ stdout: '(a)\n', code: 0 }),
+        now: () => new Date('2026-10-22T00:00:00Z'),
+        home: '/nonexistent-home',
+        platform: 'darwin',
+        env: {},
+        sleep: async () => undefined,
+        surgeInstance: async () => ({ ok: false, reason: 'not_running' }),
+        pathPresence: async () => presence,
+      }) as unknown as Deps;
+    const ctx = (presence: 'present' | 'absent' | 'unknown'): Ctx => ({ args: parseArgs(['inventory']), deps: deps(presence) });
+    const state = emptyState('run-1', new Date('2026-10-22T00:00:00Z'));
+    const pending = await measureContextWithInstance(ctx('present'), null, state);
+    expect(pending.context).toMatchObject({ macosBuild: '25B78', macosVersionExtra: '(a)', macosRestartPending: 'yes' });
+    expect((await measureContextWithInstance(ctx('absent'), null, state)).context.macosRestartPending).toBe('no');
+    expect((await measureContextWithInstance(ctx('unknown'), null, state)).context.macosRestartPending).toBeNull();
   });
 });

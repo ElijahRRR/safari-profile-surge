@@ -25,6 +25,7 @@ enum InstallPaths {
 
 /// 启动时的安装准备（幂等，每次启动执行）：
 /// 1. App Group 容器中的 bridge.json 与 bridge.token（32 字节随机，base64url，0600）——已有且有效时沿用；
+///    写入前先确认容器目录能打开，写入后用扩展相同的读取函数读回（macOS 上 containerURL 总会返回 URL，不能据此判断可用）；
 /// 2. 数据目录（0700）中的 bridge.token 副本（0600），供 LaunchAgent 启动的服务读取，服务从不访问 App Group 容器；
 /// 3. 数据目录中的 install.json（0600）。
 /// 令牌从不记录、打印或放进错误信息。
@@ -43,7 +44,13 @@ enum InstallSetup {
     @discardableResult
     static func run(bundle: Bundle = .main) throws -> Summary {
         guard let container = BridgeFiles.containerURL(bundle: bundle) else {
-            throw Failure(message: "准备原生桥失败：无法访问 App Group 容器，请检查签名设置")
+            throw Failure(message: BridgeFileProblem.noAppGroup.setupText)
+        }
+        // Apple：“In macOS, a URL of the expected form is always returned, even if the app group is invalid, so be sure to
+        // test that you can access the underlying directory before attempting to use it.”
+        // 目录不存在（签名不含该 App Group）与系统拒绝访问分开报告；不自行创建容器目录。
+        if let problem = BridgeFiles.checkDirectoryAccess(container) {
+            throw Failure(message: problem.setupText)
         }
         let configURL = container.appendingPathComponent(BridgeFiles.configFileName)
         let tokenURL = container.appendingPathComponent(BridgeFiles.tokenFileName)
@@ -67,6 +74,15 @@ enum InstallSetup {
             if tokenCreated { try SecureFile.writeAtomically(Data(token.utf8), to: tokenURL) }
         } catch {
             throw Failure(message: "准备原生桥失败：无法写入 App Group 容器")
+        }
+        // 按扩展的读取方式读回，证明容器确实可用（只比较，不记录内容）
+        switch BridgeFiles.loadCredentials(from: container) {
+        case .failure(let problem):
+            throw Failure(message: problem.setupText)
+        case .success(let readBack):
+            guard readBack.endpoint == endpoint, readBack.token == token else {
+                throw Failure(message: "准备原生桥失败：App Group 容器中读回的原生桥配置与写入的不一致")
+            }
         }
 
         let dataDirectory = InstallPaths.dataDirectory

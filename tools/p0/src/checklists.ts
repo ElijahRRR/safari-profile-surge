@@ -36,8 +36,12 @@ export const CHECKLISTS: Partial<Record<CapabilityKey, Checklist>> = {
   native_profile_id: {
     title: '原生场景 ID 稳定性',
     items: [
-      { id: 'distinct', question: '默认场景与至少两个测试场景在扩展弹窗中显示的场景 ID 前 8 位互不相同？' },
-      { id: 'safari_restart', question: 'Safari 退出重开后，各场景 ID 不变？' },
+      { id: 'distinct', question: '至少两个已命名测试场景在扩展弹窗中都显示场景 ID，且前 8 位互不相同？' },
+      {
+        id: 'default_profile',
+        question: '默认场景的结果已记录在备注中（弹窗显示「未识别当前场景」，或显示的场景 ID 前 8 位），且显示 ID 时与各已命名场景都不同？',
+      },
+      { id: 'safari_restart', question: 'Safari 退出重开后，各已命名场景的 ID 不变？' },
       { id: 'reinstall', question: '扩展停用再启用（或重新安装）后的 ID 行为已记录在备注中（不变或变化）？' },
       { id: 'resign', question: 'App 重新构建、重新签名后的 ID 行为已记录在备注中？' },
     ],
@@ -50,8 +54,21 @@ export const CHECKLISTS: Partial<Record<CapabilityKey, Checklist>> = {
       { id: 'reboot', question: '系统重启后往返仍成功？' },
       { id: 'service_restart', question: '菜单「停止后台服务」再「注册后台服务」后往返仍成功？' },
       { id: 'service_upgrade', question: '重新构建并替换 App（服务升级）后往返仍成功？' },
-      { id: 'background_wake', question: '扩展后台脚本休眠后（Safari 闲置 5 分钟以上，或在开发菜单中确认后台已卸载）点击弹窗仍能完成往返？' },
-      { id: 'no_tcc', question: '整个过程没有出现「访问其他 App 的数据」等系统提示？' },
+      {
+        id: 'background_wake',
+        question:
+          '扩展后台脚本休眠后（Safari 闲置 5 分钟以上，或在开发菜单中确认后台已卸载）点击弹窗仍能完成往返，且窗口或标签页事件后的场景上报（闹钟 sfe-profile-report）在后台卸载后仍出现在 service.log 中（RUNBOOK §3.3 第 3 步）？',
+      },
+      {
+        id: 'no_tcc',
+        question:
+          '整个过程没有出现「访问其他 App 的数据」等系统提示？（这一题只说明宿主 App 的情况：扩展被拒绝时系统不提示、直接拒绝，扩展能否访问以 roundtrip 为准）',
+      },
+      {
+        id: 'quit_prompt',
+        question:
+          'macOS 26 或更高：后台服务运行中退出 App 时的后台任务提示原文、选「允许」后往返仍成功、选「不允许」后服务与登录项状态的变化已记录在备注中（更早的系统备注写「不适用」）？',
+      },
     ],
   },
   bridge_keychain_access: {
@@ -60,7 +77,10 @@ export const CHECKLISTS: Partial<Record<CapabilityKey, Checklist>> = {
       { id: 'write', question: 'sfe-keychain 写入合成测试账号密码项成功？' },
       { id: 'read_no_prompt', question: '签名的原生桥读取该项没有额外提示？' },
       { id: 'resign_prompts', question: '重新构建/重签后的提示次数已记录在备注中？' },
-      { id: 'errors', question: '钥匙串锁定、用户拒绝时错误分类正确（denied / locked）？' },
+      {
+        id: 'errors',
+        question: '钥匙串锁定、用户拒绝时，扩展（登录填充）与 sfe-keychain（服务调用）分别得到的 reason 已记录在备注中？',
+      },
     ],
   },
   extension_install_persistence: {
@@ -71,7 +91,10 @@ export const CHECKLISTS: Partial<Record<CapabilityKey, Checklist>> = {
       { id: 'reboot', question: '系统重启后扩展仍启用？' },
       { id: 'eight_days', question: '安装 8 天以上后扩展仍启用（备注写开始与检查日期）？' },
       { id: 'rebuild', question: '重新构建安装后扩展仍启用？' },
-      { id: 'validity', question: '证书与描述文件有效期已记录在备注中？' },
+      {
+        id: 'validity',
+        question: '证书有效期，以及 App 与扩展是否嵌入描述文件（Contents/embedded.provisionprofile）、嵌入时的 ExpirationDate 已记录在备注中？',
+      },
     ],
   },
   first_request_and_old_connections: {

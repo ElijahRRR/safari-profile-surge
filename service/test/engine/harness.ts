@@ -93,8 +93,11 @@ export interface Harness {
   events: ServiceEvent[];
   responses: unknown[];
   frontId: string;
-  /** 本机事实（macOS 构建号、Safari 版本）；可在启动后修改，模拟服务运行期间 Safari 或 macOS 单独更新。 */
-  host: { macosBuild: string; safariVersion: string };
+  /**
+   * 本机事实（macOS 构建号与补充版本、后台安全改进是否待重启、Safari 版本）；可在启动后修改，模拟服务运行期间 Safari 或
+   * macOS 单独更新、装上后台安全改进。
+   */
+  host: { macosBuild: string; macosVersionExtra: string | null; macosRestartPending: CapabilityContext['macosRestartPending']; safariVersion: string };
   /** 模拟服务崩溃：旧实例放弃（不等待其挂起的写入），在同一数据库与 FakeSurge 上启动新实例。 */
   crash(): Promise<EngineAppService>;
   grant(keys: readonly CapabilityKey[], note?: string | null): void;
@@ -105,8 +108,16 @@ export interface Harness {
   close(): Promise<void>;
 }
 
+/**
+ * 不限的上下文。例外：后台安全改进的两个字段没有 any（待重启状态只有 'no' 与 'no' 匹配，提议拒绝补充版本为 any），
+ * 记为测试本机事实的初始值（没有安装、没有待重启）。
+ */
 export function anyContext(): CapabilityContext {
-  return Object.fromEntries(CAPABILITY_CONTEXT_FIELDS.map((f) => [f, 'any'])) as unknown as CapabilityContext;
+  return {
+    ...(Object.fromEntries(CAPABILITY_CONTEXT_FIELDS.map((f) => [f, 'any'])) as unknown as CapabilityContext),
+    macosVersionExtra: 'none',
+    macosRestartPending: 'no',
+  };
 }
 
 /**
@@ -117,13 +128,19 @@ export function instanceContext(fake: Pick<FakeSurge, 'version' | 'build'>): Cap
   return { ...anyContext(), surgeVersion: fake.version, surgeBuild: fake.build };
 }
 
-/** 按当前本机事实（macOS 构建号、Safari 版本）与 Surge 版本记录能力，其余字段不限：之后修改 h.host 即让这些记录过期。 */
+/** 按当前本机事实（macOS 构建号与补充版本、待重启状态、Safari 版本）与 Surge 版本记录能力，其余字段不限：之后修改 h.host 即让这些记录过期。 */
 export function grantForCurrentHost(h: Harness, keys: readonly CapabilityKey[]): void {
   for (const key of keys) {
     h.repos.capabilities.upsert({
       key,
       status: 'supported',
-      context: { ...instanceContext(h.fake), macosBuild: h.host.macosBuild, safariVersion: h.host.safariVersion },
+      context: {
+        ...instanceContext(h.fake),
+        macosBuild: h.host.macosBuild,
+        macosVersionExtra: h.host.macosVersionExtra,
+        macosRestartPending: h.host.macosRestartPending,
+        safariVersion: h.host.safariVersion,
+      },
       verifiedAt: h.clock.now().toISOString(),
       note: '测试记录',
     });
@@ -195,7 +212,7 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     followWatch(keys, false);
   };
   grant(opts.capabilities ?? ALL_CAPS);
-  const hostState = { macosBuild: '25A000', safariVersion: '19.0' };
+  const hostState: Harness['host'] = { macosBuild: '25A000', macosVersionExtra: 'none', macosRestartPending: 'no', safariVersion: '19.0' };
 
   const makeApp = () => createAppService({
     repos,
@@ -211,6 +228,8 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     demo: false,
     host: {
       macosBuild: async () => hostState.macosBuild,
+      macosVersionExtra: async () => hostState.macosVersionExtra,
+      macosRestartPending: async () => hostState.macosRestartPending,
       safariVersion: async () => hostState.safariVersion,
       signingIdentity: () => 'TEAMTEST01',
       processPathExists: () => true,

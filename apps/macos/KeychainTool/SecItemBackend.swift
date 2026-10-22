@@ -48,14 +48,22 @@ struct SecItemBackend: KeychainBackend {
 
 /// 账号密码条目的访问控制（SecAccess 受信任应用列表）：sfe-keychain 自己 + 同一 App 包内的扩展。
 ///
-/// SecAccess / SecTrustedApplication 自 macOS 10.10 标为过时，但对文件型钥匙串在 macOS 14 上仍然有效，
-/// 编译时会有过时警告。签名身份相同（同一 Team）时，系统的分区列表（teamid:<Team ID>）也允许扩展读取。
+/// SecAccessCreate / SecTrustedApplicationCreateFromPath 自 macOS 10.10 标为过时（Apple：“SecKeychain is deprecated”，
+/// https://developer.apple.com/documentation/security/secaccesscreate(_:_:_:)），编译时会有过时警告；TN3137：
+/// “The file-based keychain is on the road to deprecation. It’s not officially deprecated, but some of the APIs
+/// surrounding it are.”（https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains）。
+/// 在当前 macOS 上沙盒扩展能否按这份受信任应用列表免提示读取，Apple 没有写明，由 P0 bridge_keychain_access 确认。
+/// SecItemAdd 默认写入什么分区列表、同团队的扩展能否通过，同样待实测：security(1) 只说分区列表
+/// “limits access to the item based on an application's code signature”（是限制，不是放行）。
+/// 不在列表中的进程读取时，系统弹出授权提示，用户选「允许」或「始终允许」后即可读取
+/// （https://developer.apple.com/documentation/security/access-control-lists），所以这份列表只保证受信任方免提示，
+/// 不保证其他进程读不到。
 ///
 /// 备选方案（不在本工具中实现）：数据保护钥匙串 + 共享访问组 $(AppIdentifierPrefix)com.sfe.shared。
 /// 它要求写入方带 keychain-access-groups 权限与描述文件，裸命令行工具无法内嵌描述文件，
 /// 因此写入方必须改为宿主 App；扩展侧读取已在 KeychainAccess（SFE_DATA_PROTECTION_KEYCHAIN）中准备好。
 // P0: bridge_keychain_access —— 确认：受信任应用列表按代码签名匹配 .appex；扩展读取不出现提示；
-// App 重新构建或重签（免费描述文件约 7 天）后是否需要重新授权、提示次数。
+// App 重新构建或重签后是否需要重新授权、提示次数（默认构建是否嵌入描述文件、其有效期由 extension_install_persistence 记录）。
 enum AccountItemAccess {
     static func make(label: String) -> (access: SecAccess?, status: OSStatus) {
         guard let executable = BundleLayout.currentExecutable(),

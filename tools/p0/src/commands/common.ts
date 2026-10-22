@@ -29,7 +29,7 @@ import type { Output, Prompter } from '../io.js';
 import { logAction, verdictLabel, type CapabilityResult } from '../results.js';
 import { RunDir, assertSafeBaseDir, defaultBaseDir, newRunId } from '../run-dir.js';
 import { emptyState, loadState, saveState, type RunState, type ServersInfo } from '../state.js';
-import { DEFAULT_SURGE_CLI, SAFARI_APP, plistValue, surgeStartFingerprint, swVers, type ExecFn } from '../system.js';
+import { DEFAULT_SURGE_CLI, SAFARI_APP, plistValue, restartPending, surgeStartFingerprint, swVers, type ExecFn } from '../system.js';
 import { CANARY_FILE, TEST_NODES, TEST_PROFILE_NAME } from '../test-profile.js';
 import { createGuardedAdapter, createP0Adapter, describeLocation, emptyGuard, readCliVersion, resourcesForPath, type WriteGuard } from '../surge-access.js';
 
@@ -46,6 +46,8 @@ export interface Deps {
   surgeOverride?: SurgeAdapter;
   /** 只用于离线测试：替代运行中 Surge 实例的读取（版本来源；例如 FakeSurge.runningInstance）。 */
   surgeInstance?: () => Promise<RunningInstanceResult | RunningInstanceReport>;
+  /** 只用于离线测试：替代后台安全改进暂存位置的存在检查（缺省与服务同一 lstat 规则）。 */
+  pathPresence?: (path: string) => Promise<'present' | 'absent' | 'unknown'>;
 }
 
 export interface Ctx {
@@ -326,6 +328,8 @@ export async function measureContextWithInstance(
   extras: MeasureExtras = {},
 ): Promise<{ context: CapabilityContext; instance: RunningInstanceReport; versionCheck: SurgeVersionCheck | null }> {
   const v = await swVers(ctx.deps.exec);
+  // 与服务同一来源：已安装、要重启 Mac 才完全生效的后台安全改进（暂存位置存在为 'yes'，无法确认为 null）
+  const pending = await restartPending(ctx.deps.pathPresence);
   const safari = await plistValue(ctx.deps.exec, SAFARI_APP, 'CFBundleShortVersionString');
   const instance = extras.instance ?? (await readSurgeInstance(ctx));
   // 服务的读取器在它的时限内读不到的版本（签名校验太慢、每次读取超过总时限）不进入上下文：这样的记录在服务中永远不会生效；
@@ -338,6 +342,8 @@ export async function measureContextWithInstance(
     {
       surgeVersion: version,
       macosBuild: v.buildVersion,
+      macosVersionExtra: v.productVersionExtra,
+      macosRestartPending: pending,
       safariVersion: safari,
       entryStrategy: extras.entryStrategy ?? null,
       processPaths: extras.processPaths ?? state.processPaths,

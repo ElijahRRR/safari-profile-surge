@@ -59,6 +59,7 @@ export async function main(argv: readonly string[], deps?: Partial<Deps>): Promi
       sleep: deps?.sleep ?? sleep,
       ...(deps?.surgeOverride ? { surgeOverride: deps.surgeOverride } : {}),
       ...(deps?.surgeInstance ? { surgeInstance: deps.surgeInstance } : {}),
+      ...(deps?.pathPresence ? { pathPresence: deps.pathPresence } : {}),
     };
     const ctx: Ctx = { args, deps: full };
     switch (args.command) {

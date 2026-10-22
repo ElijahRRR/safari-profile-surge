@@ -32,7 +32,8 @@ export interface SelectionRecord {
 
 export interface InventorySummary {
   at: string;
-  macos: { productVersion: string | null; buildVersion: string | null };
+  /** productVersionExtra（后台安全改进的补充版本，'none' 为未安装）与 restartPending 在旧运行中没有。 */
+  macos: { productVersion: string | null; buildVersion: string | null; productVersionExtra?: string | null; restartPending?: 'yes' | 'no' | null };
   safari: { version: string | null; build: string | null };
   surgeApp: { version: string | null; build: string | null };
   /** 运行中 Surge 实例的版本（与服务同一读取器）；读不到时为 null。磁盘上的 Surge.app 版本见 surgeApp（只作旁证）。 */

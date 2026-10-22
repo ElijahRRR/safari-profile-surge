@@ -234,6 +234,16 @@ final class ResponseParsingTests: XCTestCase {
         XCTAssertEqual(NativeFailure.notConfigured.code, "SURGE_UNREACHABLE")
         XCTAssertTrue(NativeFailure.notConfigured.message.hasPrefix("无法连接本机服务"))
     }
+
+    func testContainerDeniedIsNotReportedAsMissingConfiguration() {
+        let failure = NativeFailure.containerDenied
+        XCTAssertEqual(failure.code, "SURGE_UNREACHABLE")
+        XCTAssertEqual(failure.reason, "container_denied")
+        XCTAssertTrue(failure.message.hasPrefix("无法连接本机服务："), failure.message)
+        XCTAssertTrue(failure.message.contains("拒绝"), failure.message)
+        XCTAssertFalse(failure.message.contains("找不到"), failure.message)
+        XCTAssertNotEqual(failure.reason, NativeFailure.notConfigured.reason)
+    }
 }
 
 extension Result {

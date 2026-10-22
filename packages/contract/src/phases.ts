@@ -199,6 +199,8 @@ export const CAPABILITY_CONTEXT_FIELDS = [
   'surgeVersion',
   'surgeBuild',
   'macosBuild',
+  'macosVersionExtra',
+  'macosRestartPending',
   'safariVersion',
   'entryStrategy',
   'processPathsDigest',
@@ -210,9 +212,13 @@ export const CAPABILITY_CONTEXT_FIELDS = [
 ] as const;
 export type CapabilityContextField = (typeof CAPABILITY_CONTEXT_FIELDS)[number];
 
-/** 每项能力依赖哪些上下文字段；依赖字段与当前值不一致即视为待验证。 */
+/**
+ * 每项能力依赖哪些上下文字段；依赖字段与当前值不一致即视为待验证。依赖 Safari 进程归属的能力（进程路径与 macOS 构建都在
+ * 依赖中）另依赖后台安全改进的补充版本与“待重启”状态：装上后 Safari 重开即使用新加密卷宗中的 WebKit，系统其余部分要到
+ * 重启后才用（Apple 平台安全指南），这期间测得的路径可能只是暂时只属于 Safari，基础构建号也可能不变。
+ */
 export const CAPABILITY_CONTEXT_DEPS: Record<CapabilityKey, readonly CapabilityContextField[]> = {
-  safari_process_attribution: ['macosBuild', 'safariVersion', 'processPathsDigest', 'surgeVersion', 'surgeBuild', 'takeoverMode'],
+  safari_process_attribution: ['macosBuild', 'macosVersionExtra', 'macosRestartPending', 'safariVersion', 'processPathsDigest', 'surgeVersion', 'surgeBuild', 'takeoverMode'],
   native_profile_id: ['macosBuild', 'safariVersion', 'signingIdentity'],
   native_bridge_ipc: ['macosBuild', 'safariVersion', 'signingIdentity'],
   bridge_keychain_access: ['macosBuild', 'signingIdentity'],
@@ -220,13 +226,13 @@ export const CAPABILITY_CONTEXT_DEPS: Record<CapabilityKey, readonly CapabilityC
   fixed_profile_no_switch: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism'],
   runtime_entry_modes: ['surgeVersion', 'surgeBuild', 'entryStrategy', 'processPathsDigest', 'autoReload', 'adapterMechanism', 'takeoverMode'],
   entry_rules_after_restart: ['surgeVersion', 'surgeBuild', 'entryStrategy'],
-  safari_udp_quic_handling: ['surgeVersion', 'surgeBuild', 'entryStrategy', 'processPathsDigest', 'macosBuild', 'safariVersion', 'takeoverMode'],
+  safari_udp_quic_handling: ['surgeVersion', 'surgeBuild', 'entryStrategy', 'processPathsDigest', 'macosBuild', 'macosVersionExtra', 'macosRestartPending', 'safariVersion', 'takeoverMode'],
   targeted_resource_refresh: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism', 'autoReload'],
   policy_path_reread: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism'],
   external_node_underlying_proxy: ['surgeVersion', 'surgeBuild'],
   connection_continuity: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism', 'autoReload', 'takeoverMode'],
   auto_reload_atomic_replace: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'autoReload'],
-  first_request_and_old_connections: ['macosBuild', 'safariVersion', 'surgeVersion', 'surgeBuild', 'entryStrategy', 'processPathsDigest'],
+  first_request_and_old_connections: ['macosBuild', 'macosVersionExtra', 'macosRestartPending', 'safariVersion', 'surgeVersion', 'surgeBuild', 'entryStrategy', 'processPathsDigest'],
   independent_node_preflight: ['surgeVersion', 'surgeBuild', 'adapterMechanism'],
   takeover_state_readable: ['surgeVersion', 'surgeBuild', 'adapterMechanism'],
   same_profile_reload_impact: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'takeoverMode'],
@@ -308,10 +314,12 @@ export const CAPABILITY_PRIMITIVES: Partial<Record<CapabilityKey, readonly strin
 export const CAPABILITY_CRITERIA: Record<CapabilityKey, string> = {
   safari_process_attribution:
     'Safari 实际连接（含扩展页面请求）按完整进程路径命中，Chrome 与其他 WebKit 应用不命中；IPv4/IPv6、HTTP/1.1、HTTP/2、HTTP/3、WebSocket 逐项通过或写明限制；DNS、WebRTC、系统服务另列覆盖情况。',
-  native_profile_id: '各场景（含默认场景）提供不同的 SFExtensionProfileKey，Safari 退出重开、扩展重装、App 重签后保持不变或变化行为已记录。',
-  native_bridge_ipc: '扩展经原生桥与服务往返成功；Safari 重开、重启、服务重启、服务升级后仍成功；后台脚本休眠后被唤醒仍能完成往返；无 TCC 提示。',
+  native_profile_id:
+    '每个已命名场景都提供 SFExtensionProfileKey 且互不相同，Safari 退出重开、扩展重装、App 重签后保持不变或变化行为已记录；默认场景是否提供已记录（不提供时按未识别场景处理、不能关联；提供时也与各已命名场景不同）。',
+  native_bridge_ipc:
+    '扩展经原生桥与服务往返成功；Safari 重开、重启、服务重启、服务升级后仍成功；后台脚本休眠后被唤醒仍能完成往返；无 TCC 提示；macOS 26 或更高时，退出 App 出现的后台任务提示与选「允许」「不允许」后服务的状态已记录。',
   bridge_keychain_access: '签名的原生桥能读取由指定写入方写入的账号密码钥匙串项，无额外提示；重建/重签后的提示次数已记录。',
-  extension_install_persistence: '不开启“允许未签名扩展”，扩展在 Safari 退出重开、重启、8 天以上与重新构建后仍保持启用；证书与描述文件有效期已记录。',
+  extension_install_persistence: '不开启“允许未签名扩展”，扩展在 Safari 退出重开、重启、8 天以上与重新构建后仍保持启用；证书有效期、App 与扩展是否嵌入描述文件及其有效期已记录。',
   fixed_profile_no_switch: '切换 SFE-ROUTE 选择时工作配置身份不变、不发生配置重载或引擎重启、Chrome 长连接与新请求不受影响。',
   runtime_entry_modes:
     '所选策略下四种模式精确生效，运行时读回包括 rule match：Safari 的 TCP、UDP、QUIC 对检测主机与其他主机都得到该模式预期的结果，Chrome 从不命中本应用入口规则或 SFE-ROUTE；每次切换不发生配置重载或引擎重启，其他应用长连接与新请求不受影响；中间状态无放行窗口；本应用入口优先于启用的模块 DIRECT 规则与用户临时规则；AND/NOT 组合（进程、协议、域名）的入口规则在该机制中可用；temp_rule 时新临时规则的插入位置已实测；ruleset_resource 时规则集文件原子替换后不调用 external-resource update，由 Surge 的文件监视在限定时间内重新读取并经见证规则读回。',

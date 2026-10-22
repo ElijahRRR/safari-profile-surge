@@ -1,6 +1,7 @@
 // attribution（引导式）：Safari 空白测试场景、Safari 扩展页面、Chrome、其他 WebKit 应用依次访问测试页与测试主机；
 // 每步结束读取 Surge 最近请求，按时间窗与测试主机归到对应应用，统计各自的进程完整路径。
 // 只有在 Chrome 与其他应用中从未出现的路径才成为候选；原始记录只保留测试主机（其他主机记为 null）。
+// 有待重启的后台安全改进（或无法确认）时结论记为不完整、候选路径不保存为后续测试的进程路径。
 
 import { existsSync } from 'node:fs';
 import { CAPABILITY_CRITERIA, VERIFY_ENDPOINTS } from '@sfe/contract';
@@ -10,6 +11,7 @@ import type { SurgeRequestRecord } from '../deps.js';
 import { refused, type ExitCode } from '../errors.js';
 import { check, logAction, verdictLabel, writeResult } from '../results.js';
 import { saveState } from '../state.js';
+import { restartPending } from '../system.js';
 import { ECHO_HOST } from '../test-profile.js';
 import { measureContext, openRun, openSession, printResult, requireServers, type Ctx } from './common.js';
 
@@ -82,6 +84,14 @@ export async function runAttribution(ctx: Ctx): Promise<ExitCode> {
   out.heading('Safari 进程归属（引导式）');
   out.line(`通过条件：${CAPABILITY_CRITERIA.safari_process_attribution}`);
   out.line('每一步完成后按回车；输入 skip 跳过该步。不要在测试期间用这些应用访问其他网站。');
+  const pendingAtStart = await restartPending(ctx.deps.pathPresence);
+  if (pendingAtStart !== 'no') {
+    out.warn(
+      pendingAtStart === 'yes'
+        ? '检测到已安装、尚未重启生效的后台安全改进：重启 Mac 之前只有 Safari 使用新的 WebKit，测得的路径可能只是暂时只属于 Safari，本次结论会记为不完整。请先重启 Mac 再运行。'
+        : '无法确认是否有待重启的后台安全改进（后台安全改进暂存位置读取失败），本次结论会记为不完整。',
+    );
+  }
 
   const records: AttributionRecord[] = [];
   const skipped: AttributionApp[] = [];
@@ -133,11 +143,24 @@ export async function runAttribution(ctx: Ctx): Promise<ExitCode> {
   const result = analyzeAttribution({ records, hosts, pageEvents, h3Observed, skipped, exists: (p) => existsSync(p) });
   dir.writeJson('attribution/analysis.json', { ...result, h3Observed, skipped, windows });
   const context = await measureContext(ctx, session, state, { processPaths: result.candidates });
+  // 后台安全改进装上后、Mac 重启前只有 Safari 使用新加密卷宗中的 WebKit（Apple 平台安全指南），这时测得的路径可能只是
+  // 暂时只属于 Safari：记为不完整（不能提议），重启 Mac 后重测。
+  const noPendingRestart = context.macosRestartPending === 'no';
+  const restartNote =
+    context.macosRestartPending === 'yes'
+      ? '有已安装、尚未重启生效的后台安全改进：重启 Mac 后重测'
+      : noPendingRestart
+        ? ''
+        : '无法确认是否有待重启的后台安全改进（后台安全改进暂存位置读取失败）';
   const saved = writeResult(dir, {
     key: 'safari_process_attribution',
     command: 'attribution',
     at: now().toISOString(),
-    checks: [...result.checks, check('Safari 步骤已完成', !skipped.includes('safari'))],
+    checks: [
+      ...result.checks,
+      check('Safari 步骤已完成', !skipped.includes('safari')),
+      check('没有待重启的后台安全改进', noPendingRestart ? true : null, restartNote),
+    ],
     summary: [
       `通过条件：${CAPABILITY_CRITERIA.safari_process_attribution}`,
       `候选进程路径：${result.candidates.join('；') || '无'}`,
@@ -149,7 +172,7 @@ export async function runAttribution(ctx: Ctx): Promise<ExitCode> {
     coverage: result.coverage,
     processPaths: result.candidates,
   });
-  if (result.candidates.length > 0 && result.invalid.length === 0) state = { ...state, processPaths: result.candidates, lastContext: context };
+  if (result.candidates.length > 0 && result.invalid.length === 0 && noPendingRestart) state = { ...state, processPaths: result.candidates, lastContext: context };
   saveState(dir, state);
   logAction(dir, { at: now().toISOString(), command: 'attribution', action: 'attribution_analyzed', detail: { candidates: result.candidates.length } });
 
@@ -158,6 +181,7 @@ export async function runAttribution(ctx: Ctx): Promise<ExitCode> {
   out.line(`候选（只属于 Safari）：${result.candidates.join('；') || '无'}`);
   if (result.conflicts.length > 0) out.warn(`以下路径同时出现在 Chrome 或其他应用中，已排除，不能扩成通用规则：${result.conflicts.join('；')}`);
   for (const e of result.invalid) out.warn(`候选路径未通过服务校验：${e.message}`);
+  if (!noPendingRestart) out.warn(`${restartNote}；本次候选路径不作为后续测试的进程路径，结论记为不完整。`);
   out.table([['协议', '结果', '说明'], ...Object.entries(result.coverage).map(([k, v]) => [k, v!.result, v!.note ?? ''])]);
   printResult(out, saved);
   return 0;

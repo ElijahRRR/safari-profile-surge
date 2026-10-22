@@ -11,8 +11,9 @@ describe('manifest', () => {
     expect(manifest.name).toBe('Safari 场景出口');
   });
 
-  it('requests only nativeMessaging and storage (no tabs)', () => {
-    expect(manifest.permissions).toEqual(['nativeMessaging', 'storage']);
+  it('requests only nativeMessaging, storage and alarms (no tabs)', () => {
+    // alarms：非持久后台的合并上报按 Apple 要求用 Alarms API 代替 setTimeout。
+    expect(manifest.permissions).toEqual(['nativeMessaging', 'storage', 'alarms']);
     expect(JSON.stringify(manifest)).not.toContain('"tabs"');
     expect(manifest.optional_permissions).toBeUndefined();
   });
@@ -24,6 +25,12 @@ describe('manifest', () => {
       expect(p).not.toContain('<all_urls>');
       expect(p).not.toMatch(/^\*:|:\/\/\*/);
     }
+  });
+
+  it('declares Safari 17.6 as the minimum version (17.6 fixed background pages that stopped responding after about 30 seconds)', () => {
+    // Apple（Optimizing your web extension for Safari）：“Provide a specific version number in strict_min_version if you have a
+    // minimum Safari version requirement.”；不声明 strict_max_version
+    expect(manifest.browser_specific_settings).toEqual({ safari: { strict_min_version: '17.6' } });
   });
 
   it('uses a non-persistent module background', () => {

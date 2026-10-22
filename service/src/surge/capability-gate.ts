@@ -2,7 +2,8 @@
 // 比较规则：记录为 any 匹配任何当前值；当前值读不到（null）时只匹配记录的 null 或 any；
 // 例外：Surge 版本与构建（NEVER_NULL_FIELDS）只在记录与当前都是格式正确的同一具体值时匹配——任一侧为 null 不匹配，
 // 记录为 any 或格式不对（早于提议校验确认的旧记录）也不匹配：版本读不到时依赖版本的能力一律待验证（失败即关闭），
-// 升级后也一定过期；adapterMechanism 只比较该能力依赖的原语（规范 JSON）。见 docs/ARCHITECTURE.md §5.2。
+// 升级后也一定过期；“后台安全改进待重启”（macosRestartPending）只有记录与当前都是 'no' 才匹配；adapterMechanism 只比较
+// 该能力依赖的原语（规范 JSON）。见 docs/ARCHITECTURE.md §5.2。
 
 import {
   CAPABILITY_CONTEXT_DEPS,
@@ -81,12 +82,47 @@ export function versionContextErrors(key: CapabilityKey, context: Pick<Capabilit
   return out;
 }
 
+/**
+ * 依赖 Safari 进程归属的能力还要求的本机上下文（服务与 P0 共用；网页确认时按同一规则判断）：
+ * - macosRestartPending 必须是 'no'。'yes' 时已安装的后台安全改进要重启 Mac 才完全生效：“After Safari has been relaunched,
+ *   it uses the framework and library content from the new cryptexes. The rest of the operating system remains unaffected
+ *   and doesn't make use of the new content until the system restarts.”（Apple 平台安全指南）这期间测得的路径可能只是暂时
+ *   只属于 Safari，重启后不再成立；null 或 'unknown'（无法确认）同样拒绝。门槛中这个字段只有 'no' 与 'no' 匹配，这样的记录
+ *   永远不会生效。
+ * - macosVersionExtra 必须是读到的具体值（没有安装时为 'none'）：null 或 any 的记录在装上后台安全改进后不会过期（基础构建号
+ *   可能不变）。
+ * 不依赖这两个字段的能力不检查。
+ */
+export function hostContextErrors(
+  key: CapabilityKey,
+  context: Partial<Pick<CapabilityContext, 'macosVersionExtra' | 'macosRestartPending'>> | null,
+): Array<{ field: 'macosVersionExtra' | 'macosRestartPending'; message: string }> {
+  const deps = CAPABILITY_CONTEXT_DEPS[key] ?? [];
+  const out: Array<{ field: 'macosVersionExtra' | 'macosRestartPending'; message: string }> = [];
+  if (deps.includes('macosRestartPending')) {
+    const v: unknown = context?.macosRestartPending;
+    if (v === 'yes') {
+      out.push({ field: 'macosRestartPending', message: '有已安装、尚未重启生效的后台安全改进（Safari 已在使用新的 WebKit，系统其余部分要到重启后才用），这时测得的进程归属不能沿用；请重启 Mac 后重测' });
+    } else if (v !== 'no') {
+      out.push({ field: 'macosRestartPending', message: '无法确认是否有待重启的后台安全改进（这样的记录永远不会生效）' });
+    }
+  }
+  if (deps.includes('macosVersionExtra')) {
+    const v: unknown = context?.macosVersionExtra;
+    if (v === null || v === undefined || v === '') out.push({ field: 'macosVersionExtra', message: '该能力依赖 macOS 补充版本（sw_vers -productVersionExtra），但读不到（这样的记录在装上后台安全改进后不会过期）' });
+    else if (v === 'any') out.push({ field: 'macosVersionExtra', message: '该能力依赖 macOS 补充版本，不能记为 any' });
+  }
+  return out;
+}
+
 export function contextFieldMatches(
   key: CapabilityKey,
   field: CapabilityContextField,
   recorded: string | null,
   current: string | null,
 ): boolean {
+  // 没有 any：只有记录与当前都确认没有待重启的后台安全改进才匹配（'yes'、'unknown'、null 与旧记录缺少该字段都不匹配）
+  if (field === 'macosRestartPending') return recorded === 'no' && current === 'no';
   if (NEVER_NULL_FIELDS.includes(field)) {
     // 只有格式正确的同一具体值才匹配：null、any 与格式不对的旧值（例如 127.0.0.1）都按不匹配（过期原因列出该字段）
     const re = field === 'surgeVersion' ? SURGE_VERSION_RE : SURGE_BUILD_RE;

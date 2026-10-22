@@ -8,7 +8,7 @@ import CapabilityContextList from '../components/CapabilityContextList.vue';
 import NoticeBox from '../components/NoticeBox.vue';
 import ProtocolCoverageTable from '../components/ProtocolCoverageTable.vue';
 import { useConsole } from '../store/context';
-import { COVERAGE_REQUIRED_KEYS, allCapabilities, capabilityCounts, coverageBlockReason, staleReasonText, versionBlockReason } from '../lib/gates';
+import { COVERAGE_REQUIRED_KEYS, allCapabilities, capabilityCounts, coverageBlockReason, hostBlockReason, staleReasonText, versionBlockReason } from '../lib/gates';
 import { CAPABILITY_STATUS_LABELS, ENTRY_STRATEGY_LABELS } from '../lib/labels';
 import { formatCount, formatDateTime } from '../lib/format';
 import { newRequestId } from '../lib/request-id';
@@ -37,7 +37,7 @@ function contextSummary(ctx: CapabilityView['context']): string {
   if (!ctx) return '—';
   const parts = [
     ctx.surgeVersion ? `Surge ${ctx.surgeVersion}${ctx.surgeBuild ? `（${ctx.surgeBuild}）` : ''}` : null,
-    ctx.macosBuild ? `macOS ${ctx.macosBuild}` : null,
+    ctx.macosBuild ? `macOS ${ctx.macosBuild}${ctx.macosVersionExtra && ctx.macosVersionExtra !== 'none' && ctx.macosVersionExtra !== 'any' ? ` ${ctx.macosVersionExtra}` : ''}` : null,
     ctx.safariVersion ? `Safari ${ctx.safariVersion}` : null,
     ctx.entryStrategy ? ENTRY_STRATEGY_LABELS[ctx.entryStrategy] : null,
   ].filter((x): x is string => x !== null);
@@ -50,7 +50,7 @@ function staleText(cap: CapabilityView): string {
 
 function confirmBlock(p: CapabilityProposalView): string | null {
   if (store.demoMode.value) return '演示模式不能确认能力';
-  return versionBlockReason(p) ?? coverageBlockReason(p);
+  return versionBlockReason(p) ?? hostBlockReason(p) ?? coverageBlockReason(p);
 }
 
 // ---------- 详情 ----------

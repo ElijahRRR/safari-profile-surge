@@ -6,7 +6,7 @@
 	<string>com.sfe.service</string>
 	<!--
 	  BundleProgram 相对 App 包解析；ProgramArguments 中的相对路径不会被解析（按 / 解析），
-	  因此由 sfe-service-launcher 按自身位置找到 Contents/Resources/node 与
+	  因此由 sfe-service-launcher 按自身位置找到 Contents/Helpers/node 与
 	  Contents/Resources/service/service.mjs 的绝对路径后 execv。不带演示参数，不含任何秘密或环境变量。
 	-->
 	<key>BundleProgram</key>

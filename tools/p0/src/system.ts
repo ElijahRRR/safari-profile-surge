@@ -1,7 +1,14 @@
-// 只读系统信息：sw_vers、Info.plist（defaults read）、进程列表（ps -axo pid,comm）、codesign。
+// 只读系统信息：sw_vers、Info.plist（defaults read）、进程列表（ps -axo pid,comm）、codesign、后台安全改进的暂存位置。
 // 子进程一律经服务的 execFixed：execFile（不经 shell）、固定绝对路径与参数、stdin 启动后立即关闭。
 
 import { execFixed } from './deps.js';
+import {
+  STAGED_CRYPTEX_PATH,
+  pathPresence as servicePathPresence,
+  restartPendingFrom,
+  versionExtraFromSwVers,
+  type PathPresence,
+} from '../../../service/src/engine/capabilities.js';
 
 export interface ExecResult {
   stdout: string;
@@ -34,13 +41,25 @@ export const SURGE_APP = '/Applications/Surge.app';
 export const DEFAULT_SURGE_CLI = '/Applications/Surge.app/Contents/Applications/surge-cli';
 export const DEFAULT_HOST_APP = '/Applications/SafariProfileSurge.app';
 
-export async function swVers(exec: ExecFn): Promise<{ productVersion: string | null; buildVersion: string | null }> {
+export async function swVers(exec: ExecFn): Promise<{ productVersion: string | null; buildVersion: string | null; productVersionExtra: string | null }> {
   const read = async (flag: string): Promise<string | null> => {
     const r = await exec('/usr/bin/sw_vers', [flag]);
     const v = r.stdout.trim();
     return r.code === 0 && /^[A-Za-z0-9.]{1,32}$/.test(v) ? v : null;
   };
-  return { productVersion: await read('-productVersion'), buildVersion: await read('-buildVersion') };
+  const productVersion = await read('-productVersion');
+  const buildVersion = await read('-buildVersion');
+  // 补充版本（后台安全改进）与服务同一规则：没有安装为 'none'，不认识的输出为 null
+  const productVersionExtra = versionExtraFromSwVers(await exec('/usr/bin/sw_vers', ['-productVersionExtra']));
+  return { productVersion, buildVersion, productVersionExtra };
+}
+
+/**
+ * 是否有已安装、要重启 Mac 才完全生效的后台安全改进（与服务同一规则：暂存位置存在为 'yes'，不存在为 'no'，无法确认为
+ * null）。TODO(P0)：暂存位置是测试 Mac 上的观察，按 P0-RUNBOOK §1.6 核对。presence 只供离线测试替换。
+ */
+export async function restartPending(presence: (path: string) => Promise<PathPresence> = servicePathPresence): Promise<'yes' | 'no' | null> {
+  return restartPendingFrom(await presence(STAGED_CRYPTEX_PATH));
 }
 
 /** 读取 App 包 Info.plist 的字符串键（defaults read 需要去掉 .plist 扩展名的路径）。 */
@@ -59,7 +78,11 @@ export interface ProcessEntry {
   path: string;
 }
 
-/** 解析 `ps -axo pid,comm` 输出（macOS 上 comm 为可执行文件完整路径）。 */
+/**
+ * 解析 `ps -axo pid,comm` 输出。comm 是进程自己提供的 argv[0]，不是内核给出的可执行文件路径（ps(1)：“a process is
+ * entitled to destroy this information”；adv_cmds 的 print.c 读 KERN_PROCARGS2 时跳过 exec_path），只作候选、未经核对。
+ * 需要确认是哪个文件时以 lsof txt 的 inode 与路径为准（服务的运行实例读取就是这样做的）。
+ */
 export function parsePsOutput(text: string): ProcessEntry[] {
   const out: ProcessEntry[] = [];
   for (const line of text.split(/\r?\n/)) {
@@ -70,7 +93,7 @@ export function parsePsOutput(text: string): ProcessEntry[] {
   return out;
 }
 
-/** 路径中含 WebKit 或 Safari 的进程候选（去重排序）。只是候选：归属以 Surge 请求记录为准。 */
+/** 路径中含 WebKit 或 Safari 的进程候选（去重排序）。只是候选、未经核对（路径来自 argv[0]）：归属以 Surge 请求记录为准。 */
 export function webkitSafariCandidates(procs: readonly ProcessEntry[]): string[] {
   return [...new Set(procs.map((p) => p.path).filter((p) => p.startsWith('/') && /webkit|safari/i.test(p)))].sort();
 }

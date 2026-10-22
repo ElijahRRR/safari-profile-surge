@@ -15,14 +15,14 @@ Safari Web Extension（MV3）：后台消息路由、弹窗、准备页、登录
 
 页面由 Vite 多入口构建；后台与内容脚本在页面构建结束后由 `build/plugin.ts` 用 esbuild 单独打包，`manifest.json` 由 `src/manifest.ts` 生成，是权限与匹配规则的唯一来源。
 
-`dist/` 是给 `apps/macos` 的 App Extension 打包用的资源目录。开发时可以用 Safari「开发」菜单临时加载，但临时扩展退出 Safari 就会移除，也不带原生桥，不是交付方式。
+`dist/` 是给 `apps/macos` 的 App Extension 打包用的资源目录。开发时可以在 Safari →「设置」→「开发者」标签中用「添加临时扩展…」加载（Apple：“Safari removes temporary extensions after 24 hours or when you quit Safari.”，https://developer.apple.com/documentation/safariservices/running-your-safari-web-extension），临时扩展也不带原生桥，不是交付方式。
 
 ## 组成
 
 | 目录 | 职责 |
 |---|---|
-| `src/background/` | 唯一调用 `runtime.sendNativeMessage` 的地方。扩展页面可转发原生请求（`requestLoginFill` 除外）；内容脚本只能发 `requestLoginFill`，后台丢弃它自报的地址、框架与路由序号，改用 `sender` 与一次新的 `getCurrentState` 重建。任何生命周期、窗口、标签页、焦点事件都只会触发 `reportProfileState` 提示上报，从不激活或进入普通模式 |
-| `src/popup/` | 弹窗（380px，EasyQuick UI）：当前场景状态、关联与创建、使用此环境、打开或定位订单页、重新检测、编辑、进入普通模式、旧窗口确认、等待中的验证与取消 |
+| `src/background/` | 唯一调用 `runtime.sendNativeMessage` 的地方。扩展页面可转发原生请求（`requestLoginFill` 除外）；内容脚本只能发 `requestLoginFill`，后台丢弃它自报的地址、框架与路由序号，改用 `sender` 与一次新的 `getCurrentState` 重建。任何生命周期、窗口、标签页、焦点事件都只会触发 `reportProfileState` 提示上报，从不激活或进入普通模式。后台是非持久的：监听器都在入口顶层同步注册，窗口/标签页事件后的合并上报用 `alarms`（闹钟 `sfe-profile-report`，1.5 秒后到点，再次创建即替换），不用 `setTimeout`（Apple：非持久后台“Use the `Alarms` API instead of `setTimeout`”，计时器在后台卸载后不会触发）；`alarms` 不可用时直接上报，不退回计时器 |
+| `src/popup/` | 弹窗（380px，EasyQuick UI）：当前场景状态、关联与创建、使用此环境、打开或定位订单页、重新检测、编辑、进入普通模式、旧窗口确认、等待中的验证与取消；未识别场景（拿不到 `SFExtensionProfileKey`，默认场景可能就是这样）只显示状态，并说明环境只能关联在已命名的 Safari 场景中 |
 | `src/prepare/` | 准备页 `prepare.html?op=<operation_id>`：表示场景到达、请求固定检测服务、提交结果、等待操作结束；成功前从不导航到 Amazon |
 | `src/content/` | 登录页条件填充：只请求页面上实际出现的字段，写入前重读 `form.action`，每页每字段最多一次，从不提交或点击；识别不到时显示「可手动填充」 |
 | `src/harness/` | 演示模式替身，只进入 `--mode harness` 构建（正式构建中被常量折叠移除） |
@@ -48,7 +48,10 @@ Safari Web Extension（MV3）：后台消息路由、弹窗、准备页、登录
 
 manifest.json 不能写注释，这些待确认项记录在这里：
 
-- **后台形式**：当前用 `"background": { "scripts": ["background.js"], "type": "module", "persistent": false }`。需要确认 Safari（macOS 14 / Safari 17 起）对非持久 module 后台的支持，以及是否应改为 `service_worker`；两种形式下都要验证后台休眠后被 `sendMessage` 唤醒仍能完成原生往返（并入 `native_bridge_ipc`）。
+- **后台形式**：当前用 `"background": { "scripts": ["background.js"], "type": "module", "persistent": false }`。需要确认 Safari（最低 17.6：17.6 才修复 “background pages would stop responding after about 30 seconds”）对非持久 module 后台的支持，以及是否应改为 `service_worker`；两种形式下都要验证后台休眠后被 `sendMessage` 唤醒仍能完成原生往返（并入 `native_bridge_ipc`）。
+- **最低版本**：manifest 以 `"browser_specific_settings": { "safari": { "strict_min_version": "17.6" } }` 声明（Apple，Optimizing your web extension for Safari：“Provide a specific version number in strict_min_version if you have a minimum Safari version requirement.”）。低于它时 Safari 如何呈现（不加载、不显示还是提示不兼容），Apple 没有写明；有低版本 Safari 的机器时记录一次。
+- **上报闹钟**：Safari 对 `alarms` 的最小延迟（是否把 1.5 秒延长）、后台卸载后闹钟能否唤醒它并派发 `onAlarm`，Apple 没有写明；按 P0-RUNBOOK §3.3 第 3 步记录在 `background_wake` 备注中。延迟变长只推迟提示性上报；闹钟不能唤醒后台时 `background_wake` 不通过。
+- **默认场景的场景标识**：默认场景是否提供 `SFExtensionProfileKey`（Apple 示例把没有这个键当作普通浏览）由 `native_profile_id` 记录；没有时弹窗显示「未识别当前场景」并提示改用已命名的场景。
 - **不申请 `tabs` 权限**时，`tabs.query({ url: [...] })` 在站点权限下是否返回匹配的标签页与 URL（决定 `amazon_tabs_open` 与订单页定位）。
 - 内容脚本消息的 `sender.id`、`sender.frameId`、`sender.tab.url` 是否都由 Safari 提供；缺任何一项时填充直接拒绝。
 - `runtime.onMessage` 用 `sendResponse` + `return true` 的异步应答，以及 `sendNativeMessage` 返回 Promise。

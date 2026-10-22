@@ -121,6 +121,42 @@ describe('docs/P0-RUNBOOK.md', () => {
     expect(text).toContain('手动');
     expect(text).toContain('SFE-P0-测试');
   });
+
+  it('native sections measure what Apple leaves open: default-profile ID, embedded provisioning profile, macOS 26 quit prompt, keychain prompt', () => {
+    const section = (key: string) => {
+      const start = text.indexOf(` ${key}（`);
+      return text.slice(start, text.indexOf('\n### ', start));
+    };
+    const profile = section('native_profile_id');
+    expect(profile).toContain('Perform normal browsing tasks.');
+    expect(profile).toContain('未识别当前场景');
+    expect(profile).not.toContain('加上默认场景都启用扩展');
+    const persistence = section('extension_install_persistence');
+    expect(persistence).toContain('embedded.provisionprofile');
+    expect(persistence).toContain('Unlike Apple’s other platforms, macOS doesn’t require a provisioning profile to run third-party code.');
+    expect(persistence).toContain('In Safari 17 or later, use the Developer tab in Settings');
+    const bridge = section('native_bridge_ipc');
+    expect(bridge).toContain('`quit_prompt`');
+    expect(bridge).toContain('sfltool dumpbtm');
+    const keychain = section('bridge_keychain_access');
+    expect(keychain).toContain('security find-generic-password -s com.sfe.account -w');
+    expect(keychain).toContain('不要选「允许」或「始终允许」');
+    // ps 的 comm 是 argv[0]，V1 只作候选
+    const v1 = text.split('\n').find((l) => l.startsWith('| V1 |'))!;
+    expect(v1).toContain('argv[0]');
+  });
+
+  it('report alarm steps: the delay expression handles a fired alarm, and the wake test schedules its own alarm after the background unloads', () => {
+    const start = text.indexOf(' native_bridge_ipc（');
+    const bridge = text.slice(start, text.indexOf('\n### ', start));
+    // 闹钟已到点时 get() 没有结果；`(…)?.scheduledTime - Date.now()` 会得到 NaN 而不是 undefined
+    expect(bridge).toContain("const a = await browser.alarms.get('sfe-profile-report'); a ? a.scheduledTime - Date.now() : '已到点'");
+    expect(bridge).not.toContain("?.scheduledTime - Date.now()");
+    // 新建标签页本身就会唤醒后台：唤醒测试由检查器创建闹钟、确认后台已卸载、之后不再操作 Safari
+    expect(bridge).toContain("browser.alarms.create('sfe-profile-report', { delayInMinutes: 2 })");
+    expect(bridge).toContain('确认后台已卸载');
+    expect(bridge).toContain('不能**用它证明闹钟能唤醒已卸载的后台');
+  });
 });
 
 describe('docs/ACCEPTANCE.md', () => {
@@ -222,5 +258,72 @@ describe('docs/INSTALL.md', () => {
   it('never instructs the tool to switch profiles or bulk-delete certificates', () => {
     expect(text).toContain('工具从不调用 switch-profile');
     expect(text).toContain('不批量删除证书');
+  });
+
+  it('follows Apple: site access is granted once for all profiles, extensions are enabled per profile, and binding uses named profiles', () => {
+    expect(text).toContain('across all profiles, private browsing, and browsing without a profile');
+    expect(text).toContain('By default, extensions are turned off for each new profile.');
+    expect(text).toContain('网站授权只需一次');
+    expect(text).not.toContain('新建场景后需要重复本步');
+    expect(text).not.toContain('不能替你给以后新建的场景自动授权');
+    expect(text).toContain('Perform normal browsing tasks.');
+    expect(text).toContain('**已命名** Safari 场景');
+  });
+
+  it('states Safari 17.6 as the minimum, the Developer tab for unsigned extensions and the macOS 26 quit prompt', () => {
+    expect(text).toContain('Safari 17.6 或更高');
+    expect(text).toContain('Fixed an issue where Safari Web Extension background pages would stop responding after about 30 seconds.');
+    expect(text).not.toContain('macOS 14（Safari 17）或更高');
+    expect(text).toContain('In Safari 17 or later, use the Developer tab in Settings');
+    expect(text).not.toContain('「开发」菜单中的「允许未签名扩展」');
+    expect(text).toContain('if background tasks are started by an app and remain active after a user quits the app');
+    expect(text).toContain('登录项与扩展');
+  });
+
+  it('does not overstate the keychain ACL or the 7-day profile (Apple: untrusted callers get a prompt; TN3125: no profile needed without restricted entitlements)', () => {
+    expect(text).not.toContain('拿到引用也读不到');
+    expect(text).not.toContain('但读不到账号密码');
+    expect(text).toContain('The user may choose to Deny, Allow, or Always Allow the access.');
+    expect(text).toContain('只有你拒绝时才读不到');
+    expect(text).toContain('A Mac app that uses no restricted entitlements doesn’t need a provisioning profile.');
+    expect(text).not.toContain('过期前需要在 Xcode 中重新构建运行');
+  });
+});
+
+describe('docs/ARCHITECTURE.md §0.1 and apps/macos/README.md (Apple documentation check)', () => {
+  const arch = read('ARCHITECTURE.md');
+  const s0 = arch.slice(arch.indexOf('## 0.'), arch.indexOf('## 1.'));
+  const macReadme = readFileSync(new URL('../../../apps/macos/README.md', import.meta.url), 'utf8');
+
+  it('§0 summarises the Apple-doc architecture risks with quotes, URLs and the measurement that decides each', () => {
+    const risks = s0.slice(s0.indexOf('### 0.1 Apple 官方文档核对的架构风险'));
+    expect(risks.length).toBeGreaterThan(0);
+    for (const [title, measurement, url] of [
+      ['**签名：Personal Team 能否作为正式交付', '`extension_install_persistence`', 'https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles'],
+      ['**原生桥依赖 App Group 容器。**', '`native_bridge_ipc`', 'https://developer.apple.com/documentation/macos-release-notes/macos-15-release-notes'],
+      ['**登录填充依赖已过时的钥匙串接口。**', '`bridge_keychain_access`', 'https://developer.apple.com/documentation/security/access-control-lists'],
+      ['**默认场景可能拿不到场景 ID。**', '`native_profile_id`', 'https://developer.apple.com/documentation/safariservices/messaging-between-the-app-and-javascript-in-a-safari-web-extension'],
+      ['**进程归属与后台安全改进（BSI）。**', '`safari_process_attribution`', 'https://support.apple.com/guide/security/background-security-improvements-sec87fc038c2/web'],
+    ] as const) {
+      const at = risks.indexOf(title);
+      expect(at, title).toBeGreaterThanOrEqual(0);
+      const next = risks.indexOf('\n\n', risks.indexOf('由谁决定', at));
+      const item = risks.slice(at, next === -1 ? undefined : next);
+      expect(item, title).toContain(measurement);
+      expect(item, title).toContain(url);
+    }
+    expect(s0).toContain('**最低系统**：macOS 14、Safari 17.6 或更高');
+    expect(arch).not.toContain('拿到引用也读不到');
+    expect(arch).toContain('`comm` 是进程自己提供的 argv[0]');
+  });
+
+  it('apps/macos/README.md drops unsupported keychain claims and per-profile site grants', () => {
+    expect(macReadme).not.toContain('对文件型钥匙串在 macOS 14 上仍有效');
+    expect(macReadme).not.toContain('不能替用户给未来的场景自动授权');
+    expect(macReadme).not.toContain('（开发菜单）');
+    expect(macReadme).not.toContain('各场景（含默认场景）');
+    expect(macReadme).toContain('limits access to the item based on an application\'s code signature');
+    expect(macReadme).toContain('Safari 17.6 或更高');
+    expect(macReadme).toContain('**只需一次**');
   });
 });

@@ -7,6 +7,8 @@ const ctx: CapabilityContext = {
   surgeVersion: '6.5.0',
   surgeBuild: '10960',
   macosBuild: '25A100',
+  macosVersionExtra: 'none',
+  macosRestartPending: 'no',
   safariVersion: '26.0',
   entryStrategy: 'temp_rule',
   processPathsDigest: 'c'.repeat(64),

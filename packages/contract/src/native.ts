@@ -27,6 +27,32 @@ import type { OldSessionPolicy } from './phases.js';
 import type { SiteCode } from './sites.js';
 
 export const NATIVE_PROTOCOL_VERSION = 1 as const;
+
+/**
+ * 最低 Safari 版本。Safari 17.6 发行说明：“Fixed an issue where Safari Web Extension background pages would stop
+ * responding after about 30 seconds.”（https://developer.apple.com/documentation/safari-release-notes/safari-17_6-release-notes）；
+ * 本扩展依赖非持久后台页与原生消息，所以 17.0–17.5 不支持。扩展 manifest 以 browser_specific_settings.safari.strict_min_version
+ * 声明（Apple：“Provide a specific version number in strict_min_version if you have a minimum Safari version requirement.”，
+ * https://developer.apple.com/documentation/safariservices/optimizing-your-web-extension-for-safari）；P0 对低于它的测量拒绝提议。
+ */
+export const SAFARI_MINIMUM_VERSION = '17.6' as const;
+
+/**
+ * Safari 版本（Info.plist 的 CFBundleShortVersionString，如 17.6、18.0.1）是否低于 SAFARI_MINIMUM_VERSION。
+ * 读不到或不是纯数字点分格式时返回 null（不能判断）。
+ */
+export function safariBelowMinimum(version: string | null): boolean | null {
+  const v = version?.trim() ?? '';
+  if (!/^\d{1,4}(\.\d{1,4}){0,3}$/.test(v)) return null;
+  const have = v.split('.').map(Number);
+  const want = SAFARI_MINIMUM_VERSION.split('.').map(Number);
+  for (let i = 0; i < Math.max(have.length, want.length); i++) {
+    const a = have[i] ?? 0;
+    const b = want[i] ?? 0;
+    if (a !== b) return a < b;
+  }
+  return false;
+}
 /** 原生宿主 App 的 bundle identifier（Safari 会忽略 sendNativeMessage 的 application 参数，仍按惯例填写）。 */
 export const NATIVE_APP_ID = 'com.sfe.SafariProfileSurge';
 /** 单条 NDJSON 消息上限。 */

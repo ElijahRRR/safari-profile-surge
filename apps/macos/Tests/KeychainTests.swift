@@ -7,8 +7,25 @@ final class KeychainStatusTests: XCTestCase {
         XCTAssertEqual(KeychainFailureReason.from(status: errSecUserCanceled), .denied)
     }
 
-    func testLockedStatus() {
+    func testInteractionNotAllowedStatus() {
+        // 线路值沿用 "locked"，但 Apple 只定义为「不允许交互」（不一定是钥匙串已锁定）
         XCTAssertEqual(KeychainFailureReason.from(status: errSecInteractionNotAllowed), .locked)
+        XCTAssertEqual(KeychainFailureReason.locked.rawValue, "locked")
+    }
+
+    func testInteractionNotAllowedTextDoesNotClaimTheKeychainIsLocked() {
+        let text = KeychainFailureReason.locked.displayText
+        XCTAssertEqual(text, "钥匙串需要用户交互但当前不允许（可能已锁定，或无法显示授权提示）")
+        XCTAssertFalse(text.hasPrefix("钥匙串已锁定"))
+    }
+
+    func testDisplayTextsAreChineseAndDistinct() {
+        let texts = KeychainFailureReason.allCases.map(\.displayText)
+        XCTAssertEqual(Set(texts).count, texts.count)
+        for text in texts {
+            XCTAssertFalse(text.isEmpty)
+            XCTAssertTrue(text.unicodeScalars.contains { (0x4E00...0x9FFF).contains($0.value) }, text)
+        }
     }
 
     func testAccessControlStatuses() {
@@ -240,8 +257,15 @@ final class BundleLayoutTests: XCTestCase {
 
     func testServiceCommandUsesAbsolutePaths() {
         let command = BundleLayout.serviceCommand(forHelperExecutable: helper.deletingLastPathComponent().appendingPathComponent("sfe-service-launcher"))
-        XCTAssertEqual(command?.node.path, "/Applications/SafariProfileSurge.app/Contents/Resources/node")
+        XCTAssertEqual(command?.node.path, "/Applications/SafariProfileSurge.app/Contents/Helpers/node")
         XCTAssertEqual(command?.script.path, "/Applications/SafariProfileSurge.app/Contents/Resources/service/service.mjs")
+    }
+
+    func testBundledNodeIsCodeInHelpersNotAResource() throws {
+        // Apple「Placing content in a bundle」：辅助工具放在 Contents/MacOS 或 Contents/Helpers，Resources 只放非代码
+        let command = try XCTUnwrap(BundleLayout.serviceCommand(forHelperExecutable: helper.deletingLastPathComponent().appendingPathComponent("sfe-service-launcher")))
+        XCTAssertEqual(command.node.deletingLastPathComponent().path, helper.deletingLastPathComponent().path)
+        XCTAssertFalse(command.node.pathComponents.contains("Resources"))
     }
 
     func testHelperOutsideTheAppBundleIsRejected() {

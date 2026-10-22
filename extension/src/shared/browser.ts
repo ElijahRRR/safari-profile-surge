@@ -58,6 +58,24 @@ export interface WebExtBrowser {
   permissions?: {
     contains(query: { origins?: string[]; permissions?: string[] }): Promise<boolean>;
   };
+  /**
+   * 只有后台脚本调用（需要 alarms 权限）。非持久后台的延迟工作只用它：Apple 要求“Use the Alarms API instead of
+   * setTimeout”，计时器在后台页卸载后不会触发；闹钟由浏览器保存，到点时派发 onAlarm（Safari 的最小延迟与
+   * 卸载后是否按时唤醒没有文档，由 P0 native_bridge_ipc 实测）。
+   * create 在不同浏览器上返回 void 或 Promise，两种都要处理。
+   */
+  alarms?: {
+    create(name: string, info: { when?: number; delayInMinutes?: number; periodInMinutes?: number }): void | Promise<void>;
+    clear(name: string): Promise<boolean>;
+    get?(name: string): Promise<BrowserAlarm | undefined>;
+    onAlarm?: BrowserEvent<(alarm: BrowserAlarm) => void>;
+  };
+}
+
+export interface BrowserAlarm {
+  name: string;
+  scheduledTime: number;
+  periodInMinutes?: number;
 }
 
 export function getBrowser(): WebExtBrowser {

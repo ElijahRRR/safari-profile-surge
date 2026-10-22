@@ -14,6 +14,8 @@ import {
   shortProfileId,
   SfeError,
   httpStatusFor,
+  SAFARI_MINIMUM_VERSION,
+  safariBelowMinimum,
 } from '../src/index.js';
 
 describe('naming', () => {
@@ -88,5 +90,18 @@ describe('phases, errors, routes', () => {
     expect(new Set(keys).size).toBe(keys.length);
     expect(buildPath(API_ROUTES.activate.path, { id: 'env_1' })).toBe('/api/environments/env_1/activate');
     expect(() => buildPath(API_ROUTES.activate.path)).toThrow();
+  });
+});
+
+describe('safari minimum version', () => {
+  // Safari 17.6 才修复 “background pages would stop responding after about 30 seconds”
+  test('is 17.6', () => {
+    expect(SAFARI_MINIMUM_VERSION).toBe('17.6');
+  });
+
+  test('compares dotted versions numerically and returns null when unreadable', () => {
+    for (const v of ['17.0', '17.5', '17.5.1', '16.6', '17']) expect(safariBelowMinimum(v)).toBe(true);
+    for (const v of ['17.6', '17.6.0', '17.6.1', '17.10', '18.0', '18.0.1', '26.0', ' 18.4 ']) expect(safariBelowMinimum(v)).toBe(false);
+    for (const v of [null, '', 'unknown', 'demo', '17.x', '18.0 (20619.1.26)', '-17.0']) expect(safariBelowMinimum(v)).toBeNull();
   });
 });

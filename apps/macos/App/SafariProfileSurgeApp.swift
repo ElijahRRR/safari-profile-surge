@@ -54,7 +54,7 @@ struct MenuContent: View {
             Button("注册后台服务") { model.registerAgent() }
         }
         if model.agentNeedsApproval {
-            Button("打开登录项设置") { model.openLoginItemsSettings() }
+            Button(ServiceAgent.openLoginItemsButtonTitle) { model.openLoginItemsSettings() }
         }
         Button("Safari 扩展设置") { model.openExtensionSettings() }
 

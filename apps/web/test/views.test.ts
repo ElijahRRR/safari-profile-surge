@@ -198,6 +198,11 @@ describe('binding wizard', () => {
     expect(Array.from(steps).map((s) => s.getAttribute('data-step-state'))).toEqual(['done', 'current', 'current', 'upcoming']);
     expect(steps[0]!.textContent).toContain('在 Safari 中创建名为「US-买家01」的场景');
     expect(steps[2]!.textContent).toContain('www.amazon.com');
+    // Safari 17 起网站授权对所有场景共用，只有扩展开关按场景分开；默认场景可能没有场景 ID
+    expect(steps[2]!.textContent).toContain('Safari 17 起网站授权对所有场景共用');
+    expect(steps[2]!.textContent).not.toContain('只申请这一个站点');
+    expect(steps[1]!.textContent).toContain('新场景的扩展默认关闭，每个场景都要单独启用');
+    expect(steps[0]!.textContent).toContain('不要使用默认场景');
     expect(document.body.textContent).toContain('1 / 4 步');
     click(document.body.querySelector('[data-test="mark-step"]'));
     await flush();

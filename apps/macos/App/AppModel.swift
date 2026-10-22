@@ -81,11 +81,11 @@ final class AppModel: ObservableObject {
             environmentsPlaceholder = message
         }
 
-        let bridgeReachable = await BridgeProbe.isReachable()
+        let bridge = await BridgeProbe.probe()
         let extensionEnabled = await ExtensionStatus.isEnabled()
 
         var lines = statusLines
-        lines.append(bridgeReachable ? "原生桥：可连接" : "原生桥：无法连接")
+        lines.append(bridge.statusLine)
         switch extensionEnabled {
         case true?: lines.append("Safari 扩展：已启用")
         case false?: lines.append("Safari 扩展：未启用")
@@ -97,7 +97,7 @@ final class AppModel: ObservableObject {
         var found: [String] = []
         if let setupProblem { found.append(setupProblem) }
         if extensionEnabled == false { found.append("Safari 扩展未启用：请在 Safari 设置的扩展中启用") }
-        if !bridgeReachable { found.append("原生桥无法连接：扩展暂时不能与本机服务通信") }
+        if let bridgeProblem = bridge.problemText { found.append(bridgeProblem) }
         problems = found
     }
 
@@ -190,7 +190,7 @@ final class AppModel: ObservableObject {
         }
         agentStatus = ServiceAgent.service.status
         if agentStatus == .requiresApproval {
-            Alerts.showInfo(title: "后台服务等待允许", message: "请在系统设置的登录项中允许 SafariProfileSurge，然后回到这里刷新状态。")
+            Alerts.showInfo(title: "后台服务等待允许", message: ServiceAgent.approvalGuidance)
         }
         refresh()
     }

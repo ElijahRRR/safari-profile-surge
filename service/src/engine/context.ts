@@ -164,6 +164,16 @@ export function surgeRestartedBetween(prev: SurgeRuntimeSample | null, next: Sur
 export interface HostInfo {
   /** sw_vers 构建号；非 macOS 为 'unknown'；读不到为 null。 */
   macosBuild(): Promise<string | null>;
+  /**
+   * `sw_vers -productVersionExtra`（后台安全改进的补充版本，engine/capabilities.ts 的 versionExtraFromSwVers）；没有安装时
+   * 为 'none'，非 macOS 为 'unknown'，读不到为 null。
+   */
+  macosVersionExtra(): Promise<string | null>;
+  /**
+   * 是否有已安装、要重启 Mac 才完全生效的后台安全改进（暂存位置 STAGED_CRYPTEX_PATH，restartPendingFrom）；非 macOS 为
+   * 'unknown'，无法确认为 null。只有 'no' 能让依赖进程归属的能力生效。
+   */
+  macosRestartPending(): Promise<CapabilityContext['macosRestartPending']>;
   /** Safari.app Info.plist 版本；非 macOS 为 'unknown'；读不到为 null。 */
   safariVersion(): Promise<string | null>;
   /** 宿主 App 上报的签名身份；未知为 null。 */
@@ -281,7 +291,12 @@ export class Engine {
   readonly deps: AppServiceDeps;
   readonly host: HostInfo;
   facts: SurgeFacts = emptySurgeFacts();
-  hostFacts: { macosBuild: string | null; safariVersion: string | null } = { macosBuild: null, safariVersion: null };
+  hostFacts: {
+    macosBuild: string | null;
+    macosVersionExtra: string | null;
+    macosRestartPending: CapabilityContext['macosRestartPending'];
+    safariVersion: string | null;
+  } = { macosBuild: null, macosVersionExtra: null, macosRestartPending: null, safariVersion: null };
   views: EventViews | null = null;
   /** 可达性检测原语：创建时静态选定，之后不变。 */
   readonly livenessPrimitive: LivenessPrimitive | null;
@@ -314,6 +329,8 @@ export class Engine {
     const off = process.platform !== 'darwin';
     this.host = {
       macosBuild: deps.host?.macosBuild ?? (async () => (off ? 'unknown' : null)),
+      macosVersionExtra: deps.host?.macosVersionExtra ?? (async () => (off ? 'unknown' : null)),
+      macosRestartPending: deps.host?.macosRestartPending ?? (async () => (off ? 'unknown' : null)),
       safariVersion: deps.host?.safariVersion ?? (async () => (off ? 'unknown' : null)),
       signingIdentity: deps.host?.signingIdentity ?? (() => null),
       processPathExists: deps.host?.processPathExists ?? (() => true),
@@ -424,9 +441,9 @@ export class Engine {
   // ---------- Surge 事实与能力上下文 ----------
 
   /**
-   * 只读 Surge 基础事实（可达性、版本、启动时间、当前配置、接管、自动重载）；从不写。同时重读本机事实（macOS 构建号、
-   * Safari 版本）：服务常驻运行，Safari 可单独经软件更新升级而不重启，能力门槛（激活前、写入 ACTIVE 前、对账）
-   * 必须按当前版本判定，不能沿用启动时的值。
+   * 只读 Surge 基础事实（可达性、版本、启动时间、当前配置、接管、自动重载）；从不写。同时重读本机事实（macOS 构建号与
+   * 补充版本、后台安全改进是否待重启、Safari 版本）：服务常驻运行，Safari 可单独经软件更新升级而不重启，后台安全改进装上
+   * 后 Safari 重开即使用新的 WebKit，能力门槛（激活前、写入 ACTIVE 前、对账）必须按当前状态判定，不能沿用启动时的值。
    *
    * 可达性只看固定的检测原语（livenessPrimitive）一次读取是否解析成功；其他任何结果都是不可达（失败即关闭），
    * 不可达时不再读取其他事实。版本与构建号来自运行中的 Surge 实例（host.surgeInstance），并与 `surge-cli --raw version`
@@ -627,6 +644,16 @@ export class Engine {
       this.hostFacts.macosBuild = null;
     }
     try {
+      this.hostFacts.macosVersionExtra = await this.host.macosVersionExtra();
+    } catch {
+      this.hostFacts.macosVersionExtra = null;
+    }
+    try {
+      this.hostFacts.macosRestartPending = await this.host.macosRestartPending();
+    } catch {
+      this.hostFacts.macosRestartPending = null;
+    }
+    try {
       this.hostFacts.safariVersion = await this.host.safariVersion();
     } catch {
       this.hostFacts.safariVersion = null;
@@ -639,6 +666,8 @@ export class Engine {
       surgeVersion: this.facts.version,
       surgeBuild: this.facts.build,
       macosBuild: this.hostFacts.macosBuild,
+      macosVersionExtra: this.hostFacts.macosVersionExtra,
+      macosRestartPending: this.hostFacts.macosRestartPending,
       safariVersion: this.hostFacts.safariVersion,
       entryStrategy: s.entryStrategy,
       processPaths: s.safariProcessPaths,

@@ -5,6 +5,13 @@ import Security
 /// （timeout 只由服务端产生）。
 enum KeychainFailureReason: String, Error, Equatable, CaseIterable {
     case denied
+    /// errSecInteractionNotAllowed。Apple 只定义为 “Interaction with the Security Server is not allowed.”
+    /// （https://developer.apple.com/documentation/security/errsecinteractionnotallowed）；需要用户认证而又不允许显示界面时
+    /// 也返回它（kSecUseAuthenticationUIFail：“if user authentication is needed, the function returns the
+    /// errSecInteractionNotAllowed error.”，https://developer.apple.com/documentation/security/ksecuseauthenticationuifail）。
+    /// 所以它表示「需要交互但当前不允许」，不一定是钥匙串已锁定。线路值沿用 "locked"（与服务端的 reason 取值一致）。
+    // P0: bridge_keychain_access —— 记录钥匙串锁定、用户拒绝时扩展（登录填充）与 sfe-keychain（LaunchAgent 启动的服务调用）
+    // 分别得到哪个 reason，再决定是否拆分。
     case locked
     case acl
     case notFound = "not_found"
@@ -29,7 +36,7 @@ enum KeychainFailureReason: String, Error, Equatable, CaseIterable {
     var displayText: String {
         switch self {
         case .denied: return "用户拒绝了访问"
-        case .locked: return "钥匙串已锁定"
+        case .locked: return "钥匙串需要用户交互但当前不允许（可能已锁定，或无法显示授权提示）"
         case .acl: return "访问控制不匹配"
         case .notFound: return "找不到该项"
         case .other: return "钥匙串返回错误"

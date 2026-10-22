@@ -115,4 +115,27 @@ describe('child process call sites close stdin', () => {
     await expect(macHost('linux').surgeInstance!()).resolves.toEqual({ ok: false, reason: 'not_darwin' });
     expect(state.calls.length).toBe(n);
   });
+
+  test('service host: the supplemental version (Background Security Improvement) runs sw_vers -productVersionExtra, stdin closed', async () => {
+    const n = state.calls.length;
+    await expect(macHost('darwin').macosVersionExtra!()).resolves.toBe('ok');
+    const calls = state.calls.slice(n);
+    expect(calls).toHaveLength(1);
+    expectClosedStdin(calls[0]!, '/usr/bin/sw_vers');
+    expect(calls[0]!.args).toEqual(['-productVersionExtra']);
+  });
+
+  test('service host: the restart-pending check only looks at the staged cryptex path (no child process)', async () => {
+    const n = state.calls.length;
+    expect(['yes', 'no', null]).toContain(await macHost('darwin').macosRestartPending!());
+    expect(state.calls.length).toBe(n);
+  });
+
+  test('service host off macOS: the Background Security Improvement facts are "unknown" without a child process', async () => {
+    const n = state.calls.length;
+    const host = macHost('linux');
+    await expect(host.macosVersionExtra!()).resolves.toBe('unknown');
+    await expect(host.macosRestartPending!()).resolves.toBe('unknown');
+    expect(state.calls.length).toBe(n);
+  });
 });

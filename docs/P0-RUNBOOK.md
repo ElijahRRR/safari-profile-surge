@@ -77,6 +77,7 @@ npx tsx tools/p0/src/cli.ts help
 - Chrome：作为对照应用，保持一个窗口。
 - 另一个 WebKit 应用：用于证明候选路径不是系统通用 WebKit 进程（例如「邮件」的快速查看预览、「快捷指令」的「获取 URL 内容」）。
 - Surge：增强模式或系统代理至少一项开启，出站模式为规则模式。记录当前是哪一项（能力上下文中的 `takeoverMode`）。
+- 后台安全改进（Background Security Improvement）：测进程归属前不能有待重启的后台安全改进。Apple：“After Safari has been relaunched, it uses the framework and library content from the new cryptexes. The rest of the operating system remains unaffected and doesn't make use of the new content until the system restarts.”（https://support.apple.com/guide/security/background-security-improvements-sec87fc038c2/web）这期间测到的路径可能只是暂时只属于 Safari。inventory 列出「后台安全改进（sw_vers -productVersionExtra）」与「后台安全改进待重启」；后者不是「否」时先重启 Mac。系统设置的软件更新页提示需要重启时同样先重启（工具的判断依据尚待 §1.6 核对）。
 
 ### 1.2 测试主机
 
@@ -129,7 +130,7 @@ npx tsx tools/p0/src/cli.ts instance [--surge-team-id <Team ID>]
 
 | 编号 | 核对 | 做法 | 期望 | 证据 |
 |---|---|---|---|---|
-| V1 | 进程列表 | `LC_ALL=C LANG=C TZ=UTC /bin/ps -ww -axo pid=,uid=,lstart=,comm=`，与 instance 结果对照 | 当前用户恰好一行完整路径 `/Applications/Surge.app/Contents/MacOS/Surge`；其他 Surge 相关进程（root 特权助手、`Contents/Applications/surge-cli`、包内的登录项等）都出现在 instance 的“已排除”列表中；启动时间与「活动监视器」及 `ps -o etime= -p <pid>` 一致；instance 没有提示超过服务读取的时限（除包信息与签名外各规则的耗时合计在 8 秒内：服务每次读取都要执行这些步骤，超过引擎的总时限即读不到版本） | instance 证据的 process、bundle_executable、start_time 与各规则的 ms |
+| V1 | 进程列表 | `LC_ALL=C LANG=C TZ=UTC /bin/ps -ww -axo pid=,uid=,lstart=,comm=`，与 instance 结果对照 | 当前用户恰好一行完整路径 `/Applications/Surge.app/Contents/MacOS/Surge`（`comm` 是进程自己提供的 argv[0]，不是内核给出的可执行文件路径——ps(1)：“a process is entitled to destroy this information”——所以这一列只作候选，是不是运行中的那份文件以 V4 的 lsof txt inode 与路径为准）；其他 Surge 相关进程（root 特权助手、`Contents/Applications/surge-cli`、包内的登录项等）都出现在 instance 的“已排除”列表中；启动时间与「活动监视器」及 `ps -o etime= -p <pid>` 一致；instance 没有提示超过服务读取的时限（除包信息与签名外各规则的耗时合计在 8 秒内：服务每次读取都要执行这些步骤，超过引擎的总时限即读不到版本） | instance 证据的 process、bundle_executable、start_time 与各规则的 ms |
 | V2 | Info.plist | `/usr/bin/plutil -extract CFBundleShortVersionString raw -o - /Applications/Surge.app/Contents/Info.plist`，再分别读 `CFBundleVersion`、`CFBundleIdentifier`、`CFBundleExecutable` | 版本与构建号等于 Surge「关于」窗口（例如 6.10.0 (12500)）；记录包标识与主程序名，交给开发者填写 `SURGE_BUNDLE_IDS` | 命令输出、关于窗口截图、info_plist |
 | V3 | 文件时间与重启 | `stat -f '%c %B' /Applications/Surge.app/Contents/Info.plist /Applications/Surge.app/Contents/MacOS/Surge`；分别在正常打开、在 Surge 菜单中退出后重新打开、注销再登录之后运行 instance | 每次都早于启动时间（证据中相对启动的毫秒数为负）；连续几天每天运行一次，记录任何让这条检查误判失败的元数据变化 | not_modified |
 | V4 | lsof | `/usr/sbin/lsof -nP -a -p <pid> -d txt -F in` 与 `stat -f %i /Applications/Surge.app/Contents/MacOS/Surge` | 主程序那一项的 inode 与路径都一致；记录是否需要额外权限与耗时 | running_image |
@@ -186,6 +187,7 @@ kill "$SELFTEST_PID"
 - 哪个请求字段是 `kill <connection-id>` 的 id：3.7 的结束连接记录。
 - `--check` 对无效配置的退出码：make-test-profile 的 `--check` 记录；可另用一份故意写错的合成配置手动核对。
 - 6.9.0 起哪些改动会让 reload 升级为完整引擎重启：3.15 只记录本次是否升级，不据一次结果推断规则。
+- 后台安全改进的识别（服务与 P0 同一规则，见 `service/src/engine/capabilities.ts`）：先记录 `man sw_vers` 中 `-productVersionExtra` 的原文；再在**没有安装**、**已安装未重启**（Safari 已重开）、**重启后**三种状态下各记录一次 `/usr/bin/sw_vers`（完整输出）、`/usr/bin/sw_vers -productVersionExtra`（输出与退出码，没有安装时是否为空）、`ls -ld /System/Volumes/Preboot/Cryptexes/Incoming`（是否存在、普通用户能否读取），以及 inventory 的两行结果。`Incoming` 这个暂存位置是测试 Mac 上的观察，Apple 没有写明路径（只写到 “applying the Incoming Cryptex”）。没有待重启时它也存在 → 依赖进程归属的三项（归属、UDP/QUIC、首请求与旧连接）会一直待验证，交给开发者改判断方法；装上后不出现 → 工具发现不了待重启，测试者继续按 §1.1 人工核对，同样交给开发者。补充版本在安装时还是重启后才变化，以及 Safari 进程路径在三种状态下是否不同（`/Applications/...`、`/System/Cryptexes/...` 或 `/System/Volumes/Preboot/Cryptexes/...`），一并记录。移除后台安全改进同样要重启才完成，有条件时也按三种状态记录一次。
 
 ## 2. 通用回退
 
@@ -217,7 +219,7 @@ kill "$SELFTEST_PID"
 ### 3.2 safari_process_attribution（Safari 精确进程归属）
 
 - **用途**：入口规则只能匹配 Safari 的完整进程路径；这是整个方案的前提。
-- **前置条件**：测试配置已手动切换；test-servers 在运行；`listRecentRequests` 有可用实现（通常需要测试配置中的回环 http-api，并已用测试配置重新 inventory）。
+- **前置条件**：测试配置已手动切换；test-servers 在运行；`listRecentRequests` 有可用实现（通常需要测试配置中的回环 http-api，并已用测试配置重新 inventory）；没有待重启的后台安全改进（§1.1）。工具检测到待重启或无法确认时开头即警告，结论记为「不完整」（检查项「没有待重启的后台安全改进」），本次候选路径不作为后续测试的进程路径，重启 Mac 后重测。
 - **步骤**：
   1. `attribution`。按提示依次进行四步，每步完成后回车：
      - Safari 空白测试场景：打开 `http://echo.p0.example.test:<端口>/attr/safari`，依次点击 HTTP/1.1、IPv4、IPv6、WebSocket（等约 5 秒）、WebRTC；点击「打开 HTTP/2 · HTTP/3 测试页」，在新标签页刷新 3 次，输入最后一次 `http=` 的值。
@@ -239,12 +241,20 @@ kill "$SELFTEST_PID"
   1. 打开扩展弹窗，确认显示服务状态（往返成功）。
   2. 依次做：Safari 退出重开；系统重启；菜单「停止后台服务」再「注册后台服务」；重新构建并替换 App（服务升级）。每次之后重复第 1 步。
   3. 后台休眠：让 Safari 闲置 5 分钟以上（或在「开发」菜单的扩展后台页确认后台已卸载），再点击扩展图标，确认往返成功。
-  4. 全程注意是否出现「访问其他 App 的数据」等系统提示。
+     - 上报闹钟（结论写进 `background_wake` 项备注）：窗口/标签页事件后的 `reportProfileState` 按 Apple 的要求用 Alarms API 代替 `setTimeout`（“When you make your background page nonpersistent: … Use the `Alarms` API instead of `setTimeout`.”，https://developer.apple.com/documentation/safariservices/optimizing-your-web-extension-for-safari），闹钟名 `sfe-profile-report`，请求 1.5 秒后到点。Safari 对闹钟的最小延迟、后台卸载后闹钟能否唤醒它，Apple 没有写明，这里实测（用已命名的测试场景：默认场景可能没有场景标识，上报会被拒绝）：
+       - 延迟：从「开发」菜单打开本扩展后台页的检查器，在测试场景新建一个标签页后立即在控制台执行 `const a = await browser.alarms.get('sfe-profile-report'); a ? a.scheduledTime - Date.now() : '已到点'`，记录结果（明显大于 1500 即 Safari 延长了闹钟；显示「已到点」表示闹钟已经触发，需要更快地执行一次）。
+       - 端到端上报：关闭检查器，让后台卸载（同上），在测试场景新建一个标签页后不再操作 Safari，等过上一步的延迟再加 1 分钟：数据目录的 `service.log` 中应有这次的 `bridge.request`（`"type":"reportProfileState"`、`"result":"ok"`），记录它与新建标签页的间隔。这一步只说明标签页事件之后上报能送达：新建标签页的事件本身就会唤醒后台，后台随即创建 1.5 秒后到点的闹钟，闹钟到点时后台多半还没卸载，所以**不能**用它证明闹钟能唤醒已卸载的后台。
+       - 闹钟唤醒已卸载的后台：从「开发」菜单打开本扩展后台页的检查器，在控制台执行 `browser.alarms.create('sfe-profile-report', { delayInMinutes: 2 })`，记下时间；关闭检查器，在「开发」菜单确认后台已卸载（闹钟到点前还没卸载时，本次不算，加大 `delayInMinutes` 重做）；之后不再操作 Safari（不打开弹窗，不新建或关闭窗口、标签页：这些事件本身会唤醒后台）。等闹钟时间过后再加 1 分钟（延迟子步骤测得 Safari 延长了闹钟时，按延长后的时间算）：数据目录的 `service.log` 中应有这次的 `bridge.request`（`"type":"reportProfileState"`、`"result":"ok"`），记录它与创建闹钟的间隔。没有出现时 `background_wake` 答「否」并写明：后台卸载后闹钟不能唤醒它，场景上报会丢失，「其他场景有打开的窗口」的确认依赖它。
+  4. 全程注意是否出现「访问其他 App 的数据」等系统提示。这只能说明宿主 App 的情况：扩展访问 App Group 容器被拒绝时系统**不弹出提示**（“This restriction also applies to app extensions, although in that case the system won’t prompt the user for consent but will instead just deny the access.”，https://developer.apple.com/documentation/macos-release-notes/macos-15-release-notes），所以扩展能否访问以第 1 步往返成功为准，`no_tcc` 答「是」不能代替它。被拒绝时弹窗显示「无法连接本机服务：系统拒绝扩展访问 App Group 容器……」（reason `container_denied`；宿主 App 自己也被拒绝时，菜单另有「系统拒绝访问 App Group 容器」）；出现时把弹窗原文（不含令牌）写进 `roundtrip` 项备注，`roundtrip` 答「否」。弹窗显示「读取原生桥配置失败（errno N）」时同样记录 N（拒绝访问实际返回哪个 errno，Apple 没有写明）。
   5. 握手与令牌（结论写进 `roundtrip` 项备注）：传输令牌从不上线路，原生桥先验证服务的 HMAC 证明（docs/ARCHITECTURE.md §7.2）。
      - 菜单「停止后台服务」后，在终端用 `nc -l 127.0.0.1 61848` 临时监听，再打开扩展弹窗：`nc` 只应收到一行 hello（只有 `v`、`type`、`clientNonce`），不含令牌、场景 ID 或消息；弹窗显示无法连接本机服务（10 秒超时，或结束 `nc` 时为「原生桥认证失败」）。之后重新「注册后台服务」，往返恢复。备注只写结论，不保存 `nc` 输出。
-     - 后台服务运行中退出 App，删除 App Group 容器中的 `bridge.token` 后重开 App（App 生成新令牌并覆盖数据目录中的副本），**不重启服务**，重复第 1 步：往返成功（服务每个连接重新读取令牌文件）。从终端删除容器内文件时若出现系统提示，备注写明提示来自终端，不计入 `no_tcc`。
-  6. `checklist native_bridge_ipc`（签名身份自动读取 `/Applications/SafariProfileSurge.app` 的 Team ID，或用 `--signing-identity` 提供）。
-- **通过条件**：扩展经原生桥与服务往返成功；Safari 重开、重启、服务重启、服务升级后仍成功；后台脚本休眠后被唤醒仍能完成往返；无 TCC 提示。
+     - 后台服务运行中退出 App，删除 App Group 容器中的 `bridge.token` 后重开 App（App 生成新令牌并覆盖数据目录中的副本），**不重启服务**，重复第 1 步：往返成功（服务每个连接重新读取令牌文件）。从终端删除容器内文件时若出现系统提示，备注写明提示来自终端，不计入 `no_tcc`。macOS 26 或更高时退出 App 会出现下一步所说的提示，这里选「允许」。
+  6. 退出 App 时的后台任务提示（结论写进 `quit_prompt` 项备注；更早的系统写「不适用」）。Apple：“On Mac computers with macOS 26 or later, if background tasks are started by an app and remain active after a user quits the app, the user is prompted to allow or not allow the background tasks to remain active.”（https://support.apple.com/guide/deployment/manage-login-items-background-tasks-mac-depdca572563/web）。选「不允许」之后会怎样，Apple 没有写明，所以这里实测：
+     - 后台服务运行中从菜单「退出」App，记录是否出现提示与提示原文；选「允许」，重复第 1 步：往返仍成功。
+     - 重开 App 再退出，这次选「不允许」：记录服务是否停止（重复第 1 步，往返是否失败）、重开 App 后菜单显示的后台服务状态（`SMAppService.status`），以及 `sfltool dumpbtm` 中 SafariProfileSurge 条目的变化（Apple 同一页：“Prints the current status of login and background items”；需要管理员权限时由你自己输入密码；备注只写这一条目的结论，不保存完整输出，它包含其他 App 的信息）。
+     - 之后在「系统设置 → 通用 → 登录项与扩展」（macOS 14 为「登录项」）中恢复允许，并在菜单中「注册后台服务」，重复第 1 步：往返恢复。
+  7. `checklist native_bridge_ipc`（签名身份自动读取 `/Applications/SafariProfileSurge.app` 的 Team ID，或用 `--signing-identity` 提供）。
+- **通过条件**：扩展经原生桥与服务往返成功；Safari 重开、重启、服务重启、服务升级后仍成功；后台脚本休眠后被唤醒仍能完成往返；无 TCC 提示；macOS 26 或更高时，退出 App 出现的后台任务提示与选「允许」「不允许」后服务的状态已记录。
 - **失败处理**：记录不支持；场景绑定与激活门槛保持关闭。不改用无令牌的传输或数据目录之外的路径。
 - **证据**：`results/native_bridge_ipc.json`（逐项结论与脱敏备注）；时间；签名身份；`log show --predicate 'subsystem == "com.sfe.SafariProfileSurge.Extension"' --last 1h` 的结论（只记录是否出现消息内容，不保存原文到仓库）。
 - **回退**：无 Surge 写入。
@@ -252,19 +262,27 @@ kill "$SELFTEST_PID"
 ### 3.4 native_profile_id（原生场景 ID 稳定性）
 
 - **用途**：绑定只认 `SFExtensionProfileKey`；不能按场景名猜测。
-- **前置条件**：同 3.3；至少两个测试场景加上默认场景都启用扩展。
-- **步骤**：在每个场景打开扩展弹窗，记录显示的场景 ID 前 8 位；Safari 退出重开、扩展停用再启用、App 重新构建签名后各记录一次。然后 `checklist native_profile_id`。
-- **通过条件**：各场景（含默认场景）提供不同的 SFExtensionProfileKey，Safari 退出重开、扩展重装、App 重签后保持不变或变化行为已记录。
-- **失败处理**：记录变化行为；产品绑定状态保持 `bound_unverified_id`，并先落地重新绑定流程。
+- **Apple 文档写了什么、没写什么**：示例代码把没有这个键当作普通浏览：`if let profileIdentifier = userInfo[SFExtensionProfileKey] as? UUID { // Perform profile specific tasks. } else { // Perform normal browsing tasks. }`（https://developer.apple.com/documentation/safariservices/messaging-between-the-app-and-javascript-in-a-safari-web-extension）；WWDC23 只说 “If your extension is active in a profile, there will be a profileIdentifier value for the key SFExtensionProfileKey.”（https://developer.apple.com/videos/play/wwdc2023/10119/）。默认场景与无痕浏览有没有这个键、值的实际类型、跨 Safari 重开与重签是否不变，Apple 都没有写，只能在这里实测。默认场景没有这个键时，服务按未识别场景处理（只允许 `getCurrentState`），环境只能关联在已命名的场景中；这不算本项不通过。
+- **前置条件**：同 3.3；至少两个已命名的测试场景都启用扩展（Safari →「设置」→「描述文件」（Profiles）→ 选择场景 →「扩展」）；默认场景也启用扩展（主「扩展」标签），用于记录。
+- **步骤**：在每个已命名场景打开扩展弹窗，记录显示的场景 ID 前 8 位；在默认场景打开弹窗，记录显示「未识别当前场景」还是场景 ID（前 8 位）；如已允许本扩展在无痕浏览中运行，在无痕窗口同样记录一次（只记录，写进 `default_profile` 项备注）。Safari 退出重开、扩展停用再启用、App 重新构建签名后各记录一次。然后 `checklist native_profile_id`。
+- **通过条件**：每个已命名场景都提供 SFExtensionProfileKey 且互不相同，Safari 退出重开、扩展重装、App 重签后保持不变或变化行为已记录；默认场景是否提供已记录（不提供时按未识别场景处理、不能关联；提供时也与各已命名场景不同）。
+- **失败处理**：记录变化行为；产品绑定状态保持 `bound_unverified_id`，并先落地重新绑定流程。默认场景提供的 ID 与某个已命名场景相同时记为不通过（两个场景无法区分）。
 - **证据**：`results/native_profile_id.json`（备注只写前 8 位）；时间；签名身份。
 - **回退**：无。
 
 ### 3.5 extension_install_persistence（扩展签名与启用持久性）
 
 - **用途**：免费 Apple ID（Personal Team）签名是否满足“正常打包签名”（ARCHITECTURE 冲突 2）。
-- **前置条件**：「允许未签名扩展」**关闭**。
-- **步骤**：安装后记录日期；Safari 退出重开、系统重启、8 天以上、重新构建后分别检查扩展是否仍启用；记录证书与描述文件有效期（Xcode → Settings → Accounts）。`checklist extension_install_persistence`。
-- **通过条件**：不开启“允许未签名扩展”，扩展在 Safari 退出重开、重启、8 天以上与重新构建后仍保持启用；证书与描述文件有效期已记录。
+- **前置条件**：「允许未签名扩展」**关闭**（Safari 17 起在 Safari →「设置」→「开发者」标签中，Apple：“In Safari 17 or later, use the Developer tab in Settings”；它在退出 Safari 时自动复位，每次检查前仍确认一遍）。
+- **步骤**：安装后记录日期；Safari 退出重开、系统重启、8 天以上、重新构建后分别检查扩展是否仍启用；记录证书有效期（Xcode → Settings → Accounts）。再记录 App 与扩展是否嵌入描述文件（写进 `validity` 项备注）：
+  - `codesign -d --entitlements - --xml /Applications/SafariProfileSurge.app` 与对 `…/Contents/PlugIns/SafariProfileSurgeExtension.appex` 的同一命令：记录签名中实际带的权限（源文件 `Config/App.entitlements`、`Config/Extension.entitlements` 只声明 App 沙盒、`application-groups`、`network.client`；签名中多出的权限如实记录）。
+  - 包内布局与嵌套代码签名：`codesign --verify --deep --strict --verbose=2 /Applications/SafariProfileSurge.app` 退出 0；`codesign -dv /Applications/SafariProfileSurge.app/Contents/Helpers/node` 显示标识 `com.sfe.node` 与 App 相同的 TeamIdentifier；`find /Applications/SafariProfileSurge.app/Contents/Resources -type f -exec file {} + | grep -c Mach-O` 为 0（Node 按 Apple「Placing content in a bundle」放在 `Contents/Helpers`：“Resources are everything that’s not code.”）。结果写进 `validity` 项备注。
+  - `ls -l /Applications/SafariProfileSurge.app/Contents/embedded.provisionprofile /Applications/SafariProfileSurge.app/Contents/PlugIns/SafariProfileSurgeExtension.appex/Contents/embedded.provisionprofile`：记录哪一个存在。
+  - 存在时：`security cms -D -i <该文件> -o "$TMPDIR/sfe-profile.plist" && plutil -p "$TMPDIR/sfe-profile.plist" | grep -E 'CreationDate|ExpirationDate'`，记录两个日期后 `rm "$TMPDIR/sfe-profile.plist"`（描述文件含设备与证书信息，不保存、不提交）。
+  - 背景：TN3125 写明 “Unlike Apple’s other platforms, macOS doesn’t require a provisioning profile to run third-party code.” “A Mac app that uses no restricted entitlements doesn’t need a provisioning profile.”（https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles）；免费团队的描述文件 “will expire 7 days from issuance”（https://developer.apple.com/help/account/basics/about-your-developer-account）。Xcode 自动签名是否仍嵌入描述文件、它过期后 App 能否启动、扩展是否保持启用、原生桥是否可用，Apple 都没有写；8 天以上的检查要覆盖嵌入的描述文件过期之后。备选钥匙串方案的 `keychain-access-groups` 一定要描述文件授权，不受本项结论豁免。
+
+  然后 `checklist extension_install_persistence`。
+- **通过条件**：不开启“允许未签名扩展”，扩展在 Safari 退出重开、重启、8 天以上与重新构建后仍保持启用；证书有效期、App 与扩展是否嵌入描述文件及其有效期已记录。
 - **失败处理**：如果只能依赖「允许未签名扩展」，交付物视为不满足约束并在 ACCEPTANCE 中写明；不作为正常安装路径。
 - **证据**：`results/extension_install_persistence.json`；日期；签名身份。
 - **回退**：无。
@@ -273,7 +291,8 @@ kill "$SELFTEST_PID"
 
 - **用途**：登录填充时由签名的原生桥自己读取账号密码，服务从不返回密码。
 - **前置条件**：同 3.3。只用合成测试值（例如 `example-test-value`），不使用真实账号。
-- **步骤**：用 sfe-keychain 写入一个合成账号密码项 → 在测试场景触发一次读取（开发构建的测试入口）→ 记录是否出现提示；重新构建/重签后重复并记录提示次数；锁定钥匙串、拒绝授权时检查错误分类（denied / locked）。`checklist bridge_keychain_access`。
+- **步骤**：用 sfe-keychain 写入一个合成账号密码项 → 在测试场景触发一次读取（开发构建的测试入口）→ 记录是否出现提示；重新构建/重签后重复并记录提示次数；锁定钥匙串、拒绝授权时检查错误分类（denied / locked），并分别记录扩展（登录填充，弹窗中的说明）与 sfe-keychain（服务调用）实际得到哪个 reason。`locked` 来自 `errSecInteractionNotAllowed`，Apple 只定义为 “Interaction with the Security Server is not allowed.”（https://developer.apple.com/documentation/security/errsecinteractionnotallowed），需要用户认证而不允许显示界面时也返回它，所以界面显示为「钥匙串需要用户交互但当前不允许（可能已锁定，或无法显示授权提示）」；钥匙串锁定时是弹出解锁提示还是直接返回这个码，以本项记录为准，之后再决定是否拆分 reason。`checklist bridge_keychain_access`。
+- **安全说明的核对（只记录，写进 `errors` 项备注）**：受信任应用列表之外的进程读取时，Apple 写明系统会询问用户，而不是直接拒绝：“Otherwise, the system prompts the user for confirmation. The user may choose to Deny, Allow, or Always Allow the access.”（https://developer.apple.com/documentation/security/access-control-lists）。在终端运行 `security find-generic-password -s com.sfe.account -w`：应出现钥匙串授权提示（macOS 10.13.1 起要求输入钥匙串密码），选「拒绝」并记录提示与命令的结果。**不要选「允许」或「始终允许」**（后者会把 `security` 永久加入该项的受信任列表）。`SecItemAdd` 默认写入什么分区列表、同团队扩展能否通过，Apple 没有写（security(1) 只说分区列表 “limits access to the item based on an application's code signature”），以本项读取结果为准。
 - **通过条件**：签名的原生桥能读取由指定写入方写入的账号密码钥匙串项，无额外提示；重建/重签后的提示次数已记录。
 - **失败处理**：首选方案与备选方案（数据保护钥匙串 + 共享访问组）都不行时，登录填充保持不可用，并在 INSTALL/ACCEPTANCE 中写明。
 - **证据**：`results/bridge_keychain_access.json`；提示次数；签名身份。
@@ -487,6 +506,7 @@ npx tsx tools/p0/src/cli.ts propose <能力> supported              # 发送到 
 
 - 提议带：上下文（与服务运行时同一来源测得）、脱敏摘要、运行目录的带密钥证据摘要（`hmac-sha256:`，原始证据不离开本机）；safari_process_attribution 与 safari_udp_quic_handling 带全部门槛协议与 DNS/WebRTC/系统服务的覆盖；归属提议带进程完整路径；runtime_entry_modes 提议带入口策略。
 - `supported` 只接受“通过”的结果；测量后上下文（Surge/macOS/Safari 版本、进程路径、原语映射等依赖字段）变化时拒绝，需要重测。
+- 依赖进程归属的三项（safari_process_attribution、safari_udp_quic_handling、first_request_and_old_connections）：测量时或提议时有待重启的后台安全改进（或无法确认），或读不到补充版本（`sw_vers -productVersionExtra`），工具直接拒绝，服务也会拒绝；之后装上后台安全改进（补充版本变化）或再次出现待重启时，已确认的这三项回到待验证，网页「能力门槛」页说明原因（需要重启 Mac 或重测）。
 - 依赖工作配置身份的能力（fixed_profile_no_switch、targeted_resource_refresh、policy_path_reread、connection_continuity、auto_reload_atomic_replace、same_profile_reload_impact）是在测试配置上测得的，必须显式加 `--working-profile any`，摘要会注明“在 P0 测试配置（源配置副本）上测得”。
 - 声明的 `--auto-reload`、`--takeover`、`--signing-identity` 必须有测量证据，对**每个**依赖该字段的能力都适用（不只是 auto_reload_atomic_replace）：具体值必须等于测量时的值（refresh 声明的自动重载设置，或测量时读到的值；测量时没有记录则不能声明）；`--auto-reload any` 需要本能力在自动重载开、关两种设置下的测量都得到与提议相同的结论，`--takeover any` 需要 enhanced、system_proxy、both 三种接管方式下都有，且这些测量的其余依赖上下文与当前一致；任一取值下另有相反结论的测量（不论先后）即拒绝，用作证据的测量次数与时间写入提议摘要。读不到的上下文字段记为 null，服务运行时同样读不到才会匹配；工具会提示。例外：Surge 版本与构建读不到（或不是 `6.10.0`、`12500` 这样的格式）、与 `surge-cli --raw version` 交叉核对不一致、低于最低支持版本 6.10.0（12500）或 Controller 协议 < 22 时，依赖它们的能力不能提议，工具直接拒绝并给出原因——这样的记录在服务中永远不会生效。
 - 提议摘要不超过服务接受的 4000 字（超出部分截断并以“…”结尾）。

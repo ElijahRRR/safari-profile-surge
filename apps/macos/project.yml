@@ -72,6 +72,7 @@ targets:
           destination: wrapper
           subpath: Contents/Helpers
     postBuildScripts:
+      # Node（Mach-O，代码）复制到 Contents/Helpers/node 并先行签名；service/dist（脚本与静态文件）复制到 Contents/Resources/service
       - name: Embed Node and service
         path: Scripts/embed-runtime.sh
         shell: /bin/sh
@@ -160,6 +161,7 @@ targets:
       - path: App/AdminProtocol.swift
       - path: App/InstallConfig.swift
       - path: App/SecureFile.swift
+      - path: App/ServiceAgent.swift
     settings:
       groups: [signing]
       base:

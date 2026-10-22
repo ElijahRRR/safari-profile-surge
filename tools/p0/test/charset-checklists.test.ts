@@ -83,8 +83,46 @@ describe('checklists', () => {
     for (const key of CAPABILITY_KEYS) expect(Boolean(AUTOMATED_BY[key]) !== Boolean(CHECKLISTS[key])).toBe(true);
   });
 
-  it('native bridge checklist covers background wake from suspension', () => {
-    expect(CHECKLISTS.native_bridge_ipc!.items.some((i) => i.id === 'background_wake')).toBe(true);
+  it('native bridge checklist covers background wake from suspension, including the alarm-driven profile report', () => {
+    const item = CHECKLISTS.native_bridge_ipc!.items.find((i) => i.id === 'background_wake');
+    // RUNBOOK §3.3 第 3 步：上报闹钟唤醒后 service.log 中没有上报时答「否」，题目必须问到它，不能只问弹窗往返
+    expect(item?.question).toContain('sfe-profile-report');
+    expect(item?.question).toContain('service.log');
+  });
+
+  it('no_tcc covers only the host app; extension access is decided by roundtrip (macOS 15: extensions are denied without a prompt)', () => {
+    const item = CHECKLISTS.native_bridge_ipc!.items.find((i) => i.id === 'no_tcc');
+    expect(item?.question).toContain('宿主 App');
+    expect(item?.question).toContain('roundtrip');
+  });
+
+  it('keychain errors item records the reason each side actually gets instead of assuming locked → locked', () => {
+    const item = CHECKLISTS.bridge_keychain_access!.items.find((i) => i.id === 'errors');
+    expect(item?.question).toContain('sfe-keychain');
+    expect(item?.question).toContain('备注');
+    expect(item?.question).not.toContain('分类正确');
+  });
+
+  it('native bridge checklist records the macOS 26 quit prompt for background tasks (Apple: users are prompted to allow or not allow)', () => {
+    const item = CHECKLISTS.native_bridge_ipc!.items.find((i) => i.id === 'quit_prompt');
+    expect(item?.question).toContain('macOS 26');
+    expect(item?.question).toContain('「不允许」');
+  });
+
+  it('profile ID checklist requires distinct IDs only for named profiles and records the default profile (Apple: no key means normal browsing)', () => {
+    const items = CHECKLISTS.native_profile_id!.items;
+    expect(items.map((i) => i.id)).toEqual(['distinct', 'default_profile', 'safari_restart', 'reinstall', 'resign']);
+    expect(items[0]!.question).toContain('已命名');
+    expect(items[0]!.question).not.toContain('默认场景');
+    // 默认场景显示「未识别当前场景」也可以回答 y；显示 ID 时必须与已命名场景不同
+    expect(items[1]!.question).toContain('未识别当前场景');
+    expect(items[1]!.question).toContain('都不同');
+  });
+
+  it('signing checklist records whether a provisioning profile is embedded (TN3125: not required on macOS without restricted entitlements)', () => {
+    const item = CHECKLISTS.extension_install_persistence!.items.find((i) => i.id === 'validity');
+    expect(item?.question).toContain('embedded.provisionprofile');
+    expect(item?.question).toContain('ExpirationDate');
   });
 
   it('first request checklist covers restored tabs, extension sleep and old connections', () => {

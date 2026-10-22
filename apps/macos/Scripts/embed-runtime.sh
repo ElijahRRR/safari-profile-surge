@@ -1,8 +1,13 @@
 #!/bin/sh
-# SafariProfileSurge.app 的 Run Script：把固定版本的 Node 与 service/dist 复制进
-# Contents/Resources（node、service/service.mjs、service/sfe.mjs、service/web/）。
+# SafariProfileSurge.app 的 Run Script：把固定版本的 Node 复制到 Contents/Helpers/node，
+# 把 service/dist 复制到 Contents/Resources/service/（service.mjs、sfe.mjs、web/）。
+# Node 是 Mach-O 可执行文件（代码），按 Apple「Placing content in a bundle」放在 Helpers：
+#   “help app, helper tool | macOS | Contents/MacOS/, Contents/Helpers/”；“Resources are everything that’s not code.”；
+#   “If you put content in the wrong location, you may encounter hard-to-debug code signing and distribution problems.”
+#   （https://developer.apple.com/documentation/bundleresources/placing-content-in-a-bundle）
+# service.mjs 与 web/ 是脚本与静态文件（资源），留在 Resources。
 # 只复制本机已有的文件，从不下载；缺少任何一项都让构建失败并说明原因。
-# 由 Xcode 在签名 App 之前运行；Node 用与 App 相同的签名身份重新签名。
+# 由 Xcode 在签名 App 之前运行；Node 用与 App 相同的签名身份重新签名（嵌套代码先于外层 App 签名）。
 set -eu
 
 fail() {
@@ -11,10 +16,13 @@ fail() {
   exit 1
 }
 
-: "${SRCROOT:?}" "${TARGET_BUILD_DIR:?}" "${UNLOCALIZED_RESOURCES_FOLDER_PATH:?}"
+: "${SRCROOT:?}" "${TARGET_BUILD_DIR:?}" "${UNLOCALIZED_RESOURCES_FOLDER_PATH:?}" "${CONTENTS_FOLDER_PATH:?}"
 REPO_ROOT="$(cd "${SRCROOT}/../.." && pwd)"
 SERVICE_DIST="${REPO_ROOT}/service/dist"
-DEST="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+RESOURCES_DEST="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+# 与 project.yml 中 sfe-keychain、sfe-service-launcher 的 copy 目标（wrapper 下的 Contents/Helpers）相同
+HELPERS_DEST="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
+NODE_DEST="${HELPERS_DEST}/node"
 
 node_bin="${SFE_NODE_BINARY:-}"
 node_pin="${SFE_NODE_VERSION:-}"
@@ -44,20 +52,22 @@ for entry in service.mjs sfe.mjs; do
 done
 [ -d "${SERVICE_DIST}/web" ] || fail "缺少 service/dist/web/：请先在仓库根目录运行 npm ci && npm run build"
 
-mkdir -p "$DEST"
-rm -rf "${DEST}/service" "${DEST}/node"
-/usr/bin/ditto "$SERVICE_DIST" "${DEST}/service"
-/usr/bin/ditto "$node_bin" "${DEST}/node"
-chmod 0755 "${DEST}/node"
+mkdir -p "$RESOURCES_DEST" "$HELPERS_DEST"
+# 旧构建把 node 放在 Resources：增量构建时一并删除，Resources 中不留任何 Mach-O。
+# 只删除本脚本负责的路径；Helpers 中的 sfe-keychain、sfe-service-launcher 由 Xcode 复制，不动。
+rm -rf "${RESOURCES_DEST}/service" "${RESOURCES_DEST}/node" "$NODE_DEST"
+/usr/bin/ditto "$SERVICE_DIST" "${RESOURCES_DEST}/service"
+/usr/bin/ditto "$node_bin" "$NODE_DEST"
+chmod 0755 "$NODE_DEST"
 
-# App 包签名会封装 Resources 中的 Mach-O；先用与 App 相同的身份签名 Node（同团队签名）
+# App 包签名把 Helpers 中的 Mach-O 当作嵌套代码封装，嵌套代码必须先签名：用与 App 相同的身份签名 Node（同团队签名）
 if [ "${CODE_SIGNING_ALLOWED:-NO}" = "YES" ] && [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]; then
   if [ "${ENABLE_HARDENED_RUNTIME:-NO}" = "YES" ]; then
     /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --identifier com.sfe.node --timestamp=none \
-      --options runtime --entitlements "${SRCROOT}/Config/node.entitlements" "${DEST}/node" || fail "Node 签名失败"
+      --options runtime --entitlements "${SRCROOT}/Config/node.entitlements" "$NODE_DEST" || fail "Node 签名失败"
   else
     /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" --identifier com.sfe.node --timestamp=none \
-      "${DEST}/node" || fail "Node 签名失败"
+      "$NODE_DEST" || fail "Node 签名失败"
   fi
 fi
 

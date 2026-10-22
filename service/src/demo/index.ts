@@ -67,11 +67,13 @@ export function createDemoSurge(dataDir: string): DemoSurge {
 
 /** 只在演示模式调用：写入工作配置设置、能力记录（supported + DEMO 说明）、本应用对象清单与默认前置。 */
 export async function prepareDemoState(repos: Repositories, demo: DemoSurge, pepper: Buffer): Promise<void> {
-  // Surge 版本与构建号记为演示 FakeSurge 运行实例报告的值：门槛中 any 不匹配任何版本（依赖版本的能力会一直待验证）
-  const demoContext = {
+  // Surge 版本与构建号记为演示 FakeSurge 运行实例报告的值：门槛中 any 不匹配任何版本（依赖版本的能力会一直待验证）；
+  // 后台安全改进待重启状态同样没有 any，记为 'no'（演示本机事实也是 'no'）
+  const demoContext: CapabilityContext = {
     ...(Object.fromEntries(CAPABILITY_CONTEXT_FIELDS.map((f) => [f, 'any'])) as unknown as CapabilityContext),
     surgeVersion: demo.fake.version,
     surgeBuild: demo.fake.build,
+    macosRestartPending: 'no',
   };
   repos.tx(() => {
     repos.settings.set('workingProfilePath', demo.profilePath);

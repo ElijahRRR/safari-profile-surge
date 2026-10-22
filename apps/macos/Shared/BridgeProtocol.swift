@@ -244,6 +244,20 @@ struct NativeFailure: Error, Equatable {
         message: "无法连接本机服务：找不到原生桥配置，请先打开 SafariProfileSurge",
         reason: "not_configured"
     )
+    /// 系统拒绝扩展读取 App Group 容器（BridgeFileProblem.denied）。扩展被拒绝时系统不弹出提示，弹窗里只有这条说明。
+    static let containerDenied = NativeFailure(
+        code: "SURGE_UNREACHABLE",
+        message: "无法连接本机服务：系统拒绝扩展访问 App Group 容器（不会弹出提示），请确认 App 与扩展使用同一 Team ID 签名后重新构建安装",
+        reason: "container_denied"
+    )
+    /// 读取 App Group 容器中的原生桥配置时遇到其他错误（只给出 errno 值）。
+    static func configUnreadable(errno code: Int32) -> NativeFailure {
+        NativeFailure(
+            code: "SURGE_UNREACHABLE",
+            message: "无法连接本机服务：读取原生桥配置失败（errno \(code)），请打开 SafariProfileSurge 后重试",
+            reason: "config_unreadable"
+        )
+    }
     static let malformedResponse = NativeFailure(code: "SURGE_UNREACHABLE", message: "无法连接本机服务：应答格式不正确", reason: "malformed")
     static let malformedFill = NativeFailure(code: "FILL_NOT_ALLOWED", message: "登录填充失败：本机服务应答格式不正确", reason: "malformed")
     static let fillRefExpired = NativeFailure(code: "FILL_NOT_ALLOWED", message: "登录填充失败：钥匙串引用已过期，请重新填充", reason: "expired")

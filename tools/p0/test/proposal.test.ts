@@ -14,6 +14,8 @@ const CTX: CapabilityContext = {
   surgeVersion: '6.5.0',
   surgeBuild: '10960',
   macosBuild: '24A335',
+  macosVersionExtra: 'none',
+  macosRestartPending: 'no',
   safariVersion: '18.0',
   entryStrategy: null,
   processPathsDigest: processPathsDigest([SAFARI]),
@@ -114,6 +116,58 @@ describe('buildProposal', () => {
     const ctx = { ...CTX, surgeVersion: null, surgeBuild: null };
     const req = buildProposal(input('open_profile_by_id', { result: result('open_profile_by_id', { context: ctx }), current: ctx }));
     expect(req.context.surgeVersion).toBeNull();
+  });
+
+  it('refuses process-attribution capabilities measured or proposed while a Background Security Improvement awaits a restart', () => {
+    const key = 'first_request_and_old_connections';
+    const pending = { ...CTX, macosRestartPending: 'yes' as const };
+    // 测量时待重启（重启后提议）：说明测量时的状态，要求重测
+    let msg = refusal(() => buildProposal(input(key, { result: result(key, { context: pending }) })));
+    expect(msg).toContain('测量时（2026-10-21T10:00:00.000Z）有已安装、尚未重启生效的后台安全改进');
+    expect(msg).toContain('请重启 Mac 后重测');
+    // 测量与提议都在待重启期间：同样拒绝（不能因为两边一致就照样提议）
+    msg = refusal(() => buildProposal(input(key, { result: result(key, { context: pending }), current: pending })));
+    expect(msg).toContain('后台安全改进');
+    // 测量时没有，提议时待重启
+    msg = refusal(() => buildProposal(input(key, { current: pending })));
+    expect(msg).toContain('请重启 Mac 后重测');
+    expect(msg).not.toContain('测量时');
+    // 无法确认，或补充版本读不到 / any
+    expect(refusal(() => buildProposal(input(key, { current: { ...CTX, macosRestartPending: null } })))).toContain('无法确认是否有待重启的后台安全改进');
+    const noExtra = { ...CTX, macosVersionExtra: null };
+    expect(refusal(() => buildProposal(input(key, { result: result(key, { context: noExtra }), current: noExtra })))).toContain('sw_vers -productVersionExtra');
+    const anyExtra = { ...CTX, macosVersionExtra: 'any' };
+    expect(refusal(() => buildProposal(input(key, { result: result(key, { context: anyExtra }), current: anyExtra })))).toContain('不能记为 any');
+    // 装上后台安全改进并重启后补充版本变化：按漂移拒绝，要求重测
+    expect(refusal(() => buildProposal(input(key, { current: { ...CTX, macosVersionExtra: '(a)' } })))).toContain('macosVersionExtra');
+    // 补充版本为具体值、没有待重启时照常提议
+    const ok = buildProposal(input(key, { result: result(key, { context: { ...CTX, macosVersionExtra: '(a)' } }), current: { ...CTX, macosVersionExtra: '(a)' } }));
+    expect(ok.context).toMatchObject({ macosVersionExtra: '(a)', macosRestartPending: 'no' });
+  });
+
+  it('capabilities that do not depend on process attribution ignore the Background Security Improvement state', () => {
+    const ctx = { ...CTX, macosVersionExtra: null, macosRestartPending: 'yes' as const };
+    expect(() => buildProposal(input('independent_node_preflight', { result: result('independent_node_preflight', { context: ctx }), current: ctx }))).not.toThrow();
+  });
+
+  it('refuses Safari-dependent capabilities measured or proposed below Safari 17.6, in either direction', () => {
+    const old = { ...CTX, safariVersion: '17.5' };
+    const measuredOld = refusal(() => buildProposal(input('native_bridge_ipc', { result: result('native_bridge_ipc', { context: old }), current: old, overrides: { signingIdentity: 'ABCDE12345' } })));
+    expect(measuredOld).toContain('测量时');
+    expect(measuredOld).toContain('17.5 低于最低支持的 17.6');
+    const unsupported = refusal(() =>
+      buildProposal(input('native_profile_id', { status: 'unsupported', result: result('native_profile_id', { verdict: 'fail', context: old }), current: old, overrides: { signingIdentity: 'ABCDE12345' } })),
+    );
+    expect(unsupported).toContain('不作为验收依据');
+    // 测量时已是 17.6、提议时降到 17.4：同样拒绝（先于漂移检查，写明低于最低版本）
+    expect(refusal(() => buildProposal(input('open_profile_by_id', { current: { ...CTX, safariVersion: '17.4' } })))).toContain('当前 Safari 版本 17.4');
+    // 17.6 本身可以提议；读不到或无法解析的版本不在这里拒绝
+    const min = { ...CTX, safariVersion: '17.6' };
+    expect(() => buildProposal(input('open_profile_by_id', { result: result('open_profile_by_id', { context: min }), current: min }))).not.toThrow();
+    const unknown = { ...CTX, safariVersion: null };
+    expect(() => buildProposal(input('open_profile_by_id', { result: result('open_profile_by_id', { context: unknown }), current: unknown }))).not.toThrow();
+    // 不依赖 Safari 版本的能力不受影响
+    expect(() => buildProposal(input('independent_node_preflight', { result: result('independent_node_preflight', { context: old }), current: old }))).not.toThrow();
   });
 
   it('refuses when dependency context drifted since measurement', () => {

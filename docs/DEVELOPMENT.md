@@ -95,7 +95,7 @@ P0 相应能力通过后，才连接真实 Surge：
 - 网页列表显示环境、绑定、代理连接地址、前置、期望/已部署/活动版本、实际出口时间、错误与下一步。
 - 插件默认展示当前可信场景的绑定；未绑定提供关联或新建，不能自动套同名环境。
 - 插件编辑和网页编辑共享操作 ID 与版本；保存后关闭界面任务仍继续。
-- 初次关联向导处理 Safari 扩展启用与网站权限，不能承诺替用户给所有未来场景自动授权。
+- 初次关联向导处理 Safari 扩展启用与网站权限。新场景默认关闭扩展（Apple：“By default, extensions are turned off for each new profile.”），每个场景都要用户自己启用，不能承诺替未来场景自动启用；网站授权自 Safari 17 起对所有场景共用（“that grants the extension access to the site across all profiles, private browsing, and browsing without a profile”），只需授权一次。默认场景可能拿不到场景 ID，环境只关联在已命名的场景中（docs/ARCHITECTURE.md §0.1）。
 - 全局一个活动环境；焦点到 Chrome 不释放当前出口，多场景冲突不能争抢。
 - 实际出口检测来自当前 Safari 场景。后台代理探针明确标为预检；不开 MITM 时不声称 Surge 看到了 HTTPS query 中的测试编号。
 

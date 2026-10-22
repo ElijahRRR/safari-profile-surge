@@ -10,6 +10,7 @@ import {
   GATING_COVERAGE_ITEMS,
   SURGE_BUILD_RE,
   SURGE_VERSION_RE,
+  type CapabilityContext,
   type CapabilityContextField,
   type CapabilityKey,
   type CapabilityProposalView,
@@ -150,8 +151,30 @@ export function versionBlockReason(proposal: Pick<CapabilityProposalView, 'key' 
 }
 
 /**
+ * 提议中的后台安全改进状态能否确认（与服务端确认时的 hostContextErrors 同一规则）：依赖 Safari 进程归属的能力，提议必须
+ * 是在确认没有待重启的后台安全改进时测得（macosRestartPending 为 'no'），并带读到的补充版本（不是 null 或 any）。
+ * 早于该规则提交的提议没有这两个字段，同样不能确认。可以确认时返回 null。
+ */
+export function hostBlockReason(proposal: Pick<CapabilityProposalView, 'key' | 'context'>): string | null {
+  const deps = CAPABILITY_CONTEXT_DEPS[proposal.key] ?? [];
+  const ctx = proposal.context as Partial<CapabilityContext> | null;
+  if (deps.includes('macosRestartPending')) {
+    const v: unknown = ctx?.macosRestartPending;
+    if (v === 'yes') return '提议是在已安装、尚未重启生效的后台安全改进期间测得的，不能确认；请重启 Mac 后重测并重新提议（新的提议送达后这条提议自动移除）';
+    if (v !== 'no') return '提议没有确认是否有待重启的后台安全改进，不能确认；请重测并重新提议（新的提议送达后这条提议自动移除）';
+  }
+  if (deps.includes('macosVersionExtra')) {
+    const v: unknown = ctx?.macosVersionExtra;
+    if (v === null || v === undefined || v === '' || v === 'any') return '提议中的后台安全改进版本读不到或为 any，不能确认；请重测并重新提议（新的提议送达后这条提议自动移除）';
+  }
+  return null;
+}
+
+/**
  * 过期原因的说明。版本字段区分三种情况，不把“读不到”说成“已变化”：当前读不到 Surge 版本（依赖版本的能力一律
  * 按待验证处理，重测之前要先能读到版本）；验证记录没有具体版本（null、any 或格式不对的旧记录，需要重测）；确实变了。
+ * 后台安全改进待重启状态：记录为 'no' 而过期时，当前有已安装、尚未重启生效的后台安全改进（或无法确认），要先重启 Mac；
+ * 记录不是 'no'（旧记录没有该字段）时需要重测。补充版本：记录没有具体值时需要重测，否则为“已变化”。
  * 其他字段沿用“已变化”。
  * surge 为 null（尚未拿到状态）时版本字段只说“与当前不一致”。
  */
@@ -162,7 +185,19 @@ export function staleReasonText(cap: Pick<CapabilityView, 'staleReasons' | 'cont
   const unreadable: CapabilityContextField[] = [];
   const missing: CapabilityContextField[] = [];
   const unknown: CapabilityContextField[] = [];
+  let restartPending = false;
   for (const f of cap.staleReasons) {
+    if (f === 'macosRestartPending') {
+      if ((cap.context as Partial<CapabilityContext>).macosRestartPending === 'no') restartPending = true;
+      else missing.push(f);
+      continue;
+    }
+    if (f === 'macosVersionExtra') {
+      const v: unknown = (cap.context as Partial<CapabilityContext>).macosVersionExtra;
+      if (v === null || v === undefined || v === '' || v === 'any') missing.push(f);
+      else changed.push(f);
+      continue;
+    }
     const statusKey = VERSION_FIELDS[f];
     if (!statusKey) changed.push(f);
     else if (!surge) unknown.push(f);
@@ -171,6 +206,7 @@ export function staleReasonText(cap: Pick<CapabilityView, 'staleReasons' | 'cont
     else changed.push(f);
   }
   const parts: string[] = [];
+  if (restartPending) parts.push('Mac 有已安装、尚未重启生效的后台安全改进（或无法确认是否有）：Safari 可能已在使用新的 WebKit，进程归属按待验证处理，请重启 Mac');
   if (unreadable.length) parts.push(`读不到当前的 ${fieldList(unreadable)}，依赖版本的能力按待验证处理`);
   if (missing.length) parts.push(`验证记录缺少 ${fieldList(missing)}，需要重测`);
   if (unknown.length) parts.push(`${fieldList(unknown)}与当前不一致`);

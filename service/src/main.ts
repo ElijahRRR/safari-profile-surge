@@ -12,6 +12,7 @@ import { SfeError } from '@sfe/contract';
 import { loadConfig, type ServiceConfig } from './config.js';
 import { openRepositories, type Repositories } from './db/index.js';
 import { createAppService, type EngineAppService } from './engine/app-service.js';
+import { STAGED_CRYPTEX_PATH, pathPresence, restartPendingFrom, versionExtraFromSwVers } from './engine/capabilities.js';
 import type { HostInfo } from './engine/context.js';
 import { createHttpServer, type HttpServerHandle } from './http/server.js';
 import { issueLoginUrl } from './http/login.js';
@@ -101,10 +102,22 @@ async function execText(file: string, args: string[]): Promise<string> {
   return r.stdout.trim();
 }
 
+/** `sw_vers -productVersionExtra` → 补充版本（与 P0 同一规则；退出码非 0 或启动失败按读不到）。 */
+async function macosVersionExtra(): Promise<string | null> {
+  const r = await execFixed('/usr/bin/sw_vers', ['-productVersionExtra'], { timeout: 10_000 });
+  return versionExtraFromSwVers({ code: r.error ? -1 : 0, stdout: r.stdout });
+}
+
 /** 非演示模式的本机事实（导出只为测试接线）。 */
 export function macHost(platform: NodeJS.Platform): Partial<HostInfo> {
   if (platform !== 'darwin') {
-    return { macosBuild: async () => 'unknown', safariVersion: async () => 'unknown', surgeInstance: async () => ({ ok: false, reason: 'not_darwin' }) };
+    return {
+      macosBuild: async () => 'unknown',
+      macosVersionExtra: async () => 'unknown',
+      macosRestartPending: async () => 'unknown',
+      safariVersion: async () => 'unknown',
+      surgeInstance: async () => ({ ok: false, reason: 'not_darwin' }),
+    };
   }
   // 运行中 Surge 的版本：一个常驻的读取器（缓存包信息与签名结果，同时到来的读取共用一次）；Team ID 未知，与 CLI 路径校验
   // 一致只做 --verify --strict；codesign 用较短的服务超时（读取在执行器通道上进行，引擎另有总时限）
@@ -112,6 +125,9 @@ export function macHost(platform: NodeJS.Platform): Partial<HostInfo> {
   return {
     surgeInstance: () => instance.read(),
     macosBuild: async () => (await execText('/usr/bin/sw_vers', ['-buildVersion'])) || null,
+    macosVersionExtra,
+    // 暂存的加密卷宗存在 → 已安装的后台安全改进要重启才完全生效（TODO(P0)：暂存位置是测试 Mac 上的观察，见 STAGED_CRYPTEX_PATH）
+    macosRestartPending: async () => restartPendingFrom(await pathPresence(STAGED_CRYPTEX_PATH)),
     safariVersion: async () => (await execText('/usr/bin/defaults', ['read', '/Applications/Safari.app/Contents/Info', 'CFBundleShortVersionString'])) || null,
     processPathExists: (p) => {
       try {
@@ -229,7 +245,14 @@ async function startServiceHeld(opts: StartOptions): Promise<RunningService> {
     surgeCliPath: config.surgeCliPath,
     demo: config.demo,
     host: config.demo
-      ? { macosBuild: async () => 'demo', safariVersion: async () => 'demo', processPathExists: () => true, surgeInstance: () => demoSurge!.fake.runningInstance() }
+      ? {
+          macosBuild: async () => 'demo',
+          macosVersionExtra: async () => 'demo',
+          macosRestartPending: async () => 'no',
+          safariVersion: async () => 'demo',
+          processPathExists: () => true,
+          surgeInstance: () => demoSurge!.fake.runningInstance(),
+        }
       : macHost(config.platform),
     loginUrl: () => {
       if (!http) throw new SfeError('INTERNAL', '签发登录链接失败：网页服务尚未启动');

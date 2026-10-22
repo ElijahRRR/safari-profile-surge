@@ -166,6 +166,8 @@ export const CONTEXT_FIELD_LABELS: Record<CapabilityContextField, string> = {
   surgeVersion: 'Surge 版本',
   surgeBuild: 'Surge 构建',
   macosBuild: 'macOS 构建',
+  macosVersionExtra: '后台安全改进版本',
+  macosRestartPending: '后台安全改进待重启状态',
   safariVersion: 'Safari 版本',
   entryStrategy: '入口策略',
   processPathsDigest: '进程路径摘要',

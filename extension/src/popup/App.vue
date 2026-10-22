@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, provide, ref } from 'vue';
 import { Icon } from '@sfe/easyquick';
+import { SITES } from '@sfe/contract';
 import { DIALOG_COUNT } from '../ui/dialog';
 import { ENTRY_MODE_TEXT } from '../shared/text';
 import BoundView from './BoundView.vue';
@@ -15,6 +16,10 @@ const s = c.state;
 
 const dialogs = ref(0);
 provide(DIALOG_COUNT, dialogs);
+
+// 原生桥拿不到 SFExtensionProfileKey 时服务按未识别场景处理（只允许读取状态）。Apple 的示例把没有这个键当作
+// 普通浏览，Safari 的默认场景很可能就是这样，所以提示改用已命名的场景（默认场景的实际行为由 P0 native_profile_id 记录）。
+const siteHosts = Object.values(SITES).map((site) => site.host).join('、');
 
 const view = computed(() => {
   if (!s.current) return s.loading ? 'loading' : 'error';
@@ -80,7 +85,10 @@ onBeforeUnmount(() => {
           <h2 class="text-base font-semibold text-gray-900 dark:text-white">未识别当前场景</h2>
         </div>
         <p class="text-sm text-gray-600 dark:text-gray-300">Safari 没有提供当前场景的标识。扩展只能读取状态，不能关联、切换或修改环境。</p>
-        <p class="text-sm text-gray-500 dark:text-dark-400">需要 macOS 14 与 Safari 17 或更新版本，并确认本扩展在此场景已启用。</p>
+        <p class="text-sm text-gray-700 dark:text-gray-300" data-test="named-profile-required">
+          环境只能关联在已命名的 Safari 场景中（默认场景可能拿不到场景标识）。请在 Safari 设置的「描述文件」中新建一个场景并为它启用本扩展（对 {{ siteHosts }} 的网站授权已对所有场景生效，授权过就不必重复），再在该场景的窗口中打开本扩展。
+        </p>
+        <p class="text-sm text-gray-500 dark:text-dark-400">已经在已命名的场景中仍看到此提示时：需要 macOS 14 与 Safari 17.6 或更新版本，并确认本扩展在此场景已启用。</p>
       </div>
     </div>
 

@@ -76,7 +76,18 @@ describe('main', () => {
   it('checklist then propose --dry-run builds a proposal with a keyed evidence digest', async () => {
     const base = rawBase();
     await main(['inventory', '--raw-dir', base], deps());
-    const answers = ['y', '', 'y', '', 'y', '', 'y', '', 'y', '', 'y', '后台卸载后 3 秒内完成往返', 'y', ''];
+    // 8 项：往返、Safari 重开、重启、服务重启、服务升级、后台唤醒（含上报闹钟）、无系统提示（只说明宿主 App）、
+    // macOS 26 退出提示（更早的系统写不适用）
+    const answers = [
+      'y', '',
+      'y', '',
+      'y', '',
+      'y', '',
+      'y', '',
+      'y', '后台卸载后 3 秒内完成往返；后台卸载后闹钟到点约 20 秒内 service.log 出现 reportProfileState',
+      'y', '宿主 App 无提示；扩展访问以 roundtrip 为准',
+      'y', '不适用（测试机为 macOS 15）',
+    ];
     expect(await main(['checklist', 'native_bridge_ipc', '--raw-dir', base, '--signing-identity', 'ABCDE12345'], deps(answers))).toBe(EXIT.OK);
     const d = deps();
     expect(await main(['propose', 'native_bridge_ipc', 'supported', '--dry-run', '--raw-dir', base, '--signing-identity', 'ABCDE12345'], d)).toBe(EXIT.OK);

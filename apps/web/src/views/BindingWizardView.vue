@@ -1,7 +1,9 @@
 <script setup lang="ts">
 // 场景关联向导：环境记录不等于 Safari 场景。每个待关联环境逐步完成：在 Safari 设置中创建同名场景、
 // 在该场景启用扩展、允许访问 www.amazon.com、打开扩展弹窗选择该环境。前三步是用户确认的进度
-// （bindingStage），最后一步由扩展经原生桥完成绑定；不能承诺新场景自动获得授权。
+// （bindingStage），最后一步由扩展经原生桥完成绑定。新场景默认关闭扩展（Apple：“By default, extensions are
+// turned off for each new profile.”），不能替用户自动启用；网站授权自 Safari 17 起对所有场景共用（“across all
+// profiles, private browsing, and browsing without a profile”），只需授权一次。默认场景可能没有场景 ID，只用已命名场景。
 import { computed, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { SITES, type EnvironmentView } from '@sfe/contract';
@@ -36,9 +38,23 @@ interface Step {
 function stepsFor(env: EnvironmentView): Step[] {
   const host = SITES[env.site]?.host ?? 'www.amazon.com';
   return [
-    { key: 'profile', title: `在 Safari 中创建名为「${env.displayName}」的场景`, detail: 'Safari → 设置 → 场景 → 新建场景。名称建议与环境名称一致，便于核对；绑定以场景 ID 为准，不按名称匹配。' },
-    { key: 'extension', title: '在该场景中启用「Safari 场景出口」扩展', detail: 'Safari → 设置 → 扩展，在上方选择这个场景后勾选扩展。新场景的扩展默认关闭。' },
-    { key: 'site', title: `允许扩展访问 ${host}`, detail: '在扩展设置中把网站访问设为允许，或首次打开弹窗时按提示授权。只申请这一个站点。' },
+    {
+      key: 'profile',
+      title: `在 Safari 中创建名为「${env.displayName}」的场景`,
+      detail:
+        'Safari → 设置 →「描述文件」（Profiles），新建一个场景。名称建议与环境名称一致，便于核对；绑定以场景 ID 为准，不按名称匹配。不要使用默认场景：它可能没有场景 ID，无法关联。',
+    },
+    {
+      key: 'extension',
+      title: '在该场景中启用「Safari 场景出口」扩展',
+      detail: 'Safari → 设置 →「描述文件」→ 选择这个场景 →「扩展」，勾选扩展。新场景的扩展默认关闭，每个场景都要单独启用。',
+    },
+    {
+      key: 'site',
+      title: `允许扩展访问 ${host}`,
+      detail:
+        '在扩展设置中把网站访问设为允许，或首次打开弹窗时按提示授权。Safari 17 起网站授权对所有场景共用，已在其他场景授权过就不必重复。扩展只申请站点与出口检测服务的主机，不申请所有网站。',
+    },
     { key: 'associate', title: '打开扩展弹窗并选择此环境', detail: `在该场景的窗口中点击扩展图标，在「关联已有环境」中选择 ${envLabel(env)}。完成后此环境会从本列表移除。` },
   ];
 }

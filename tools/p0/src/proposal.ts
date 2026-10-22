@@ -5,11 +5,15 @@
 // 具体值必须等于测量时的值；any 需要本能力在每个取值下都有同样结论的测量（自动重载开与关；接管 enhanced、
 // system_proxy、both），且这些测量与当前上下文的其余依赖字段一致；任一取值下另有相反结论的测量（不论先后）即拒绝，
 // 用作证据的测量写入摘要。依赖 Surge 版本/构建的能力在提议时与测量时都必须读到格式正确的版本，读不到即拒绝。
+// 依赖进程归属的能力在提议时与测量时都必须确认没有待重启的后台安全改进、读到补充版本（与服务同一校验 hostContextErrors）。
+// 依赖 Safari 版本的能力：测量时或提议时的 Safari 版本可解析且低于 SAFARI_MINIMUM_VERSION（17.6）即拒绝（服务不按 Safari 版本拒绝）。
 // 摘要不超过服务的 4000 字上限。
 
 import {
   CAPABILITY_CONTEXT_DEPS,
   CAPABILITY_CRITERIA,
+  SAFARI_MINIMUM_VERSION,
+  safariBelowMinimum,
   type CapabilityContext,
   type CapabilityContextField,
   type CapabilityKey,
@@ -19,7 +23,7 @@ import {
 } from '@sfe/contract';
 import { PROPOSAL_SUMMARY_MAX_CHARS } from './constants.js';
 import { contextDrift, type ContextOverrides } from './context.js';
-import { coverageAllowsSupported, validateSafariProcessPaths, versionContextErrors } from './deps.js';
+import { coverageAllowsSupported, hostContextErrors, validateSafariProcessPaths, versionContextErrors } from './deps.js';
 import { refused } from './errors.js';
 import { redactSummaryLines } from './redact.js';
 import { verdictLabel, type CapabilityResult } from './results.js';
@@ -120,7 +124,27 @@ export function buildProposal(input: ProposalInput): ProposeCapabilityRequest {
   if (measuredVersionErrors.length > 0) {
     throw refused(`生成提议失败：测量时（${result.at}）${measuredVersionErrors.map((e) => e.message).join('；')}。请重测`);
   }
+  // 依赖进程归属的能力：后台安全改进装上后、Mac 重启前只有 Safari 使用新的 WebKit，这时测得的路径可能只是暂时只属于
+  // Safari；待重启（或无法确认）时测得或提议的记录在服务端永远不会生效，服务端也会以 EVIDENCE_REQUIRED 拒绝。先于漂移检查。
+  const measuredHostErrors = hostContextErrors(key, result.context);
+  if (measuredHostErrors.length > 0) {
+    throw refused(`生成提议失败：测量时（${result.at}）${measuredHostErrors.map((e) => e.message).join('；')}。请重测`);
+  }
+  const currentHostErrors = hostContextErrors(key, input.current);
+  if (currentHostErrors.length > 0) {
+    throw refused(`生成提议失败：${currentHostErrors.map((e) => e.message).join('；')}`);
+  }
   const deps = CAPABILITY_CONTEXT_DEPS[key];
+  // 依赖 Safari 版本的能力：Safari 17.6 才修复 “background pages would stop responding after about 30 seconds”，低于它的
+  // 测量不作为验收依据（不论提议支持还是不支持）。读不到或无法解析的版本不在这里拒绝，验收时按记录的版本人工核对。
+  if (deps.includes('safariVersion')) {
+    if (safariBelowMinimum(result.context.safariVersion) === true) {
+      throw refused(`生成提议失败：测量时（${result.at}）Safari 版本 ${result.context.safariVersion} 低于最低支持的 ${SAFARI_MINIMUM_VERSION}，这样的测量不作为验收依据。请升级 Safari 后重测`);
+    }
+    if (safariBelowMinimum(input.current.safariVersion) === true) {
+      throw refused(`生成提议失败：当前 Safari 版本 ${input.current.safariVersion} 低于最低支持的 ${SAFARI_MINIMUM_VERSION}。请升级 Safari 后重测`);
+    }
+  }
   const overrides = input.overrides;
   const declared = new Set(Object.entries(overrides).filter(([, v]) => v !== undefined).map(([k]) => k));
   const conclusion = status === 'supported' ? '都已通过' : '都得到同样的结论';

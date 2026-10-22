@@ -12,7 +12,10 @@ const ACTION: Record<'put' | 'get' | 'delete', string> = {
 
 const REASON: Record<SecretStoreFailureReason, string> = {
   denied: '用户拒绝了访问',
-  locked: '钥匙串已锁定',
+  // errSecInteractionNotAllowed：Apple 只定义为 “Interaction with the Security Server is not allowed.”；需要用户认证而又
+  // 不允许显示界面时也返回它（kSecUseAuthenticationUIFail）。从 LaunchAgent 调用 sfe-keychain 时可能无法显示授权提示，
+  // 所以不一定是钥匙串已锁定。线路值沿用 locked；文字与 apps/macos/Shared/KeychainStatus.swift 的 displayText 一致。
+  locked: '钥匙串需要用户交互但当前不允许（可能已锁定，或无法显示授权提示）',
   acl: '访问控制不匹配',
   not_found: '找不到该项',
   timeout: '等待钥匙串授权超时，可重试',

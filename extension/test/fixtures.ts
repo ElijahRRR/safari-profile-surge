@@ -9,7 +9,7 @@ import type {
   ProxyRevisionView,
   RouteStateView,
 } from '@sfe/contract';
-import type { BrowserTab, MessageSender, RuntimeMessageListener, WebExtBrowser } from '../src/shared/browser';
+import type { BrowserAlarm, BrowserTab, MessageSender, RuntimeMessageListener, WebExtBrowser } from '../src/shared/browser';
 import type { PageClient, ProfileStateReport } from '../src/shared/messages';
 
 export const NOW = new Date('2026-10-21T08:00:00.000Z');
@@ -186,6 +186,12 @@ export function mockClient(handlers: Partial<Record<string, Handler>>, profile: 
 
 export interface MockBrowser extends WebExtBrowser {
   listeners: Record<string, Array<(...args: unknown[]) => unknown>>;
+  /** 浏览器一侧保存的闹钟（后台页卸载后仍在）。 */
+  pendingAlarms: Map<string, BrowserAlarm>;
+  /** 让闹钟到点：从 pendingAlarms 移除并派发给当前注册的 onAlarm 监听器；没有这个闹钟时返回 false。 */
+  fireAlarm(name: string): boolean;
+  /** 模拟非持久后台页被卸载：页面里注册的监听器全部失效，浏览器一侧的闹钟保留。 */
+  unloadBackground(): void;
 }
 
 function event(name: string, listeners: MockBrowser['listeners']) {
@@ -197,10 +203,32 @@ function event(name: string, listeners: MockBrowser['listeners']) {
   };
 }
 
-export function mockBrowser(opts: { tabs?: BrowserTab[]; permission?: boolean; windows?: number } = {}): MockBrowser {
+export function mockBrowser(opts: { tabs?: BrowserTab[]; permission?: boolean; windows?: number; alarms?: boolean } = {}): MockBrowser {
   const listeners: MockBrowser['listeners'] = {};
+  const pendingAlarms = new Map<string, BrowserAlarm>();
+  // 闹钟由测试用 fireAlarm 手动到点，替身本身不用计时器（便于断言后台从不用 setTimeout 安排上报）。
+  const alarms = opts.alarms === false ? undefined : {
+    create: vi.fn((name: string, info: { when?: number; delayInMinutes?: number }) => {
+      const scheduledTime = info.when ?? Date.now() + (info.delayInMinutes ?? 0) * 60_000;
+      pendingAlarms.set(name, { name, scheduledTime });
+    }),
+    clear: vi.fn(async (name: string) => pendingAlarms.delete(name)),
+    get: vi.fn(async (name: string) => pendingAlarms.get(name)),
+    onAlarm: event('alarms.onAlarm', listeners),
+  };
   const b = {
     listeners,
+    pendingAlarms,
+    fireAlarm(name: string): boolean {
+      const alarm = pendingAlarms.get(name);
+      if (!alarm) return false;
+      pendingAlarms.delete(name);
+      for (const fn of [...(listeners['alarms.onAlarm'] ?? [])]) fn({ ...alarm });
+      return true;
+    },
+    unloadBackground() {
+      for (const fns of Object.values(listeners)) fns.length = 0;
+    },
     runtime: {
       id: 'ext-id-1',
       getURL: (p: string) => `safari-web-extension://ext-uuid/${p.replace(/^\//, '')}`,
@@ -227,6 +255,7 @@ export function mockBrowser(opts: { tabs?: BrowserTab[]; permission?: boolean; w
       onFocusChanged: event('windows.onFocusChanged', listeners),
     },
     permissions: { contains: vi.fn(async () => opts.permission ?? true) },
+    ...(alarms ? { alarms } : {}),
   };
   return b as unknown as MockBrowser;
 }

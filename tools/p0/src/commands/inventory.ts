@@ -49,7 +49,7 @@ import {
   type ProbeOutcome,
   type ReadPrimitive,
 } from '../surge-access.js';
-import { SAFARI_APP, SURGE_APP, appVersion, listProcesses, surgeProcesses, swVers, webkitSafariCandidates } from '../system.js';
+import { SAFARI_APP, SURGE_APP, appVersion, listProcesses, restartPending, surgeProcesses, swVers, webkitSafariCandidates } from '../system.js';
 import { TEST_PROFILE_NAME } from '../test-profile.js';
 import { createRun, crossCheckVersion, fmtBool, measureContext, openRun, printResult, profileNameOf, readSurgeInstance, resolveCli, tryRead, type Ctx } from './common.js';
 import { instanceEvidence, instanceSummaryText, printInstanceReport, warnOnDiskDifference, warnServiceLimits } from './instance.js';
@@ -144,7 +144,8 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   out.heading(`P0 盘点（只读） · 运行 ${dir.id}`);
   out.line(`原始证据目录：${dir.path}（0700，文件 0600，不在仓库内）`);
 
-  const macos = await swVers(exec);
+  // 补充版本与待重启状态与服务同一规则（能力上下文的 macosVersionExtra、macosRestartPending）
+  const macos = { ...(await swVers(exec)), restartPending: await restartPending(ctx.deps.pathPresence) };
   const safari = await appVersion(exec, SAFARI_APP);
   const surgeApp = await appVersion(exec, SURGE_APP);
   // Surge 版本只来自运行中的实例（与服务同一读取器）；磁盘上的 Surge.app 版本只作旁证，两者不一致时提示。
@@ -321,6 +322,11 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   out.table([
     ['项目', '结果'],
     ['macOS', `${macos.productVersion ?? '读不到'}（${macos.buildVersion ?? '读不到'}）`],
+    ['后台安全改进（sw_vers -productVersionExtra）', macos.productVersionExtra === 'none' ? '未安装' : (macos.productVersionExtra ?? '读不到')],
+    [
+      '后台安全改进待重启',
+      macos.restartPending === 'yes' ? '是：重启 Mac 之前不要测进程归属' : macos.restartPending === 'no' ? '否' : '无法确认（进程归属的结论会记为不完整）',
+    ],
     ['Safari', `${safari.version ?? '读不到'}（${safari.build ?? '读不到'}）`],
     ['运行中的 Surge', instanceSummaryText(instance)],
     ['版本交叉核对（surge-cli --raw version）', versionCheckText(versionCheck)],

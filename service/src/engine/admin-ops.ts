@@ -31,7 +31,7 @@ import { isSurgeReferenceName } from '../domain/validate.js';
 import { labelOf, revisionNodeName } from '../domain/naming.js';
 import { nodeLineChanged } from '../domain/node-line.js';
 import { BUILTIN_POLICIES } from '../surge/rules.js';
-import { coverageAllowsSupported, versionContextErrors } from '../surge/capability-gate.js';
+import { coverageAllowsSupported, hostContextErrors, versionContextErrors } from '../surge/capability-gate.js';
 import { validateSafariProcessPaths } from '../surge/generate.js';
 import { keyedRequestDigest } from '../util/keyed-digest.js';
 import { insertOperation, type AcceptDeps } from './accept.js';
@@ -81,6 +81,9 @@ export async function proposeCapability(deps: AcceptDeps, req: ProposeCapability
   // 依赖 Surge 版本/构建的能力必须带读到的具体版本：null 或 any 的记录在门槛中永远不会生效（读不到版本即待验证），
   // 格式不对的值（例如 CLI 交互模式输出的 127.0.0.1）不是版本。
   evidence.push(...versionContextErrors(req.key, req.context).map((e) => ({ field: `context.${e.field}`, message: e.message })));
+  // 依赖 Safari 进程归属的能力：有待重启的后台安全改进（或无法确认）时测得的记录永远不会生效；补充版本读不到或为 any 时
+  // 装上后台安全改进后记录不会过期。
+  evidence.push(...hostContextErrors(req.key, req.context).map((e) => ({ field: `context.${e.field}`, message: e.message })));
   if (COVERAGE_REQUIRED.includes(req.key) && (typeof req.protocol_coverage !== 'object' || req.protocol_coverage === null)) {
     evidence.push({ field: 'protocol_coverage', message: '该能力的提议必须带逐协议覆盖' });
   }
@@ -94,10 +97,10 @@ export async function proposeCapability(deps: AcceptDeps, req: ProposeCapability
   if (evidence.length > 0) throw new SfeError('EVIDENCE_REQUIRED', '提交能力证据失败：缺少必需的证据', { fieldErrors: evidence });
   const id = engine.ids.next('prop');
   engine.repos.tx(() => {
-    // 同一能力较早的、永远不能确认的待确认提议（早于版本校验提交，带 null、any 或 127.0.0.1）随这次重测的提议作废，
-    // 不再留在网页的待确认列表中；其他待确认提议不受影响。
+    // 同一能力较早的、永远不能确认的待确认提议（早于版本校验提交，带 null、any 或 127.0.0.1；或缺少可用的后台安全改进
+    // 状态）随这次重测的提议作废，不再留在网页的待确认列表中；其他待确认提议不受影响。
     for (const old of engine.repos.proposals.list({ pending: true, key: req.key })) {
-      if (proposalVersionErrors(old).length > 0) engine.repos.proposals.markRejected(old.id, engine.now());
+      if (proposalVersionErrors(old).length > 0 || hostContextErrors(old.key, old.context).length > 0) engine.repos.proposals.markRejected(old.id, engine.now());
     }
     engine.repos.proposals.insert({
       id,
@@ -165,6 +168,14 @@ export async function confirmCapability(deps: AcceptDeps, req: ConfirmCapability
       if (repos.tx(() => repos.proposals.markRejected(proposal.id, engine.now()))) engine.emit({ capabilities: true });
       throw new SfeError('EVIDENCE_REQUIRED', '确认能力失败：提议中的 Surge 版本或构建号不可用，这条提议已移除；请在能读取运行中 Surge 的版本后重测并重新提议', {
         fieldErrors: versionErrors.map((e) => ({ field: `context.${e.field}`, message: e.message })),
+      });
+    }
+    // 同一规则：后台安全改进待重启（或无法确认）时测得、或缺少补充版本的提议永远不能确认（早于该规则提交的提议没有这两个字段）。
+    const hostErrors = hostContextErrors(proposal.key, proposal.context);
+    if (hostErrors.length > 0) {
+      if (repos.tx(() => repos.proposals.markRejected(proposal.id, engine.now()))) engine.emit({ capabilities: true });
+      throw new SfeError('EVIDENCE_REQUIRED', '确认能力失败：提议缺少可用的后台安全改进状态（例如测量时 Mac 有待重启的后台安全改进），这条提议已移除；请重启 Mac 后重测并重新提议', {
+        fieldErrors: hostErrors.map((e) => ({ field: `context.${e.field}`, message: e.message })),
       });
     }
     if (proposal.proposedStatus === 'supported' && COVERAGE_REQUIRED.includes(key)) {

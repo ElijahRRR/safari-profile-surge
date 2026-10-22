@@ -15,6 +15,7 @@ import {
   contextFieldMatches,
   coverageAllowsSupported,
   createCapabilityGate,
+  hostContextErrors,
   mechanismFingerprint,
   versionContextErrors,
   type CapabilityRecordInput,
@@ -39,6 +40,8 @@ const CTX: CapabilityContext = {
   surgeVersion: '6.5.0',
   surgeBuild: '10960',
   macosBuild: '24A335',
+  macosVersionExtra: 'none',
+  macosRestartPending: 'no',
   safariVersion: '18.0',
   entryStrategy: 'ruleset_resource',
   processPathsDigest: 'pp-1',
@@ -63,6 +66,8 @@ const ALT: Record<string, string> = {
   surgeVersion: '6.6.0',
   surgeBuild: '11000',
   macosBuild: '24B83',
+  macosVersionExtra: '(a)',
+  macosRestartPending: 'yes',
   safariVersion: '18.1',
   entryStrategy: 'temp_rule',
   processPathsDigest: 'pp-2',
@@ -196,7 +201,8 @@ describe('Surge version and build never match on null or any', () => {
   }
 
   test('other fields keep the old rule: null/null and any/null still match', () => {
-    for (const field of ['takeoverMode', 'autoReload', 'macosBuild', 'safariVersion', 'signingIdentity'] as const) {
+    // macosVersionExtra 与 macosBuild 同一规则（提议另行拒绝 null 与 any，见 hostContextErrors）
+    for (const field of ['takeoverMode', 'autoReload', 'macosBuild', 'macosVersionExtra', 'safariVersion', 'signingIdentity'] as const) {
       expect(contextFieldMatches('runtime_entry_modes', field, null, null)).toBe(true);
       expect(contextFieldMatches('runtime_entry_modes', field, 'any', null)).toBe(true);
     }
@@ -289,6 +295,94 @@ describe('versionContextErrors (proposal validation shared by service and P0)', 
     const independent = CAPABILITY_KEYS.filter((k) => !CAPABILITY_CONTEXT_DEPS[k].includes('surgeVersion') && !CAPABILITY_CONTEXT_DEPS[k].includes('surgeBuild'));
     expect(independent).toContain('native_profile_id');
     for (const key of independent) expect(versionContextErrors(key, { surgeVersion: null, surgeBuild: 'any' })).toEqual([]);
+  });
+});
+
+// 后台安全改进：装上后 Safari 重开即使用新加密卷宗中的 WebKit，系统其余部分要到重启后才用（Apple 平台安全指南）；
+// 基础构建号可能不变（设备管理文档另记补充版本）。依赖进程归属的能力因此也依赖补充版本与待重启状态。
+describe('Background Security Improvement context', () => {
+  const ATTRIBUTION_KEYS = CAPABILITY_KEYS.filter((k) => CAPABILITY_CONTEXT_DEPS[k].includes('processPathsDigest') && CAPABILITY_CONTEXT_DEPS[k].includes('macosBuild'));
+
+  test('every capability that depends on process paths and the macOS build also depends on both improvement fields; nothing else does', () => {
+    expect(ATTRIBUTION_KEYS).toEqual(['safari_process_attribution', 'safari_udp_quic_handling', 'first_request_and_old_connections']);
+    for (const key of CAPABILITY_KEYS) {
+      const deps = CAPABILITY_CONTEXT_DEPS[key];
+      const expected = ATTRIBUTION_KEYS.includes(key);
+      expect(deps.includes('macosVersionExtra'), key).toBe(expected);
+      expect(deps.includes('macosRestartPending'), key).toBe(expected);
+    }
+  });
+
+  test("restart pending only matches 'no' recorded and 'no' current (no any, no null, no legacy record)", () => {
+    const m = (r: string | null | undefined, c: string | null) => contextFieldMatches('safari_process_attribution', 'macosRestartPending', r as string | null, c);
+    expect(m('no', 'no')).toBe(true);
+    for (const [r, c] of [
+      ['no', 'yes'],
+      ['no', null],
+      ['no', 'unknown'],
+      ['yes', 'yes'],
+      ['yes', 'no'],
+      ['any', 'no'],
+      ['any', 'yes'],
+      [null, null],
+      [null, 'no'],
+      [undefined, 'no'],
+      ['unknown', 'unknown'],
+    ] as const) {
+      expect(m(r, c), `${String(r)} vs ${String(c)}`).toBe(false);
+    }
+  });
+
+  test('a staged improvement (restart pending) makes the attribution capabilities unverified and blocks activation', async () => {
+    const records = CAPABILITY_KEYS.map((k) => record(k));
+    const pending = { ...CTX, macosRestartPending: 'yes' as const };
+    const views = computeCapabilityViews(records, pending);
+    for (const v of views) {
+      if (ATTRIBUTION_KEYS.includes(v.key)) expect(v, v.key).toMatchObject({ effectiveStatus: 'unverified', staleReasons: ['macosRestartPending'] });
+      else expect(v.effectiveStatus, v.key).toBe('supported');
+    }
+    const err = await createCapabilityGate({ list: () => records, currentContext: async () => pending })
+      .require(CAPABILITY_GATES.activate)
+      .catch((e: unknown) => e);
+    expect((err as SfeError).code).toBe('CAPABILITY_UNVERIFIED');
+    expect((err as SfeError).details).toEqual({
+      missing: [
+        { key: 'safari_process_attribution', staleReasons: ['macosRestartPending'] },
+        { key: 'safari_udp_quic_handling', staleReasons: ['macosRestartPending'] },
+      ],
+    });
+  });
+
+  test('an installed improvement with an unchanged base build expires attribution records via the supplemental version', () => {
+    const views = computeCapabilityViews(CAPABILITY_KEYS.map((k) => record(k)), { ...CTX, macosVersionExtra: '(a)' });
+    for (const v of views) {
+      if (ATTRIBUTION_KEYS.includes(v.key)) expect(v.staleReasons, v.key).toEqual(['macosVersionExtra']);
+      else expect(v.effectiveStatus, v.key).toBe('supported');
+    }
+  });
+
+  test('records written before the fields existed are stale on both fields', () => {
+    const { macosVersionExtra: _e, macosRestartPending: _p, ...legacy } = CTX;
+    const v = computeCapabilityViews([record('safari_process_attribution', { context: legacy as CapabilityContext })], CTX)[0]!;
+    expect(v).toMatchObject({ effectiveStatus: 'unverified', staleReasons: ['macosVersionExtra', 'macosRestartPending'] });
+  });
+
+  test('hostContextErrors (proposal validation shared by service, P0 and the web)', () => {
+    const fields = (key: CapabilityKey, ctx: Partial<CapabilityContext> | null) => hostContextErrors(key, ctx).map((e) => e.field);
+    expect(fields('safari_process_attribution', { macosVersionExtra: 'none', macosRestartPending: 'no' })).toEqual([]);
+    expect(fields('safari_process_attribution', { macosVersionExtra: '(a)', macosRestartPending: 'no' })).toEqual([]);
+    expect(fields('safari_process_attribution', { macosVersionExtra: 'none', macosRestartPending: 'yes' })).toEqual(['macosRestartPending']);
+    expect(fields('safari_process_attribution', { macosVersionExtra: 'none', macosRestartPending: 'unknown' })).toEqual(['macosRestartPending']);
+    expect(fields('safari_process_attribution', { macosVersionExtra: 'none', macosRestartPending: null })).toEqual(['macosRestartPending']);
+    expect(fields('safari_process_attribution', { macosVersionExtra: null, macosRestartPending: 'no' })).toEqual(['macosVersionExtra']);
+    expect(fields('safari_process_attribution', { macosVersionExtra: 'any', macosRestartPending: 'no' })).toEqual(['macosVersionExtra']);
+    expect(fields('first_request_and_old_connections', {})).toEqual(['macosRestartPending', 'macosVersionExtra']);
+    expect(fields('safari_udp_quic_handling', null)).toEqual(['macosRestartPending', 'macosVersionExtra']);
+    expect(hostContextErrors('safari_process_attribution', { macosVersionExtra: 'none', macosRestartPending: 'yes' })[0]!.message).toContain('请重启 Mac 后重测');
+    expect(hostContextErrors('safari_process_attribution', { macosVersionExtra: 'none', macosRestartPending: null })[0]!.message).toContain('无法确认');
+    for (const key of CAPABILITY_KEYS.filter((k) => !CAPABILITY_CONTEXT_DEPS[k].includes('macosRestartPending'))) {
+      expect(fields(key, { macosVersionExtra: null, macosRestartPending: 'yes' }), key).toEqual([]);
+    }
   });
 });
 

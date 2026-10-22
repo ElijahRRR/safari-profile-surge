@@ -378,6 +378,17 @@ export interface CapabilityContext {
   surgeVersion: string | null;
   surgeBuild: string | null;
   macosBuild: string | null;
+  /**
+   * `sw_vers -productVersionExtra`：后台安全改进（Background Security Improvement）的补充版本，例如 `(a)`；没有安装时为
+   * 'none'，非 macOS 为 'unknown'，读不到为 null。Apple 的设备管理文档把它与基础构建号分开记录，装上后基础构建号可能不变。
+   */
+  macosVersionExtra: string | null;
+  /**
+   * 是否有已安装、要重启 Mac 才完全生效的后台安全改进：'yes' 期间 Safari 重开后已使用新加密卷宗中的 WebKit，系统其余部分
+   * 要到重启后才用（Apple 平台安全指南），测得的进程归属不能沿用。门槛中只有记录与当前都是 'no' 才匹配（没有 any）；
+   * 非 macOS 为 'unknown'，无法确认为 null。
+   */
+  macosRestartPending: 'no' | 'yes' | 'unknown' | null;
   safariVersion: string | null;
   entryStrategy: EntryStrategy | null;
   processPathsDigest: string | null;

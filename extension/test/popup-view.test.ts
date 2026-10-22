@@ -37,6 +37,31 @@ describe('popup states', () => {
     expect(wrapper.find('[data-test="open-create"]').exists()).toBe(false);
   });
 
+  it('without a profile identifier (e.g. the default profile) explains that only a named Safari profile can be bound', async () => {
+    const state = currentState({
+      profile: { identified: false, profileIdShort: null },
+      environment: null,
+      route: null,
+      relation: 'other_active',
+      otherActiveLabel: null,
+      bindable: [],
+    });
+    const { wrapper, calls } = await mountPopup(state);
+    const hint = wrapper.find('[data-test="named-profile-required"]').text();
+    expect(hint).toContain('环境只能关联在已命名的 Safari 场景中（默认场景可能拿不到场景标识）');
+    // 默认场景是否提供场景标识由 P0 native_profile_id 实测，不写成定论
+    expect(hint).not.toContain('默认场景不能关联');
+    expect(hint).toContain('新建一个场景并为它启用本扩展');
+    // Apple：Safari 17 起网站授权对所有场景生效（Managing Safari web extension permissions），不要求每个新场景重新授权
+    expect(hint).toContain('www.amazon.com 的网站授权已对所有场景生效，授权过就不必重复');
+    expect(hint).not.toMatch(/启用本扩展并允许/);
+    expect(wrapper.find('[data-test="unbound-view"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="end-current"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="normal"]').exists()).toBe(false);
+    expect(wrapper.findAll('button').map((b) => b.text())).toEqual([]);
+    expect(calls.map((m) => m.type)).toEqual(['getCurrentState']);
+  });
+
   it('shows the load error when the first read fails', async () => {
     const { wrapper } = await mountPopup(currentState(), {
       getCurrentState: () => ({ ok: false, error: { code: 'INTERNAL', message: '连接本机服务失败：原生桥不可用' } }),

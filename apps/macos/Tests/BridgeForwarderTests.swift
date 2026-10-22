@@ -132,6 +132,16 @@ final class BridgeForwarderTests: XCTestCase {
         XCTAssertEqual(errorReason(outcome.response), "not_configured")
     }
 
+    func testDeniedContainerAccessIsReportedWithoutSendingAnything() throws {
+        let transport = FakeTransport()
+        let forwarder = makeForwarder(transport: transport, credentials: .failure(BridgeFileProblem.denied.nativeFailure))
+        let outcome = try XCTUnwrap(run(forwarder, message: jsonObject(#"{"v":1,"message":{"type":"getCurrentState"}}"#)))
+        XCTAssertTrue(transport.sentLines.isEmpty)
+        XCTAssertEqual(errorCode(outcome.response), "SURGE_UNREACHABLE")
+        XCTAssertEqual(errorReason(outcome.response), "container_denied")
+        XCTAssertEqual(outcome.logCode, "SURGE_UNREACHABLE")
+    }
+
     func testTransportFailuresMapToUnreachable() throws {
         for failure in [BridgeTransportError.connectFailed, .timeout, .closedWithoutResponse, .responseTooLarge, .sendFailed] {
             let transport = FakeTransport()
@@ -191,7 +201,8 @@ final class BridgeForwarderTests: XCTestCase {
         let message = jsonObject(#"{"v":1,"message":{"type":"requestLoginFill","top_url":"https://www.amazon.com/ap/signin","frame_is_top":true,"form_action":null,"fields":["password"],"route_epoch":3}}"#)
         let outcome = try XCTUnwrap(run(forwarder, message: message))
         XCTAssertEqual(errorCode(outcome.response), "FILL_NOT_ALLOWED")
-        XCTAssertEqual(errorMessage(outcome.response), "无法读取钥匙串中的登录密码：钥匙串已锁定")
+        XCTAssertEqual(errorMessage(outcome.response), "无法读取钥匙串中的登录密码：钥匙串需要用户交互但当前不允许（可能已锁定，或无法显示授权提示）")
+        XCTAssertEqual(errorReason(outcome.response), "locked")
         XCTAssertEqual(outcome.logCode, "FILL_NOT_ALLOWED")
     }
 

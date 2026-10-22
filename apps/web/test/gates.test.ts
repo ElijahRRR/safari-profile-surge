@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { CAPABILITY_GATES, GATING_COVERAGE_ITEMS, type CapabilityProposalView, type ProtocolCoverage } from '@sfe/contract';
 import PendingDeployCard from '../src/components/PendingDeployCard.vue';
 import CapabilitiesView from '../src/views/CapabilitiesView.vue';
-import { coverageBlockReason, evaluateGate, staleReasonText, versionBlockReason } from '../src/lib/gates';
+import { coverageBlockReason, evaluateGate, hostBlockReason, staleReasonText, versionBlockReason } from '../src/lib/gates';
 import { allSupported, byText, capabilities, click, environment, flush, mountWith, revision, snapshot, testContext, type Call } from './fixtures';
 
 afterEach(() => {
@@ -183,6 +183,8 @@ function proposal(over: Partial<CapabilityProposalView> = {}): CapabilityProposa
       surgeVersion: '6.5.0',
       surgeBuild: '3000',
       macosBuild: '24A335',
+      macosVersionExtra: 'none',
+      macosRestartPending: 'no',
       safariVersion: '18.0',
       entryStrategy: 'temp_rule',
       processPathsDigest: 'hmac:abcd',
@@ -237,9 +239,44 @@ describe('versionBlockReason', () => {
   });
 });
 
+describe('hostBlockReason (Background Security Improvement)', () => {
+  const ctx = proposal().context;
+
+  it('blocks confirming a process-attribution proposal measured while an improvement awaited a restart, or without the fields', () => {
+    expect(hostBlockReason(proposal())).toBeNull();
+    expect(hostBlockReason(proposal({ context: { ...ctx, macosVersionExtra: '(a)' } }))).toBeNull();
+    expect(hostBlockReason(proposal({ context: { ...ctx, macosRestartPending: 'yes' } }))).toContain('请重启 Mac 后重测并重新提议');
+    expect(hostBlockReason(proposal({ context: { ...ctx, macosRestartPending: null } }))).toContain('没有确认是否有待重启的后台安全改进');
+    expect(hostBlockReason(proposal({ context: { ...ctx, macosVersionExtra: null } }))).toContain('后台安全改进版本读不到或为 any');
+    expect(hostBlockReason(proposal({ context: { ...ctx, macosVersionExtra: 'any' } }))).toContain('后台安全改进版本读不到或为 any');
+    // 早于该规则提交的提议没有这两个字段
+    const { macosVersionExtra: _e, macosRestartPending: _p, ...legacy } = ctx;
+    expect(hostBlockReason(proposal({ context: legacy as typeof ctx }))).not.toBeNull();
+  });
+
+  it('does not check capabilities that do not depend on process attribution', () => {
+    expect(hostBlockReason(proposal({ key: 'native_bridge_ipc', context: { ...ctx, macosRestartPending: 'yes', macosVersionExtra: null } }))).toBeNull();
+  });
+});
+
 describe('staleReasonText', () => {
   const ctx = proposal().context;
   const SURGE = { version: '6.5.0', build: '3000' };
+
+  it('says a restart is needed when a Background Security Improvement awaits one (or it cannot be told)', () => {
+    expect(staleReasonText({ staleReasons: ['macosRestartPending'], context: ctx }, SURGE)).toBe(
+      'Mac 有已安装、尚未重启生效的后台安全改进（或无法确认是否有）：Safari 可能已在使用新的 WebKit，进程归属按待验证处理，请重启 Mac',
+    );
+    expect(staleReasonText({ staleReasons: ['macosVersionExtra'], context: ctx }, SURGE)).toBe('后台安全改进版本已变化');
+    // 旧记录没有这两个字段：需要重测，不是“已变化”或“请重启”
+    const { macosVersionExtra: _e, macosRestartPending: _p, ...legacy } = ctx;
+    expect(staleReasonText({ staleReasons: ['macosVersionExtra', 'macosRestartPending'], context: legacy as typeof ctx }, SURGE)).toBe(
+      '验证记录缺少 后台安全改进版本、后台安全改进待重启状态，需要重测',
+    );
+    expect(staleReasonText({ staleReasons: ['macosVersionExtra', 'macosRestartPending'], context: { ...ctx, macosVersionExtra: '(a)' } }, SURGE)).toBe(
+      'Mac 有已安装、尚未重启生效的后台安全改进（或无法确认是否有）：Safari 可能已在使用新的 WebKit，进程归属按待验证处理，请重启 Mac；后台安全改进版本已变化',
+    );
+  });
 
   it('says the current Surge version cannot be read instead of claiming it changed', () => {
     const text = staleReasonText({ staleReasons: ['surgeVersion', 'surgeBuild'], context: ctx }, { version: null, build: null });
@@ -320,6 +357,42 @@ describe('capabilities page', () => {
     click(confirm);
     await flush();
     expect(calls.some((c) => c.url === '/api/capabilities' && c.method === 'POST')).toBe(false);
+    m.unmount();
+  });
+
+  it('shows the restart-needed reason and disables 确认 for a proposal measured while an improvement awaited a restart', async () => {
+    const caps = capabilities(allSupported()).map((c) =>
+      c.key === 'safari_process_attribution' ? { ...c, effectiveStatus: 'unverified' as const, staleReasons: ['macosRestartPending' as const], context: proposal().context } : c,
+    );
+    const pending = proposal({ context: { ...proposal().context, macosRestartPending: 'yes' } });
+    const { ctx, calls } = testContext(() => ({ status: 404 }), snapshot({ capabilities: caps, capabilityProposals: [pending] }));
+    const m = await mountWith(CapabilitiesView, ctx, {}, '/capabilities');
+    const reasons = Array.from(document.body.querySelectorAll('[data-test="stale-reason"]')).map((e) => e.textContent?.trim());
+    expect(reasons).toEqual(['Mac 有已安装、尚未重启生效的后台安全改进（或无法确认是否有）：Safari 可能已在使用新的 WebKit，进程归属按待验证处理，请重启 Mac']);
+    const confirm = document.body.querySelector<HTMLButtonElement>('[data-test="confirm-proposal"]')!;
+    expect(confirm.disabled).toBe(true);
+    expect(document.body.querySelector('[data-test="confirm-block"]')?.textContent).toContain('请重启 Mac 后重测并重新提议');
+    click(confirm);
+    await flush();
+    expect(calls.some((c) => c.url === '/api/capabilities' && c.method === 'POST')).toBe(false);
+    m.unmount();
+  });
+
+  it('details of a record from before the improvement fields existed say 未记录 and ask for a re-test', async () => {
+    const { macosVersionExtra: _e, macosRestartPending: _p, ...legacy } = proposal().context;
+    const caps = capabilities(allSupported()).map((c) =>
+      c.key === 'safari_process_attribution'
+        ? { ...c, effectiveStatus: 'unverified' as const, staleReasons: ['macosVersionExtra' as const, 'macosRestartPending' as const], context: legacy as ReturnType<typeof proposal>['context'] }
+        : c,
+    );
+    const { ctx } = testContext(() => ({ status: 404 }), snapshot({ capabilities: caps }));
+    const m = await mountWith(CapabilitiesView, ctx, {}, '/capabilities');
+    click(document.body.querySelector('[aria-label="查看 Safari 精确进程归属 的详情"]'));
+    await flush();
+    expect(document.body.querySelector('[data-test="detail-stale-reason"]')?.textContent).toBe('过期原因：验证记录缺少 后台安全改进版本、后台安全改进待重启状态，需要重测');
+    const dl = document.body.querySelector('.modal dl, dl')!;
+    expect(dl.textContent).toContain('后台安全改进待重启状态');
+    expect(dl.textContent).toContain('未记录');
     m.unmount();
   });
 

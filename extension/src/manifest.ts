@@ -1,7 +1,11 @@
-// manifest.json 的唯一来源（构建时写出）。权限按 ARCHITECTURE §9：只有 nativeMessaging 与 storage，
-// 不申请 tabs；站点权限只有各站点主机与固定的检测服务主机；内容脚本只匹配登录路径、只在顶层框架。
+// manifest.json 的唯一来源（构建时写出）。权限按 ARCHITECTURE §9：只有 nativeMessaging、storage 与 alarms
+// （非持久后台的合并上报按 Apple 要求用 alarms 代替 setTimeout），不申请 tabs；
+// 站点权限只有各站点主机与固定的检测服务主机；内容脚本只匹配登录路径、只在顶层框架。
+// 最低 Safari 版本用 browser_specific_settings.safari.strict_min_version 声明（Apple：“Provide a specific version number in
+// strict_min_version if you have a minimum Safari version requirement.”，Optimizing your web extension for Safari）：
+// 17.6 才修复后台页约 30 秒后停止响应。低于它时 Safari 如何呈现（不加载或提示不兼容），Apple 没有写明。
 
-import { SITES, VERIFY_ENDPOINTS } from '@sfe/contract';
+import { SAFARI_MINIMUM_VERSION, SITES, VERIFY_ENDPOINTS } from '@sfe/contract';
 
 export const EXTENSION_NAME = 'Safari 场景出口';
 export const EXTENSION_VERSION = '0.1.0';
@@ -43,7 +47,7 @@ export function buildManifest(): Record<string, unknown> {
     version: EXTENSION_VERSION,
     description: '按 Safari 场景使用指定的 Surge 出口，Chrome 保持原规则。',
     icons,
-    permissions: ['nativeMessaging', 'storage'],
+    permissions: ['nativeMessaging', 'storage', 'alarms'],
     host_permissions: [...siteHostPermissions(), ...verifyHostPermissions()],
     background: { scripts: ['background.js'], type: 'module', persistent: false },
     content_scripts: [
@@ -60,5 +64,6 @@ export function buildManifest(): Record<string, unknown> {
       default_icon: { '16': 'icons/icon-16.png', '32': 'icons/icon-32.png', '48': 'icons/icon-48.png' },
     },
     content_security_policy: { extension_pages: extensionPagesCsp() },
+    browser_specific_settings: { safari: { strict_min_version: SAFARI_MINIMUM_VERSION } },
   };
 }
