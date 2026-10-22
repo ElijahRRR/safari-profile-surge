@@ -113,7 +113,9 @@ export const CLI_COMMANDS: CliCommandTable = {
   },
   listRecentRequests: {
     evidence: 'unverified',
-    argv: () => ['--raw', 'dump', 'request'],
+    // 6.5.0 (10960): recent returns { requests: [...] }; request returns a combined
+    // active-requests/recent-requests envelope, which is not the recent-list API.
+    argv: () => ['--raw', 'dump', 'recent'],
     parse: (out) => parseRequestRecords(jsonOrThrow(out.stdout, '最近请求')),
   },
   listPolicies: {

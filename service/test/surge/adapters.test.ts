@@ -67,6 +67,19 @@ describe('CLI command table', () => {
 describe('createCliAdapter', () => {
   const okExec = (stdout: string): ExecFn => vi.fn(async () => ({ stdout, stderr: '' }));
 
+  test('reads recent requests without using the combined request dump envelope', async () => {
+    // Surge Mac 6.5.0 (10960) read-only observation; all record values are synthetic.
+    const record = { id: 42, remoteHost: 'verify.example.test', processPath: '/Applications/Safari.app/Contents/MacOS/Safari', method: 'HTTPS', startDate: 1760000000, completed: true, failed: false };
+    const exec: ExecFn = vi.fn(async (_file, args) => ({
+      stdout: JSON.stringify(args.join(' ') === '--raw dump recent'
+        ? { requests: [record] }
+        : { 'active-requests': [], 'recent-requests': [record], replica: 0, 'persistent-store': null }),
+      stderr: '',
+    }));
+    const adapter = createCliAdapter({ cliPath: CLI, mechanism: { listRecentRequests: 'cli' }, exec, scrub: (s) => s });
+    await expect(adapter.listRecentRequests()).resolves.toMatchObject([{ id: '42', remoteHost: 'verify.example.test', completed: true }]);
+  });
+
   test('does not run the unsupported version flag or treat its connection address as a version', async () => {
     // Observed on Surge Mac 6.5.0: --version enters interactive mode (exit 0 at EOF).
     const exec = okExec('No command is provided, enter interactive mode.\nTips: Use surge-cli --help to show available commands.\nConnected to 127.0.0.1\n> ');
