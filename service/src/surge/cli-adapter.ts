@@ -1,11 +1,12 @@
 // CLI 实现：execFile（不经 shell，stdin 立即关闭）、固定 argv、超时与输出上限。未映射到 cli 的原语一律
-// CAPABILITY_UNVERIFIED；交互模式提示先于其他分类识别为命令失败；子进程错误与 stderr 先脱敏、截断再进入
-// 错误信息。见 docs/ARCHITECTURE.md §5.1。
+// CAPABILITY_UNVERIFIED；交互模式提示先于其他分类识别为命令失败；退出 0 但输出说无法连接时按无法连接处理，
+// 不进入解析；子进程错误与 stderr 先脱敏、截断再进入错误信息。见 docs/ARCHITECTURE.md §5.1。
 
 import { SfeError } from '@sfe/contract';
 import type { SurgeAdapter } from '../ports.js';
 import { execFixed } from '../util/exec-fixed.js';
 import { CLI_COMMANDS, type CliCommand, type CliOutput } from './cli-commands.js';
+import { parseJsonLoose } from './parse-output.js';
 import { capabilityUnverified, truncate, type MechanismMap, type SurgePrimitive } from './primitives.js';
 import { redactFreeText } from './redact-profile.js';
 
@@ -58,6 +59,16 @@ interface ExecError {
 
 const UNREACHABLE_TEXT_RE = /not running|connection refused|ECONNREFUSED|could ?n[o']t connect|unable to connect|无法连接/i;
 
+/**
+ * 退出 0（或 --check 的非零结果）时输出里的“无法连接”文字：stderr 总是检查；stdout 只在不是 JSON 时检查（JSON 结果中的
+ * 名称或规则可能恰好含有这些词）。返回匹配的那一段，没有时为 null。6.5 在 Surge 未运行时的实际输出尚未实测（P0-RUNBOOK V7）。
+ */
+function unreachableText(stdout: string, stderr: string): string | null {
+  if (UNREACHABLE_TEXT_RE.test(stderr)) return stderr;
+  if (parseJsonLoose(stdout) === undefined && UNREACHABLE_TEXT_RE.test(stdout)) return stdout;
+  return null;
+}
+
 export function createCliAdapter(opts: CliAdapterOptions): SurgeAdapter {
   const exec = opts.exec ?? defaultExec;
   const timeout = opts.timeoutMs ?? 15_000;
@@ -101,6 +112,10 @@ export function createCliAdapter(opts: CliAdapterOptions): SurgeAdapter {
     }
     // 先于解析：退出 0 加提示不是成功（--check 会被当作通过，写命令解析为 undefined 会被当作已写入）。
     if (showsInteractiveBanner(out.stdout, out.stderr)) throw interactiveModeError(primitive);
+    // 同样先于解析：退出 0 但输出说无法连接，不是结果（空输出会被当作“没有临时规则”，--check 会被当作通过，
+    // 写命令会被当作已写入）。
+    const unreachable = unreachableText(out.stdout, out.stderr);
+    if (unreachable !== null) throw new SfeError('SURGE_UNREACHABLE', `连接 Surge 失败：${truncate(scrubAll(unreachable))}`);
     return cmd.parse(out, { scrub: scrubAll });
   }
 

@@ -61,14 +61,17 @@ function logsNamed(hh: Harness, msg: string): Array<Record<string, unknown>> {
 
 describe('choosing the liveness primitive', () => {
   test('takes the first read primitive mapped to cli, http or fake, in a fixed order, and never getVersion', () => {
-    expect(LIVENESS_PRIMITIVES).toEqual(['listExternalResources', 'listTempRules', 'getCurrentProfile', 'listPolicies']);
+    expect(LIVENESS_PRIMITIVES).toEqual(['listExternalResources', 'getCurrentProfile', 'listPolicies']);
     expect(LIVENESS_PRIMITIVES).not.toContain('getVersion');
     const all = (m: string) => Object.fromEntries(SURGE_PRIMITIVES.map((p) => [p, m]));
     expect(chooseLivenessPrimitive(all('fake'))).toBe('listExternalResources');
     expect(chooseLivenessPrimitive(all('cli'))).toBe('listExternalResources');
     // Surge 6.5 只有命令行工具：external-resource list 与 dump temp-rule 在帮助中出现过
     expect(chooseLivenessPrimitive({ ...all('unavailable'), listExternalResources: 'cli', listTempRules: 'cli' })).toBe('listExternalResources');
-    expect(chooseLivenessPrimitive({ ...all('unavailable'), listTempRules: 'cli' })).toBe('listTempRules');
+    // dump temp-rule 的空输出（没有临时规则）不能证明连接：只映射了它时没有检测原语
+    expect(LIVENESS_PRIMITIVES).not.toContain('listTempRules');
+    expect(chooseLivenessPrimitive({ ...all('unavailable'), listTempRules: 'cli' })).toBeNull();
+    expect(chooseLivenessPrimitive({ ...all('unavailable'), listTempRules: 'cli', listPolicies: 'cli' })).toBe('listPolicies');
     // 只配置 HTTP API
     expect(chooseLivenessPrimitive({ ...all('unavailable'), getCurrentProfile: 'http', listPolicies: 'http' })).toBe('getCurrentProfile');
     expect(chooseLivenessPrimitive({ ...all('unavailable'), listPolicies: 'http' })).toBe('listPolicies');
@@ -240,6 +243,41 @@ describe('reachability without getVersion', () => {
     expect(JSON.stringify(st)).not.toContain('127.0.0.1');
     expect(h.logs.join('\n')).not.toContain('127.0.0.1');
     expect(h.logs.join('\n')).not.toMatch(/interactive mode/i);
+  });
+
+  test('CLI-only with just dump temp-rule mapped: exit 0, empty stdout and "Could not connect" on stderr never makes Surge reachable', async () => {
+    // 外部资源读取在 P0 中解析失败（例如输出 {}），只映射了 dump temp-rule；Surge 未运行时 CLI 退出 0、stdout 为空
+    const mechanism: MechanismMap = Object.fromEntries(SURGE_PRIMITIVES.map((p) => [p, 'unavailable' as const]));
+    mechanism.listTempRules = 'cli';
+    const argvs: string[][] = [];
+    const exec: ExecFn = async (_file, args) => {
+      argvs.push([...args]);
+      return { stdout: '', stderr: 'Could not connect to Surge\n' };
+    };
+    const cli = createCliAdapter({ cliPath: CLI, mechanism, exec, scrub: (s) => s });
+    h = await createHarness({ livenessPrimitive: 'auto', surge: (fake) => createCompositeAdapter({ mechanism, cli, fake }) });
+    expect(h.app.engine.livenessPrimitive).toBeNull();
+    const st = await h.app.refreshSurge(WEB);
+    expect(st).toMatchObject({ reachable: false, version: null, message: LIVENESS_FAILURE_TEXT.not_configured });
+    expect(st.message).toContain('无法连接');
+    expect(argvs).toEqual([]);
+    // 读取本身也不再把这样的输出当作“没有临时规则”
+    await expect(cli.listTempRules()).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
+  });
+
+  test('CLI liveness read exiting 0 with empty stdout and "Could not connect" on stderr → 无法连接 Surge, nothing else read', async () => {
+    const mechanism: MechanismMap = Object.fromEntries(SURGE_PRIMITIVES.map((p) => [p, 'fake' as const]));
+    mechanism.listExternalResources = 'cli';
+    const exec: ExecFn = async () => ({ stdout: '', stderr: 'Could not connect to Surge\n' });
+    const cli = createCliAdapter({ cliPath: CLI, mechanism, exec, scrub: (s) => s });
+    h = await createHarness({ livenessPrimitive: 'auto', surge: (fake) => createCompositeAdapter({ mechanism, cli, fake }) });
+    expect(h.app.engine.livenessPrimitive).toBe('listExternalResources');
+    const before = counts(h, FACT_READS);
+    const reads = h.fake.instanceReads;
+    const st = await h.app.refreshSurge(WEB);
+    expect(st).toMatchObject({ reachable: false, version: null, message: LIVENESS_FAILURE_TEXT.unreachable });
+    expect(counts(h, FACT_READS)).toEqual(before);
+    expect(h.fake.instanceReads).toBe(reads);
   });
 
   test('no liveness primitive → not reachable without any Surge call', async () => {

@@ -95,6 +95,53 @@ describe('capability proposals and confirmation', () => {
     expect(ok.proposal_id).toMatch(/^prop_/);
   });
 
+  test('confirming a pending proposal re-checks the version: one stored without a usable version is refused before any setting or record changes', async () => {
+    h = await createHarness();
+    const newPath = '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview';
+    // 早于提议校验写入的提议（a95e67d 的 P0 只警告就提交了读不到版本的提议；更早的解析器记录 127.0.0.1）
+    const bad: Array<{ key: 'runtime_entry_modes' | 'safari_process_attribution'; surgeVersion: string | null; surgeBuild: string | null; fields: string[] }> = [
+      { key: 'runtime_entry_modes', surgeVersion: null, surgeBuild: null, fields: ['context.surgeVersion', 'context.surgeBuild'] },
+      { key: 'runtime_entry_modes', surgeVersion: '127.0.0.1', surgeBuild: null, fields: ['context.surgeVersion', 'context.surgeBuild'] },
+      { key: 'runtime_entry_modes', surgeVersion: 'any', surgeBuild: 'any', fields: ['context.surgeVersion', 'context.surgeBuild'] },
+      { key: 'safari_process_attribution', surgeVersion: '6.5.0', surgeBuild: null, fields: ['context.surgeBuild'] },
+    ];
+    const settingsBefore = h.repos.settings.getAll();
+    const recordsBefore = JSON.stringify(h.repos.capabilities.list());
+    expect(settingsBefore.entryStrategy).toBe('ruleset_resource');
+    for (const [i, c] of bad.entries()) {
+      const id = `prop_legacy${i}`;
+      h.repos.proposals.insert({
+        id,
+        key: c.key,
+        proposedStatus: 'supported',
+        context: { ...anyContext(), surgeVersion: c.surgeVersion, surgeBuild: c.surgeBuild, processPathsDigest: processPathsDigest([newPath]) },
+        summary: '旧提议（测试）',
+        evidenceDigest: 'sha256:0123456789abcdef',
+        submittedBy: 'agent',
+        ...(c.key === 'runtime_entry_modes' ? { entryStrategy: 'temp_rule' as const } : { safariProcessPaths: [newPath], protocolCoverage: FULL_COVERAGE }),
+      });
+      const err = await expectError(h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id: id }, WEB), 'EVIDENCE_REQUIRED');
+      expect(err.fieldErrors?.map((e) => e.field), JSON.stringify(c)).toEqual(c.fields);
+      // 提议保持待确认，设置与全部能力记录（包括依赖入口策略或进程路径的其他能力）不变
+      expect(h.repos.proposals.get(id)).toMatchObject({ confirmedAt: null, rejectedAt: null });
+    }
+    expect(h.repos.settings.getAll()).toEqual(settingsBefore);
+    expect(JSON.stringify(h.repos.capabilities.list())).toBe(recordsBefore);
+    // 同一形状、带读到的版本时照常确认
+    h.repos.proposals.insert({
+      id: 'prop_measured',
+      key: 'runtime_entry_modes',
+      proposedStatus: 'supported',
+      context: measuredContext(),
+      summary: '重测后的提议（测试）',
+      evidenceDigest: 'sha256:0123456789abcdef',
+      submittedBy: 'agent',
+      entryStrategy: 'temp_rule',
+    });
+    await h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id: 'prop_measured' }, WEB);
+    expect(h.repos.settings.get('entryStrategy')).toBe('temp_rule');
+  });
+
   test('capabilities that do not depend on the Surge version accept a null version', async () => {
     h = await createHarness({ capabilities: [] });
     const { proposal_id } = await h.app.proposeCapability(proposal({ key: 'open_profile_by_id', context: { ...anyContext(), surgeVersion: null, surgeBuild: null } }), AGENT);

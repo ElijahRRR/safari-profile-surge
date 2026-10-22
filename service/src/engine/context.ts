@@ -55,8 +55,10 @@ import { readFile } from 'node:fs/promises';
  * 可达性检测使用的只读原语，按顺序取第一个已映射到 cli、http 或 fake 的。选择在引擎创建时静态完成，从不按成败
  * 换用另一个，也从不使用 getVersion（Surge 6.5 的命令行工具没有版本命令）。原语只有在 P0 实测读取成功后才会被映射；
  * 只配置 HTTP API 时落到 getCurrentProfile 或 listPolicies。
+ * 不含 listTempRules：`--raw dump temp-rule` 的空输出就是“没有临时规则”，与 Surge 未运行时可能的空输出无法区分，
+ * 不能证明连接（HTTP 实现也没有它）。TODO(P0)：V7 记录 Surge 未运行时的输出后再评估。
  */
-export const LIVENESS_PRIMITIVES = ['listExternalResources', 'listTempRules', 'getCurrentProfile', 'listPolicies'] as const satisfies readonly SurgePrimitive[];
+export const LIVENESS_PRIMITIVES = ['listExternalResources', 'getCurrentProfile', 'listPolicies'] as const satisfies readonly SurgePrimitive[];
 export type LivenessPrimitive = (typeof LIVENESS_PRIMITIVES)[number];
 
 export function chooseLivenessPrimitive(mechanism: Readonly<Record<string, string>>): LivenessPrimitive | null {
@@ -66,7 +68,6 @@ export function chooseLivenessPrimitive(mechanism: Readonly<Record<string, strin
 /** 检测读取：解析成功且结构正确才算可达（适配器返回意外的值也按无法确认处理）。 */
 const LIVENESS_READ: Record<LivenessPrimitive, (s: SurgeAdapter) => Promise<boolean>> = {
   listExternalResources: async (s) => Array.isArray(await s.listExternalResources()),
-  listTempRules: async (s) => Array.isArray(await s.listTempRules()),
   getCurrentProfile: async (s) => {
     const p: unknown = await s.getCurrentProfile();
     return typeof p === 'object' && p !== null && typeof (p as { name?: unknown }).name === 'string';
@@ -85,6 +86,15 @@ export const LIVENESS_FAILURE_TEXT: Record<LivenessFailure, string> = {
   unreachable: '无法连接 Surge',
   unconfirmed: '无法确认 Surge 连接：只读检测失败或输出无法识别',
 };
+
+/**
+ * 运行实例读取的总时限（毫秒）。读取在执行器通道上进行（周期对账、刷新、动作前检查都经 readBasicFacts）：ps、plutil、
+ * lsof、codesign 各自的超时加起来可达数十秒，排队的操作（包括进入普通模式）不能被它拖住。超过时限按 read_failed
+ * （版本为 null，依赖版本的能力按待验证处理）；读取本身继续完成并更新读取器的缓存，下一次读取通常直接命中。
+ */
+export const DEFAULT_INSTANCE_READ_BUDGET_MS = 8_000;
+
+const INSTANCE_READ_TIMED_OUT = Symbol('instance-read-timed-out');
 
 export function versionUnknownMessage(issue: SurgeVersionIssue): string {
   return `无法确认运行中的 Surge 版本（${RUNNING_INSTANCE_FAILURE_TEXT[issue]}）：依赖 Surge 版本的能力按待验证处理`;
@@ -151,6 +161,8 @@ export interface AppServiceDeps {
    * 测试夹具用它固定检测读取，避免检测消耗测试注入的故障。
    */
   livenessPrimitive?: LivenessPrimitive | null;
+  /** 运行实例读取的总时限（毫秒，缺省 DEFAULT_INSTANCE_READ_BUDGET_MS）。 */
+  instanceReadBudgetMs?: number;
 }
 
 export interface EngineKeys {
@@ -432,13 +444,22 @@ export class Engine {
   /**
    * 运行中 Surge 的版本与构建号（只决定版本，从不决定可达性）：来自运行实例读取，版本与构建号一起接受或一起为 null。
    * 读取器已经校验过格式；这里再按 A0 的格式核对一次（注入的实现返回其他值时按 version_malformed）。
+   * 总时限（instanceReadBudgetMs）到达时不再等待，按 read_failed。
    */
   private async readVersion(facts: SurgeFacts): Promise<SurgeVersionIssue | null> {
     let r: RunningInstanceResult;
+    let cancelBudget: () => void = () => undefined;
+    const budget = new Promise<typeof INSTANCE_READ_TIMED_OUT>((resolve) => {
+      cancelBudget = this.clock.setTimeout(() => resolve(INSTANCE_READ_TIMED_OUT), this.deps.instanceReadBudgetMs ?? DEFAULT_INSTANCE_READ_BUDGET_MS);
+    });
     try {
-      r = await this.host.surgeInstance();
+      const v = await Promise.race([this.host.surgeInstance(), budget]);
+      if (v === INSTANCE_READ_TIMED_OUT) return 'read_failed';
+      r = v;
     } catch {
       return 'read_failed';
+    } finally {
+      cancelBudget();
     }
     if (typeof r !== 'object' || r === null) return 'read_failed';
     if (r.ok !== true) {

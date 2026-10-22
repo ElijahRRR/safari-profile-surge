@@ -76,11 +76,14 @@ export function helpWords(help: string): Set<string> {
 
 /**
  * 解析 --help 的输出。输出是交互模式提示（帮助参数没有被识别）时命令词按空处理：不能从提示文字推断
- * 任何命令存在，也就不经 CLI 探测任何原语。
+ * 任何命令存在，也就不经 CLI 探测任何原语。只有匹配提示、且没有列出原语表中任何一条命令（没有原语的固定命令词
+ * 全部出现）时才算提示：帮助正文常会说明交互模式（例如“不带命令运行进入交互模式”），这时仍按帮助解析。
  */
 export function parseCliHelp(help: string): { words: Set<string>; interactive: boolean } {
-  if (INTERACTIVE_BANNER_RE.test(help)) return { words: new Set(), interactive: true };
-  return { words: helpWords(help), interactive: false };
+  const words = helpWords(help);
+  if (!INTERACTIVE_BANNER_RE.test(help)) return { words, interactive: false };
+  const listsCommands = [...READ_PRIMITIVES, ...ACTIVE_PRIMITIVES].some((p) => cliAvailability(p, words) === 'in_help');
+  return listsCommands ? { words, interactive: false } : { words: new Set(), interactive: true };
 }
 
 /** CLI 原语表中该原语的固定命令词（去掉参数）；表中没有时为 null。 */

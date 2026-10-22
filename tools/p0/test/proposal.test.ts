@@ -96,6 +96,14 @@ describe('buildProposal', () => {
     }
   });
 
+  it('refuses when the version was read at measurement time but cannot be read now, without calling it a change', () => {
+    // 测量时 6.5.0 (10960)，提议时读不到：说“读不到”，不说“已变化”
+    const msg = refusal(() => buildProposal(input('independent_node_preflight', { current: { ...CTX, surgeVersion: null, surgeBuild: null } })));
+    expect(msg).toContain('读不到');
+    expect(msg).toContain('请在能读取运行中 Surge 的版本与构建号后重测');
+    expect(msg).not.toContain('已变化');
+  });
+
   it('refuses when the measurement had no Surge version even if it can be read now', () => {
     const r = result('independent_node_preflight', { context: { ...CTX, surgeVersion: null, surgeBuild: null } });
     const msg = refusal(() => buildProposal(input('independent_node_preflight', { result: r })));

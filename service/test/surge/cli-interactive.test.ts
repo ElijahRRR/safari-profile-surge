@@ -96,6 +96,41 @@ describe('interactive banner is never a result', () => {
   });
 });
 
+describe('exit 0 with connection-failure text is never a result', () => {
+  const COULD_NOT = 'Could not connect to Surge\n';
+
+  test.each(CLI_PRIMITIVES)('%s: exit 0, empty stdout and "Could not connect" on stderr is SURGE_UNREACHABLE', async (p) => {
+    const err = await failure(invoke(adapter(async () => ({ stdout: '', stderr: COULD_NOT })), p));
+    expect(err).toMatchObject({ code: 'SURGE_UNREACHABLE', message: '连接 Surge 失败：Could not connect to Surge' });
+  });
+
+  test('--check: exit 0 with the text on stderr or as plain stdout is not a passed check', async () => {
+    await expect(adapter(async () => ({ stdout: '', stderr: COULD_NOT })).checkProfile('/tmp/c.conf')).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
+    await expect(adapter(async () => ({ stdout: 'Surge is not running', stderr: '' })).checkProfile('/tmp/c.conf')).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
+    // 没有这些文字的退出 0 仍是通过
+    await expect(adapter(async () => ({ stdout: 'Profile check passed', stderr: '' })).checkProfile('/tmp/c.conf')).resolves.toMatchObject({ ok: true });
+  });
+
+  test('write commands: exit 0 with the text is not a successful write', async () => {
+    await expect(adapter(async () => ({ stdout: '无法连接 Surge', stderr: '' })).updateExternalResource('policy-path:sfe-nodes.list')).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
+    await expect(adapter(async () => ({ stdout: '', stderr: 'connect ECONNREFUSED 127.0.0.1:6171' })).addTempRule(SAMPLE_ARGS.addTempRule![0] as string)).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
+  });
+
+  test('the text inside a JSON result on stdout is data, not a connection failure', async () => {
+    const stdout = JSON.stringify(['DOMAIN,not running.example.test,REJECT']);
+    await expect(adapter(async () => ({ stdout, stderr: '' })).listTempRules()).resolves.toEqual(['DOMAIN,not running.example.test,REJECT']);
+  });
+
+  test('the echoed text is scrubbed and truncated like other errors', async () => {
+    const stderr = `Could not connect: password=exampleP0 ${'x'.repeat(500)}`;
+    const scrub = (s: string) => s.replace(/exampleP0/g, '***');
+    const err = await failure(adapter(async () => ({ stdout: '', stderr }), scrub).listTempRules());
+    expect(err.code).toBe('SURGE_UNREACHABLE');
+    expect(err.message).not.toContain('exampleP0');
+    expect(err.message.length).toBeLessThan(400);
+  });
+});
+
 describe('CLI argv shape', () => {
   test('every command names a subcommand (only --check is a bare flag) and never asks for --version', () => {
     const BARE_FLAG_COMMANDS = new Set(['--check']);

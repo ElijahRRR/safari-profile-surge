@@ -130,28 +130,31 @@ npx tsx tools/p0/src/cli.ts instance [--surge-team-id <Team ID>]
 | V4 | lsof | `/usr/sbin/lsof -nP -a -p <pid> -d txt -F in` 与 `stat -f %i /Applications/Surge.app/Contents/MacOS/Surge` | 主程序那一项的 inode 与路径都一致；记录是否需要额外权限与耗时 | running_image |
 | V5 | 签名 | `/usr/bin/codesign --verify --strict /Applications/Surge.app`；`/usr/bin/codesign -dv --verbose=2 /Applications/Surge.app` 读取 TeamIdentifier | 退出 0；记录耗时与 Team ID，然后用 `instance --surge-team-id <Team ID>` 复核 | signature（耗时见各规则的 ms） |
 | V6 | 规则自测（不碰 Surge） | 见下方步骤：在运行目录中做一个临时 App，用 `instance --self-test-bundle <该 App>` 核对 | 直接启动：通过；原子改写其 Info.plist：`modified_after_start`；启动前 `cp -p` 一份主程序、启动后用 `mv` 覆盖：`running_image_mismatch`（APFS 改名不更新 ctime 时）或 `modified_after_start`（更新时）——记录是哪一个；给包目录加扩展属性：仍通过 | `instance/selftest-*.json` |
-| V7 | Surge 未运行 | 在 Surge 菜单中手动退出 Surge，运行 instance；再运行 `time /Applications/Surge.app/Contents/Applications/surge-cli --raw external-resource list </dev/null; echo "exit=$?"`；之后手动重新打开 Surge | instance 报告 `not_running`（退出 3）；记录该 CLI 命令的退出码、输出与耗时，交给开发者据此确定“无法连接”的文字模式 | 终端输出 |
+| V7 | Surge 未运行 | 在 Surge 菜单中手动退出 Surge，运行 instance；再运行 `time /Applications/Surge.app/Contents/Applications/surge-cli --raw external-resource list </dev/null; echo "exit=$?"`；之后手动重新打开 Surge | instance 报告 `not_running`（退出 3）；记录该 CLI 命令的退出码、输出与耗时，交给开发者据此确定“无法连接”的文字模式（目前退出 0 时也按 stderr 或非 JSON 的 stdout 中的 not running、could not connect 等判断为无法连接；`dump temp-rule` 的空输出无法与“没有临时规则”区分，不用于可达性检测） | 终端输出 |
 | V8 | 交互模式提示 | `time /Applications/Surge.app/Contents/Applications/surge-cli --version </dev/null; echo "exit=$?"`；检查 `inventory/surge-cli-help.txt` 与运行目录中的调用记录 | `--version` 在 2 秒内结束并打印交互模式提示（服务与 P0 按 `interactive_mode` 处理）；inventory 的帮助原文、每个已映射的读原语与测试配置的 `--check` 都没有出现该提示；记录写命令（external-resource update、temp-rule add/remove）在 refresh/entry 中成功时的原始输出，交给开发者收紧解析 | 终端输出、`inventory/surge-cli-help.txt`、调用记录 |
 | V9 | HTTP API | 测试配置启用回环 HTTP API 时：`curl -sS -D - -o /dev/null http://127.0.0.1:<端口>/v1/outbound`（不带密钥） | 只记录响应头名称与任何像版本的值；**不使用**（即使有，将来也只作交叉核对，与运行实例不一致时版本为空）。需要带密钥的请求时用 `curl -H @<0600 的头文件>`，不要把密钥写在命令行 | 终端输出 |
 | V10 | 真实更新 | 只在 Surge 自己提示有更新、你本来就要更新时进行：安装后如果 Surge 没有立即自动重新打开，先运行 instance；重新打开后再运行一次 | 重新打开前：给出失败原因（例如 `modified_after_start`、`running_image_mismatch`），从不显示新版本；重新打开后：显示新版本。Surge 自动重新打开时只记录这一点。**不要为了测试而触发更新** | 两次 instance 证据 |
 
-V6 的步骤（全部在运行目录中，`RUN` 为 instance 打印的运行目录；每种情况用一个新的临时 App，测完结束进程）：
+V6 的步骤（全部在运行目录中，命令在仓库根目录执行）。`RUN` 必须是运行目录的**绝对路径**：默认为 `$HOME/Library/Application Support/SafariProfileSurge/p0/<运行编号>`，`<运行编号>` 是 instance 标题中「运行」后面的编号；用过 `--raw-dir <目录>` 时为 `<目录>/<运行编号>`（同样写绝对路径，之后的 instance 命令也带同一个 `--raw-dir`）。instance 打印的证据路径把主目录显示为 `~`，不要原样放进引号：引号里的 `~` 不会展开，命令会在当前目录（仓库）下建出名为 `~` 的目录，`--self-test-bundle` 也会因为不是绝对路径被拒绝；照抄时把 `~` 换成 `$HOME`。每种情况用一个新的临时 App：把 `CASE` 换成该情况的名字（plain、plist、mv、xattr）后从 `CASE=` 一行重新执行，每次都会建一个带时间的新目录（不复用上一次的 Info.plist、扩展属性或进程）；测完结束进程。
 
 ```sh
-APP="$RUN/selftest/SFE-P0-Selftest.app"; mkdir -p "$APP/Contents/MacOS"
-printf '#include <unistd.h>\nint main(void){for(;;)pause();}\n' > "$RUN/selftest/main.c"
-cc -o "$APP/Contents/MacOS/selftest" "$RUN/selftest/main.c"
+RUN="$HOME/Library/Application Support/SafariProfileSurge/p0/<运行编号>"   # 用过 --raw-dir 时换成 <目录>/<运行编号>
+case "$RUN" in /*) [ -d "$RUN" ] && echo "RUN 可用" || echo "RUN 不存在，请核对运行编号" ;; *) echo "RUN 必须是绝对路径（不要用引号里的 ~）" ;; esac
+CASE=plain   # 情况名：plain、plist、mv、xattr
+DIR="$RUN/selftest/$CASE-$(date +%Y%m%d%H%M%S)"; APP="$DIR/SFE-P0-Selftest.app"; mkdir -p "$APP/Contents/MacOS"
+printf '#include <unistd.h>\nint main(void){for(;;)pause();}\n' > "$DIR/main.c"
+cc -o "$APP/Contents/MacOS/selftest" "$DIR/main.c"
 plutil -create xml1 "$APP/Contents/Info.plist"
 plutil -insert CFBundleIdentifier -string test.sfe.p0.instance-selftest "$APP/Contents/Info.plist"
 plutil -insert CFBundleExecutable -string selftest "$APP/Contents/Info.plist"
 plutil -insert CFBundleShortVersionString -string 1.0.0 "$APP/Contents/Info.plist"
 plutil -insert CFBundleVersion -string 1 "$APP/Contents/Info.plist"
 codesign -s - --force "$APP"
-cp -p "$APP/Contents/MacOS/selftest" "$RUN/selftest/selftest.copy"   # 只用于 mv 的情况
+cp -p "$APP/Contents/MacOS/selftest" "$DIR/selftest.copy"   # 只用于 mv 的情况
 sleep 2; "$APP/Contents/MacOS/selftest" & SELFTEST_PID=$!
-npx tsx tools/p0/src/cli.ts instance --self-test-bundle "$APP"        # 期望通过
-# 原子改写 Info.plist：plutil -convert xml1 -o "$RUN/selftest/Info.new" "$APP/Contents/Info.plist" && mv "$RUN/selftest/Info.new" "$APP/Contents/Info.plist"
-# 覆盖主程序：mv "$RUN/selftest/selftest.copy" "$APP/Contents/MacOS/selftest"
+npx tsx tools/p0/src/cli.ts instance --run <运行编号> --self-test-bundle "$APP"   # 期望通过；用过 --raw-dir 时加上同一个 --raw-dir
+# 原子改写 Info.plist：plutil -convert xml1 -o "$DIR/Info.new" "$APP/Contents/Info.plist" && mv "$DIR/Info.new" "$APP/Contents/Info.plist"
+# 覆盖主程序：mv "$DIR/selftest.copy" "$APP/Contents/MacOS/selftest"
 # 包目录扩展属性：xattr -w com.example.sfe-p0 1 "$APP"
 kill "$SELFTEST_PID"
 ```

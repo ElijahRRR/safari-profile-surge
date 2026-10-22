@@ -2,7 +2,7 @@
 // inventory/surge-instance.json，以及与服务同一读取器的接线（ps 固定参数与 C/UTC 环境、--surge-team-id 只会更严）。
 // node:fs/promises 的 realpath/stat 换成合成结果，模拟测试 Mac 上的 /Applications/Surge.app；从不执行 surge-cli。
 
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -178,9 +178,16 @@ function lstartOf(d: Date): string {
 }
 
 describe('p0 instance --self-test-bundle (V6, never Surge)', () => {
-  async function scratch(startOffsetSec: number) {
+  async function scratch(startOffsetSec: number, opts: { viaSymlink?: boolean } = {}) {
     // 先建运行目录，再在其中做临时 App（真实文件与真实 bigint stat；ps/plutil/lsof/codesign 为合成输出）
     const created = setup('linux', async () => ({ stdout: '', stderr: '', code: -1 }));
+    if (opts.viaSymlink) {
+      // 运行目录经符号链接到达（macOS 的 os.tmpdir() 在 /var/folders 下，/var 指向 /private/var）
+      const real = mkdtempSync(join(tmpdir(), 'sfe-p0-instance-real-'));
+      const link = join(mkdtempSync(join(tmpdir(), 'sfe-p0-instance-link-')), 'link');
+      symlinkSync(real, link);
+      created.base = join(link, 'p0');
+    }
     await main(['instance', '--raw-dir', created.base], created.deps);
     const runDir = onlyRun(created.base);
     const bundle = join(runDir, 'selftest', 'SFE-P0-Selftest.app');
@@ -189,6 +196,8 @@ describe('p0 instance --self-test-bundle (V6, never Surge)', () => {
     const exePath = join(bundle, 'Contents', 'MacOS', 'selftest');
     writeFileSync(exePath, 'synthetic');
     const ino = statSync(exePath, { bigint: true }).ino;
+    // 真实的 lsof 打印解析后的路径；ps 保留启动时的路径形式（两者可能不同，读取器都要接受）
+    const realExe = realpathSync(exePath);
     const start = new Date(Math.floor(Date.now() / 1000) * 1000 + startOffsetSec * 1000);
     const calls: Call[] = [];
     const plist: Record<string, string> = { CFBundleIdentifier: 'test.sfe.p0.instance-selftest', CFBundleExecutable: 'selftest', CFBundleShortVersionString: '1.0.0', CFBundleVersion: '1' };
@@ -196,7 +205,7 @@ describe('p0 instance --self-test-bundle (V6, never Surge)', () => {
       calls.push({ file, args: [...args], env: opts?.env });
       if (file === '/bin/ps') return { stdout: `  999 ${UID} ${lstartOf(start)} ${exePath}\n  404 ${UID} ${START} ${EXE}\n`, stderr: '', code: 0 };
       if (file === '/usr/bin/plutil') return { stdout: `${plist[args[1]!]}\n`, stderr: '', code: 0 };
-      if (file === '/usr/sbin/lsof') return { stdout: `p999\nftxt\ni${ino}\nn${exePath}\n`, stderr: '', code: 0 };
+      if (file === '/usr/sbin/lsof') return { stdout: `p999\nftxt\ni${ino}\nn${realExe}\n`, stderr: '', code: 0 };
       if (file === '/usr/bin/codesign') return { stdout: '', stderr: '', code: 0 };
       return { stdout: '', stderr: '', code: -1 };
     };
@@ -208,9 +217,18 @@ describe('p0 instance --self-test-bundle (V6, never Surge)', () => {
     const { t, bundle, runDir, calls } = await scratch(120);
     expect(await main(['instance', '--raw-dir', t.base, '--self-test-bundle', bundle], t.deps)).toBe(EXIT.OK);
     expect(t.out.text()).toContain('自测结果：通过（1.0.0（1））');
-    expect(calls.find((c) => c.file === '/usr/bin/codesign')!.args).toEqual(['--verify', '--strict', bundle]);
+    // 读取器对包的真实路径做签名校验（运行目录在符号链接之后时两者不同）
+    expect(calls.find((c) => c.file === '/usr/bin/codesign')!.args).toEqual(['--verify', '--strict', realpathSync(bundle)]);
     const ev = JSON.parse(readFileSync(join(runDir, 'instance', readdirSync(join(runDir, 'instance')).find((n) => n.startsWith('selftest-'))!), 'utf8'));
     expect(ev).toMatchObject({ result: { ok: true, instance: { pid: 999, bundleId: 'test.sfe.p0.instance-selftest' } }, selfTest: { bundle } });
+  });
+
+  it('passes when the run directory is reached through a symlink: ps shows the unresolved path, lsof the resolved one', async () => {
+    const { t, bundle, calls } = await scratch(120, { viaSymlink: true });
+    expect(realpathSync(bundle)).not.toBe(bundle);
+    expect(await main(['instance', '--raw-dir', t.base, '--self-test-bundle', bundle], t.deps)).toBe(EXIT.OK);
+    expect(t.out.text()).toContain('自测结果：通过（1.0.0（1））');
+    expect(calls.find((c) => c.file === '/usr/bin/codesign')!.args).toEqual(['--verify', '--strict', realpathSync(bundle)]);
   });
 
   it('files written after the scratch app started → modified_after_start', async () => {

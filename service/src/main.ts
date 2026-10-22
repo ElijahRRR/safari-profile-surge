@@ -26,7 +26,7 @@ import { secretStoreError } from './secrets/errors.js';
 import { createCliAdapter, defaultCodesignRunner, verifyCliPath } from './surge/cli-adapter.js';
 import { createCompositeAdapter } from './surge/composite.js';
 import { createHttpAdapter, parseHttpApiLine } from './surge/http-adapter.js';
-import { createDefaultSurgeInstanceReader } from './surge/running-instance.js';
+import { SERVICE_CODESIGN_TIMEOUT_MS, createDefaultSurgeInstanceReader } from './surge/running-instance.js';
 import { capabilityUnverified, SURGE_PRIMITIVES, type MechanismMap } from './surge/primitives.js';
 import { createDemoSurge, prepareDemoState, seedDemoData } from './demo/index.js';
 import { systemClock } from './util/clock.js';
@@ -106,8 +106,9 @@ export function macHost(platform: NodeJS.Platform): Partial<HostInfo> {
   if (platform !== 'darwin') {
     return { macosBuild: async () => 'unknown', safariVersion: async () => 'unknown', surgeInstance: async () => ({ ok: false, reason: 'not_darwin' }) };
   }
-  // 运行中 Surge 的版本：一个常驻的读取器（缓存包信息与签名结果）；Team ID 未知，与 CLI 路径校验一致只做 --verify --strict
-  const instance = createDefaultSurgeInstanceReader({ platform, uid: process.getuid?.() ?? -1, teamId: null });
+  // 运行中 Surge 的版本：一个常驻的读取器（缓存包信息与签名结果，同时到来的读取共用一次）；Team ID 未知，与 CLI 路径校验
+  // 一致只做 --verify --strict；codesign 用较短的服务超时（读取在执行器通道上进行，引擎另有总时限）
+  const instance = createDefaultSurgeInstanceReader({ platform, uid: process.getuid?.() ?? -1, teamId: null, codesignTimeoutMs: SERVICE_CODESIGN_TIMEOUT_MS });
   return {
     surgeInstance: () => instance.read(),
     macosBuild: async () => (await execText('/usr/bin/sw_vers', ['-buildVersion'])) || null,

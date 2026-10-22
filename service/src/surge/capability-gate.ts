@@ -10,6 +10,8 @@ import {
   CAPABILITY_LABELS,
   CAPABILITY_PRIMITIVES,
   GATING_COVERAGE_ITEMS,
+  SURGE_BUILD_RE,
+  SURGE_VERSION_RE,
   SfeError,
   type CapabilityContext,
   type CapabilityContextField,
@@ -55,9 +57,8 @@ function parseMechanism(value: string): Record<string, string> | null {
  */
 export const NEVER_NULL_FIELDS: readonly CapabilityContextField[] = ['surgeVersion', 'surgeBuild'];
 
-/** Surge 版本号（例如 6.5.0）与构建号（例如 10960）的格式；不接受 CLI 交互模式输出中的地址（例如 127.0.0.1）。 */
-export const SURGE_VERSION_RE = /^\d{1,3}\.\d{1,3}(\.\d{1,3})?$/;
-export const SURGE_BUILD_RE = /^\d{1,10}$/;
+/** Surge 版本号与构建号的格式（定义在契约中，网页确认提议时用同一格式）；不接受 CLI 交互模式输出中的地址（例如 127.0.0.1）。 */
+export { SURGE_BUILD_RE, SURGE_VERSION_RE };
 
 /**
  * 能力提议中版本字段的校验（服务与 P0 共用）：该能力依赖 Surge 版本或构建时，上下文必须带格式正确的具体值——

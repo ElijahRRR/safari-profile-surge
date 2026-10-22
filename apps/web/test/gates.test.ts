@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { CAPABILITY_GATES, GATING_COVERAGE_ITEMS, type CapabilityProposalView, type ProtocolCoverage } from '@sfe/contract';
 import PendingDeployCard from '../src/components/PendingDeployCard.vue';
 import CapabilitiesView from '../src/views/CapabilitiesView.vue';
-import { coverageBlockReason, evaluateGate, staleReasonText } from '../src/lib/gates';
+import { coverageBlockReason, evaluateGate, staleReasonText, versionBlockReason } from '../src/lib/gates';
 import { allSupported, byText, capabilities, click, environment, flush, mountWith, revision, snapshot, testContext, type Call } from './fixtures';
 
 afterEach(() => {
@@ -199,6 +199,26 @@ describe('coverageBlockReason', () => {
   });
 });
 
+describe('versionBlockReason', () => {
+  it('blocks confirming a version-dependent proposal without a readable, well-formed Surge version and build', () => {
+    const ctx = proposal().context;
+    expect(versionBlockReason(proposal())).toBeNull();
+    expect(versionBlockReason(proposal({ context: { ...ctx, surgeVersion: '6.5', surgeBuild: '1' } }))).toBeNull();
+    expect(versionBlockReason(proposal({ context: { ...ctx, surgeVersion: null, surgeBuild: null } }))).toBe(
+      '提议中的 Surge 版本、Surge 构建读不到或格式不正确，不能确认；请在能读取运行中 Surge 的版本后重测并重新提议',
+    );
+    // 旧解析器从 CLI 交互模式输出中取到的地址、any、带说明的构建号
+    expect(versionBlockReason(proposal({ context: { ...ctx, surgeVersion: '127.0.0.1' } }))).toContain('Surge 版本');
+    expect(versionBlockReason(proposal({ context: { ...ctx, surgeVersion: 'any', surgeBuild: 'any' } }))).toContain('Surge 版本、Surge 构建');
+    expect(versionBlockReason(proposal({ context: { ...ctx, surgeBuild: '10960 (beta)' } }))).toContain('Surge 构建');
+  });
+
+  it('does not check capabilities that do not depend on the Surge version', () => {
+    const ctx = proposal().context;
+    expect(versionBlockReason(proposal({ key: 'open_profile_by_id', context: { ...ctx, surgeVersion: null, surgeBuild: null } }))).toBeNull();
+  });
+});
+
 describe('staleReasonText', () => {
   const ctx = proposal().context;
   const SURGE = { version: '6.5.0', build: '3000' };
@@ -266,6 +286,19 @@ describe('capabilities page', () => {
     await flush();
     const call = calls.find((c) => c.url === '/api/capabilities' && c.method === 'POST');
     expect(call?.body).toEqual({ request_id: expect.any(String), action: 'confirm', proposal_id: 'prop_1' });
+    m.unmount();
+  });
+
+  it('disables 确认 with the reason for a pending proposal recorded without a usable Surge version', async () => {
+    const legacy = proposal({ key: 'runtime_entry_modes', protocolCoverage: null, context: { ...proposal().context, surgeVersion: null, surgeBuild: null } });
+    const { ctx, calls } = testContext(() => ({ status: 404 }), snapshot({ capabilityProposals: [legacy] }));
+    const m = await mountWith(CapabilitiesView, ctx, {}, '/capabilities');
+    const confirm = document.body.querySelector<HTMLButtonElement>('[data-test="confirm-proposal"]')!;
+    expect(confirm.disabled).toBe(true);
+    expect(document.body.querySelector('[data-test="confirm-block"]')?.textContent).toContain('读不到或格式不正确，不能确认');
+    click(confirm);
+    await flush();
+    expect(calls.some((c) => c.url === '/api/capabilities' && c.method === 'POST')).toBe(false);
     m.unmount();
   });
 

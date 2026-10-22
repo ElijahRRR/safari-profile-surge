@@ -234,6 +234,13 @@ export const CAPABILITY_CONTEXT_DEPS: Record<CapabilityKey, readonly CapabilityC
   profile_batch_create: ['macosBuild', 'safariVersion'],
 };
 
+/**
+ * Surge 版本号（例如 6.5.0）与构建号（例如 10960）的格式（服务、P0 与网页共用）：依赖版本的能力，其提议与确认都要求
+ * 上下文带符合格式的具体值；不接受 CLI 交互模式输出中的地址（例如 127.0.0.1）。见 docs/ARCHITECTURE.md §5.2。
+ */
+export const SURGE_VERSION_RE = /^\d{1,3}\.\d{1,3}(\.\d{1,3})?$/;
+export const SURGE_BUILD_RE = /^\d{1,10}$/;
+
 /** 动作 → 必需能力（全部 supported 且上下文匹配）。见 docs/ARCHITECTURE.md §5.2。 */
 export const CAPABILITY_GATES = {
   /** 任何节点资源发布，自动或用户手动发起，要求完全相同。 */

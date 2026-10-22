@@ -71,6 +71,24 @@ describe('parseCliHelp', () => {
     expect(cliAvailability('checkProfile', r.words)).toBe('not_in_help');
   });
 
+  it('help text that lists commands and also documents interactive mode is still help', () => {
+    for (const note of ['Run without a command to enter interactive mode.', '  -i, --interactive   Enter interactive mode', 'If no command is provided, surge-cli enters interactive mode.']) {
+      const help = `Usage: surge-cli [options] <command>\n${note}\n  --raw  machine readable output\n  --check <path>\nCommands:\n  dump policy\n  dump temp-rule\n  external-resource list\n  external-resource update <key>\n  temp-rule add <rule>\n  temp-rule remove <rule>`;
+      const r = parseCliHelp(help);
+      expect(r.interactive, note).toBe(false);
+      expect(r.words).toEqual(helpWords(help));
+      for (const p of ['listTempRules', 'listExternalResources', 'updateExternalResource', 'addTempRule', 'removeTempRule', 'checkProfile', 'listPolicies'] as const) {
+        expect(cliAvailability(p, r.words), `${note} ${p}`).toBe('in_help');
+      }
+    }
+  });
+
+  it('banner wording without any listed command is still the banner (words that complete no command do not count)', () => {
+    const r = parseCliHelp(`${BANNER}\nUse list or update after connecting.`);
+    expect(r.interactive).toBe(true);
+    expect([...r.words]).toEqual([]);
+  });
+
   it('reads ordinary help text as before', () => {
     const help = 'Usage: surge-cli [options] <command>\n  --raw  machine readable output\n  --check <path>\nCommands:\n  dump temp-rule\n  external-resource list';
     const r = parseCliHelp(help);

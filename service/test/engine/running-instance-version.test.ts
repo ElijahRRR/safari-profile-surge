@@ -4,7 +4,8 @@
 
 import { afterEach, describe, expect, test } from 'vitest';
 import { CAPABILITY_CONTEXT_DEPS, CAPABILITY_KEYS } from '@sfe/contract';
-import { versionUnknownMessage } from '../../src/engine/context.js';
+import { DEFAULT_INSTANCE_READ_BUDGET_MS, versionUnknownMessage } from '../../src/engine/context.js';
+import type { RunningInstanceResult } from '../../src/surge/running-instance.js';
 import { PROFILE_A, WEB, activeEnv, anyContext, createHarness, rid, safariOutcome, type Harness } from './harness.js';
 
 let h: Harness | undefined;
@@ -112,5 +113,54 @@ describe('the running instance becomes unprovable while an environment is active
     await h.idle();
     expect(writes(h)).toEqual(before);
     expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', activeEnvironmentId: null });
+  });
+});
+
+describe('a running-instance read that never finishes', () => {
+  test('is cut off at the engine budget (read_failed, version null) and a queued normal-mode request still finishes within a bounded time', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'ACTIVE', phase: 'active_verified' });
+    // 例如 codesign 卡在 trustd/syspolicyd：读取一直不返回
+    let started = 0;
+    h.fake.runningInstance = () => {
+      started++;
+      return new Promise<RunningInstanceResult>(() => undefined);
+    };
+    const t0 = h.clock.now().getTime();
+    // 周期对账在执行器通道上读取事实，进入普通模式的操作排在它后面
+    const reconcile = h.app.runPeriodicReconcile();
+    await new Promise((r) => setImmediate(r));
+    expect(started).toBe(1);
+    const n = await h.app.enterNormal({ request_id: rid('normal'), old_session_policy: 'closed_confirmed', confirmed_environment_id: envId }, WEB);
+    const phase = () => h!.repos.operations.get(n.operation_id)!.phase;
+    // 假时钟按 0.5 秒推进；每一步给真实的文件读写留出时间（只有假时钟决定是否超过时限）
+    for (let i = 0; i < 60 && phase() !== 'NORMAL_RESTORED'; i++) {
+      await h.clock.advanceAsync(500);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(phase()).toBe('NORMAL_RESTORED');
+    await reconcile;
+    // 每次读取最多等一个总时限（对账一次，普通模式本身也可能读一次）
+    expect(h.clock.now().getTime() - t0).toBeLessThanOrEqual(3 * DEFAULT_INSTANCE_READ_BUDGET_MS);
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+    expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+    expect(h.app.engine.facts).toMatchObject({ reachable: true, version: null, build: null, versionIssue: 'read_failed' });
+    expect(h.app.engine.facts.message).toBe(versionUnknownMessage('read_failed'));
+  });
+
+  test('a read that finishes inside the budget is used as is', async () => {
+    h = await createHarness({ capabilities: [] });
+    const original = h.fake.runningInstance.bind(h.fake);
+    h.fake.runningInstance = () =>
+      new Promise<RunningInstanceResult>((resolve) => {
+        h!.clock.setTimeout(() => void original().then(resolve), DEFAULT_INSTANCE_READ_BUDGET_MS - 1_000);
+      });
+    const timers = h.clock.pendingTimers();
+    const st = h.app.refreshSurge(WEB);
+    await h.clock.advanceAsync(DEFAULT_INSTANCE_READ_BUDGET_MS - 1_000);
+    await expect(st).resolves.toMatchObject({ reachable: true, version: '6.5.0', build: '10960', message: null });
+    // 时限定时器已取消
+    expect(h.clock.pendingTimers()).toBe(timers);
   });
 });

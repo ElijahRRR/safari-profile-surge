@@ -41,6 +41,15 @@ export const RUNNING_INSTANCE_PS_ENV: Readonly<Record<string, string>> = { LC_AL
 
 export const PS_INSTANCE_ARGS = ['-ww', '-axo', 'pid=,uid=,lstart=,comm='] as const;
 
+/** codesign 的缺省超时（P0 盘点与 instance 命令：记录真实耗时，V5）。 */
+export const RUNNING_INSTANCE_CODESIGN_TIMEOUT_MS = 60_000;
+
+/**
+ * 服务常驻读取器的 codesign 超时：读取在执行器通道上进行（对账、动作前检查），慢的签名校验（trustd、syspolicyd 繁忙）
+ * 不能长时间拖住排队的操作；超时按 signature_invalid（失败即关闭）。引擎另有总时限（DEFAULT_INSTANCE_READ_BUDGET_MS）。
+ */
+export const SERVICE_CODESIGN_TIMEOUT_MS = 15_000;
+
 export type RunningInstanceFailure =
   | 'not_darwin'
   | 'unavailable'
@@ -141,6 +150,8 @@ export interface RunningInstanceOptions {
   bundleIds?: readonly string[];
   /** 记录的 Team ID；null 时只做 --verify --strict（与 CLI 路径校验一致）。只能让校验更严。 */
   teamId: string | null;
+  /** codesign 超时（毫秒；缺省 RUNNING_INSTANCE_CODESIGN_TIMEOUT_MS，服务用 SERVICE_CODESIGN_TIMEOUT_MS）。 */
+  codesignTimeoutMs?: number;
 }
 
 /** 规则编号对应设计 B 的步骤；证据（P0 inventory/instance）逐条记录结果与耗时。 */
@@ -171,6 +182,7 @@ export interface RunningInstanceReport {
 }
 
 export interface RunningInstanceReader {
+  /** 同时到来的读取共用一次进行中的读取（调用方超时不再等待时，读取仍会完成并更新缓存，不会叠加新的读取）。 */
   read(): Promise<RunningInstanceResult>;
   /** 与 read 相同，另带逐条规则的证据（P0 用）。 */
   inspect(): Promise<RunningInstanceReport>;
@@ -266,6 +278,8 @@ export function createRunningInstanceReader(deps: RunningInstanceDeps, opts: Run
   const bundleIds = opts.bundleIds ?? SURGE_BUNDLE_IDS;
   const bundleName = expectedBundle.slice(expectedBundle.lastIndexOf('/') + 1);
   const clock = deps.clock ?? (() => performance.now());
+  const codesignTimeoutMs = opts.codesignTimeoutMs ?? RUNNING_INSTANCE_CODESIGN_TIMEOUT_MS;
+  let inflight: Promise<RunningInstanceResult> | null = null;
   let cache: { key: string; instance: Omit<RunningSurgeInstance, 'pid' | 'startedAt'> } | null = null;
 
   async function plistValue(plistPath: string, key: string): Promise<string | null> {
@@ -450,7 +464,7 @@ export function createRunningInstanceReader(deps: RunningInstanceDeps, opts: Run
     if (cached) step('signature', 'cached');
     else {
       if (opts.teamId !== null && !TEAM_ID_RE.test(opts.teamId)) return fail('signature', 'signature_invalid', { invalidTeamId: true });
-      const sig = await deps.exec(RUNNING_INSTANCE_BINARIES.codesign, codesignArgs(bundlePath, opts.teamId), { timeoutMs: 60_000 });
+      const sig = await deps.exec(RUNNING_INSTANCE_BINARIES.codesign, codesignArgs(bundlePath, opts.teamId), { timeoutMs: codesignTimeoutMs });
       const sigDetail = { code: sig.code, teamRequirement: opts.teamId !== null };
       if (sig.code !== 0) return fail('signature', 'signature_invalid', sigDetail);
       step('signature', 'pass', sigDetail);
@@ -478,12 +492,20 @@ export function createRunningInstanceReader(deps: RunningInstanceDeps, opts: Run
         return { result: { ok: false, reason: 'read_failed' }, steps: [], cached: false };
       }
     },
-    read: async () => {
-      try {
-        return (await inspect()).result;
-      } catch {
-        return { ok: false, reason: 'read_failed' };
-      }
+    read: () => {
+      if (inflight) return inflight;
+      const run = (async (): Promise<RunningInstanceResult> => {
+        try {
+          return (await inspect()).result;
+        } catch {
+          return { ok: false, reason: 'read_failed' };
+        }
+      })();
+      inflight = run;
+      void run.finally(() => {
+        if (inflight === run) inflight = null;
+      });
+      return run;
     },
   };
 }
@@ -512,10 +534,12 @@ export interface DefaultSurgeInstanceReaderOptions {
   /** 缺省 defaultRunningInstanceExec；P0 传入自己的执行器（同一 execFixed）。 */
   exec?: RunningInstanceExec;
   teamId: string | null;
+  /** codesign 超时；缺省 RUNNING_INSTANCE_CODESIGN_TIMEOUT_MS（P0），服务传 SERVICE_CODESIGN_TIMEOUT_MS。 */
+  codesignTimeoutMs?: number;
 }
 
 /** 真实的读取依赖：真实路径、bigint stat 与固定执行方式（P0 的自测 App 核对也用它，只换期望的包）。 */
-export function defaultRunningInstanceDeps(opts: Omit<DefaultSurgeInstanceReaderOptions, 'teamId'>): RunningInstanceDeps {
+export function defaultRunningInstanceDeps(opts: Omit<DefaultSurgeInstanceReaderOptions, 'teamId' | 'codesignTimeoutMs'>): RunningInstanceDeps {
   return {
     platform: opts.platform,
     uid: opts.uid,
@@ -527,5 +551,10 @@ export function defaultRunningInstanceDeps(opts: Omit<DefaultSurgeInstanceReader
 
 /** 服务与 P0 共用的工厂：同一常量（/Applications/Surge.app、SURGE_BUNDLE_IDS）、同一 stat(bigint)、同一执行方式（stdin 关闭、ps 固定环境）。 */
 export function createDefaultSurgeInstanceReader(opts: DefaultSurgeInstanceReaderOptions): RunningInstanceReader {
-  return createRunningInstanceReader(defaultRunningInstanceDeps(opts), { expectedBundle: SURGE_APP_BUNDLE, bundleIds: SURGE_BUNDLE_IDS, teamId: opts.teamId });
+  return createRunningInstanceReader(defaultRunningInstanceDeps(opts), {
+    expectedBundle: SURGE_APP_BUNDLE,
+    bundleIds: SURGE_BUNDLE_IDS,
+    teamId: opts.teamId,
+    ...(opts.codesignTimeoutMs !== undefined ? { codesignTimeoutMs: opts.codesignTimeoutMs } : {}),
+  });
 }

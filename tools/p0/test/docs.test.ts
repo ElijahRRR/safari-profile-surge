@@ -34,6 +34,16 @@ describe('docs/P0-RUNBOOK.md', () => {
     expect(text).toContain('从**运行中的 Surge 实例**取得');
   });
 
+  it('V6 defines RUN as an absolute $HOME path (instance prints ~, which does not expand inside quotes) and builds a new scratch app per case', () => {
+    const v6 = text.slice(text.indexOf('V6 的步骤'), text.indexOf('## 2. 通用回退'));
+    expect(v6).toContain('RUN="$HOME/Library/Application Support/SafariProfileSurge/p0/<运行编号>"');
+    expect(v6).not.toMatch(/RUN="~/);
+    expect(v6).toContain('绝对路径');
+    expect(v6).toMatch(/APP="\$DIR\/SFE-P0-Selftest\.app"/);
+    expect(v6).toContain('DIR="$RUN/selftest/$CASE-$(date +%Y%m%d%H%M%S)"');
+    expect(v6).toContain('instance --run <运行编号> --self-test-bundle "$APP"');
+  });
+
   it('documents the overall order and the manual profile switch', () => {
     for (const cmd of ['inventory', 'instance', 'test-servers', 'make-test-profile', 'attribution', 'entry', 'refresh', 'continuity', 'chain', 'charset', 'preflight', 'checklist', 'propose', 'rollback']) {
       expect(text).toContain(cmd);

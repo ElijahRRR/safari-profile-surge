@@ -11,7 +11,19 @@ interface Rec {
   stdinErrorHandled: boolean;
 }
 
-const state = vi.hoisted(() => ({ calls: [] as Rec[] }));
+const state = vi.hoisted(() => ({ calls: [] as Rec[], readerOptions: [] as unknown[] }));
+
+// 记录服务创建运行实例读取器时的选项（实现不变）
+vi.mock('../../src/surge/running-instance.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/surge/running-instance.js')>();
+  return {
+    ...actual,
+    createDefaultSurgeInstanceReader: (opts: Parameters<typeof actual.createDefaultSurgeInstanceReader>[0]) => {
+      state.readerOptions.push(opts);
+      return actual.createDefaultSurgeInstanceReader(opts);
+    },
+  };
+});
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -37,7 +49,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 const { defaultCodesignRunner, defaultExec } = await import('../../src/surge/cli-adapter.js');
 const { defaultDeps } = await import('../../src/cli/sfe.js');
-const { defaultRunningInstanceExec, PS_INSTANCE_ARGS, RUNNING_INSTANCE_PS_ENV } = await import('../../src/surge/running-instance.js');
+const { defaultRunningInstanceExec, PS_INSTANCE_ARGS, RUNNING_INSTANCE_PS_ENV, SERVICE_CODESIGN_TIMEOUT_MS } = await import('../../src/surge/running-instance.js');
 const { macHost } = await import('../../src/main.js');
 
 function last(): Rec {
@@ -90,6 +102,12 @@ describe('child process call sites close stdin', () => {
     expectClosedStdin(calls[0]!, '/bin/ps');
     expect(calls[0]!.args).toEqual([...PS_INSTANCE_ARGS]);
     expect(calls[0]!.opts.env).toEqual(RUNNING_INSTANCE_PS_ENV);
+  });
+
+  test('service host: the darwin reader uses the shorter service codesign timeout and no Team ID', () => {
+    const n = state.readerOptions.length;
+    macHost('darwin');
+    expect(state.readerOptions.slice(n)).toEqual([expect.objectContaining({ platform: 'darwin', teamId: null, codesignTimeoutMs: SERVICE_CODESIGN_TIMEOUT_MS })]);
   });
 
   test('service host off macOS: no child process for the running instance', async () => {

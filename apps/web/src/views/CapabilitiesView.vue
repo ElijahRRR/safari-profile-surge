@@ -8,7 +8,7 @@ import CapabilityContextList from '../components/CapabilityContextList.vue';
 import NoticeBox from '../components/NoticeBox.vue';
 import ProtocolCoverageTable from '../components/ProtocolCoverageTable.vue';
 import { useConsole } from '../store/context';
-import { COVERAGE_REQUIRED_KEYS, allCapabilities, capabilityCounts, coverageBlockReason, staleReasonText } from '../lib/gates';
+import { COVERAGE_REQUIRED_KEYS, allCapabilities, capabilityCounts, coverageBlockReason, staleReasonText, versionBlockReason } from '../lib/gates';
 import { CAPABILITY_STATUS_LABELS, ENTRY_STRATEGY_LABELS } from '../lib/labels';
 import { formatCount, formatDateTime } from '../lib/format';
 import { newRequestId } from '../lib/request-id';
@@ -50,7 +50,7 @@ function staleText(cap: CapabilityView): string {
 
 function confirmBlock(p: CapabilityProposalView): string | null {
   if (store.demoMode.value) return '演示模式不能确认能力';
-  return coverageBlockReason(p);
+  return versionBlockReason(p) ?? coverageBlockReason(p);
 }
 
 // ---------- 详情 ----------

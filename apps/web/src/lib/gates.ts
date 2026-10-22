@@ -2,11 +2,14 @@
 // 门槛不满足时按钮禁用并列出缺失的能力；服务端仍会再次拒绝。
 
 import {
+  CAPABILITY_CONTEXT_DEPS,
   CAPABILITY_GATES,
   CAPABILITY_KEYS,
   CAPABILITY_LABELS,
   CAPABILITY_MEASURED_GATES,
   GATING_COVERAGE_ITEMS,
+  SURGE_BUILD_RE,
+  SURGE_VERSION_RE,
   type CapabilityContextField,
   type CapabilityKey,
   type CapabilityProposalView,
@@ -122,6 +125,27 @@ const VERSION_FIELDS: Partial<Record<CapabilityContextField, 'version' | 'build'
 
 function fieldList(fields: readonly CapabilityContextField[]): string {
   return fields.map((f) => CONTEXT_FIELD_LABELS[f] ?? f).join('、');
+}
+
+/**
+ * 提议中的 Surge 版本与构建能否确认（与服务端确认时的 versionContextErrors 同一规则）：该能力依赖版本或构建时，上下文
+ * 必须带格式正确的具体值；null（读不到）、any 或格式不对（例如旧解析器取到的 127.0.0.1）都不能确认，服务端同样拒绝。
+ * 可以确认时返回 null。
+ */
+export function versionBlockReason(proposal: Pick<CapabilityProposalView, 'key' | 'context'>): string | null {
+  const deps = CAPABILITY_CONTEXT_DEPS[proposal.key] ?? [];
+  const checks: Array<[CapabilityContextField, RegExp]> = [
+    ['surgeVersion', SURGE_VERSION_RE],
+    ['surgeBuild', SURGE_BUILD_RE],
+  ];
+  const bad: CapabilityContextField[] = [];
+  for (const [field, re] of checks) {
+    if (!deps.includes(field)) continue;
+    const v: unknown = proposal.context?.[field];
+    if (typeof v !== 'string' || !re.test(v)) bad.push(field);
+  }
+  if (bad.length === 0) return null;
+  return `提议中的 ${fieldList(bad)}读不到或格式不正确，不能确认；请在能读取运行中 Surge 的版本后重测并重新提议`;
 }
 
 /**

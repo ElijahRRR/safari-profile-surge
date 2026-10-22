@@ -9,9 +9,11 @@ import { describe, expect, test, vi } from 'vitest';
 import {
   PS_INSTANCE_ARGS,
   RUNNING_INSTANCE_BINARIES,
+  RUNNING_INSTANCE_CODESIGN_TIMEOUT_MS,
   RUNNING_INSTANCE_FAILURES,
   RUNNING_INSTANCE_FAILURE_TEXT,
   RUNNING_INSTANCE_PS_ENV,
+  SERVICE_CODESIGN_TIMEOUT_MS,
   SURGE_APP_BUNDLE,
   SURGE_BUNDLE_IDS,
   bundleOfMainExecutable,
@@ -393,6 +395,65 @@ describe('running Surge instance', () => {
     // 新的包信息（例如已更新但还没有重启）：缓存不命中，按 ctime 拒绝
     w.files[PLIST] = [fid(77n, START_SEC + 7200)];
     expect(await reader.read()).toEqual({ ok: false, reason: 'modified_after_start' });
+  });
+
+  test('the cache key includes the file identities: an Info.plist replaced by rename with pre-start times (new inode) is read and verified again', async () => {
+    const w = world();
+    const d = deps(w);
+    const reader = createRunningInstanceReader(d, OPTS);
+    expect((await reader.read()).ok).toBe(true);
+    const count = (f: string) => callsTo(d, f).length;
+    const before = { plutil: count('/usr/bin/plutil'), codesign: count('/usr/bin/codesign') };
+    // 同一进程、同一启动时间；新文件的 ctime 与 birthtime 仍早于启动（APFS 上改名替换是否更新 ctime 待 V6 记录），只有 inode 不同
+    w.files[PLIST] = [fid(31n, START_SEC - 10)];
+    w.codesign = [1];
+    const report = await reader.inspect();
+    expect(report.result).toEqual({ ok: false, reason: 'signature_invalid' });
+    expect(report.cached).toBe(false);
+    expect(report.steps.some((s) => s.outcome === 'cached')).toBe(false);
+    // 四个键重新读取（CFBundleExecutable 每次都读，另三个键与再读一次的 CFBundleExecutable 来自 plutil），签名重新校验
+    expect(count('/usr/bin/plutil')).toBe(before.plutil + 5);
+    expect(count('/usr/bin/codesign')).toBe(before.codesign + 1);
+  });
+
+  test('codesign timeout: 60 s by default (P0 evidence), the shorter service value when given', async () => {
+    expect(SERVICE_CODESIGN_TIMEOUT_MS).toBeLessThan(RUNNING_INSTANCE_CODESIGN_TIMEOUT_MS);
+    expect(SERVICE_CODESIGN_TIMEOUT_MS).toBeLessThanOrEqual(15_000);
+    const timeoutOf = (d: MockDeps) => d.exec.mock.calls.filter((c) => c[0] === '/usr/bin/codesign').map((c) => c[2].timeoutMs);
+    const p0 = deps(world());
+    expect((await createRunningInstanceReader(p0, OPTS).read()).ok).toBe(true);
+    expect(timeoutOf(p0)).toEqual([RUNNING_INSTANCE_CODESIGN_TIMEOUT_MS]);
+    const svc = deps(world());
+    expect((await createRunningInstanceReader(svc, { ...OPTS, codesignTimeoutMs: SERVICE_CODESIGN_TIMEOUT_MS }).read()).ok).toBe(true);
+    expect(timeoutOf(svc)).toEqual([SERVICE_CODESIGN_TIMEOUT_MS]);
+    // 工厂同样传递
+    const exec = vi.fn<RunningInstanceExec>(async () => ({ stdout: '', stderr: '', code: 0 }));
+    const factory = createDefaultSurgeInstanceReader({ platform: 'linux', uid: UID, exec, teamId: null, codesignTimeoutMs: SERVICE_CODESIGN_TIMEOUT_MS });
+    expect(await factory.read()).toEqual({ ok: false, reason: 'not_darwin' });
+  });
+
+  test('concurrent reads share one in-flight read (a caller that stopped waiting does not stack another codesign); the next read starts fresh', async () => {
+    const d = deps(world());
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const real = d.exec.getMockImplementation()!;
+    d.exec.mockImplementation(async (file, args, o) => {
+      if (file === '/usr/bin/codesign') await gate;
+      return real(file, args, o);
+    });
+    const reader = createRunningInstanceReader(d, OPTS);
+    const a = reader.read();
+    const b = reader.read();
+    await new Promise((r) => setImmediate(r));
+    release();
+    expect(await a).toEqual({ ok: true, instance: OK_INSTANCE });
+    expect(await b).toEqual({ ok: true, instance: OK_INSTANCE });
+    expect(callsTo(d, '/bin/ps')).toHaveLength(1);
+    expect(callsTo(d, '/usr/bin/codesign')).toHaveLength(1);
+    expect((await reader.read()).ok).toBe(true);
+    expect(callsTo(d, '/bin/ps')).toHaveLength(2);
   });
 
   test('failures are not cached: a failed signature check runs again on the next read', async () => {

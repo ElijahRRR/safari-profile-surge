@@ -146,6 +146,14 @@ export async function confirmCapability(deps: AcceptDeps, req: ConfirmCapability
     const proposal = typeof req.proposal_id === 'string' ? repos.proposals.get(req.proposal_id) : null;
     if (!proposal || proposal.confirmedAt || proposal.rejectedAt) throw new SfeError('NOT_FOUND', '确认能力失败：提议不存在或已处理');
     key = proposal.key;
+    // 与提议时同一规则（早于该规则提交的提议可能带 null、any 或 127.0.0.1）：在改动设置、让其他能力回到待验证之前拒绝；
+    // 提议保持待确认，需要在能读取运行中 Surge 的版本后重测并重新提议。
+    const versionErrors = versionContextErrors(key, proposal.context ?? { surgeVersion: null, surgeBuild: null });
+    if (versionErrors.length > 0) {
+      throw new SfeError('EVIDENCE_REQUIRED', '确认能力失败：提议中的 Surge 版本或构建号不可用，请在能读取运行中 Surge 的版本后重测并重新提议', {
+        fieldErrors: versionErrors.map((e) => ({ field: `context.${e.field}`, message: e.message })),
+      });
+    }
     if (proposal.proposedStatus === 'supported' && COVERAGE_REQUIRED.includes(key)) {
       const cov = coverageAllowsSupported(proposal.protocolCoverage);
       if (!cov.ok) {

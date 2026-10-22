@@ -8,6 +8,22 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
+// 帮助中列出的读原语经服务的 CLI 适配器（execFixed → execFile）探测：换成记录调用、按 ENOENT 失败的假实现，
+// 测试机上即使装有 Surge 也不会执行真实的 surge-cli。
+const spawned = vi.hoisted(() => [] as Array<{ file: string; args: string[] }>);
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return {
+    ...actual,
+    execFile: (file: string, args: readonly string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+      spawned.push({ file, args: [...args] });
+      queueMicrotask(() => cb(Object.assign(new Error(`spawn ${file} ENOENT`), { code: 'ENOENT' }), '', ''));
+      const stdin = { on: () => stdin, end: () => undefined };
+      return { stdin };
+    },
+  };
+});
+
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return {
@@ -46,6 +62,7 @@ function runFiles(base: string): { dir: string; inventory: Record<string, unknow
 
 describe('inventory --help', () => {
   it('banner instead of help: empty command list, warning, raw output kept, no CLI primitive executed', async () => {
+    spawned.length = 0;
     const r = run(BANNER);
     expect(await r.go()).toBe(EXIT.OK);
     const { dir, inventory } = runFiles(r.base);
@@ -56,6 +73,21 @@ describe('inventory --help', () => {
     expect(readFileSync(join(dir, 'inventory', 'surge-cli-help.txt'), 'utf8')).toContain('No command is provided');
     // 只执行了 --help，没有任何其他 surge-cli 调用
     expect(r.calls.filter((c) => c.file === CLI)).toEqual([{ file: CLI, args: ['--help'] }]);
+    expect(spawned).toEqual([]);
+  });
+
+  it('help that lists commands and mentions interactive mode: commands are in help, no warning', async () => {
+    const r = run(
+      'Usage: surge-cli [options] <command>\nRun without a command to enter interactive mode.\n  --raw  machine readable output\n  --check <path>\nCommands:\n  dump temp-rule\n  external-resource list\n  external-resource update <key>\n  temp-rule add <rule>\n  temp-rule remove <rule>\n',
+    );
+    expect(await r.go()).toBe(EXIT.OK);
+    const { inventory } = runFiles(r.base);
+    expect(r.out.text()).not.toContain('进入了交互模式');
+    expect(inventory.cliHelpInteractive).toBe(false);
+    expect(inventory.cliHelp).toMatchObject({ listTempRules: 'in_help', listExternalResources: 'in_help', updateExternalResource: 'in_help', addTempRule: 'in_help', checkProfile: 'in_help' });
+    // 读原语按帮助经 CLI 探测（假的 execFile 让它们以 ENOENT 失败，但确实尝试了）
+    expect(spawned.filter((c) => c.file === CLI).map((c) => c.args)).toEqual(expect.arrayContaining([['--raw', 'dump', 'temp-rule'], ['--raw', 'external-resource', 'list']]));
+    expect((inventory.probes as { cli: Record<string, { status: string }> }).cli.listTempRules!.status).toBe('error');
   });
 
   it('ordinary help without command words: no warning', async () => {
