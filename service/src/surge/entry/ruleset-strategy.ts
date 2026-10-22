@@ -402,7 +402,9 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       mode = 'UNKNOWN';
       evidence.push('有规则排在入口之前');
     }
-    return { mode, bits: s.bits, evidence, precedenceIssues: issues, changedOwnedFiles: overwritableBits(s).map((b) => s.files[b].name) };
+    // 旧格式文件没有见证：已加载内容只由探测核对（EntryReadback.witnessConfirmed）
+    const witnessConfirmed = ENTRY_BITS_IN_ORDER.some((b) => s.loaded[b] === 'unwitnessed') ? { witnessConfirmed: false } : {};
+    return { mode, bits: s.bits, evidence, precedenceIssues: issues, changedOwnedFiles: overwritableBits(s).map((b) => s.files[b].name), ...witnessConfirmed };
   }
 
   /** 只看文件与归属、资源、规则顺序（不看已加载内容与探测）的模式；有任何异常为 null。 */
@@ -460,8 +462,10 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
    */
   function blockedOnWayToNormalReadback(s: RulesetState, kept: Array<'udp' | 'block'>): EntryReadback {
     const base = readbackOf(s);
+    // 有规则排在入口之前时，入口之外的规则仍可能让 Safari 新请求经 SFE-ROUTE：只说本应用入口不会
+    const notViaRoute = hasBlockingIssue(s.issues) ? '本应用入口不会让 Safari 新请求经 SFE-ROUTE，但有规则排在入口之前' : 'Safari 新请求不会经 SFE-ROUTE';
     const note = kept.includes('block')
-      ? '普通模式的中间阻断不再写入：verify/active 已关（Safari 新请求不会经 SFE-ROUTE），udp 已关；上一次保留的 block 关闭尚未加载（Surge 已加载的是写前的阻断或已是这次的关闭），不重新打开，由 NORMAL 一段再写入'
+      ? `普通模式的中间阻断不再写入：verify/active 已关（${notViaRoute}），udp 已关；上一次保留的 block 关闭尚未加载（Surge 已加载的是写前的阻断或已是这次的关闭），不重新打开，由 NORMAL 一段再写入`
       : kept.includes('udp')
         ? '普通模式的中间阻断已成立：block 已开、verify/active 已关（Safari 全部流量仍被 block 拒绝）；上一次保留的 udp 关闭尚未加载，不重新打开，由 NORMAL 一段再写入，未写入'
         : '普通模式的中间阻断已成立：block 已开、verify/active 已关，udp 已按普通模式关闭（Safari 全部流量仍被 block 拒绝），未写入';

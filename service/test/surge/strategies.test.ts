@@ -675,6 +675,8 @@ describe('ruleset_resource strategy', () => {
     const rb = await ctrl.read();
     expect(rb.mode).toBe('NORMAL');
     expect(rb.evidence).toContain('规则集 active：文件没有见证规则');
+    // 只由探测确认：读回标明未经见证确认（普通模式的步骤据此不写“见证确认”）
+    expect(rb.witnessConfirmed).toBe(false);
     const rec = stepRecorder(fake);
     const steps: string[] = [];
     expect(
@@ -687,7 +689,9 @@ describe('ruleset_resource strategy', () => {
     ).toBe('BLOCKED');
     expect(steps).toEqual(['block+', 'udp+', 'verify-', 'active-']);
     assertNoWindow(rec.seen, 'NORMAL', 'BLOCKED');
-    expect((await ctrl.read()).evidence.filter((e) => e.includes('见证一致'))).toHaveLength(4);
+    const after = await ctrl.read();
+    expect(after.evidence.filter((e) => e.includes('见证一致'))).toHaveLength(4);
+    expect(after.witnessConfirmed).toBeUndefined();
   });
 
   test('pre-witness files of the earlier format (bare DOMAIN placeholder that any process matches) are recognised as off, reported, and rewritten scoped by the next transition', async () => {

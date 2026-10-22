@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { SfeError } from '@sfe/contract';
 import { createProfileFiles } from '../../src/surge/files.js';
 import { killSafariConnections } from '../../src/surge/safari-connections.js';
+import type { SurgeAdapter, SurgeRequestRecord } from '../../src/ports.js';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FakeSurge, createFakeSurgeEnvironment } from '../../src/surge/fake.js';
 
 let dir: string;
@@ -95,6 +96,48 @@ describe('killSafariConnections', () => {
     const err = (await killSafariConnections(fake, { processPaths: [FAKE_SAFARI_PATH], verifyHost: 'verify.example.test', now, bestEffort: false }).catch((e: unknown) => e)) as SfeError;
     expect(err.code).toBe('READBACK_MISMATCH');
     expect((err.details!.killResults as unknown[]).length).toBe(2);
+  });
+
+  test('entry not known to block Safari: a new connection on the original rules is expected; one that may use the buyer exit is not', async () => {
+    const rec = (id: string, policyName: string | null, leafPolicyName: string | null = null): SurgeRequestRecord => ({
+      id,
+      processPath: FAKE_SAFARI_PATH,
+      remoteHost: 'www.example.test',
+      policyName,
+      leafPolicyName,
+      rule: null,
+      protocol: 'tcp',
+      startedAt: null,
+      completed: false,
+      failed: false,
+    });
+    // Safari 在每次结束之后立即重连（next）
+    const reconnecting = (next: SurgeRequestRecord): SurgeAdapter => {
+      const active = new Map([['1', rec('1', 'SFE-ROUTE', 'SFE-N-E0001-US01-v001')]]);
+      return {
+        listActiveRequests: async () => [...active.values()],
+        killRequest: async (id: string) => {
+          active.delete(id);
+          active.set(next.id, next);
+        },
+      } as unknown as SurgeAdapter;
+    };
+    const opts = { processPaths: [FAKE_SAFARI_PATH], verifyHost: 'verify.example.test', now, bestEffort: false };
+    // 入口应已阻断（缺省）：任何新连接都记为失败
+    const strict = (await killSafariConnections(reconnecting(rec('2', 'DIRECT')), opts).catch((e: unknown) => e)) as SfeError;
+    expect(strict.code).toBe('READBACK_MISMATCH');
+    expect(strict.details!.killResults).toContainEqual(expect.objectContaining({ surgeRequestId: '2', ok: false, error: '结束后出现的新连接' }));
+    // 入口不确定阻断：按原规则（DIRECT、用户自己的策略组）重连是预期的
+    for (const next of [rec('2', 'DIRECT'), rec('2', 'Daily', 'Front-A')]) {
+      const results = await killSafariConnections(reconnecting(next), { ...opts, entryBlocksSafari: false });
+      expect(results).toEqual([expect.objectContaining({ surgeRequestId: '1', ok: true })]);
+    }
+    // 经 SFE-ROUTE、叶节点是本应用出口节点、或读不到策略（无法判断）：可能在买家出口上，仍记为失败
+    for (const next of [rec('2', 'SFE-ROUTE', 'SFE-N-E0001-US01-v001'), rec('2', 'User-Group', 'SFE-N-E0001-US01-v001'), rec('2', null, null)]) {
+      const err = (await killSafariConnections(reconnecting(next), { ...opts, entryBlocksSafari: false }).catch((e: unknown) => e)) as SfeError;
+      expect(err.code).toBe('READBACK_MISMATCH');
+      expect(err.details!.killResults).toContainEqual(expect.objectContaining({ surgeRequestId: '2', ok: false, error: '结束后出现的新连接（可能经买家出口）' }));
+    }
   });
 
   test('best effort reports failures and requests that are still present', async () => {

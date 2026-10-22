@@ -279,6 +279,12 @@ export interface EntryReadback {
    */
   runtimeConfirmed?: boolean;
   /**
+   * ruleset_resource：false 表示有入口文件没有见证规则（旧格式），这些位的已加载内容只由 Safari 与对照的运行时探测核对
+   * （NORMAL 时），未经见证确认 Surge 已加载的是文件中的这一版；evidence 逐位写明。缺省（undefined）为全部由见证确认或不适用
+   * （temp_rule）。
+   */
+  witnessConfirmed?: boolean;
+  /**
    * 普通模式的中间阻断（EntryTransitionOptions.towardNormal）不写入而返回 BLOCKED 时：上一次普通模式在 NORMAL 一段写入、
    * 超时后保留的关闭（ruleset_resource 的 udp/block，走向 NORMAL）尚未由见证确认加载的位。不重新收紧，由 NORMAL 一段再写入。
    * 含 block 时 Surge 已加载的是写前的阻断或已是这次的关闭：verify/active 已由见证确认关闭，Safari 新请求不会经 SFE-ROUTE，
