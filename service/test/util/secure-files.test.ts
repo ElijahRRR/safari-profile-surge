@@ -185,6 +185,23 @@ describe('classifyDirectoryRisk', () => {
     symlinkSync(cloud, link);
     expect(classifyDirectoryRisk(link, h)).toBe('synced');
   });
+
+  test.each([
+    ['Library/CloudStorage', 'synced'],
+    ['Documents', 'protected'],
+  ] as const)('checks canonical home and new descendants of a link to %s', (directory, risk) => {
+    const base = fresh();
+    const actualHome = join(base, 'actual-home');
+    const destination = join(actualHome, directory);
+    mkdirSync(destination, { recursive: true });
+    const homeAlias = join(base, 'home-alias');
+    symlinkSync(actualHome, homeAlias);
+    const shortcut = join(base, 'shortcut');
+    symlinkSync(destination, shortcut);
+
+    expect(classifyDirectoryRisk(destination, homeAlias)).toBe(risk);
+    expect(classifyDirectoryRisk(join(shortcut, 'not-created', 'data'), homeAlias)).toBe(risk);
+  });
 });
 
 describe('assertUnixSocketPathLength', () => {

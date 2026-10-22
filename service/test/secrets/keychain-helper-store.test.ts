@@ -183,26 +183,23 @@ describe('KeychainHelperStore', () => {
 
   test('timeout kills the helper and is reported as recoverable timeout', async () => {
     const h = makeHelper('hang');
-    const store = new KeychainHelperStore({ helperPath: h.exe, timeoutMs: 400 });
+    let exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | undefined;
+    const store = new KeychainHelperStore({
+      helperPath: h.exe,
+      timeoutMs: 400,
+      spawn: (cmd, args, opts) => {
+        const child = spawn(cmd, [...args], opts);
+        // Observe the child directly: it can time out before writing calls.jsonl.
+        // A missing log must not turn into process.kill(0, 0), which probes the group.
+        exit = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+        return child;
+      },
+    });
     const err = (await store.put('sec_x', VALUE, 'proxy').catch((e: unknown) => e)) as Error;
     expect(err).toMatchObject({ code: 'SECRET_STORE_FAILED', details: { reason: 'timeout' } });
     expect(err.message).not.toContain(VALUE);
-    // 等待助手子进程被结束
-    let pid = 0;
-    for (let i = 0; i < 50 && pid === 0; i++) {
-      pid = h.calls()[0]?.pid ?? 0;
-      if (pid === 0) await new Promise((r) => setTimeout(r, 20));
-    }
-    let alive = true;
-    for (let i = 0; i < 50 && alive; i++) {
-      try {
-        process.kill(pid, 0);
-        await new Promise((r) => setTimeout(r, 20));
-      } catch {
-        alive = false;
-      }
-    }
-    expect(alive).toBe(false);
+    expect(exit).toBeDefined();
+    await expect(exit).resolves.toEqual({ code: null, signal: 'SIGKILL' });
   }, 10_000);
 
   test('missing helper binary is reported without crashing', async () => {
