@@ -93,6 +93,11 @@ export async function proposeCapability(deps: AcceptDeps, req: ProposeCapability
   if (evidence.length > 0) throw new SfeError('EVIDENCE_REQUIRED', '提交能力证据失败：缺少必需的证据', { fieldErrors: evidence });
   const id = engine.ids.next('prop');
   engine.repos.tx(() => {
+    // 同一能力较早的、永远不能确认的待确认提议（早于版本校验提交，带 null、any 或 127.0.0.1）随这次重测的提议作废，
+    // 不再留在网页的待确认列表中；其他待确认提议不受影响。
+    for (const old of engine.repos.proposals.list({ pending: true, key: req.key })) {
+      if (proposalVersionErrors(old).length > 0) engine.repos.proposals.markRejected(old.id, engine.now());
+    }
     engine.repos.proposals.insert({
       id,
       key: req.key,
@@ -109,6 +114,11 @@ export async function proposeCapability(deps: AcceptDeps, req: ProposeCapability
   });
   engine.emit({ capabilities: true });
   return { proposal_id: id };
+}
+
+/** 已存提议的版本字段按提议校验再查一次；不为空时这条提议永远不能确认（提议的上下文不会再变）。 */
+function proposalVersionErrors(p: { key: CapabilityKey; context: CapabilityContext | null }): ReturnType<typeof versionContextErrors> {
+  return versionContextErrors(p.key, p.context ?? { surgeVersion: null, surgeBuild: null });
 }
 
 /** 依赖某个上下文字段的能力（不含正在确认的那一项）回到待验证。 */
@@ -146,11 +156,13 @@ export async function confirmCapability(deps: AcceptDeps, req: ConfirmCapability
     const proposal = typeof req.proposal_id === 'string' ? repos.proposals.get(req.proposal_id) : null;
     if (!proposal || proposal.confirmedAt || proposal.rejectedAt) throw new SfeError('NOT_FOUND', '确认能力失败：提议不存在或已处理');
     key = proposal.key;
-    // 与提议时同一规则（早于该规则提交的提议可能带 null、any 或 127.0.0.1）：在改动设置、让其他能力回到待验证之前拒绝；
-    // 提议保持待确认，需要在能读取运行中 Surge 的版本后重测并重新提议。
-    const versionErrors = versionContextErrors(key, proposal.context ?? { surgeVersion: null, surgeBuild: null });
+    // 与提议时同一规则（早于该规则提交的提议可能带 null、any 或 127.0.0.1）：在改动设置、让其他能力回到待验证之前拒绝。
+    // 提议的上下文不会再变，这条提议永远不能确认：标为已驳回（不再显示在待确认列表中），需要在能读取运行中 Surge 的
+    // 版本后重测并重新提议。设置与能力记录不变。
+    const versionErrors = proposalVersionErrors(proposal);
     if (versionErrors.length > 0) {
-      throw new SfeError('EVIDENCE_REQUIRED', '确认能力失败：提议中的 Surge 版本或构建号不可用，请在能读取运行中 Surge 的版本后重测并重新提议', {
+      if (repos.tx(() => repos.proposals.markRejected(proposal.id, engine.now()))) engine.emit({ capabilities: true });
+      throw new SfeError('EVIDENCE_REQUIRED', '确认能力失败：提议中的 Surge 版本或构建号不可用，这条提议已移除；请在能读取运行中 Surge 的版本后重测并重新提议', {
         fieldErrors: versionErrors.map((e) => ({ field: `context.${e.field}`, message: e.message })),
       });
     }

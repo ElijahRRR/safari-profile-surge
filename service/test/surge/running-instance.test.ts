@@ -14,6 +14,7 @@ import {
   RUNNING_INSTANCE_FAILURE_TEXT,
   RUNNING_INSTANCE_PS_ENV,
   SERVICE_CODESIGN_TIMEOUT_MS,
+  SERVICE_INSTANCE_READ_BUDGET_MS,
   SURGE_APP_BUNDLE,
   SURGE_BUNDLE_IDS,
   bundleOfMainExecutable,
@@ -24,6 +25,8 @@ import {
   parseLstartUtc,
   parsePsInstanceLines,
   predatesStart,
+  serviceInstanceResult,
+  serviceLimitsExceeded,
   type RunningInstanceDeps,
   type RunningInstanceExec,
   type RunningInstanceFileId,
@@ -506,6 +509,66 @@ describe('running Surge instance', () => {
     });
     expect(await createRunningInstanceReader(d, OPTS).read()).toEqual({ ok: false, reason: 'read_failed' });
     expect((await createRunningInstanceReader(d, OPTS).inspect()).result).toEqual({ ok: false, reason: 'plist_unreadable' });
+  });
+});
+
+// P0 的 codesign 超时（60 秒）长于服务（15 秒），引擎另有 8 秒总时限：P0 按服务的时限核对自己的读取，
+// 否则会记录并提议一个服务永远读不到的版本。
+describe('service limits (P0 checks its read against the service reader)', () => {
+  /** 每个程序的耗时推进合成时钟；codesign 的耗时超过给定超时时像 execFixed 一样被结束（退出码 -1）。 */
+  function timedDeps(costs: Partial<Record<string, number>>): MockDeps {
+    const d = deps(world());
+    let now = 0;
+    d.clock = () => now;
+    const real = d.exec.getMockImplementation()!;
+    d.exec.mockImplementation(async (file, args, o) => {
+      const cost = costs[file] ?? 0;
+      if (cost > o.timeoutMs) {
+        now += o.timeoutMs;
+        return { stdout: '', stderr: '', code: -1 };
+      }
+      now += cost;
+      return real(file, args, o);
+    });
+    return d;
+  }
+  const SERVICE_OPTS: RunningInstanceOptions = { teamId: null, codesignTimeoutMs: SERVICE_CODESIGN_TIMEOUT_MS };
+  const total = (steps: ReadonlyArray<{ ms: number }>) => steps.reduce((s, x) => s + x.ms, 0);
+
+  test('codesign slower than the service timeout: P0 reads the version, the service reader does not, and the check says so', async () => {
+    const p0 = await createRunningInstanceReader(timedDeps({ '/usr/bin/codesign': 20_000 }), OPTS).inspect();
+    expect(p0.result).toEqual({ ok: true, instance: OK_INSTANCE });
+    expect(serviceLimitsExceeded(p0)).toEqual([{ limit: 'signature', ms: 20_000, limitMs: SERVICE_CODESIGN_TIMEOUT_MS, reason: 'signature_invalid' }]);
+    expect(serviceInstanceResult(p0)).toEqual({ ok: false, reason: 'signature_invalid' });
+    // 服务的读取器得到同一结论（失败不缓存：每次读取都重做 codesign）
+    const d = timedDeps({ '/usr/bin/codesign': 20_000 });
+    const service = createRunningInstanceReader(d, SERVICE_OPTS);
+    for (let i = 0; i < 2; i++) expect(await service.read()).toEqual(serviceInstanceResult(p0));
+    expect(callsTo(d, '/usr/bin/codesign')).toHaveLength(2);
+  });
+
+  test('steps repeated on every cached read reaching the engine budget → read_failed; a slow first read alone is fine', async () => {
+    const slow = await createRunningInstanceReader(timedDeps({ '/bin/ps': 5_000, '/usr/sbin/lsof': 3_000 }), OPTS).inspect();
+    expect(slow.result.ok).toBe(true);
+    expect(serviceLimitsExceeded(slow)).toEqual([{ limit: 'repeat_read', ms: 8_000, limitMs: SERVICE_INSTANCE_READ_BUDGET_MS, reason: 'read_failed' }]);
+    expect(serviceInstanceResult(slow)).toEqual({ ok: false, reason: 'read_failed' });
+    // 第一次读取只因为包信息与签名超过总时限：服务在后台完成并缓存，之后的读取直接命中
+    const costs = { '/usr/bin/plutil': 500, '/usr/bin/codesign': 10_000 };
+    const first = await createRunningInstanceReader(timedDeps(costs), OPTS).inspect();
+    expect(total(first.steps)).toBeGreaterThan(SERVICE_INSTANCE_READ_BUDGET_MS);
+    expect(serviceLimitsExceeded(first)).toEqual([]);
+    expect(serviceInstanceResult(first)).toBe(first.result);
+    const service = createRunningInstanceReader(timedDeps(costs), SERVICE_OPTS);
+    await service.inspect();
+    const again = await service.inspect();
+    expect(again.cached).toBe(true);
+    expect(total(again.steps)).toBeLessThan(SERVICE_INSTANCE_READ_BUDGET_MS);
+  });
+
+  test('failed reads are reported as they are', () => {
+    const failed = { result: { ok: false as const, reason: 'not_running' as const }, steps: [{ rule: 'process' as const, outcome: 'fail' as const, detail: {}, ms: 60_000 }], cached: false };
+    expect(serviceLimitsExceeded(failed)).toEqual([]);
+    expect(serviceInstanceResult(failed)).toBe(failed.result);
   });
 });
 

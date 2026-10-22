@@ -41,14 +41,20 @@ export const RUNNING_INSTANCE_PS_ENV: Readonly<Record<string, string>> = { LC_AL
 
 export const PS_INSTANCE_ARGS = ['-ww', '-axo', 'pid=,uid=,lstart=,comm='] as const;
 
-/** codesign 的缺省超时（P0 盘点与 instance 命令：记录真实耗时，V5）。 */
+/** codesign 的缺省超时（P0 盘点与 instance 命令：记录真实耗时，V5；是否在服务的时限内见 serviceLimitsExceeded）。 */
 export const RUNNING_INSTANCE_CODESIGN_TIMEOUT_MS = 60_000;
 
 /**
  * 服务常驻读取器的 codesign 超时：读取在执行器通道上进行（对账、动作前检查），慢的签名校验（trustd、syspolicyd 繁忙）
- * 不能长时间拖住排队的操作；超时按 signature_invalid（失败即关闭）。引擎另有总时限（DEFAULT_INSTANCE_READ_BUDGET_MS）。
+ * 不能长时间拖住排队的操作；超时按 signature_invalid（失败即关闭）。引擎另有总时限（SERVICE_INSTANCE_READ_BUDGET_MS）。
  */
 export const SERVICE_CODESIGN_TIMEOUT_MS = 15_000;
+
+/**
+ * 引擎等待一次运行实例读取的总时限（引擎的 DEFAULT_INSTANCE_READ_BUDGET_MS）：超过即按 read_failed，读取本身继续完成并
+ * 更新缓存。放在读取器旁边，P0 不经引擎就能按同一时限核对（serviceLimitsExceeded）。
+ */
+export const SERVICE_INSTANCE_READ_BUDGET_MS = 8_000;
 
 export type RunningInstanceFailure =
   | 'not_darwin'
@@ -186,6 +192,45 @@ export interface RunningInstanceReader {
   read(): Promise<RunningInstanceResult>;
   /** 与 read 相同，另带逐条规则的证据（P0 用）。 */
   inspect(): Promise<RunningInstanceReport>;
+}
+
+/** 一次读取中服务的读取器做不到的部分（P0 按服务的时限核对，见 serviceLimitsExceeded）。 */
+export interface ServiceLimitExceeded {
+  /** signature：codesign 超过服务的超时；repeat_read：缓存命中后每次都要执行的步骤超过引擎的总时限。 */
+  limit: 'signature' | 'repeat_read';
+  ms: number;
+  limitMs: number;
+  /** 服务在这种情况下得到的结论。 */
+  reason: RunningInstanceFailure;
+}
+
+/** 缓存命中时服务读取器仍然每次执行的规则（包信息与签名以外的全部步骤：ps、CFBundleExecutable、stat、lsof）。 */
+const REPEATED_RULES: readonly RunningInstanceRule[] = ['platform', 'process', 'bundle_executable', 'start_time', 'not_modified', 'running_image', 'stable'];
+
+/**
+ * 按服务常驻读取器的时限核对一次读取（P0 instance、inventory 与 propose 用；P0 的 codesign 超时更长，以记录真实耗时）：
+ * - 签名一步不短于 SERVICE_CODESIGN_TIMEOUT_MS：服务的 codesign 超时，按 signature_invalid；失败不缓存，每次读取都重做；
+ * - 缓存命中后仍要执行的步骤合计（REPEATED_RULES）不短于 SERVICE_INSTANCE_READ_BUDGET_MS：引擎每次都等不到结果，
+ *   按 read_failed。（第一次未缓存的读取超过总时限不算：它在后台完成并填好缓存，之后的读取直接命中。）
+ * 只核对成功的读取；返回空数组表示服务能读到同一版本。
+ */
+export function serviceLimitsExceeded(
+  report: RunningInstanceReport,
+  limits: { codesignTimeoutMs: number; readBudgetMs: number } = { codesignTimeoutMs: SERVICE_CODESIGN_TIMEOUT_MS, readBudgetMs: SERVICE_INSTANCE_READ_BUDGET_MS },
+): ServiceLimitExceeded[] {
+  if (!report.result.ok) return [];
+  const out: ServiceLimitExceeded[] = [];
+  const sig = report.steps.find((s) => s.rule === 'signature' && s.outcome === 'pass');
+  if (sig && sig.ms >= limits.codesignTimeoutMs) out.push({ limit: 'signature', ms: sig.ms, limitMs: limits.codesignTimeoutMs, reason: 'signature_invalid' });
+  const repeated = report.steps.filter((s) => REPEATED_RULES.includes(s.rule)).reduce((sum, s) => sum + s.ms, 0);
+  if (repeated >= limits.readBudgetMs) out.push({ limit: 'repeat_read', ms: repeated, limitMs: limits.readBudgetMs, reason: 'read_failed' });
+  return out;
+}
+
+/** 服务按同一时限得到的结论：读取成功但超过服务的时限时为第一个超限项的失败原因（版本为 null）。 */
+export function serviceInstanceResult(report: RunningInstanceReport): RunningInstanceResult {
+  const over = serviceLimitsExceeded(report);
+  return over.length > 0 ? { ok: false, reason: over[0]!.reason } : report.result;
 }
 
 // ---------- 解析（纯函数） ----------

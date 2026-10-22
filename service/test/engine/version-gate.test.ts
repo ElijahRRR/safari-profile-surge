@@ -14,9 +14,9 @@ afterEach(async () => {
 const VERSION_KEYS = CAPABILITY_KEYS.filter((k) => CAPABILITY_CONTEXT_DEPS[k].includes('surgeVersion') || CAPABILITY_CONTEXT_DEPS[k].includes('surgeBuild'));
 
 describe('unreadable running Surge version', () => {
-  test('version-dependent capabilities recorded as any become unverified; others keep their status', async () => {
+  test('version-dependent capabilities recorded for the running version become unverified; others keep their status', async () => {
     h = await createHarness();
-    // 测试工具按 any 记录全部能力：读得到版本时都有效
+    // 测试工具按 FakeSurge 运行实例的版本（其余字段 any）记录全部能力：读得到同一版本时都有效
     expect((await h.app.listCapabilities()).every((c) => c.effectiveStatus === 'supported')).toBe(true);
     // 运行实例的包信息缺构建号：版本与构建号一起读不到
     h.fake.build = null;

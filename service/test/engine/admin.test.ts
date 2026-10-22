@@ -95,7 +95,7 @@ describe('capability proposals and confirmation', () => {
     expect(ok.proposal_id).toMatch(/^prop_/);
   });
 
-  test('confirming a pending proposal re-checks the version: one stored without a usable version is refused before any setting or record changes', async () => {
+  test('confirming a pending proposal re-checks the version: one stored without a usable version is refused and dismissed before any setting or record changes', async () => {
     h = await createHarness();
     const newPath = '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview';
     // 早于提议校验写入的提议（a95e67d 的 P0 只警告就提交了读不到版本的提议；更早的解析器记录 127.0.0.1）
@@ -120,11 +120,17 @@ describe('capability proposals and confirmation', () => {
         submittedBy: 'agent',
         ...(c.key === 'runtime_entry_modes' ? { entryStrategy: 'temp_rule' as const } : { safariProcessPaths: [newPath], protocolCoverage: FULL_COVERAGE }),
       });
+      expect((await h.app.snapshot(WEB)).capabilityProposals.map((p) => p.id)).toContain(id);
+      const events = h.events.length;
       const err = await expectError(h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id: id }, WEB), 'EVIDENCE_REQUIRED');
       expect(err.fieldErrors?.map((e) => e.field), JSON.stringify(c)).toEqual(c.fields);
-      // 提议保持待确认，设置与全部能力记录（包括依赖入口策略或进程路径的其他能力）不变
-      expect(h.repos.proposals.get(id)).toMatchObject({ confirmedAt: null, rejectedAt: null });
+      // 这条提议永远不能确认：标为已驳回，不再出现在待确认列表中（网页收到能力更新）；再次确认为 NOT_FOUND
+      expect(h.repos.proposals.get(id)).toMatchObject({ confirmedAt: null, rejectedAt: expect.any(String) });
+      expect((await h.app.snapshot(WEB)).capabilityProposals.map((p) => p.id)).not.toContain(id);
+      expect(h.events.slice(events).some((e) => e.type === 'capabilities.updated')).toBe(true);
+      await expectError(h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id: id }, WEB), 'NOT_FOUND');
     }
+    // 设置与全部能力记录（包括依赖入口策略或进程路径的其他能力）不变
     expect(h.repos.settings.getAll()).toEqual(settingsBefore);
     expect(JSON.stringify(h.repos.capabilities.list())).toBe(recordsBefore);
     // 同一形状、带读到的版本时照常确认
@@ -140,6 +146,36 @@ describe('capability proposals and confirmation', () => {
     });
     await h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id: 'prop_measured' }, WEB);
     expect(h.repos.settings.get('entryStrategy')).toBe('temp_rule');
+  });
+
+  test('a new proposal for the same capability dismisses older pending proposals that can never be confirmed; other pending proposals stay', async () => {
+    h = await createHarness({ capabilities: [] });
+    const legacy = (id: string, key: 'connection_continuity' | 'policy_path_reread', surgeVersion: string | null) =>
+      h.repos.proposals.insert({
+        id,
+        key,
+        proposedStatus: 'supported',
+        context: { ...anyContext(), surgeVersion, surgeBuild: null },
+        summary: '旧提议（测试）',
+        evidenceDigest: 'sha256:0123456789abcdef',
+        submittedBy: 'agent',
+      });
+    // 早于版本校验提交的提议（旧解析器记录 127.0.0.1；a95e67d 的 P0 提交读不到版本的提议）
+    legacy('prop_legacy_a', 'connection_continuity', '127.0.0.1');
+    legacy('prop_legacy_b', 'connection_continuity', null);
+    legacy('prop_legacy_other', 'policy_path_reread', null);
+    const valid = await h.app.proposeCapability(proposal(), AGENT);
+    const pending = () => h.repos.proposals.list({ pending: true }).map((p) => p.id).sort();
+    expect(pending()).toEqual(['prop_legacy_other', valid.proposal_id].sort());
+    expect(h.repos.proposals.get('prop_legacy_a')!.rejectedAt).not.toBeNull();
+    expect(h.repos.proposals.get('prop_legacy_b')!.rejectedAt).not.toBeNull();
+    // 能确认的较早提议不被作废（例如对同一能力分别实测的两个结论，由网页选择确认哪一个）
+    const second = await h.app.proposeCapability(proposal({ proposed_status: 'unsupported' }), AGENT);
+    expect(pending()).toEqual(['prop_legacy_other', valid.proposal_id, second.proposal_id].sort());
+    expect((await h.app.snapshot(WEB)).capabilityProposals.map((p) => p.id).sort()).toEqual(pending());
+    // 重测后的提议照常确认
+    await h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id: valid.proposal_id }, WEB);
+    expect((await h.app.listCapabilities()).find((c) => c.key === 'connection_continuity')).toMatchObject({ status: 'supported', effectiveStatus: 'supported' });
   });
 
   test('capabilities that do not depend on the Surge version accept a null version', async () => {

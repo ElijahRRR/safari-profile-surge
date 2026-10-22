@@ -189,6 +189,22 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(existsSync(join(env!.run().path, 'proposals'))).toBe(false);
   });
 
+  it('propose refuses version-dependent capabilities when the version was read only because P0 waits longer than the service', async () => {
+    // codesign 用了 20 秒：P0 读到 6.5.0（10960），服务的 15 秒超时内读不到（signature_invalid）
+    const slow = async () => {
+      const r = await env!.surge.runningInstance();
+      return { result: r, steps: [{ rule: 'signature' as const, outcome: 'pass' as const, detail: { code: 0 }, ms: 20_000 }], cached: false };
+    };
+    expect(await main(['refresh', '--auto-reload', 'off', ...common()], { ...env!.deps(), surgeInstance: slow })).toBe(EXIT.OK);
+    expect(result('auto_reload_atomic_replace')).toMatchObject({ verdict: 'pass', context: { surgeVersion: null, surgeBuild: null } });
+    const d = { ...env!.deps(), surgeInstance: slow };
+    const code = await main(['propose', 'auto_reload_atomic_replace', 'supported', '--working-profile', 'any', '--auto-reload', 'off', '--dry-run', '--raw-dir', env!.base], d);
+    expect(code).toBe(EXIT.REFUSED);
+    expect(d.out.text()).toContain('该能力依赖 Surge 版本，但读不到');
+    expect(d.out.text()).toContain('读到了运行中 Surge 的版本，但服务在它的时限内读不到：签名校验耗时 20.000 秒');
+    expect(existsSync(join(env!.run().path, 'proposals'))).toBe(false);
+  });
+
   it('the measured context takes the Surge version from the running instance, never from getVersion', async () => {
     env!.surge.version = '6.5.2';
     env!.surge.build = '10970';

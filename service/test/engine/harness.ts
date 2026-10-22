@@ -96,13 +96,21 @@ export function anyContext(): CapabilityContext {
   return Object.fromEntries(CAPABILITY_CONTEXT_FIELDS.map((f) => [f, 'any'])) as unknown as CapabilityContext;
 }
 
-/** 按当前本机事实（macOS 构建号、Safari 版本）记录能力，其余字段不限：之后修改 h.host 即让这些记录过期。 */
+/**
+ * 记录能力用的上下文：Surge 版本与构建号取 FakeSurge 运行实例当前报告的值（门槛中 any 不匹配任何版本），其余字段不限。
+ * 之后修改 h.fake.version/build 即让依赖版本的记录过期。
+ */
+export function instanceContext(fake: Pick<FakeSurge, 'version' | 'build'>): CapabilityContext {
+  return { ...anyContext(), surgeVersion: fake.version, surgeBuild: fake.build };
+}
+
+/** 按当前本机事实（macOS 构建号、Safari 版本）与 Surge 版本记录能力，其余字段不限：之后修改 h.host 即让这些记录过期。 */
 export function grantForCurrentHost(h: Harness, keys: readonly CapabilityKey[]): void {
   for (const key of keys) {
     h.repos.capabilities.upsert({
       key,
       status: 'supported',
-      context: { ...anyContext(), macosBuild: h.host.macosBuild, safariVersion: h.host.safariVersion },
+      context: { ...instanceContext(h.fake), macosBuild: h.host.macosBuild, safariVersion: h.host.safariVersion },
       verifiedAt: h.clock.now().toISOString(),
       note: '测试记录',
     });
@@ -157,7 +165,7 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
       repos.capabilities.upsert({
         key,
         status: 'supported',
-        context: anyContext(),
+        context: instanceContext(fake),
         verifiedAt: clock.now().toISOString(),
         note: note ?? (covers ? 'readback-covers: server, port, underlying-proxy' : '测试记录'),
       });

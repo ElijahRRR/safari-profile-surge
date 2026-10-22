@@ -58,14 +58,19 @@ export function createDemoSurge(dataDir: string): DemoSurge {
 
 /** 只在演示模式调用：写入工作配置设置、能力记录（supported + DEMO 说明）、本应用对象清单与默认前置。 */
 export async function prepareDemoState(repos: Repositories, demo: DemoSurge, pepper: Buffer): Promise<void> {
-  const anyContext = Object.fromEntries(CAPABILITY_CONTEXT_FIELDS.map((f) => [f, 'any'])) as unknown as CapabilityContext;
+  // Surge 版本与构建号记为演示 FakeSurge 运行实例报告的值：门槛中 any 不匹配任何版本（依赖版本的能力会一直待验证）
+  const demoContext = {
+    ...(Object.fromEntries(CAPABILITY_CONTEXT_FIELDS.map((f) => [f, 'any'])) as unknown as CapabilityContext),
+    surgeVersion: demo.fake.version,
+    surgeBuild: demo.fake.build,
+  };
   repos.tx(() => {
     repos.settings.set('workingProfilePath', demo.profilePath);
     repos.settings.set('workingProfileName', WORKING_PROFILE_NAME);
     repos.settings.set('entryStrategy', 'ruleset_resource');
     repos.settings.set('safariProcessPaths', [FAKE_SAFARI_PATH]);
     for (const key of CAPABILITY_KEYS) {
-      repos.capabilities.upsert({ key, status: 'supported', context: anyContext, verifiedAt: new Date().toISOString(), note: DEMO_CAPABILITY_NOTE });
+      repos.capabilities.upsert({ key, status: 'supported', context: demoContext, verifiedAt: new Date().toISOString(), note: DEMO_CAPABILITY_NOTE });
     }
     if (!repos.frontProxies.byName('Front-A')) {
       repos.frontProxies.insert({ id: 'front_demo0001', surgeName: 'Front-A', state: 'ok', isDefault: true, lastCheckedAt: new Date().toISOString() });

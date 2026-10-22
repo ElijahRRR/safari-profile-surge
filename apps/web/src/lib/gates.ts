@@ -122,6 +122,7 @@ export function coverageBlockReason(proposal: Pick<CapabilityProposalView, 'key'
  * 值为 Surge 状态里对应的当前值字段（与能力上下文同一来源）。
  */
 const VERSION_FIELDS: Partial<Record<CapabilityContextField, 'version' | 'build'>> = { surgeVersion: 'version', surgeBuild: 'build' };
+const VERSION_FORMAT: Partial<Record<CapabilityContextField, RegExp>> = { surgeVersion: SURGE_VERSION_RE, surgeBuild: SURGE_BUILD_RE };
 
 function fieldList(fields: readonly CapabilityContextField[]): string {
   return fields.map((f) => CONTEXT_FIELD_LABELS[f] ?? f).join('、');
@@ -145,12 +146,13 @@ export function versionBlockReason(proposal: Pick<CapabilityProposalView, 'key' 
     if (typeof v !== 'string' || !re.test(v)) bad.push(field);
   }
   if (bad.length === 0) return null;
-  return `提议中的 ${fieldList(bad)}读不到或格式不正确，不能确认；请在能读取运行中 Surge 的版本后重测并重新提议`;
+  return `提议中的 ${fieldList(bad)}读不到或格式不正确，不能确认；请在能读取运行中 Surge 的版本后重测并重新提议（新的提议送达后这条提议自动移除）`;
 }
 
 /**
  * 过期原因的说明。版本字段区分三种情况，不把“读不到”说成“已变化”：当前读不到 Surge 版本（依赖版本的能力一律
- * 按待验证处理，重测之前要先能读到版本）；验证记录没有版本（需要重测）；确实变了。其他字段沿用“已变化”。
+ * 按待验证处理，重测之前要先能读到版本）；验证记录没有具体版本（null、any 或格式不对的旧记录，需要重测）；确实变了。
+ * 其他字段沿用“已变化”。
  * surge 为 null（尚未拿到状态）时版本字段只说“与当前不一致”。
  */
 export function staleReasonText(cap: Pick<CapabilityView, 'staleReasons' | 'context'>, surge: Pick<SurgeStatusView, 'version' | 'build'> | null): string {
@@ -165,7 +167,7 @@ export function staleReasonText(cap: Pick<CapabilityView, 'staleReasons' | 'cont
     if (!statusKey) changed.push(f);
     else if (!surge) unknown.push(f);
     else if (surge[statusKey] === null) unreadable.push(f);
-    else if (cap.context[f] === null) missing.push(f);
+    else if (!VERSION_FORMAT[f]!.test(cap.context[f] ?? '')) missing.push(f);
     else changed.push(f);
   }
   const parts: string[] = [];

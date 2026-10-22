@@ -205,7 +205,7 @@ describe('versionBlockReason', () => {
     expect(versionBlockReason(proposal())).toBeNull();
     expect(versionBlockReason(proposal({ context: { ...ctx, surgeVersion: '6.5', surgeBuild: '1' } }))).toBeNull();
     expect(versionBlockReason(proposal({ context: { ...ctx, surgeVersion: null, surgeBuild: null } }))).toBe(
-      '提议中的 Surge 版本、Surge 构建读不到或格式不正确，不能确认；请在能读取运行中 Surge 的版本后重测并重新提议',
+      '提议中的 Surge 版本、Surge 构建读不到或格式不正确，不能确认；请在能读取运行中 Surge 的版本后重测并重新提议（新的提议送达后这条提议自动移除）',
     );
     // 旧解析器从 CLI 交互模式输出中取到的地址、any、带说明的构建号
     expect(versionBlockReason(proposal({ context: { ...ctx, surgeVersion: '127.0.0.1' } }))).toContain('Surge 版本');
@@ -232,6 +232,9 @@ describe('staleReasonText', () => {
 
   it('says the record has no version when it was measured without one', () => {
     expect(staleReasonText({ staleReasons: ['surgeVersion', 'surgeBuild'], context: { ...ctx, surgeVersion: null, surgeBuild: null } }, SURGE)).toBe('验证记录缺少 Surge 版本、Surge 构建，需要重测');
+    // 早于提议校验确认的记录（any 或旧解析器的 127.0.0.1）在读到版本时同样过期：不是“已变化”，而是没有具体版本
+    expect(staleReasonText({ staleReasons: ['surgeVersion', 'surgeBuild'], context: { ...ctx, surgeVersion: 'any', surgeBuild: 'any' } }, SURGE)).toBe('验证记录缺少 Surge 版本、Surge 构建，需要重测');
+    expect(staleReasonText({ staleReasons: ['surgeVersion'], context: { ...ctx, surgeVersion: '127.0.0.1' } }, SURGE)).toBe('验证记录缺少 Surge 版本，需要重测');
   });
 
   it('keeps 已变化 for real changes and other fields, and combines reasons', () => {

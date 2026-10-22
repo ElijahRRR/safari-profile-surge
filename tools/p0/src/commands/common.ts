@@ -13,6 +13,7 @@ import {
   SURGE_PRIMITIVES,
   createDefaultSurgeInstanceReader,
   parseHttpApiLine,
+  serviceInstanceResult,
   verifyCliPath,
   type MechanismMap,
   type RunningInstanceReport,
@@ -265,6 +266,8 @@ export async function tryRead<T>(fn: () => Promise<T>): Promise<T | null> {
 /**
  * 读取运行中的 Surge 实例（只读）：与服务同一工厂（createDefaultSurgeInstanceReader）、同一常量与执行方式（P0 的
  * execFixed，stdin 关闭，ps 固定 C/UTC 环境）。--surge-team-id 只会让签名校验更严（失败即关闭，不会与服务结论相反地放宽）。
+ * codesign 超时比服务长（记录真实耗时，V5）；服务的时限（codesign 15 秒、引擎总时限 8 秒）由 serviceLimitsExceeded
+ * 核对，能力上下文只采用服务按同一时限也能读到的版本（serviceInstanceResult）。
  */
 export async function readSurgeInstance(ctx: Ctx): Promise<RunningInstanceReport> {
   if (ctx.deps.surgeInstance) {
@@ -304,7 +307,9 @@ export async function measureContextWithInstance(
   const v = await swVers(ctx.deps.exec);
   const safari = await plistValue(ctx.deps.exec, SAFARI_APP, 'CFBundleShortVersionString');
   const instance = extras.instance ?? (await readSurgeInstance(ctx));
-  const version = instance.result.ok ? { version: instance.result.instance.version, build: instance.result.instance.build } : null;
+  // 服务的读取器在它的时限内读不到的版本（签名校验太慢、每次读取超过总时限）不进入上下文：这样的记录在服务中永远不会生效
+  const svc = serviceInstanceResult(instance);
+  const version = svc.ok ? { version: svc.instance.version, build: svc.instance.build } : null;
   const autoReload = session ? await tryRead(() => session.adapter.getAutoReloadSetting()) : null;
   const takeover: TakeoverState | null = session ? await tryRead(() => session.adapter.getTakeoverState()) : null;
   const context = buildContext(

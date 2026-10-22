@@ -51,6 +51,17 @@ describe('version from the running Surge instance', () => {
     expect((await h.app.listCapabilities()).find((c) => c.key === 'runtime_entry_modes')).toMatchObject({ effectiveStatus: 'unverified', staleReasons: ['surgeVersion', 'surgeBuild'] });
   });
 
+  test('a record confirmed with any as version (before the proposal rule) stays unverified once the version is read and after an upgrade', async () => {
+    h = await createHarness();
+    h.repos.capabilities.upsert({ key: 'runtime_entry_modes', status: 'supported', context: anyContext(), verifiedAt: h.clock.now().toISOString(), note: '旧记录' });
+    for (const [version, build] of [['6.5.0', '10960'], ['6.6.0', '11200']] as const) {
+      h.fake.version = version;
+      h.fake.build = build;
+      expect(await h.app.refreshSurge(WEB)).toMatchObject({ version, build, message: null });
+      expect((await h.app.listCapabilities()).find((c) => c.key === 'runtime_entry_modes')).toMatchObject({ effectiveStatus: 'unverified', staleReasons: ['surgeVersion', 'surgeBuild'] });
+    }
+  });
+
   test('without a host instance reader the engine defaults to not_darwin (or unavailable on macOS): version null', async () => {
     h = await createHarness({ surgeInstance: false });
     const reason = process.platform === 'darwin' ? 'unavailable' : 'not_darwin';
@@ -147,6 +158,24 @@ describe('a running-instance read that never finishes', () => {
     expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
     expect(h.app.engine.facts).toMatchObject({ reachable: true, version: null, build: null, versionIssue: 'read_failed' });
     expect(h.app.engine.facts.message).toBe(versionUnknownMessage('read_failed'));
+  });
+
+  test('a read that fails after the budget logs its own reason (e.g. the service codesign timeout), once per reason', async () => {
+    h = await createHarness({ capabilities: [] });
+    // 服务的 codesign 超时（15 秒）晚于引擎的总时限（8 秒）：引擎先按 read_failed，读取随后以 signature_invalid 结束
+    h.fake.runningInstance = () =>
+      new Promise<RunningInstanceResult>((resolve) => {
+        h!.clock.setTimeout(() => resolve({ ok: false, reason: 'signature_invalid' }), DEFAULT_INSTANCE_READ_BUDGET_MS + 7_000);
+      });
+    const late = () => h!.logs.map((l) => JSON.parse(l) as Record<string, unknown>).filter((e) => e.msg === 'surge.version_read_late');
+    for (let i = 0; i < 2; i++) {
+      const st = h.app.refreshSurge(WEB);
+      await h.clock.advanceAsync(DEFAULT_INSTANCE_READ_BUDGET_MS);
+      await expect(st).resolves.toMatchObject({ reachable: true, version: null, build: null, message: versionUnknownMessage('read_failed') });
+      await h.clock.advanceAsync(7_000);
+      await new Promise((r) => setImmediate(r));
+    }
+    expect(late()).toEqual([expect.objectContaining({ level: 'warn', reason: 'signature_invalid' })]);
   });
 
   test('a read that finishes inside the budget is used as is', async () => {

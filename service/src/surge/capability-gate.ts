@@ -1,8 +1,8 @@
 // 能力门槛：记录的结论与当前上下文比较后的有效状态。任一依赖字段不匹配 → 待验证。
 // 比较规则：记录为 any 匹配任何当前值；当前值读不到（null）时只匹配记录的 null 或 any；
-// 例外：Surge 版本与构建（NEVER_NULL_FIELDS）任一侧为 null 都不匹配，记录为 any 也不匹配读不到的当前值——
-// 版本读不到时依赖版本的能力一律待验证（失败即关闭）；
-// adapterMechanism 只比较该能力依赖的原语（规范 JSON）。见 docs/ARCHITECTURE.md §5.2。
+// 例外：Surge 版本与构建（NEVER_NULL_FIELDS）只在记录与当前都是格式正确的同一具体值时匹配——任一侧为 null 不匹配，
+// 记录为 any 或格式不对（早于提议校验确认的旧记录）也不匹配：版本读不到时依赖版本的能力一律待验证（失败即关闭），
+// 升级后也一定过期；adapterMechanism 只比较该能力依赖的原语（规范 JSON）。见 docs/ARCHITECTURE.md §5.2。
 
 import {
   CAPABILITY_CONTEXT_DEPS,
@@ -53,7 +53,8 @@ function parseMechanism(value: string): Record<string, string> | null {
 
 /**
  * 读不到（null）就绝不匹配的上下文字段：Surge 版本与构建。null 不表示“与测量时相同”——可能是读取失败，也可能是
- * 运行中的 Surge 已被替换或升级；记录为 null 或 any 都不能让读不到版本的当前上下文通过。
+ * 运行中的 Surge 已被替换或升级；记录为 null 或 any 都不能让读不到版本的当前上下文通过。记录必须是格式正确的具体值
+ * 才可能匹配：记录为 any（早于提议校验、经维护通道提议并确认的旧记录）会让升级不再使能力过期，按不匹配处理。
  */
 export const NEVER_NULL_FIELDS: readonly CapabilityContextField[] = ['surgeVersion', 'surgeBuild'];
 
@@ -62,7 +63,7 @@ export { SURGE_BUILD_RE, SURGE_VERSION_RE };
 
 /**
  * 能力提议中版本字段的校验（服务与 P0 共用）：该能力依赖 Surge 版本或构建时，上下文必须带格式正确的具体值——
- * null（读不到）、any 或格式不对都拒绝，因为这样的记录在门槛中永远不会匹配，或会让升级不再使能力过期。
+ * null（读不到）、any 或格式不对都拒绝，因为这样的记录在门槛中永远不会匹配（any 会让升级不再使能力过期，门槛按不匹配处理）。
  * 不依赖版本的能力不检查。
  */
 export function versionContextErrors(key: CapabilityKey, context: Pick<CapabilityContext, 'surgeVersion' | 'surgeBuild'>): Array<{ field: 'surgeVersion' | 'surgeBuild'; message: string }> {
@@ -86,7 +87,11 @@ export function contextFieldMatches(
   recorded: string | null,
   current: string | null,
 ): boolean {
-  if (NEVER_NULL_FIELDS.includes(field) && (recorded === null || current === null)) return false;
+  if (NEVER_NULL_FIELDS.includes(field)) {
+    // 只有格式正确的同一具体值才匹配：null、any 与格式不对的旧值（例如 127.0.0.1）都按不匹配（过期原因列出该字段）
+    const re = field === 'surgeVersion' ? SURGE_VERSION_RE : SURGE_BUILD_RE;
+    return recorded !== null && current !== null && re.test(recorded) && recorded === current;
+  }
   if (recorded === 'any') return true;
   if (current === null) return recorded === null;
   if (recorded === null) return false;

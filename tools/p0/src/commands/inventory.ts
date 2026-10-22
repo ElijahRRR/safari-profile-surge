@@ -13,6 +13,8 @@ import {
   listRelativeReferences,
   listRemoteSourceHosts,
   parseHttpApiLine,
+  serviceInstanceResult,
+  serviceLimitsExceeded,
   type SurgeAdapter,
 } from '../deps.js';
 import { refused, type ExitCode } from '../errors.js';
@@ -40,7 +42,7 @@ import {
 import { SAFARI_APP, SURGE_APP, appVersion, listProcesses, surgeProcesses, swVers, webkitSafariCandidates } from '../system.js';
 import { TEST_PROFILE_NAME } from '../test-profile.js';
 import { createRun, fmtBool, measureContext, openRun, printResult, profileNameOf, readSurgeInstance, resolveCli, tryRead, type Ctx } from './common.js';
-import { instanceEvidence, instanceSummaryText, printInstanceReport, warnOnDiskDifference } from './instance.js';
+import { instanceEvidence, instanceSummaryText, printInstanceReport, warnOnDiskDifference, warnServiceLimits } from './instance.js';
 
 const HELP_LINE_RE = /temp|rule|resource|policy|polic|request|dump|version|check|select|kill|profile|group|test/i;
 
@@ -123,6 +125,8 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   const surgeApp = await appVersion(exec, SURGE_APP);
   // Surge 版本只来自运行中的实例（与服务同一读取器）；磁盘上的 Surge.app 版本只作旁证，两者不一致时提示。
   const instance = await readSurgeInstance(ctx);
+  // 服务按它的时限（codesign 15 秒、引擎总时限 8 秒）得到的结论：读不到时版本按未知记入盘点
+  const svc = serviceInstanceResult(instance);
   dir.writeJson('inventory/surge-instance.json', instanceEvidence(now().toISOString(), instance, surgeApp));
   const procs = await listProcesses(exec);
   const webkit = webkitSafariCandidates(procs);
@@ -230,8 +234,8 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     macos,
     safari,
     surgeApp,
-    surgeVersion: instance.result.ok ? { version: instance.result.instance.version, build: instance.result.instance.build } : { version: null, build: null },
-    surgeInstance: { ok: instance.result.ok, reason: instance.result.ok ? null : instance.result.reason },
+    surgeVersion: svc.ok ? { version: svc.instance.version, build: svc.instance.build } : { version: null, build: null },
+    surgeInstance: { ok: svc.ok, reason: svc.ok ? null : svc.reason },
     cliVerified: { ok: cli.ok, reason: cli.reason },
     httpApi: httpApiInfo,
     currentProfileName: currentProfile,
@@ -246,7 +250,7 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     profile: profileInfo,
     cliHelp,
     cliHelpInteractive: helpInteractive,
-    surgeInstance: { ok: instance.result.ok, reason: instance.result.ok ? null : instance.result.reason, cached: instance.cached, evidence: 'inventory/surge-instance.json' },
+    surgeInstance: { ok: svc.ok, reason: svc.ok ? null : svc.reason, cached: instance.cached, serviceLimitsExceeded: serviceLimitsExceeded(instance), evidence: 'inventory/surge-instance.json' },
     probes: { cli: cliProbes, http: httpProbes },
     values: Object.fromEntries(Object.entries(values).map(([k, v]) => [k, summarizeValue(k as ReadPrimitive, v)])),
     proposedMechanism: proposal.mechanism,
@@ -274,6 +278,7 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     ['外部资源', Array.isArray(values.listExternalResources) ? `${(values.listExternalResources as unknown[]).length} 个` : '读不到'],
   ]);
   warnOnDiskDifference(out, instance, surgeApp);
+  warnServiceLimits(out, instance);
   if (!instance.result.ok) {
     out.warn('无法确认运行中 Surge 的版本：能力上下文中的版本与构建号为空，依赖 Surge 版本的能力不能提议。逐条检查见下表与 inventory/surge-instance.json');
   }

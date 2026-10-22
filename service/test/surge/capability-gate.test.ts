@@ -148,8 +148,9 @@ describe('context comparison rules', () => {
 });
 
 // 读不到 Surge 版本时（例如 Surge 6.5 的 surge-cli --version 进入交互模式），依赖版本的能力一律待验证：
-// 记录的 null 或 any 都不能匹配读不到的当前版本，记录的 null 也不匹配读到的版本。
-describe('Surge version and build never match on null', () => {
+// 记录的 null 或 any 都不能匹配读不到的当前版本，记录的 null 也不匹配读到的版本；记录的 any 也不匹配读到的版本
+// （早于提议校验确认的旧记录不能在升级后继续有效）。
+describe('Surge version and build never match on null or any', () => {
   const VERSION_KEYS = CAPABILITY_KEYS.filter((k) => CAPABILITY_CONTEXT_DEPS[k].some((f) => NEVER_NULL_FIELDS.includes(f)));
   const NULL_VERSION = { surgeVersion: null, surgeBuild: null };
 
@@ -158,15 +159,19 @@ describe('Surge version and build never match on null', () => {
   });
 
   for (const field of ['surgeVersion', 'surgeBuild'] as const) {
-    test(`${field}: null on either side does not match, recorded any does not match a null current`, () => {
+    test(`${field}: null on either side does not match, recorded any or a malformed value never matches`, () => {
       const value = field === 'surgeVersion' ? '6.5.0' : '10960';
       expect(contextFieldMatches('runtime_entry_modes', field, null, null)).toBe(false);
       expect(contextFieldMatches('runtime_entry_modes', field, 'any', null)).toBe(false);
       expect(contextFieldMatches('runtime_entry_modes', field, value, null)).toBe(false);
       expect(contextFieldMatches('runtime_entry_modes', field, null, value)).toBe(false);
-      // 具体值照常比较；记录为 any 仍匹配读到的具体值
+      // 具体值照常比较
       expect(contextFieldMatches('runtime_entry_modes', field, value, value)).toBe(true);
-      expect(contextFieldMatches('runtime_entry_modes', field, 'any', value)).toBe(true);
+      expect(contextFieldMatches('runtime_entry_modes', field, value, field === 'surgeVersion' ? '6.6.0' : '11000')).toBe(false);
+      // 记录为 any 不匹配读到的具体值（否则升级后不会过期）；格式不对的旧值即使与当前值相同也不匹配
+      expect(contextFieldMatches('runtime_entry_modes', field, 'any', value)).toBe(false);
+      expect(contextFieldMatches('runtime_entry_modes', field, '127.0.0.1', '127.0.0.1')).toBe(false);
+      expect(contextFieldMatches('runtime_entry_modes', field, 'any', 'any')).toBe(false);
     });
   }
 
@@ -193,14 +198,29 @@ describe('Surge version and build never match on null', () => {
     }
   });
 
-  test('records with any as version are stale while the current version cannot be read', () => {
+  test('records with any as version (confirmed before the proposal rule) are stale whether or not the version can be read, also after an upgrade', () => {
     const recorded = CAPABILITY_KEYS.map((key) => record(key, { context: { ...CTX, surgeVersion: 'any', surgeBuild: 'any' } }));
-    const unreadable = computeCapabilityViews(recorded, { ...CTX, ...NULL_VERSION });
-    for (const v of unreadable) expect(v.effectiveStatus, v.key).toBe(VERSION_KEYS.includes(v.key) ? 'unverified' : 'supported');
-    expect(unreadable.find((v) => v.key === 'external_node_underlying_proxy')!.staleReasons).toEqual(['surgeVersion', 'surgeBuild']);
-    // 只有构建号读不到时，只列构建号
-    const noBuild = computeCapabilityViews(recorded, { ...CTX, surgeBuild: null });
-    expect(noBuild.find((v) => v.key === 'external_node_underlying_proxy')!.staleReasons).toEqual(['surgeBuild']);
+    for (const current of [{ ...CTX, ...NULL_VERSION }, CTX, { ...CTX, surgeVersion: '6.6.0', surgeBuild: '11200' }]) {
+      const views = computeCapabilityViews(recorded, current);
+      for (const v of views) {
+        if (VERSION_KEYS.includes(v.key)) {
+          expect(v.effectiveStatus, v.key).toBe('unverified');
+          expect(v.staleReasons, v.key).toEqual(['surgeVersion', 'surgeBuild'].filter((f) => CAPABILITY_CONTEXT_DEPS[v.key].includes(f as never)));
+        } else {
+          expect(v.effectiveStatus, v.key).toBe('supported');
+        }
+      }
+    }
+    // 只有构建号记为 any 时，只列构建号
+    const anyBuild = computeCapabilityViews([record('runtime_entry_modes', { context: { ...CTX, surgeBuild: 'any' } })], CTX).find((v) => v.key === 'runtime_entry_modes')!;
+    expect(anyBuild).toMatchObject({ effectiveStatus: 'unverified', staleReasons: ['surgeBuild'] });
+  });
+
+  test('a record holding 127.0.0.1 as version (pre-PR #5 parser) is stale even if the current value were the same string', () => {
+    const v = computeCapabilityViews([record('takeover_state_readable', { context: { ...CTX, surgeVersion: '127.0.0.1' } })], { ...CTX, surgeVersion: '127.0.0.1' }).find(
+      (x) => x.key === 'takeover_state_readable',
+    )!;
+    expect(v).toMatchObject({ effectiveStatus: 'unverified', staleReasons: ['surgeVersion'] });
   });
 
   test('an old record holding 127.0.0.1 as version (pre-PR #5 parser) is stale while the version cannot be read', () => {

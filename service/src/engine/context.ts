@@ -39,7 +39,7 @@ import type { EntryConfig } from '../surge/entry/common.js';
 import type { EntryOwnership } from '../surge/entry/ownership.js';
 import { parseHttpApiLine } from '../surge/http-adapter.js';
 import { SURGE_BUILD_RE, SURGE_VERSION_RE } from '../surge/capability-gate.js';
-import { RUNNING_INSTANCE_FAILURE_TEXT, isRunningInstanceFailure, type RunningInstanceResult } from '../surge/running-instance.js';
+import { RUNNING_INSTANCE_FAILURE_TEXT, SERVICE_INSTANCE_READ_BUDGET_MS, isRunningInstanceFailure, type RunningInstanceResult } from '../surge/running-instance.js';
 import type { SurgePrimitive } from '../surge/primitives.js';
 import { classifyDirectoryRisk } from '../util/secure-files.js';
 import { emptySurgeFacts, type SurgeFacts, type SurgeVersionIssue } from '../domain/views.js';
@@ -90,9 +90,10 @@ export const LIVENESS_FAILURE_TEXT: Record<LivenessFailure, string> = {
 /**
  * 运行实例读取的总时限（毫秒）。读取在执行器通道上进行（周期对账、刷新、动作前检查都经 readBasicFacts）：ps、plutil、
  * lsof、codesign 各自的超时加起来可达数十秒，排队的操作（包括进入普通模式）不能被它拖住。超过时限按 read_failed
- * （版本为 null，依赖版本的能力按待验证处理）；读取本身继续完成并更新读取器的缓存，下一次读取通常直接命中。
+ * （版本为 null，依赖版本的能力按待验证处理）；读取本身继续完成并更新读取器的缓存，下一次读取通常直接命中；它失败时
+ * 另记原因（surge.version_read_late）。值定义在 surge/running-instance.ts，P0 按同一时限核对读取。
  */
-export const DEFAULT_INSTANCE_READ_BUDGET_MS = 8_000;
+export const DEFAULT_INSTANCE_READ_BUDGET_MS = SERVICE_INSTANCE_READ_BUDGET_MS;
 
 const INSTANCE_READ_TIMED_OUT = Symbol('instance-read-timed-out');
 
@@ -211,6 +212,7 @@ export class Engine {
   /** 上一次检测与版本读取的结论（只在变化时记日志）；undefined 表示尚未读取。 */
   private lastLiveness: LivenessFailure | null | undefined = undefined;
   private lastVersionIssue: SurgeVersionIssue | null | undefined = undefined;
+  private lastLateInstanceFailure: SurgeVersionIssue | null = null;
   private keysCache: EngineKeys | null = null;
   private keysLoading: Promise<EngineKeys> | null = null;
 
@@ -453,8 +455,13 @@ export class Engine {
       cancelBudget = this.clock.setTimeout(() => resolve(INSTANCE_READ_TIMED_OUT), this.deps.instanceReadBudgetMs ?? DEFAULT_INSTANCE_READ_BUDGET_MS);
     });
     try {
-      const v = await Promise.race([this.host.surgeInstance(), budget]);
-      if (v === INSTANCE_READ_TIMED_OUT) return 'read_failed';
+      const read = this.host.surgeInstance();
+      const v = await Promise.race([read, budget]);
+      if (v === INSTANCE_READ_TIMED_OUT) {
+        this.noteLateInstanceRead(read);
+        return 'read_failed';
+      }
+      this.lastLateInstanceFailure = null;
       r = v;
     } catch {
       return 'read_failed';
@@ -473,6 +480,23 @@ export class Engine {
     facts.version = inst.version;
     facts.build = inst.build;
     return null;
+  }
+
+  /**
+   * 总时限到达后读取仍在进行：它失败时记下原因（例如服务的 codesign 超时得到的 signature_invalid），否则日志中只有
+   * read_failed，看不出是哪一步失败。成功时不记（结果已进入读取器的缓存）。同一原因连续出现只记一次；只含原因代码。
+   */
+  private noteLateInstanceRead(read: Promise<RunningInstanceResult>): void {
+    void Promise.resolve(read).then(
+      (late: unknown) => {
+        const reason: unknown = typeof late === 'object' && late !== null && (late as { ok?: unknown }).ok !== true ? (late as { reason?: unknown }).reason : null;
+        const failure = isRunningInstanceFailure(reason) ? reason : null;
+        if (failure === this.lastLateInstanceFailure) return;
+        this.lastLateInstanceFailure = failure;
+        if (failure !== null) this.logger.log('warn', 'surge.version_read_late', { reason: failure });
+      },
+      () => undefined,
+    );
   }
 
   /** 只在结论变化时记日志；不记录任何输出内容。 */

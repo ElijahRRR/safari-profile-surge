@@ -3,6 +3,7 @@
 import { readFileSync } from 'node:fs';
 import { CAPABILITY_CRITERIA, CAPABILITY_KEYS, CAPABILITY_LABELS } from '@sfe/contract';
 import { describe, expect, it } from 'vitest';
+import { SERVICE_CODESIGN_TIMEOUT_MS, SERVICE_INSTANCE_READ_BUDGET_MS } from '../src/deps.js';
 
 const read = (name: string): string => readFileSync(new URL(`../../../docs/${name}`, import.meta.url), 'utf8');
 
@@ -34,6 +35,13 @@ describe('docs/P0-RUNBOOK.md', () => {
     expect(text).toContain('从**运行中的 Surge 实例**取得');
   });
 
+  it('V1 and V5 hold the instance read to the service reader limits (P0 waits longer than the service)', () => {
+    const row = (n: number) => text.split('\n').find((l) => l.startsWith(`| V${n} |`))!;
+    expect(row(5)).toContain(`在 ${SERVICE_CODESIGN_TIMEOUT_MS / 1000} 秒内完成`);
+    expect(row(1)).toContain(`合计在 ${SERVICE_INSTANCE_READ_BUDGET_MS / 1000} 秒内`);
+    expect(text).toContain('instance 同时按服务的时限核对');
+  });
+
   it('V6 defines RUN as an absolute $HOME path (instance prints ~, which does not expand inside quotes) and builds a new scratch app per case', () => {
     const v6 = text.slice(text.indexOf('V6 的步骤'), text.indexOf('## 2. 通用回退'));
     expect(v6).toContain('RUN="$HOME/Library/Application Support/SafariProfileSurge/p0/<运行编号>"');
@@ -42,6 +50,25 @@ describe('docs/P0-RUNBOOK.md', () => {
     expect(v6).toMatch(/APP="\$DIR\/SFE-P0-Selftest\.app"/);
     expect(v6).toContain('DIR="$RUN/selftest/$CASE-$(date +%Y%m%d%H%M%S)"');
     expect(v6).toContain('instance --run <运行编号> --self-test-bundle "$APP"');
+  });
+
+  it('V6 command blocks carry no # comments: macOS zsh (interactivecomments off) passes them to the command as arguments', () => {
+    const v6 = text.slice(text.indexOf('V6 的步骤'), text.indexOf('## 2. 通用回退'));
+    const blocks = [...v6.matchAll(/```sh\n([\s\S]*?)```/g)].map((m) => m[1]!);
+    expect(blocks).toHaveLength(2);
+    for (const line of blocks.join('').split('\n')) {
+      // 单引号中的 # 是字面量（printf 写出的 #include）
+      expect(line.replace(/'[^']*'/g, "''"), line).not.toContain('#');
+    }
+    // 第一段建 App 并运行一次 instance；按情况的改动写在正文中；第二段再运行一次并结束进程
+    expect(blocks[0]).toContain('CASE=plain\n');
+    expect(blocks[0]).toContain('cp -p "$APP/Contents/MacOS/selftest" "$DIR/selftest.copy"\n');
+    expect(blocks[0]).toContain('instance --run <运行编号> --self-test-bundle "$APP"\n');
+    expect(blocks[1]).toBe('npx tsx tools/p0/src/cli.ts instance --run <运行编号> --self-test-bundle "$APP"\nkill "$SELFTEST_PID"\n');
+    for (const c of ['plutil -convert xml1 -o "$DIR/Info.new" "$APP/Contents/Info.plist" && mv "$DIR/Info.new" "$APP/Contents/Info.plist"', 'mv "$DIR/selftest.copy" "$APP/Contents/MacOS/selftest"', 'xattr -w com.example.sfe-p0 1 "$APP"']) {
+      expect(v6).toContain(`\`${c}\``);
+    }
+    expect(v6).toContain('--raw-dir <目录>');
   });
 
   it('documents the overall order and the manual profile switch', () => {

@@ -8,13 +8,14 @@ import { join } from 'node:path';
 import { CAPABILITY_CONTEXT_DEPS, type CapabilityKey, type CapabilityStatus } from '@sfe/contract';
 import { parseCapabilityKey } from '../args.js';
 import type { ContextOverrides } from '../context.js';
-import { NdjsonClientError, RUNNING_INSTANCE_FAILURE_TEXT, ndjsonRequest, versionContextErrors } from '../deps.js';
+import { NdjsonClientError, RUNNING_INSTANCE_FAILURE_TEXT, ndjsonRequest, serviceLimitsExceeded, versionContextErrors } from '../deps.js';
 import { failed, refused, usage, type ExitCode } from '../errors.js';
 import { computeEvidenceManifest } from '../evidence.js';
 import { buildProposal } from '../proposal.js';
 import { readResult, readResultHistory } from '../results.js';
 import { DEFAULT_HOST_APP, codesignTeamId } from '../system.js';
 import { measureContextWithInstance, openRun, openSession, type Ctx, type Session } from './common.js';
+import { serviceLimitText } from './instance.js';
 
 function serviceDataDir(ctx: Ctx): string {
   if (ctx.args.strings['data-dir']) return ctx.args.strings['data-dir'];
@@ -41,11 +42,16 @@ export async function runPropose(ctx: Ctx): Promise<ExitCode> {
     processPaths: result?.processPaths ?? state.processPaths,
     signingIdentity,
   });
-  // 依赖 Surge 版本/构建的能力：读不到运行中 Surge 的版本（或读到的不是版本）时拒绝，而不是提示后照样提议——
-  // 这样的记录在服务端永远不会生效（版本读不到即待验证，不再匹配记录的 null 或 any），服务端也会拒绝。
+  // 依赖 Surge 版本/构建的能力：读不到运行中 Surge 的版本（或读到的不是版本，或服务的读取器在它的时限内读不到）时
+  // 拒绝，而不是提示后照样提议——这样的记录在服务端永远不会生效（版本读不到即待验证，不再匹配记录的 null 或 any）。
   const versionErrors = versionContextErrors(key, current);
   if (versionErrors.length > 0) {
-    const why = instance.result.ok ? '' : `运行中的 Surge 无法确认：${RUNNING_INSTANCE_FAILURE_TEXT[instance.result.reason]}。`;
+    const over = serviceLimitsExceeded(instance);
+    const why = !instance.result.ok
+      ? `运行中的 Surge 无法确认：${RUNNING_INSTANCE_FAILURE_TEXT[instance.result.reason]}。`
+      : over.length > 0
+        ? `读到了运行中 Surge 的版本，但服务在它的时限内读不到：${serviceLimitText(over)}。`
+        : '';
     throw refused(
       `生成提议失败：${versionErrors.map((e) => e.message).join('；')}。${why}依赖 Surge 版本的能力要在读到运行中 Surge 的版本与构建号后才能提议（运行 instance 查看逐条检查；版本只来自运行中的 Surge 实例，不要把 getVersion 映射为 cli）`,
     );

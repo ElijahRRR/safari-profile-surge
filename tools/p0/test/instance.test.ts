@@ -158,6 +158,34 @@ describe('p0 instance (read-only)', () => {
     expect(exec.mock.calls.map((c) => c[0])).toEqual(['/usr/bin/defaults', '/usr/bin/defaults']);
   });
 
+  it('a version read only because P0 waits longer than the service exits 3: the service reader would not read it', async () => {
+    const ok = { pid: 404, startedAt: '2026-10-21T09:00:00.000Z', bundlePath: APP, bundleId: 'com.nssurge.surge-mac', version: '6.5.0', build: '10960' };
+    const step = (rule: Report['steps'][number]['rule'], ms: number) => ({ rule, outcome: 'pass' as const, detail: {}, ms });
+    const cases: Array<{ steps: Report['steps']; text: string; reason: string }> = [
+      // codesign 用了 20 秒：P0 的 60 秒超时内通过，服务的 15 秒超时内不会
+      { steps: [step('process', 100), step('info_plist', 50), step('signature', 20_000)], text: '签名校验耗时 20.000 秒，达到服务的 codesign 超时 15 秒', reason: 'signature_invalid' },
+      // ps 与 lsof 每次读取都要执行（缓存只省掉包信息与签名）：合计 9 秒，超过引擎的 8 秒总时限
+      { steps: [step('process', 6_000), step('info_plist', 50), step('running_image', 3_000), step('signature', 100)], text: '合计 9.000 秒，达到引擎的读取总时限 8 秒', reason: 'read_failed' },
+    ];
+    for (const c of cases) {
+      const report: Report = { result: { ok: true, instance: ok }, steps: c.steps, cached: false };
+      const t = setup('linux', async () => ({ stdout: '', stderr: '', code: -1 }), { surgeInstance: async () => report });
+      expect(await main(['instance', '--raw-dir', t.base], t.deps), c.reason).toBe(EXIT.REFUSED);
+      const text = t.out.text();
+      expect(text).toContain('运行中的 Surge：6.5.0（10960）· pid 404');
+      expect(text).toContain('但超过服务读取的时限，服务读不到这个版本');
+      expect(text).toContain(c.text);
+      const [ev] = evidenceFiles(onlyRun(t.base));
+      expect(ev).toMatchObject({ result: { ok: true }, service: { codesignTimeoutMs: 15_000, readBudgetMs: 8_000, result: { ok: false, reason: c.reason } } });
+    }
+    // 只有第一次读取慢（包信息与签名，服务会缓存）：通过
+    const firstOnly: Report = { result: { ok: true, instance: ok }, steps: [step('process', 500), step('info_plist', 4_000), step('signature', 10_000)], cached: false };
+    const t = setup('linux', async () => ({ stdout: '', stderr: '', code: -1 }), { surgeInstance: async () => firstOnly });
+    expect(await main(['instance', '--raw-dir', t.base], t.deps)).toBe(EXIT.OK);
+    expect(t.out.text()).not.toContain('服务读取的时限');
+    expect(evidenceFiles(onlyRun(t.base))[0]).toMatchObject({ service: { exceeded: [], result: { ok: true } } });
+  });
+
   it('uses the latest run when one exists, and an injected reader for offline tests', async () => {
     const report: Report = { result: { ok: false, reason: 'translocated' }, steps: [{ rule: 'bundle_executable', outcome: 'fail', detail: { reason: 'translocated', matching: 0 }, ms: 1 }], cached: false };
     const t = setup('linux', async () => ({ stdout: '', stderr: '', code: -1 }), { surgeInstance: async () => report });
@@ -277,6 +305,19 @@ describe('inventory: running Surge instance', () => {
     expect(text).not.toContain('Surge getVersion');
     // 能力上下文（takeover_state_readable 的结果）用同一次读取的版本
     expect(JSON.parse(readFileSync(join(runDir, 'results', 'takeover_state_readable.json'), 'utf8')).context).toMatchObject({ surgeVersion: '6.5.0', surgeBuild: '10960' });
+  });
+
+  it('a version the service reader would not read within its limits is recorded as unknown, with the reason', async () => {
+    const slow: Report = { ...OK, steps: [{ rule: 'signature', outcome: 'pass', detail: { code: 0 }, ms: 16_000 }] };
+    const t = inventoryWith(slow, ['6.5.0', '10960']);
+    expect(await main(['inventory', '--raw-dir', t.base], t.deps)).toBe(EXIT.OK);
+    const runDir = onlyRun(t.base);
+    const inventory = JSON.parse(readFileSync(join(runDir, 'inventory.json'), 'utf8')) as Record<string, any>;
+    expect(inventory.summary.surgeVersion).toEqual({ version: null, build: null });
+    expect(inventory.summary.surgeInstance).toEqual({ ok: false, reason: 'signature_invalid' });
+    expect(inventory.surgeInstance.serviceLimitsExceeded).toEqual([{ limit: 'signature', ms: 16_000, limitMs: 15_000, reason: 'signature_invalid' }]);
+    expect(JSON.parse(readFileSync(join(runDir, 'results', 'takeover_state_readable.json'), 'utf8')).context).toMatchObject({ surgeVersion: null, surgeBuild: null });
+    expect(t.out.text()).toContain('读到了运行中 Surge 的版本，但超过服务读取的时限：签名校验耗时 16.000 秒');
   });
 
   it('an unreadable instance gives a null version with a warning; a different on-disk version is flagged', async () => {
