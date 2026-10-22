@@ -1,6 +1,6 @@
 // 能力验证上下文（CapabilityContext）的构造。字段来源与服务运行时一致（ARCHITECTURE §5.2）：
-// sw_vers 构建号、Safari.app Info.plist、运行中的 Surge 实例（surge/running-instance.ts，与服务同一读取器；
-// 从不经 getVersion）、getTakeoverState、getAutoReloadSetting、
+// sw_vers 构建号、Safari.app Info.plist、运行中的 Surge 实例（surge/running-instance.ts，与服务同一读取器，
+// 并与 getVersion 即 `surge-cli --raw version` 交叉核对，见 commands/common.ts）、getTakeoverState、getAutoReloadSetting、
 // 已确认的进程路径与入口策略、原语实现映射。读不到的字段记 null（服务运行时同样读不到才会匹配）；
 // 例外：Surge 版本与构建读不到时永远不匹配（NEVER_NULL_FIELDS），依赖它们的能力不能提议。
 

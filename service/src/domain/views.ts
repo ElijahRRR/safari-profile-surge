@@ -21,7 +21,7 @@ import {
   type SurgeStatusView,
   type TakeoverState,
 } from '@sfe/contract';
-import type { RunningInstanceFailure } from '../surge/running-instance.js';
+import type { RunningInstanceFailure, SurgeVersionCheckFailure } from '../surge/running-instance.js';
 import type {
   AccountRecord,
   EnvironmentRecord,
@@ -150,19 +150,32 @@ export function buildRouteSummary(route: RouteStateRecord): RouteSummaryView {
 // ---------- Surge 状态 ----------
 
 /**
- * Surge 可达、但运行中的版本与构建号无法确认的原因（内部；不进入契约视图，展示文字见 Engine.readBasicFacts）：
- * 运行实例读取（surge/running-instance.ts）的失败原因，例如 not_running、modified_after_start、running_image_mismatch。
+ * Surge 可达、但运行中的版本与构建号不被接受的原因（内部；不进入契约视图，展示文字见 Engine.readBasicFacts）：
+ * 运行实例读取（surge/running-instance.ts）的失败原因（例如 not_running、modified_after_start、running_image_mismatch），
+ * 或与 `surge-cli --raw version` 交叉核对的结论：cli_version_unreadable、cli_bundle_mismatch、surge_version_unsupported
+ * （低于最低支持版本 6.10.0 / 12500 / Controller 协议 22）。
  */
-export type SurgeVersionIssue = RunningInstanceFailure;
+export type SurgeVersionIssue = RunningInstanceFailure | SurgeVersionCheckFailure;
 
 export interface SurgeFacts {
   reachable: boolean;
-  /** 运行中 Surge 的版本与构建号：读不到或格式不对时为 null（依赖版本的能力按待验证处理，§5.2）。 */
+  /**
+   * 运行中 Surge 的版本与构建号：只有运行实例读取与 `surge-cli --raw version` 一致、且不低于最低支持版本时才填写；
+   * 否则为 null（依赖版本的能力按待验证处理、相应动作拒绝，§5.2；进入普通模式不受影响）。
+   */
   version: string | null;
   build: string | null;
+  /** Controller 协议号（只来自 `surge-cli --raw version`，与版本、构建号一起接受或一起为 null）。 */
+  controllerProtocol: number | null;
   /** 只在可达时填写：版本或构建号为 null 的原因；可达且都已确认时为 null。 */
   versionIssue: SurgeVersionIssue | null;
+  /**
+   * 引擎启动时间（getRuntimeInfo：`dump performance` 的 uptime 或 /v1/metrics 的 surge_uptime_seconds 换算，整秒）；
+   * 读不到为 null。比较两次读取时用 surgeRestartedBetween（引擎 context.ts），不能直接比较字符串。
+   */
   startedAt: string | null;
+  /** 引擎运行时长（秒）；读不到为 null。 */
+  uptimeSeconds: number | null;
   currentProfileName: string | null;
   currentProfilePath: string | null;
   onWorkingProfile: boolean | null;
@@ -181,8 +194,10 @@ export function emptySurgeFacts(): SurgeFacts {
     reachable: false,
     version: null,
     build: null,
+    controllerProtocol: null,
     versionIssue: null,
     startedAt: null,
+    uptimeSeconds: null,
     currentProfileName: null,
     currentProfilePath: null,
     onWorkingProfile: null,

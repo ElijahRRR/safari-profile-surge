@@ -109,8 +109,8 @@ describe('runEntrySequence with the ruleset strategy on FakeSurge', () => {
 
   it('stops at the failed step and reports the last confirmed bits', async () => {
     const { surge, ruleset } = await setup();
-    surge.failNext('updateExternalResource');
-    const run = await runEntrySequence({ controller: ruleset, now: () => Date.now() }, ['BLOCKED', 'ACTIVE']);
+    // 第一步确认之后，下一步等待文件监视时的 rule match 读回失败（策略从不调用 updateExternalResource）
+    const run = await runEntrySequence({ controller: ruleset, now: () => Date.now(), onStep: () => surge.failNext('matchRule') }, ['BLOCKED', 'ACTIVE']);
     expect(run.stoppedEarly).toBe(true);
     expect(run.modes).toHaveLength(1);
     expect(run.modes[0]!.error?.code).toBe('SURGE_COMMAND_FAILED');
@@ -265,16 +265,23 @@ describe('probeTempInsertion', () => {
     expect(surge.tempRules).toEqual([userRule]);
   });
 
-  it('the temp_rule strategy refuses transitions it cannot make safely', async () => {
-    const { temp, surge } = await setup({ tempRuleInsertion: 'tail' });
-    const run = await runEntrySequence({ controller: temp, now: () => Date.now() }, ['BLOCKED', 'VERIFY_ONLY']);
-    expect(run.modes[0]!.ok).toBe(true);
-    expect(run.stoppedEarly).toBe(true);
-    expect(run.modes[1]!.error?.code).toBe('CAPABILITY_UNVERIFIED');
-    // 拒绝发生在写入之前：仍是 BLOCKED
-    expect((await temp.read()).mode).toBe('BLOCKED');
-    expect(surge.calls.reloadProfile ?? 0).toBe(0);
-  });
+  for (const insertion of ['head', 'tail'] as const) {
+    it(`the temp_rule strategy reaches every mode with ${insertion} insertion (its rule conditions are disjoint, so order does not matter)`, async () => {
+      const { temp, surge } = await setup({ tempRuleInsertion: insertion });
+      const run = await runEntrySequence({ controller: temp, now: () => Date.now() }, ['BLOCKED', 'VERIFY_ONLY', 'ACTIVE', 'NORMAL']);
+      expect(run.stoppedEarly).toBe(false);
+      expect(run.modes.map((m) => [m.target, m.readbackMode, m.ok])).toEqual([
+        ['BLOCKED', 'BLOCKED', true],
+        ['VERIFY_ONLY', 'VERIFY_ONLY', true],
+        ['ACTIVE', 'ACTIVE', true],
+        ['NORMAL', 'NORMAL', true],
+      ]);
+      // 每一步记录的位组合都是读回确认的已知模式（放行窗口分析据此计算允许的结果）
+      for (const st of run.timeline.steps) expect(Object.values(ENTRY_MODE_BITS)).toContainEqual(st.after);
+      expect(surge.tempRules).toEqual([]);
+      expect(surge.calls.reloadProfile ?? 0).toBe(0);
+    });
+  }
 });
 
 describe('profileBoundary', () => {

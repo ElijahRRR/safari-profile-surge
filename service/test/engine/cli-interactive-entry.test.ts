@@ -47,7 +47,8 @@ describe('temp_rule entry when the CLI write enters interactive mode', () => {
     const a = await h.app.activate(envId, { request_id: rid('act') }, WEB);
     await h.idle();
     const op = h.repos.operations.get(a.operation_id)!;
-    expect(calls.some((c) => c[0] === 'temp-rule' && c[1] === 'add')).toBe(true);
+    // 文档写法 `rule temp add <rule>`（Mac 6.9.0+）；写命令不加 --raw
+    expect(calls.some((c) => c[0] === 'rule' && c[1] === 'temp' && c[2] === 'add')).toBe(true);
     expect(op.status).not.toBe('succeeded');
     expect(op.error?.details).toMatchObject({ cause: 'SURGE_COMMAND_FAILED' });
     const steps = h.repos.operations.listSteps(a.operation_id).map((s) => s.message);
@@ -62,7 +63,10 @@ describe('temp_rule entry when the CLI write enters interactive mode', () => {
     h = await createHarness({ entryStrategy: 'temp_rule' });
     const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await bind(h, PROFILE_A, envId);
-    await h.app.activate(envId, { request_id: rid('act') }, WEB);
+    // 激活到 VERIFY_ONLY 等待后取消：回滚停在 BLOCKED（临时规则 {block}）
+    const a = await h.app.activate(envId, { request_id: rid('act') }, WEB);
+    await h.idle();
+    await h.app.cancelOperation(a.operation_id, { request_id: rid('cancel') }, WEB);
     await h.idle();
     expect(h.repos.routeState.get().entryMode).toBe('BLOCKED');
     const rulesBefore = [...h.fake.tempRules];
@@ -73,7 +77,7 @@ describe('temp_rule entry when the CLI write enters interactive mode', () => {
     const n = await h.app.enterNormal(active ? { request_id: rid('normal'), old_session_policy: 'closed_confirmed', confirmed_environment_id: active } : { request_id: rid('normal') }, WEB);
     await h.idle();
     const op = h.repos.operations.get(n.operation_id)!;
-    expect(calls.some((c) => c[0] === 'temp-rule' && c[1] === 'remove')).toBe(true);
+    expect(calls.some((c) => c[0] === 'rule' && c[1] === 'temp' && c[2] === 'remove')).toBe(true);
     expect(op.status).toBe('failed');
     expect(op.error).toMatchObject({ code: 'SURGE_COMMAND_FAILED', message: INTERACTIVE_MESSAGE, details: { primitive: 'removeTempRule', reason: 'interactive_mode' } });
     expect(h.repos.routeState.get().entryMode).toBe('BLOCKED');

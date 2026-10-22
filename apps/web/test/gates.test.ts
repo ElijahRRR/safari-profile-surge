@@ -56,6 +56,24 @@ describe('publish button', () => {
     m.unmount();
   });
 
+  it('explains why new nodes stay pending while local policy-path re-reading is unproven (Surge 6.10 skips local resources)', async () => {
+    const { ctx } = testContext(() => ({ status: 500 }), snapshot({ environments: [pendingEnv], capabilities: capabilities({ ...allSupported(), policy_path_reread: 'unverified' }) }));
+    const m = await mountWith(PendingDeployCard, ctx);
+    const note = document.body.querySelector('[data-test="policy-path-note"]')!;
+    expect(note.textContent).toContain('Local resources are skipped.');
+    expect(note.textContent).toContain('已部署的节点不受影响');
+    expect(document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!.disabled).toBe(true);
+    m.unmount();
+  });
+
+  it('shows no policy-path note when only other publish capabilities are missing', async () => {
+    const { ctx } = testContext(() => ({ status: 500 }), snapshot({ environments: [pendingEnv], capabilities: capabilities({ ...allSupported(), connection_continuity: 'unverified' }) }));
+    const m = await mountWith(PendingDeployCard, ctx);
+    expect(document.body.querySelector('[data-test="publish-gate"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-test="policy-path-note"]')).toBeNull();
+    m.unmount();
+  });
+
   it('publishes when the gate is met', async () => {
     const { ctx, calls } = testContext(
       (c: Call) => (c.url === '/api/deployments/publish' ? { status: 202, body: { operation_id: 'op_7', environment_id: null, revision: null, duplicate: false } } : { status: 404 }),

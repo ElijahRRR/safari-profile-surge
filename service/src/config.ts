@@ -28,6 +28,7 @@ export const SURGE_ADAPTER_PRIMITIVES = [
   'selectGroupPolicy',
   'testPolicy',
   'listRules',
+  'matchRule',
   'listActiveRequests',
   'listRecentRequests',
   'killRequest',
@@ -232,12 +233,6 @@ export function readInstallConfig(path: string): InstallConfig {
       for (const [k, v] of Object.entries(obj.adapterMechanism as Record<string, unknown>)) {
         if (!known.has(k)) {
           issues.push(`安装配置中的原语 ${k.slice(0, 64)} 不存在，已忽略`);
-          continue;
-        }
-        if (k === 'getVersion' && v !== 'unavailable') {
-          // 版本只来自运行中的 Surge 实例（surge/running-instance.ts）；Surge 6.5 的 surge-cli 没有版本命令
-          // （--version 进入交互模式），HTTP 实现也没有。名字保留在原语清单中只为兼容旧的 install.json。
-          issues.push('安装配置中的原语 getVersion 已不再使用（版本改由运行中的 Surge 实例读取），按不可用处理');
           continue;
         }
         if (v === 'cli' || v === 'http' || v === 'unavailable') cfg.adapterMechanism[k as SurgePrimitive] = v;

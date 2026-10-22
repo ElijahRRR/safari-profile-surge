@@ -4,6 +4,7 @@ import { analyzeAttribution, type AttributionInput, type AttributionRecord } fro
 import { analyzeContinuity, formatPeriod, percentile, summarizePeriods, type Sample } from '../src/analysis/continuity.js';
 import { analyzeEntryWindow, candidateBits, expectedOutcome, outcomeOf, type EntryTimeline } from '../src/analysis/entry-window.js';
 import { compareSignals, type ReloadSignals } from '../src/analysis/reload.js';
+import { classOf, isEntryRule, judgeMatchMatrix, matchProbes, outcomeOfPolicy, type MatchRecord } from '../src/analysis/rule-match.js';
 import { udpQuicCoverage, websocketEvidence, type ModeWindow, type UdpCoverageInput } from '../src/analysis/udp-coverage.js';
 import { coverageAllowsSupported, planEntryTransition } from '../src/deps.js';
 
@@ -241,18 +242,83 @@ describe('continuity analysis', () => {
 });
 
 describe('reload signals', () => {
-  const s = (over: Partial<ReloadSignals> = {}): ReloadSignals => ({ at: 'x', canaryLoaded: false, surgeStart: 'S@1', tempRules: ['r1'], profileName: 'SFE-P0-测试', ...over });
-
-  it('reports no reload only when the canary was definitely not read', () => {
-    expect(compareSignals(s(), s())).toEqual({ reloaded: false, reasons: [] });
-    expect(compareSignals(s(), s({ canaryLoaded: null })).reloaded).toBeNull();
+  const s = (over: Partial<ReloadSignals> = {}): ReloadSignals => ({
+    at: 'x',
+    profileCanaryLoaded: false,
+    surgeStart: 'S@1',
+    engineUptimeSeconds: 100,
+    tempRules: ['r1'],
+    profileName: 'SFE-P0-测试',
+    ...over,
   });
 
-  it('detects canary reads, restarts, lost temp rules and profile changes', () => {
-    expect(compareSignals(s(), s({ canaryLoaded: true })).reasons).toHaveLength(1);
-    expect(compareSignals(s(), s({ surgeStart: 'S@2' })).reasons[0]).toContain('重启');
+  it('reports no reload only when the profile canary was definitely not read', () => {
+    expect(compareSignals(s(), s({ engineUptimeSeconds: 130 }))).toEqual({ reloaded: false, reasons: [], processRestarted: false, engineRestarted: false });
+    expect(compareSignals(s(), s({ profileCanaryLoaded: null })).reloaded).toBeNull();
+  });
+
+  it('detects profile canary reads, process and engine restarts, lost temp rules and profile changes', () => {
+    expect(compareSignals(s(), s({ profileCanaryLoaded: true })).reasons).toEqual(['配置 canary 已被重新读取（发生了配置重载）']);
+    const proc = compareSignals(s(), s({ surgeStart: 'S@2' }));
+    expect(proc.reasons[0]).toContain('重启');
+    expect(proc.processRestarted).toBe(true);
     expect(compareSignals(s(), s({ tempRules: [] })).reasons[0]).toContain('临时规则');
     expect(compareSignals(s(), s({ profileName: '其他' })).reloaded).toBe(true);
+  });
+
+  it('an engine-only restart (6.9+ reload may escalate to it) shows as falling uptime with the same process start', () => {
+    const c = compareSignals(s(), s({ engineUptimeSeconds: 3, tempRules: [] }));
+    expect(c).toMatchObject({ reloaded: true, processRestarted: false, engineRestarted: true });
+    expect(c.reasons).toContain('引擎运行时长回落（引擎重启）');
+    // 运行时长读不到时不判定重启（未知），也不当作“未重载”的证据之外的结论
+    expect(compareSignals(s(), s({ engineUptimeSeconds: null })).engineRestarted).toBeNull();
+  });
+});
+
+describe('rule match matrix', () => {
+  const SAFARI = '/Applications/Safari.app/Contents/MacOS/Safari';
+  const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  const probes = matchProbes({ processPaths: [SAFARI], controlPaths: [CHROME, SAFARI], verifyHost: 'api.ipify.org', otherHost: 'echo.p0.example.test' });
+  const rec = (mode: MatchRecord['mode'], p: (typeof probes)[number], rule: string | null, policy: string | null): MatchRecord => ({ ...p, mode, rule, policy, error: rule === null ? 'SURGE_COMMAND_FAILED' : null });
+  const udp = `AND,((PROCESS-NAME,${SAFARI}),(PROTOCOL,UDP)),REJECT`;
+  const active = `AND,((PROCESS-NAME,${SAFARI}),(NOT,((PROTOCOL,UDP)))),SFE-ROUTE`;
+
+  it('probes Safari and each control path (never a Safari path as control) × verify/other host × TCP/UDP/QUIC; QUIC counts as UDP', () => {
+    expect(probes).toHaveLength(12);
+    expect(probes.filter((p) => !p.safari).every((p) => p.processPath === CHROME)).toBe(true);
+    expect(classOf({ protocol: 'QUIC', verify: true })).toBe('udpVerify');
+    expect(classOf({ protocol: 'TCP', verify: false })).toBe('tcpOther');
+    expect(isEntryRule('RULE-SET,sfe-entry-udp.list,REJECT', [SAFARI])).toBe(true);
+    expect(isEntryRule('FINAL,DIRECT', [SAFARI])).toBe(false);
+    expect(outcomeOfPolicy('REJECT-DROP')).toBe('reject');
+    expect(outcomeOfPolicy('SFE-N-P0-A')).toBe('route');
+    expect(outcomeOfPolicy('DIRECT')).toBe('pass');
+  });
+
+  it('ACTIVE: UDP and QUIC rejected by our rule, TCP routed by our rule, Chrome untouched → no mismatch', () => {
+    const records = probes.map((p) => (p.safari ? rec('ACTIVE', p, p.protocol === 'TCP' ? active : udp, p.protocol === 'TCP' ? 'SFE-ROUTE' : 'REJECT') : rec('ACTIVE', p, 'FINAL,DIRECT', 'DIRECT')));
+    const j = judgeMatchMatrix(records, [SAFARI]);
+    expect(j).toEqual({ safari: { total: 6, mismatches: [] }, control: { total: 6, hits: [] }, errors: 0 });
+  });
+
+  it('flags QUIC that escapes the UDP rule, a pass where a rule is expected, a Chrome hit and failed reads', () => {
+    const records = probes.map((p) => {
+      if (!p.safari) return rec('ACTIVE', p, p.verify && p.protocol === 'TCP' ? active : 'FINAL,DIRECT', p.verify && p.protocol === 'TCP' ? 'SFE-ROUTE' : 'DIRECT');
+      if (p.protocol === 'QUIC') return rec('ACTIVE', p, 'FINAL,DIRECT', 'DIRECT');
+      if (p.protocol === 'UDP' && !p.verify) return rec('ACTIVE', p, null, null);
+      return rec('ACTIVE', p, p.protocol === 'TCP' ? active : udp, p.protocol === 'TCP' ? 'SFE-ROUTE' : 'REJECT');
+    });
+    const j = judgeMatchMatrix(records, [SAFARI]);
+    expect(j.safari.mismatches).toHaveLength(2);
+    expect(j.safari.mismatches[0]).toContain('QUIC');
+    expect(j.control.hits).toHaveLength(1);
+    expect(j.errors).toBe(1);
+  });
+
+  it('NORMAL: Safari must not hit an entry rule', () => {
+    const p = probes[0]!;
+    expect(judgeMatchMatrix([rec('NORMAL', p, 'FINAL,DIRECT', 'DIRECT')], [SAFARI]).safari.mismatches).toEqual([]);
+    expect(judgeMatchMatrix([rec('NORMAL', p, 'RULE-SET,sfe-entry-block.list,REJECT', 'REJECT')], [SAFARI]).safari.mismatches).toHaveLength(1);
   });
 });
 

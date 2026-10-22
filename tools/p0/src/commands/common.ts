@@ -1,5 +1,6 @@
 // 各命令共用：运行目录、合成测试凭据、Surge 会话（固定原语映射 + 写入守卫 + 调用记录）、测试服务检查、
-// 上下文测量（Surge 版本来自运行中的 Surge 实例，与服务同一读取器）、写入前快照与确认。
+// 上下文测量（Surge 版本来自运行中的 Surge 实例，与服务同一读取器，并与 `surge-cli --raw version` 交叉核对）、
+// 写入前快照与确认。
 
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
@@ -12,6 +13,7 @@ import { buildContext, type ContextOverrides } from '../context.js';
 import {
   SURGE_PRIMITIVES,
   createDefaultSurgeInstanceReader,
+  crossCheckSurgeVersion,
   parseHttpApiLine,
   serviceInstanceResult,
   verifyCliPath,
@@ -19,6 +21,7 @@ import {
   type RunningInstanceReport,
   type RunningInstanceResult,
   type SurgeAdapter,
+  type SurgeVersionCheck,
 } from '../deps.js';
 import { refused } from '../errors.js';
 import { directGet, parseProxyAddress, type ProxyAddress } from '../http-client.js';
@@ -28,7 +31,7 @@ import { RunDir, assertSafeBaseDir, defaultBaseDir, newRunId } from '../run-dir.
 import { emptyState, loadState, saveState, type RunState, type ServersInfo } from '../state.js';
 import { DEFAULT_SURGE_CLI, SAFARI_APP, plistValue, surgeStartFingerprint, swVers, type ExecFn } from '../system.js';
 import { CANARY_FILE, TEST_NODES, TEST_PROFILE_NAME } from '../test-profile.js';
-import { createGuardedAdapter, createP0Adapter, describeLocation, emptyGuard, resourcesForPath, type WriteGuard } from '../surge-access.js';
+import { createGuardedAdapter, createP0Adapter, describeLocation, emptyGuard, readCliVersion, resourcesForPath, type WriteGuard } from '../surge-access.js';
 
 export interface Deps {
   exec: ExecFn;
@@ -297,19 +300,38 @@ export async function measureContext(
   return (await measureContextWithInstance(ctx, session, state, extras)).context;
 }
 
-/** 同 measureContext，另返回运行实例的读取结果（拒绝提议时说明原因）。版本从不经 getVersion。 */
+/**
+ * 运行实例（服务时限内可读时）与 `surge-cli --raw version` 的交叉核对，与服务 engine/context.ts 的 readVersion 同一规则
+ * （crossCheckSurgeVersion）：运行实例低于最低支持版本 6.10.0（12500）、CLI 不支持 version、两者版本或构建号不同、
+ * Controller 协议 < 22、CLI 读不到——任一即失败。运行实例读不到时为 null（原因见运行实例的结果）。
+ * 没有会话（没有原语映射）时 CLI 版本按读不到处理。
+ */
+export async function crossCheckVersion(
+  session: { adapter: Pick<SurgeAdapter, 'getVersion'> } | null,
+  instance: RunningInstanceReport,
+): Promise<SurgeVersionCheck | null> {
+  const svc = serviceInstanceResult(instance);
+  if (!svc.ok) return null;
+  return crossCheckSurgeVersion(svc.instance, session ? await readCliVersion(session.adapter) : null);
+}
+
+/**
+ * 同 measureContext，另返回运行实例的读取结果与版本交叉核对（拒绝提议时说明原因）。上下文中的版本与构建号只在交叉
+ * 核对通过时记录（与服务的 SurgeFacts 一致）；否则为 null，依赖版本的能力不能提议。
+ */
 export async function measureContextWithInstance(
   ctx: Ctx,
   session: { adapter: SurgeAdapter; mechanism: MechanismMap } | null,
   state: RunState,
   extras: MeasureExtras = {},
-): Promise<{ context: CapabilityContext; instance: RunningInstanceReport }> {
+): Promise<{ context: CapabilityContext; instance: RunningInstanceReport; versionCheck: SurgeVersionCheck | null }> {
   const v = await swVers(ctx.deps.exec);
   const safari = await plistValue(ctx.deps.exec, SAFARI_APP, 'CFBundleShortVersionString');
   const instance = extras.instance ?? (await readSurgeInstance(ctx));
-  // 服务的读取器在它的时限内读不到的版本（签名校验太慢、每次读取超过总时限）不进入上下文：这样的记录在服务中永远不会生效
-  const svc = serviceInstanceResult(instance);
-  const version = svc.ok ? { version: svc.instance.version, build: svc.instance.build } : null;
+  // 服务的读取器在它的时限内读不到的版本（签名校验太慢、每次读取超过总时限）不进入上下文：这样的记录在服务中永远不会生效；
+  // 运行实例与 CLI 报告的版本不一致、低于最低支持版本或协议过低时同样不进入。
+  const versionCheck = await crossCheckVersion(session, instance);
+  const version = versionCheck?.ok ? { version: versionCheck.version, build: versionCheck.build } : null;
   const autoReload = session ? await tryRead(() => session.adapter.getAutoReloadSetting()) : null;
   const takeover: TakeoverState | null = session ? await tryRead(() => session.adapter.getTakeoverState()) : null;
   const context = buildContext(
@@ -326,7 +348,7 @@ export async function measureContextWithInstance(
     },
     extras.overrides,
   );
-  return { context, instance };
+  return { context, instance, versionCheck };
 }
 
 export interface Snapshot {

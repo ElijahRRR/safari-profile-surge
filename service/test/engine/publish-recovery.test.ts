@@ -1,6 +1,8 @@
 // 发布批次的崩溃恢复与回滚归属（§6.2）：合并进批次的操作与导入逐行操作在崩溃后不会永远停在 running；
 // 多目标发布按操作记录；回滚写入失败或中途崩溃时，本应用自己写入的节点资源不会被误报为外部修改。
 // 从不重放写入：写入阶段的批次记为 UNKNOWN_STATE，由下一次发布按事实收敛。
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { NODE_RESOURCE_FILE, type ImportPreviewRequest } from '@sfe/contract';
 import type { ManagedProfileFiles } from '../../src/surge/files.js';
@@ -11,14 +13,28 @@ afterEach(async () => {
   await h?.close();
 });
 
-type FakeMethod = 'updateExternalResource' | 'listPolicies';
+// getGroupMembers：写入节点资源之后第一次读组成员就是等待它重新读取（写入之前另读一次组成员，作为“成员变化”的对照）；
+// 发布从不调用 updateExternalResource（Surge 6.10 的外部资源更新跳过本地资源）。
+type FakeMethod = 'getGroupMembers' | 'listPolicies';
 
-/** 让某个 FakeSurge 原语挂起（模拟进程在调用中途崩溃）。 */
-function hang(name: FakeMethod): { entered: () => boolean; restore: () => void } {
+/** 节点资源文件的当前内容。 */
+function nodeResource(): string {
+  return readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8');
+}
+
+/** 节点资源文件自调用时起是否已被改写（发布已写入）。 */
+function resourceWritten(): () => boolean {
+  const before = nodeResource();
+  return () => nodeResource() !== before;
+}
+
+/** 让某个 FakeSurge 原语挂起（模拟进程在调用中途崩溃）；when 为 false 的调用照常执行。 */
+function hang(name: FakeMethod, when: () => boolean = () => true): { entered: () => boolean; restore: () => void } {
   const fake = h.fake as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
   const orig = fake[name]!.bind(h.fake);
   let entered = false;
-  fake[name] = () => {
+  fake[name] = (...args: unknown[]) => {
+    if (!when()) return orig(...args);
     entered = true;
     return new Promise(() => undefined);
   };
@@ -49,10 +65,10 @@ async function queueTwoPortEdits(): Promise<{ x: string; y: string; ux: string; 
 }
 
 describe('publish batch crash recovery', () => {
-  test('crash while refreshing: the merged sibling is settled too, and the next publish converges both', async () => {
+  test('crash while waiting for Surge to re-read the resource: the merged sibling is settled too, and the next publish converges both', async () => {
     h = await createHarness({ dbFile: true });
     const { x, y, ux, uy } = await queueTwoPortEdits();
-    const stuck = hang('updateExternalResource');
+    const stuck = hang('getGroupMembers', resourceWritten());
     h.app.executor.start();
     await until(stuck.entered);
     // X 是主操作，Y 被合并进同一批次
@@ -75,6 +91,7 @@ describe('publish batch crash recovery', () => {
     expect(h.repos.environments.get(x)!.deployedProxyRevision).toBe(2);
     expect(h.repos.environments.get(y)!.deployedProxyRevision).toBe(2);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
   });
 
   test('crash before any write: the re-run batch re-collects the merged sibling instead of leaving it running', async () => {
@@ -155,14 +172,17 @@ describe('deployment records', () => {
 });
 
 describe('rollback ownership of the node resource', () => {
-  /** 第一次定向刷新失败（读回不一致 → 回滚）；回滚写入节点资源时按 mode 失败或挂起。 */
+  /** 第一次读回不一致（写入之后等待期间读到的仍是旧成员 → 回滚）；回滚写入节点资源时按 mode 失败或挂起。 */
   function failRefreshThenRollbackWrite(mode: 'throw' | 'hang'): { rollbackWriteEntered: () => boolean; restore: () => void } {
-    const origUpdate = h.fake.updateExternalResource.bind(h.fake);
-    let refreshes = 0;
-    h.fake.updateExternalResource = async (key: string) => {
-      refreshes++;
-      if (refreshes === 1) throw new Error('refresh failed');
-      return origUpdate(key);
+    const written = resourceWritten();
+    const origMembers = h.fake.getGroupMembers.bind(h.fake);
+    let lied = false;
+    h.fake.getGroupMembers = async (group: string) => {
+      if (!lied && written()) {
+        lied = true;
+        return ['REJECT', 'SFE-N-E0001-US01-v001'];
+      }
+      return origMembers(group);
     };
     const engine = h.app.engine;
     const origFiles = engine.profileFiles.bind(engine);
@@ -186,7 +206,6 @@ describe('rollback ownership of the node resource', () => {
     return {
       rollbackWriteEntered: () => entered,
       restore: () => {
-        h.fake.updateExternalResource = origUpdate;
         engine.profileFiles = origFiles;
       },
     };

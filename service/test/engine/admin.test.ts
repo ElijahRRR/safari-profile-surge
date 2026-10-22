@@ -31,7 +31,7 @@ const FULL_COVERAGE: ProtocolCoverage = {
 
 /** 测量时读到的 Surge 版本与构建（与 FakeSurge 默认值相同）：依赖版本的能力不能记为 null 或 any。其余字段不限。 */
 function measuredContext() {
-  return { ...anyContext(), surgeVersion: '6.5.0', surgeBuild: '10960' };
+  return { ...anyContext(), surgeVersion: '6.10.0', surgeBuild: '12500' };
 }
 
 function proposal(patch: Partial<ProposeCapabilityRequest> = {}): ProposeCapabilityRequest {

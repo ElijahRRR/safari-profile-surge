@@ -1,6 +1,6 @@
 // surge-cli 交互模式：6.5.0 (10960) 实测，遇到无法识别的参数（例如 --version）时打印提示并进入交互模式，
-// stdin 结束时退出 0，输出中带有 Connected to 127.0.0.1。这些测试证明：提示在退出码分类与解析之前识别为
-// SURGE_COMMAND_FAILED（reason interactive_mode），且不回显输出；默认执行器关闭 stdin，不会等到超时。
+// stdin 结束时退出 0，输出中带有 Connected to 127.0.0.1（6.10 包内仍有同样的提示文字）。这些测试证明：提示在退出码
+// 分类与解析之前识别为 SURGE_COMMAND_FAILED（reason interactive_mode），且不回显输出；默认执行器关闭 stdin，不会等到超时。
 // 合成数据，假的 surge-cli 只是本地脚本。
 
 import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -8,19 +8,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test, vi } from 'vitest';
 import type { SfeError } from '@sfe/contract';
-import { CLI_COMMANDS } from '../../src/surge/cli-commands.js';
+import { CLI_COMMANDS, cliArgvs } from '../../src/surge/cli-commands.js';
 import { INTERACTIVE_BANNER_RE, createCliAdapter, defaultExec, type ExecFn } from '../../src/surge/cli-adapter.js';
 import { SURGE_PRIMITIVES, type MechanismMap, type SurgePrimitive } from '../../src/surge/primitives.js';
+import { CLI_PATH as CLI, CLI_SAMPLE_ARGS as SAMPLE_ARGS } from './cli-samples.js';
 
-const CLI = '/Applications/Surge.app/Contents/Applications/surge-cli';
 const BANNER = 'No command is provided, enter interactive mode.\nTips: Use surge-cli --help to show available commands.\nConnected to 127.0.0.1\n> ';
 const MESSAGE = '执行 Surge 命令失败：命令行工具不支持该命令（进入了交互模式）';
-const SAMPLE_ARGS: Record<string, unknown[]> = {
-  checkProfile: ['/tmp/sfe-candidate/日常-Safari环境.conf'],
-  updateExternalResource: ['policy-path:sfe-nodes.list'],
-  addTempRule: ['PROCESS-NAME,/Applications/Safari.app/Contents/MacOS/Safari,REJECT'],
-  removeTempRule: ['PROCESS-NAME,/Applications/Safari.app/Contents/MacOS/Safari,REJECT'],
-};
 const allCli: MechanismMap = Object.fromEntries(SURGE_PRIMITIVES.map((p) => [p, 'cli']));
 const CLI_PRIMITIVES = Object.keys(CLI_COMMANDS) as SurgePrimitive[];
 
@@ -135,19 +129,20 @@ describe('CLI argv shape', () => {
   test('every command names a subcommand (only --check is a bare flag) and never asks for --version', () => {
     const BARE_FLAG_COMMANDS = new Set(['--check']);
     for (const p of CLI_PRIMITIVES) {
-      const cmd = CLI_COMMANDS[p] as { argv: (...a: unknown[]) => string[] };
-      const argv = cmd.argv(...(SAMPLE_ARGS[p] ?? []));
-      const args = SAMPLE_ARGS[p] ?? [];
-      const words = argv.filter((w) => !args.includes(w));
-      const flags = words.filter((w) => w.startsWith('-'));
-      const verbs = words.filter((w) => !w.startsWith('-'));
-      expect(argv, p).not.toContain('--version');
-      expect(argv, p).not.toContain('-v');
-      if (flags.some((f) => BARE_FLAG_COMMANDS.has(f))) {
-        expect(flags, p).toEqual(['--check']);
-      } else {
-        expect(verbs.length, `${p}: ${argv.join(' ')}`).toBeGreaterThan(0);
-        expect(flags.every((f) => f === '--raw'), `${p}: ${argv.join(' ')}`).toBe(true);
+      const args = (SAMPLE_ARGS[p] ?? []).flatMap((a) => (typeof a === 'string' ? [a] : []));
+      for (const argv of cliArgvs(p, SAMPLE_ARGS[p] ?? [])!) {
+        // key=value 选项（rule match 的 process-path= 等）是参数，不是命令词
+        const words = argv.filter((w) => !args.includes(w) && !w.includes('='));
+        const flags = words.filter((w) => w.startsWith('-'));
+        const verbs = words.filter((w) => !w.startsWith('-'));
+        expect(argv, p).not.toContain('--version');
+        expect(argv, p).not.toContain('-v');
+        if (flags.some((f) => BARE_FLAG_COMMANDS.has(f))) {
+          expect(flags, p).toEqual(['--check']);
+        } else {
+          expect(verbs.length, `${p}: ${argv.join(' ')}`).toBeGreaterThan(0);
+          expect(flags.every((f) => f === '--raw'), `${p}: ${argv.join(' ')}`).toBe(true);
+        }
       }
     }
   });

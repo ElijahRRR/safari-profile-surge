@@ -82,13 +82,13 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: 'charset',
     summary: '逐类测试代理凭据字符经 Surge 节点行传到出口服务器后是否保持原样',
-    usage: 'charset [--classes <类别> …]',
+    usage: 'charset [--classes <类别> …] [--reload-wait 10]',
     positionals: { min: 0, max: 0 },
-    flags: { classes: { kind: 'list' }, wait: { kind: 'number', min: 1, max: 120 } },
+    flags: { classes: { kind: 'list' }, wait: { kind: 'number', min: 1, max: 120 }, 'reload-wait': { kind: 'number', min: 1, max: 120 } },
   },
   {
     name: 'refresh',
-    summary: '定向刷新测试节点资源并读回；测量自动重载、原子替换与是否发生重载',
+    summary: '原子替换测试节点资源与规则集（不调用 update），测量 Surge 自动重新读取的延迟与影响、自动重载与是否发生重载或引擎重启',
     usage: 'refresh --auto-reload on|off [--wait 8] [--skip-removal-fallback]',
     positionals: { min: 0, max: 0 },
     flags: {
@@ -133,9 +133,9 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: 'chain',
     summary: '证明外部节点经 underlying-proxy 前置：前置可达、前置不可达、前置名缺失',
-    usage: 'chain',
+    usage: 'chain [--reload-wait 10]',
     positionals: { min: 0, max: 0 },
-    flags: { wait: { kind: 'number', min: 1, max: 120 } },
+    flags: { wait: { kind: 'number', min: 1, max: 120 }, 'reload-wait': { kind: 'number', min: 1, max: 120 } },
   },
   {
     name: 'preflight',

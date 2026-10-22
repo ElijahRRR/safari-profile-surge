@@ -5,8 +5,13 @@
 import type { ProbeRecord, ProxyRevisionRecord } from '../../db/index.js';
 import type { Engine } from '../context.js';
 
+/**
+ * 预检的链路说明。Surge Mac 6.9.0+ 的 `rule explain` 按文档能显示策略组选择与底层代理链（手册：“the matched rule, each
+ * policy-group decision with its reason, the Smart Group selection, and the underlying proxy chain”），但本应用尚未使用它，
+ * 输出格式也未经实测（TODO(P0)）：前置链路仍以 external_node_underlying_proxy 的网络实测为准。
+ */
 export const CHAIN_EVIDENCE_PREFLIGHT =
-  '预检只证明候选节点经前置可以连通；6.5 无法读出完整链路，前置链路依赖 external_node_underlying_proxy 实测，不以出口 IP 作为链路证明';
+  '预检只证明候选节点经前置可以连通；前置链路以 external_node_underlying_proxy 实测为准（Surge 6.9 起的 rule explain 按文档可显示底层代理链，本应用尚未使用、未经实测），不以出口 IP 作为链路证明';
 export const CHAIN_EVIDENCE_UNTESTED = '独立预检能力尚未通过实测：不借当前选择组测试，待激活时由 Safari 实测';
 
 export interface PreflightInput {

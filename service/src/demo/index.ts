@@ -26,6 +26,13 @@ import { readFileSync } from 'node:fs';
 
 export const DEMO_CAPABILITY_NOTE = 'DEMO：FakeSurge 演示，不代表真实网络';
 
+/** 演示 FakeSurge 的本地文件监视延迟（毫秒）：发布写入后等待一次轮询即读到新成员。演示专用，不代表真实 Surge。 */
+export const DEMO_LOCAL_WATCH_LATENCY_MS = 100;
+
+/** 演示的发布等待与入口规则集等待：按演示监视延迟轮询，演示启动（经真实流程发布并激活）约一秒完成。 */
+export const DEMO_RESOURCE_RELOAD_WAIT = { timeoutMs: 5_000, pollMs: DEMO_LOCAL_WATCH_LATENCY_MS } as const;
+export const DEMO_RULESET_WATCH = { timeoutMs: 5_000, pollMs: DEMO_LOCAL_WATCH_LATENCY_MS } as const;
+
 /** 演示场景（/dev/native 使用的场景编号）。 */
 export const DEMO_PROFILES = {
   active: 'demo-profile-0001',
@@ -46,7 +53,9 @@ export function createDemoSurge(dataDir: string): DemoSurge {
   const surgeDirectory = join(dataDir, 'surge');
   const verifyHost = VERIFY_ENDPOINTS[0]!.host;
   const env = createFakeSurgeEnvironment(surgeDirectory, { entryStrategy: 'ruleset_resource', processPaths: [FAKE_SAFARI_PATH], verifyHost });
-  const fake = new FakeSurge({ directory: surgeDirectory });
+  // 只用于演示：假定 Surge 会监视本地 policy-path 文件（延迟很短），与演示中写为 supported 的 policy_path_reread 记录一致。
+  // 真实 Surge 是否监视没有写入文档，需要 P0 实测；没有该记录时发布停在待部署。
+  const fake = new FakeSurge({ directory: surgeDirectory, watchLocalPolicyPaths: true, localWatchLatencyMs: DEMO_LOCAL_WATCH_LATENCY_MS });
   const hooks: DemoHooks = {
     // 演示扩展不访问外部检测服务：在 FakeSurge 中模拟 Safari 访问检测服务的连接，供核对使用
     beforeVerificationCheck: ({ verifyHost: host, processPaths }) => {

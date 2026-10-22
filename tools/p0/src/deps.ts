@@ -14,5 +14,8 @@ export type {
   SurgeAdapter,
   SurgeExternalResource,
   SurgeRequestRecord,
+  SurgeResourceUpdateResult,
+  SurgeRuleMatchResult,
   SurgeRuleRecord,
+  SurgeVersion,
 } from '../../../service/src/ports.js';

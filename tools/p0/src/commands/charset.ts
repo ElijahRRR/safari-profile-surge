@@ -1,14 +1,16 @@
 // charset：逐类测试代理凭据字符。每类一个合成节点（用户名/密码开头、中间、结尾都含该类字符）写入测试资源，
-// --check 测试配置，定向刷新，逐个选择并经 SFE-ROUTE 发请求，比较出口服务实际收到的值。只有完全一致的类别
-// 才算已证明安全；结果用于决定是否放宽 SURGE_SAFE_CREDENTIAL_RE（domain/validate.ts）。入口必须是 NORMAL。
+// --check 测试配置，不调用 external-resource update（本地资源被跳过），等待 Surge 自动重新读取（以同时写入的
+// 正常节点 C 出现在组成员中为准，字符类节点可能被 Surge 跳过），逐个选择并经 SFE-ROUTE 发请求，比较出口服务实际
+// 收到的值。只有完全一致的类别才算已证明安全；结果用于决定是否放宽 SURGE_SAFE_CREDENTIAL_RE（domain/validate.ts）。
+// 时限内没有重新读取时不测试任何类别（结论为未测试，不当作“被 Surge 跳过”）。入口必须是 NORMAL。
 
 import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME } from '@sfe/contract';
-import { CHARSET_EXPECT_FILE, SERVER_LOGS } from '../constants.js';
+import { CHARSET_EXPECT_FILE, DEFAULT_RELOAD_WAIT_SECONDS, SERVER_LOGS } from '../constants.js';
 import { charsetExpectation, charsetNodeLine, classifyCharset, selectClasses, type CharsetAuthVerdict, type CharsetClassResult } from '../charset.js';
 import { resourceFile } from '../deps.js';
 import { refused, type ExitCode } from '../errors.js';
 import { saveState } from '../state.js';
-import { entryFilesForBits, testNodeLine, testNodeResource, type TestPorts } from '../test-profile.js';
+import { TEST_NODES, entryFilesForBits, testNodeLine, testNodeResource, type TestPorts } from '../test-profile.js';
 import { allowRefreshFor, confirmWrites, loadCredentials, openRun, openSession, requireServers, tryRead, verifyHostOf, proxyOf, type Ctx } from './common.js';
 import { TestOps, requestViaRoute } from './test-ops.js';
 
@@ -24,6 +26,7 @@ const RESULT_LABEL: Record<CharsetClassResult, string> = {
 export async function runCharset(ctx: Ctx): Promise<ExitCode> {
   const { out, now, sleep } = ctx.deps;
   const waitMs = (ctx.args.numbers.wait ?? 2) * 1000;
+  const reloadWaitMs = (ctx.args.numbers['reload-wait'] ?? DEFAULT_RELOAD_WAIT_SECONDS) * 1000;
   let classes;
   try {
     classes = selectClasses(ctx.args.lists.classes);
@@ -54,30 +57,36 @@ export async function runCharset(ctx: Ctx): Promise<ExitCode> {
     ctx,
     '凭据字符测试',
     [
-      `测试节点资源加入 ${expectations.length} 个合成凭据节点（只对本机测试出口有效）并 --check、定向刷新`,
+      `测试节点资源加入 ${expectations.length} 个合成凭据节点（只对本机测试出口有效）与正常节点 ${TEST_NODES.c} 并 --check；不调用 update，等待 Surge 自动重新读取（至多 ${reloadWaitMs / 1000} 秒）`,
       'SFE-ROUTE 依次选择每个字符类节点，经 SFE-ROUTE 发一次测试请求',
-      '恢复测试节点资源（A、B）并刷新，恢复原选择',
+      '恢复测试节点资源（A、B）并等待重新读取，恢复原选择',
     ],
-    ['测试节点资源恢复为只含 A、B 并刷新；SFE-ROUTE 选择恢复', '合成凭据只在测试资源与运行目录中'],
+    ['测试节点资源恢复为只含 A、B 并等待重新读取；SFE-ROUTE 选择恢复', '合成凭据只在测试资源与运行目录中'],
   );
   if (!ok) throw refused('已取消：没有写入任何东西');
   dir.writeJson(CHARSET_EXPECT_FILE, { classes: expectations });
 
   const outcome: Array<{ index: number; id: string; label: string; result: CharsetClassResult; verdicts: CharsetAuthVerdict[] }> = [];
   let checkOk = true;
+  let reread = false;
   try {
-    const lines = [testNodeLine('a', ports, creds.password), testNodeLine('b', ports, creds.password), ...expectations.map((e) => charsetNodeLine(e, ports))];
+    // 正常节点 C 作为“已重新读取”的见证：字符类节点可能被 Surge 跳过，不能用它们判断文件是否已被读取。
+    const lines = [testNodeLine('a', ports, creds.password), testNodeLine('b', ports, creds.password), testNodeLine('c', ports, creds.password), ...expectations.map((e) => charsetNodeLine(e, ports))];
     await ops.writeTestFile(NODE_RESOURCE_FILE, resourceFile(7, lines));
     if (session.mechanism.checkProfile !== 'unavailable' && ops.state.testProfilePath) {
       const c = await tryRead(() => session.adapter.checkProfile(ops.state.testProfilePath!));
       checkOk = c?.ok ?? true;
       dir.writeJson(`charset/check-${now().getTime()}.json`, c);
     }
-    const r = await ops.refresh(key, 'charset-nodes');
-    if (!r.ok) throw refused(`凭据字符测试失败：刷新测试资源失败（${r.code}）`);
-    await sleep(1000);
-    const members = (await tryRead(() => session.adapter.getGroupMembers(ROUTE_GROUP_NAME))) ?? [];
+    const w = await ops.waitForMembers((m) => m.includes(TEST_NODES.c), reloadWaitMs);
+    reread = w.ok;
+    if (!reread) out.warn(`测试节点资源写入后 ${reloadWaitMs / 1000} 秒内没有被 Surge 自动重新读取：本地 policy-path 的重新读取（refresh 的 policy_path_reread）未成立时无法测试凭据字符`);
+    const members = w.value ?? [];
     for (const e of expectations) {
+      if (!reread) {
+        outcome.push({ index: e.index, id: e.id, label: classes.find((c) => c.index === e.index)!.cls.label, result: 'not_tested', verdicts: [] });
+        continue;
+      }
       const cls = classes.find((c) => c.index === e.index)!.cls;
       const inMembers = members.includes(e.node);
       let selected = false;
@@ -101,7 +110,8 @@ export async function runCharset(ctx: Ctx): Promise<ExitCode> {
   } finally {
     try {
       await ops.writeTestFile(NODE_RESOURCE_FILE, testNodeResource(['a', 'b'], ports, creds.password, 8));
-      await ops.refresh(key, 'charset-restore');
+      const restored = await ops.waitForMembers((m) => m.length === 3 && m[0] === 'REJECT' && m[1] === TEST_NODES.a && m[2] === TEST_NODES.b, reloadWaitMs);
+      if (!restored.ok && reread) out.warn(`恢复后 SFE-ROUTE 成员读回为 ${restored.value?.join('、') ?? '读不到'}：请按回退方式处理`);
       await ops.select(before ?? 'REJECT').catch(() => undefined);
     } catch {
       out.warn('恢复测试资源或选择失败：请按回退方式处理');
@@ -109,7 +119,7 @@ export async function runCharset(ctx: Ctx): Promise<ExitCode> {
     saveState(dir, ops.state);
   }
   const safe = outcome.filter((o) => o.result === 'safe');
-  dir.writeJson('charset/result.json', { at: now().toISOString(), checkOk, outcome: outcome.map(({ index, id, result, verdicts }) => ({ index, id, result, verdicts })) });
+  dir.writeJson('charset/result.json', { at: now().toISOString(), checkOk, reread, outcome: outcome.map(({ index, id, result, verdicts }) => ({ index, id, result, verdicts })) });
   out.heading('凭据字符测试结果');
   out.table([['类别', '结果'], ...outcome.map((o) => [o.label, RESULT_LABEL[o.result]])]);
   out.line(`已证明安全的类别：${safe.map((o) => o.label).join('、') || '无'}`);

@@ -28,7 +28,7 @@ import { createCompositeAdapter } from './surge/composite.js';
 import { createHttpAdapter, parseHttpApiLine } from './surge/http-adapter.js';
 import { SERVICE_CODESIGN_TIMEOUT_MS, createDefaultSurgeInstanceReader } from './surge/running-instance.js';
 import { capabilityUnverified, SURGE_PRIMITIVES, type MechanismMap } from './surge/primitives.js';
-import { createDemoSurge, prepareDemoState, seedDemoData } from './demo/index.js';
+import { DEMO_RESOURCE_RELOAD_WAIT, DEMO_RULESET_WATCH, createDemoSurge, prepareDemoState, seedDemoData } from './demo/index.js';
 import { systemClock } from './util/clock.js';
 import { execFixed } from './util/exec-fixed.js';
 import { createIdGenerator } from './util/ids.js';
@@ -161,7 +161,21 @@ async function buildRealSurge(config: ServiceConfig, repos: Repositories, logger
   return createCompositeAdapter(parts);
 }
 
+/**
+ * 启动服务。启动期间持有一个引用的定时器，直到监听建立：系统时钟的定时器都 unref（服务存活由 HTTP/IPC 监听维持，见
+ * util/clock.ts），监听建立之前的等待（例如演示数据经真实流程发布时等待 Surge 重新读取节点资源）若只剩这些定时器，
+ * 事件循环会提前排空，`void main()` 结束、进程无输出地以 0 退出。
+ */
 export async function startService(opts: StartOptions): Promise<RunningService> {
+  const startupHold = setInterval(() => undefined, 60_000);
+  try {
+    return await startServiceHeld(opts);
+  } finally {
+    clearInterval(startupHold);
+  }
+}
+
+async function startServiceHeld(opts: StartOptions): Promise<RunningService> {
   const config = loadConfig({ argv: opts.argv, env: opts.env, platform: opts.platform, homedir: opts.homedir, cwd: opts.cwd });
   assertRuntime(config.nodeVersionPin);
   ensurePrivateDirSync(config.dataDir);
@@ -222,7 +236,8 @@ export async function startService(opts: StartOptions): Promise<RunningService> 
       return issueLoginUrl(sessions, http);
     },
     serviceVersion: SERVICE_VERSION,
-    ...(demoSurge ? { demoHooks: demoSurge.hooks } : {}),
+    // 演示的等待按演示 FakeSurge 的监视延迟轮询（演示专用；真实 Surge 用缺省值，TODO(P0) 按实测设定）
+    ...(demoSurge ? { demoHooks: demoSurge.hooks, resourceReloadWait: DEMO_RESOURCE_RELOAD_WAIT, rulesetWatch: DEMO_RULESET_WATCH } : {}),
   });
   await app.start();
   if (demoSurge && opts.seedDemo !== false) {

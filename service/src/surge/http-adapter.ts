@@ -1,11 +1,17 @@
-// HTTP API 实现：只连回环地址，密钥运行时从工作配置读取（getKey），只放在 X-Key 请求头中，
-// 从不进入日志、错误或返回值。端点在 6.5 上均未核对（TODO(P0)）；外部资源与临时规则的 HTTP 版本
-// 标注为 6.9+/6.10+，这里一律 CAPABILITY_UNVERIFIED。见 docs/ARCHITECTURE.md §5.1。
+// HTTP API 实现（https://manual.nssurge.com/tools/http-api.html，目标 Surge Mac 6.10.0）：只连回环地址，密钥运行时从
+// 工作配置读取（getKey），只放在 X-Key 请求头中，从不进入日志、错误或返回值。
+// - 临时规则与规则求值：HTTP API 在任何版本都没有对应端点，只能经 CLI（rule temp、rule match），这里一律 CAPABILITY_UNVERIFIED；
+// - 外部资源：Mac 6.10.0+ 才有（“External Resources (iOS 5.23.0+, Mac 6.10.0+)”），按单个 key 更新，从不 all；
+// - 引擎运行时长：/v1/metrics 的 surge_uptime_seconds（Mac 6.9.0+，纯文本）；
+// - 版本：没有能给出 Controller 协议号的端点，保持 CAPABILITY_UNVERIFIED。
+// 文档没有给出响应结构的端点（/v1/policy_groups、/v1/rules、/v1/requests/*、/v1/profiles/current 的名称字段等）逐项标
+// TODO(P0)，结构不对时报错。写入只有：SFE-ROUTE 的选择、结束单个请求、更新单个外部资源。见 docs/ARCHITECTURE.md §5.1。
 
 import { isIP } from 'node:net';
 import { SfeError, type TakeoverState } from '@sfe/contract';
 import type { SurgeAdapter, SurgePolicyDetail, SurgePolicyTestResult, SurgeRuleRecord } from '../ports.js';
-import { parsePolicyNames, parseRequestRecords, unrecognized } from './parse-output.js';
+import { safeConnectionId, safeResourceKey, safeRouteSelection } from './cli-commands.js';
+import { parseExternalResources, parseMetricsUptime, parsePolicyNames, parseRequestRecords, parseResourceUpdateMap, unrecognized } from './parse-output.js';
 import { capabilityUnverified, maskKnown, truncate, type MechanismMap, type SurgePrimitive } from './primitives.js';
 import { parseProxyLine } from './proxy-line.js';
 import { redactFreeText, redactProxyLine } from './redact-profile.js';
@@ -120,11 +126,17 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
 
     async getVersion() {
       guard('getVersion');
+      // /v1/metrics 的 surge_build_info 只有版本与构建号，没有 Controller 协议号（版本门槛需要它）。
       throw capabilityUnverified('getVersion');
     },
     async getRuntimeInfo() {
       guard('getRuntimeInfo');
-      throw capabilityUnverified('getRuntimeInfo');
+      // Prometheus 文本（“`/v1/metrics` returns plain text instead of JSON”）：surge_uptime_seconds “Engine uptime”。
+      const body = await request('GET', '/v1/metrics');
+      if (typeof body !== 'string') throw unrecognized('引擎运行时长');
+      const uptimeSeconds = parseMetricsUptime(body);
+      const at = now().getTime();
+      return { uptimeSeconds, startedAt: new Date(Math.floor((at - uptimeSeconds * 1000) / 1000) * 1000) };
     },
     async getAutoReloadSetting() {
       guard('getAutoReloadSetting');
@@ -137,7 +149,8 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
 
     async getCurrentProfile() {
       guard('getCurrentProfile');
-      // sensitive=0；只取名称，配置正文立即丢弃。
+      // sensitive=0；只取名称，配置正文立即丢弃。文档只说明该端点返回配置正文（“Obtain the text content of the current
+      // profile.”），name 字段未写入文档，也没有路径——TODO(P0)：确认有 name 字段才保留这个实现；路径用 CLI 的 status。
       const json = await request('GET', '/v1/profiles/current?sensitive=0');
       const name = isObject(json) && typeof json.name === 'string' ? json.name : null;
       if (name === null) throw unrecognized('当前配置');
@@ -183,6 +196,7 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
 
     async getGroupMembers(group: string) {
       guard('getGroupMembers');
+      // “List all policy groups and their options.”——结构未写入文档（TODO(P0)）。
       const json = await request('GET', '/v1/policy_groups');
       const members = isObject(json) ? json[group] : undefined;
       if (!Array.isArray(members)) throw new SfeError('SURGE_COMMAND_FAILED', '读取策略组失败：组不存在', { details: { group } });
@@ -202,7 +216,9 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
 
     async selectGroupPolicy(group: string, policy: string) {
       guard('selectGroupPolicy');
-      await request('POST', '/v1/policy_groups/select', { group_name: group, policy });
+      // 只选择 SFE-ROUTE，选项不能是 auto（与 CLI 相同的限制）。
+      const [g, p] = safeRouteSelection(group, policy);
+      await request('POST', '/v1/policy_groups/select', { group_name: g, policy: p });
     },
 
     async testPolicy(policy: string, url: string): Promise<SurgePolicyTestResult> {
@@ -238,18 +254,31 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
     },
     async killRequest(id: string) {
       guard('killRequest');
-      const n = Number(id);
-      await request('POST', '/v1/requests/kill', { id: Number.isSafeInteger(n) ? n : id });
+      // 文档：POST /v1/requests/kill，{"id": 100}——只结束一个请求，只接受数字 id。
+      const n = Number(safeConnectionId(id));
+      if (!Number.isSafeInteger(n)) throw new SfeError('VALIDATION_FAILED', '执行 Surge 命令失败：连接编号不合法');
+      await request('POST', '/v1/requests/kill', { id: n });
+    },
+
+    async matchRule() {
+      guard('matchRule');
+      // HTTP API 没有规则求值端点（rule match 只在 CLI，Mac 6.9.0+）。
+      throw capabilityUnverified('matchRule');
     },
 
     async listExternalResources() {
       guard('listExternalResources');
-      throw capabilityUnverified('listExternalResources');
+      // Mac 6.10.0+：GET /v1/external_resources → {"defines": [...]}（与 CLI 用同一解析）。
+      return parseExternalResources(await request('GET', '/v1/external_resources'));
     },
-    async updateExternalResource() {
+    async updateExternalResource(key: string) {
       guard('updateExternalResource');
-      throw capabilityUnverified('updateExternalResource');
+      // Mac 6.10.0+：POST /v1/external_resources/update {"key": …}。“Local resources are skipped.”；结果是键到 "success"
+      // 或错误文字的映射，键不存在时 400（request 按命令失败抛出）。从不使用 "all"。
+      const k = safeResourceKey(key);
+      return parseResourceUpdateMap(await request('POST', '/v1/external_resources/update', { key: k }), k, (t) => opts.scrub(redactFreeText(t)));
     },
+    // HTTP API 没有临时规则端点（任何版本）：只能经 CLI 的 rule temp。
     async listTempRules() {
       guard('listTempRules');
       throw capabilityUnverified('listTempRules');

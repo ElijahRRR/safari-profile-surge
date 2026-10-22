@@ -17,7 +17,12 @@ import {
   SERVICE_INSTANCE_READ_BUDGET_MS,
   SURGE_APP_BUNDLE,
   SURGE_BUNDLE_IDS,
+  SURGE_MINIMUM,
+  SURGE_VERSION_CHECK_FAILURE_TEXT,
   bundleOfMainExecutable,
+  compareSurgeVersions,
+  crossCheckSurgeVersion,
+  meetsSurgeMinimumVersion,
   createDefaultSurgeInstanceReader,
   createRunningInstanceReader,
   defaultRunningInstanceExec,
@@ -602,5 +607,56 @@ describe('default reader shared by the service and P0', () => {
     expect(JSON.parse(ok.stdout)).toEqual({ n: 0, lc: 'C', tz: 'UTC', home: null });
     expect((await defaultRunningInstanceExec(process.execPath, [script, '4'], { timeoutMs: 5_000 })).code).toBe(4);
     expect((await defaultRunningInstanceExec('ps', ['-ww'], { timeoutMs: 5_000 })).code).toBe(-1);
+  });
+});
+
+// 最低支持版本（Surge Mac 6.10.0、构建 12500、Controller 协议 22）与 `surge-cli --raw version` 的交叉核对：
+// CLI 只是旁证，与运行实例不一致、读不到或不支持 version 命令时都不接受（失败即关闭）。
+describe('Surge minimum version and the CLI cross-check', () => {
+  const instance = { version: '6.10.0', build: '12500' };
+  const cli = { version: '6.10.0', build: '12500', coreVersion: 6100, controllerProtocol: 24 };
+
+  test('the documented minimum', () => {
+    expect(SURGE_MINIMUM).toEqual({ version: '6.10.0', build: 12500, controllerProtocol: 22 });
+    expect(compareSurgeVersions('6.10.0', '6.9.1')).toBeGreaterThan(0);
+    expect(compareSurgeVersions('6.10', '6.10.0')).toBe(0);
+    expect(compareSurgeVersions('6.5.0', '6.10.0')).toBeLessThan(0);
+  });
+
+  test.each([
+    [{ version: '6.10.0', build: '12500' }, true],
+    [{ version: '6.11.0', build: '12590' }, true],
+    [{ version: '6.9.1', build: '12290' }, false],
+    [{ version: '6.5.0', build: '10960' }, false],
+    // 版本与构建号都要满足（beta 或改过的包）
+    [{ version: '6.10.0', build: '12499' }, false],
+    [{ version: '6.9.9', build: '12600' }, false],
+    [{ version: '127.0.0.1', build: '12500' }, false],
+  ])('%j meets the minimum: %s', (v, expected) => {
+    expect(meetsSurgeMinimumVersion(v)).toBe(expected);
+  });
+
+  test('accepted only when the CLI agrees with the running instance and the protocol is at least 22', () => {
+    expect(crossCheckSurgeVersion(instance, cli)).toEqual({ ok: true, version: '6.10.0', build: '12500', controllerProtocol: 24, coreVersion: 6100 });
+    expect(crossCheckSurgeVersion(instance, { ...cli, controllerProtocol: 22 })).toMatchObject({ ok: true, controllerProtocol: 22 });
+    expect(crossCheckSurgeVersion(instance, { ...cli, controllerProtocol: 21 })).toEqual({ ok: false, reason: 'surge_version_unsupported' });
+    expect(crossCheckSurgeVersion(instance, { ...cli, build: '12510' })).toEqual({ ok: false, reason: 'cli_bundle_mismatch' });
+    expect(crossCheckSurgeVersion(instance, { ...cli, version: '6.10.1' })).toEqual({ ok: false, reason: 'cli_bundle_mismatch' });
+    expect(crossCheckSurgeVersion(instance, null)).toEqual({ ok: false, reason: 'cli_version_unreadable' });
+    // version 命令不存在（6.5 交互模式、旧核心 Unknown command）说明低于 6.8.0
+    expect(crossCheckSurgeVersion(instance, 'unsupported')).toEqual({ ok: false, reason: 'surge_version_unsupported' });
+  });
+
+  test('a running instance below the minimum is unsupported whatever the CLI says', () => {
+    const old = { version: '6.5.0', build: '10960' };
+    expect(crossCheckSurgeVersion(old, null)).toEqual({ ok: false, reason: 'surge_version_unsupported' });
+    expect(crossCheckSurgeVersion(old, { ...cli, ...old })).toEqual({ ok: false, reason: 'surge_version_unsupported' });
+  });
+
+  test('every failure has a user-facing explanation', () => {
+    for (const reason of ['cli_version_unreadable', 'cli_bundle_mismatch', 'surge_version_unsupported'] as const) {
+      expect(SURGE_VERSION_CHECK_FAILURE_TEXT[reason].length).toBeGreaterThan(0);
+    }
+    expect(SURGE_VERSION_CHECK_FAILURE_TEXT.surge_version_unsupported).toContain('6.10.0');
   });
 });

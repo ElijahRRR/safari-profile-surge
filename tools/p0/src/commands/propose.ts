@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { CAPABILITY_CONTEXT_DEPS, type CapabilityKey, type CapabilityStatus } from '@sfe/contract';
 import { parseCapabilityKey } from '../args.js';
 import type { ContextOverrides } from '../context.js';
-import { NdjsonClientError, RUNNING_INSTANCE_FAILURE_TEXT, ndjsonRequest, serviceLimitsExceeded, versionContextErrors } from '../deps.js';
+import { NdjsonClientError, RUNNING_INSTANCE_FAILURE_TEXT, SURGE_VERSION_CHECK_FAILURE_TEXT, ndjsonRequest, serviceLimitsExceeded, versionContextErrors } from '../deps.js';
 import { failed, refused, usage, type ExitCode } from '../errors.js';
 import { computeEvidenceManifest } from '../evidence.js';
 import { buildProposal } from '../proposal.js';
@@ -37,12 +37,13 @@ export async function runPropose(ctx: Ctx): Promise<ExitCode> {
     session = await openSession(ctx, dir, state, { needTestProfile: false }).catch(() => null);
   }
   const signingIdentity = deps.includes('signingIdentity') ? await codesignTeamId(ctx.deps.exec, ctx.args.strings['app-path'] ?? DEFAULT_HOST_APP) : null;
-  const { context: current, instance } = await measureContextWithInstance(ctx, session, state, {
+  const { context: current, instance, versionCheck } = await measureContextWithInstance(ctx, session, state, {
     entryStrategy: result?.entryStrategy ?? null,
     processPaths: result?.processPaths ?? state.processPaths,
     signingIdentity,
   });
-  // 依赖 Surge 版本/构建的能力：读不到运行中 Surge 的版本（或读到的不是版本，或服务的读取器在它的时限内读不到）时
+  // 依赖 Surge 版本/构建的能力：读不到运行中 Surge 的版本（或读到的不是版本，或服务的读取器在它的时限内读不到），
+  // 或与 `surge-cli --raw version` 交叉核对不通过（不一致、低于最低支持版本 6.10.0（12500）、Controller 协议 < 22）时
   // 拒绝，而不是提示后照样提议——这样的记录在服务端永远不会生效（版本读不到即待验证，不再匹配记录的 null 或 any）。
   const versionErrors = versionContextErrors(key, current);
   if (versionErrors.length > 0) {
@@ -51,9 +52,11 @@ export async function runPropose(ctx: Ctx): Promise<ExitCode> {
       ? `运行中的 Surge 无法确认：${RUNNING_INSTANCE_FAILURE_TEXT[instance.result.reason]}。`
       : over.length > 0
         ? `读到了运行中 Surge 的版本，但服务在它的时限内读不到：${serviceLimitText(over)}。`
-        : '';
+        : versionCheck !== null && !versionCheck.ok
+          ? `版本交叉核对未通过：${SURGE_VERSION_CHECK_FAILURE_TEXT[versionCheck.reason]}。`
+          : '';
     throw refused(
-      `生成提议失败：${versionErrors.map((e) => e.message).join('；')}。${why}依赖 Surge 版本的能力要在读到运行中 Surge 的版本与构建号后才能提议（运行 instance 查看逐条检查；版本只来自运行中的 Surge 实例，不要把 getVersion 映射为 cli）`,
+      `生成提议失败：${versionErrors.map((e) => e.message).join('；')}。${why}依赖 Surge 版本的能力要在运行中 Surge 的版本与构建号可读、且与 surge-cli --raw version 一致（getVersion 映射为 cli）后才能提议（运行 instance 与 inventory 查看逐条检查）`,
     );
   }
   const overrides: ContextOverrides = {};

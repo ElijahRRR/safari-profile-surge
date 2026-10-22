@@ -73,7 +73,7 @@ describe('parseCliHelp', () => {
 
   it('help text that lists commands and also documents interactive mode is still help', () => {
     for (const note of ['Run without a command to enter interactive mode.', '  -i, --interactive   Enter interactive mode', 'If no command is provided, surge-cli enters interactive mode.']) {
-      const help = `Usage: surge-cli [options] <command>\n${note}\n  --raw  machine readable output\n  --check <path>\nCommands:\n  dump policy\n  dump temp-rule\n  external-resource list\n  external-resource update <key>\n  temp-rule add <rule>\n  temp-rule remove <rule>`;
+      const help = `Usage: surge-cli [options] <command>\n${note}\n  --raw  machine readable output\n  --check <path>\nCommands:\n  dump policy\n  dump temp-rule\n  external-resource list\n  external-resource update <key>\n  rule temp add <rule>\n  rule temp remove <rule>`;
       const r = parseCliHelp(help);
       expect(r.interactive, note).toBe(false);
       expect(r.words).toEqual(helpWords(help));

@@ -1,7 +1,10 @@
 // entry：在测试配置上用服务的入口策略（temp_rule 或 ruleset_resource）驱动 NORMAL→BLOCKED→VERIFY_ONLY→ACTIVE→NORMAL，
-// Safari 测试页与 Chrome 测试页保持轮询。检查：每个模式读回精确、切换中无放行窗口（Surge 记录）、Chrome 不受影响、
-// 优先于注入的临时规则/模块 DIRECT 规则、UDP/QUIC 被拒绝并回落 TCP 经 SFE-ROUTE、没有配置重载、
+// Safari 测试页与 Chrome 测试页保持轮询。检查：每个模式读回精确（策略自身的读回之外，另以 rule match 矩阵核对 Safari
+// 的 TCP/UDP/QUIC 与 Chrome 从不命中，见 analysis/rule-match.ts）、切换中无放行窗口（Surge 记录）、Chrome 不受影响、
+// 优先于注入的临时规则/模块 DIRECT 规则、UDP/QUIC 被拒绝并回落 TCP 经 SFE-ROUTE、没有配置重载（配置 canary）或引擎
+// 重启（引擎运行时长）、temp_rule 新临时规则的插入位置（文档只写“Add a temporary rule with the highest priority”）、
 // BLOCKED 后结束 Safari 旧连接、（可选）Surge 重启后的规则去留。--to 只做一次切换（例如回到 NORMAL）。
+// ruleset_resource 的每一步由服务策略原子替换规则集文件并等待 Surge 文件监视重新读取（不调用 external-resource update）。
 // UDP/QUIC 结果另带逐协议覆盖：IPv6、WebSocket 在本次运行中实测；扩展页面请求与测试页请求无法区分，
 // 由同一进程路径的归属结果补足（见 analysis/udp-coverage.ts）。
 // 临时规则一律按规范化文本比较（Surge 列出时可能改变逗号与括号周围的空格）；注入测试规则前确认没有相同的用户规则。
@@ -10,17 +13,19 @@ import { existsSync, readFileSync } from 'node:fs';
 import { CAPABILITY_CRITERIA, ENTRY_RULESET_FILES, type EntryStrategy, type KillResult, type KnownEntryMode, type ProtocolCoverage } from '@sfe/contract';
 import { analyzeEntryWindow, outcomeOf, type ObservedRequest } from '../analysis/entry-window.js';
 import { compareSignals, type ReloadSignals } from '../analysis/reload.js';
+import { judgeMatchMatrix, matchProbes, type MatchRecord } from '../analysis/rule-match.js';
 import { udpQuicCoverage, websocketEvidence, type ModeWindow } from '../analysis/udp-coverage.js';
 import { DEFAULT_H3_HOST, DEFAULT_IPV6_HOST } from '../constants.js';
 import { processPathsDigest } from '../context.js';
 import {
+  CONTROL_PROCESS_PATH,
   ENTRY_BITS_IN_ORDER,
   createRulesetStrategy,
   createTempRuleStrategy,
   killSafariConnections,
   normalizeRuleText,
   ownedRulesetRecords,
-  tempRuleText,
+  tempEntryRuleTexts,
   validateSafariProcessPaths,
   type EntryController,
   type SurgeRequestRecord,
@@ -31,10 +36,10 @@ import { refused, type ExitCode } from '../errors.js';
 import { check, readResult, writeResult, type CheckItem } from '../results.js';
 import { markTempRule, recordTempRuleIntent, saveState } from '../state.js';
 import { surgeStartFingerprint } from '../system.js';
-import { CANARY_FILE, ECHO_HOST, PRECEDENCE_MODULE_FILE, TEST_NODES, TEST_USERS, profileRuleLines } from '../test-profile.js';
+import { ECHO_HOST, PRECEDENCE_MODULE_FILE, TEST_NODES, TEST_USERS, profileRuleLines } from '../test-profile.js';
 import { describeImpact, startOtherAppTraffic, trafficImpact, trafficUnaffected } from '../traffic.js';
 import { allowRefreshFor, confirmWrites, measureContext, openRun, openSession, printResult, printSnapshot, proxyOf, requireServers, takeSnapshot, tryRead, verifyHostOf, type Ctx } from './common.js';
-import { TestOps, chromeImpact, pageEvents } from './test-ops.js';
+import { TestOps, chromeImpact, nextCanaryIndex, pageEvents } from './test-ops.js';
 
 const SEQUENCE: readonly KnownEntryMode[] = ['BLOCKED', 'VERIFY_ONLY', 'ACTIVE', 'NORMAL'];
 const SETTLE_MS = 2000;
@@ -43,24 +48,38 @@ interface RestartInfo {
   readback: string | null;
   ourRulesPresent: boolean | null;
   startChanged: boolean | null;
+  /** 引擎运行时长回落（只重启引擎时进程启动时间不变）；读不到为 null。 */
+  engineRestarted: boolean | null;
   normalAfter: boolean;
+}
+
+/**
+ * 对照进程路径（rule match 的 process-path）：同一运行目录中归属测得的 Chrome 路径（attribution/analysis.json），
+ * 没有时为 Chrome 的标准路径（CONTROL_PROCESS_PATH；rule match 只是求值，不要求该进程存在）。
+ */
+function controlPaths(dir: { readJson<T>(rel: string): T | null }, processPaths: readonly string[]): string[] {
+  const measured = dir.readJson<{ perApp?: { chrome?: unknown } }>('attribution/analysis.json')?.perApp?.chrome;
+  const list = Array.isArray(measured) ? measured.filter((p): p is string => typeof p === 'string' && p.startsWith('/') && !processPaths.includes(p)).slice(0, 3) : [];
+  return list.length > 0 ? list : [CONTROL_PROCESS_PATH];
 }
 
 /** 主序列完成后：回到 ACTIVE，由操作员手动退出并重开 Surge，读回入口规则去留，再回到 NORMAL。 */
 async function restartPhase(
   ctx: Ctx,
   controller: EntryController,
-  session: { adapter: { listTempRules(): Promise<string[]> } },
+  session: { adapter: Pick<import('../deps.js').SurgeAdapter, 'listTempRules' | 'getRuntimeInfo'> },
   ourTempRules: readonly string[],
   onStep: (step: { bit: string; value: boolean }) => void,
 ): Promise<RestartInfo> {
   const { prompt, exec } = ctx.deps;
   await controller.transition('ACTIVE', onStep);
   const startBefore = await surgeStartFingerprint(exec);
+  const uptimeBefore = (await tryRead(() => session.adapter.getRuntimeInfo()))?.uptimeSeconds ?? null;
   await prompt.pause('现在在 Surge 菜单中退出 Surge，再重新打开，等待接管恢复');
   const rb = await tryRead(() => controller.read());
   const temps = await tryRead(() => session.adapter.listTempRules());
   const startAfter = await surgeStartFingerprint(exec);
+  const uptimeAfter = (await tryRead(() => session.adapter.getRuntimeInfo()))?.uptimeSeconds ?? null;
   let normalAfter = true;
   try {
     await controller.transition('NORMAL', onStep);
@@ -73,6 +92,7 @@ async function restartPhase(
     readback: rb?.mode ?? null,
     ourRulesPresent: temps === null || ourTempRules.length === 0 ? null : ourTempRules.some((r) => hasRule(temps, r)),
     startChanged: startBefore === null || startAfter === null ? null : startBefore !== startAfter,
+    engineRestarted: uptimeBefore === null || uptimeAfter === null ? null : uptimeAfter < uptimeBefore,
     normalAfter,
   };
 }
@@ -110,7 +130,8 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   const ipv6Host = DEFAULT_IPV6_HOST;
   const proxy = proxyOf(ctx);
   const dwellMs = (ctx.args.numbers.dwell ?? 20) * 1000;
-  const cfg = { processPaths: [...processPaths], verifyHost, siteHosts: [ECHO_HOST, h3Host, 'www.amazon.com'] };
+  const controls = controlPaths(dir, processPaths);
+  const cfg = { processPaths: [...processPaths], verifyHost, siteHosts: [ECHO_HOST, h3Host, 'www.amazon.com'], controlProcessPaths: controls };
   const operationId = `p0-${dir.id}`;
   session.guard.killablePaths = new Set(processPaths);
 
@@ -144,8 +165,8 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
     const insertion = (ctx.args.strings['temp-insertion'] as 'head' | 'tail' | undefined) ?? ops.state.tempRuleInsertion ?? undefined;
     controller = createTempRuleStrategy({ adapter: session.adapter, ownership: createFileEntryOwnership(dir), config: () => cfg, operationId: () => operationId, insertion });
   }
-  // 临时规则：本策略可能添加的四条精确规则先登记意图，守卫只放行它们。
-  const entryTempRules = strategy === 'temp_rule' ? ENTRY_BITS_IN_ORDER.map((b) => tempRuleText(b, cfg)) : [];
+  // 临时规则：本策略可能添加的五条精确规则（条件互不相交，见 generate.ts tempRuleText）先登记意图，守卫只放行它们。
+  const entryTempRules = strategy === 'temp_rule' ? tempEntryRuleTexts(cfg) : [];
   const register = async (rule: string, purpose: string): Promise<void> => {
     ops.state = recordTempRuleIntent(ops.state, rule, purpose, now());
     saveState(dir, ops.state);
@@ -256,11 +277,12 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
     ctx,
     `入口模式测试（${strategy}）`,
     [
-      `SFE-ROUTE 选择 ${TEST_NODES.a}；原子替换 canary 规则集（不刷新）作为重载检测`,
+      `SFE-ROUTE 选择 ${TEST_NODES.a}；原子替换测试配置中的配置 canary 行作为重载检测（只影响测试主机；自动重载开时会让 Surge 重载测试配置，6.9.0 起可能升级为完整引擎重启，请先在 Surge 设置中关闭自动重载）`,
       ...(probeMain ? ['添加并删除两条永不命中的临时规则，正向确认 listTempRules 并测量新临时规则的插入位置'] : []),
       ...(precedenceTests.has('temp') ? [`添加临时规则 DOMAIN,${verifyHost},DIRECT，确认 VERIFY_ONLY 被拒绝后删除`] : []),
       ...(precedenceTests.has('module') ? [`由你在 Surge 中手动启用测试模块 ${PRECEDENCE_MODULE_FILE}，确认 VERIFY_ONLY 被拒绝后手动停用`] : []),
-      `按 ${strategy} 策略依次切换 ${SEQUENCE.join(' → ')}，每个模式停留 ${dwellMs / 1000} 秒`,
+      `按 ${strategy} 策略依次切换 ${SEQUENCE.join(' → ')}，每个模式停留 ${dwellMs / 1000} 秒${strategy === 'ruleset_resource' ? '（规则集文件原子替换后不调用 update，等待 Surge 文件监视重新读取）' : ''}`,
+      `每个模式读回后以 rule match 核对 Safari 与对照进程（${controls.length} 个）的 TCP、UDP、QUIC（只求值，不建立连接）`,
       ...(ctx.args.booleans['no-kill-test'] ? [] : ['BLOCKED 后结束属于 Safari 进程路径的连接（逐条记录，不影响其他应用）']),
       ...(ctx.args.booleans['restart-test'] ? ['主序列结束后再次进入 ACTIVE，由你手动退出并重新打开 Surge，读回入口规则去留，再回到 NORMAL'] : []),
     ],
@@ -282,6 +304,20 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
     for (const r of list ?? []) records.set(r.id, r);
   };
   const checksPrecedence: CheckItem[] = [];
+  const matchRecords: MatchRecord[] = [];
+  const matchAvailable = session.mechanism.matchRule !== 'unavailable';
+  const probes = matchProbes({ processPaths, controlPaths: controls, verifyHost, otherHost: ECHO_HOST });
+  const probeMatrix = async (mode: KnownEntryMode): Promise<void> => {
+    if (!matchAvailable) return;
+    for (const p of probes) {
+      try {
+        const r = await session.adapter.matchRule({ host: p.host, processPath: p.processPath, protocol: p.protocol, port: 443 });
+        matchRecords.push({ ...p, mode, rule: r.rule, policy: r.policy, error: null });
+      } catch (e) {
+        matchRecords.push({ ...p, mode, rule: null, policy: null, error: (e as { code?: string }).code ?? 'ERROR' });
+      }
+    }
+  };
   let canaryIndex: number | null = null;
   let sigBefore: ReloadSignals | null = null;
   let sigAfter: ReloadSignals | null = null;
@@ -295,14 +331,14 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   try {
     const selected = await ops.select(TEST_NODES.a);
     if (selected !== TEST_NODES.a) out.warn(`SFE-ROUTE 选择读回为 ${selected ?? '读不到'}`);
-    canaryIndex = Math.floor(now().getTime() / 1000) % 1_000_000;
-    await allowRefreshFor(session, ops.state, [CANARY_FILE]);
-    await ops.armCanary(canaryIndex);
+    canaryIndex = nextCanaryIndex(now());
+    await ops.armProfileCanary(canaryIndex);
     await sleep(3000);
     sigBefore = await ops.signals(proxy, servers.echoPort, canaryIndex);
-    if (sigBefore.canaryLoaded !== false) {
-      out.warn('canary 在没有刷新时已被读取或无法判断（自动重载可能已开启）：本次无法用 canary 判断是否重载');
+    if (sigBefore.profileCanaryLoaded !== false) {
+      out.warn('配置 canary 在布置后已被读取或无法判断（自动重载可能已开启）：本次无法用它判断是否发生配置重载，只用引擎运行时长等信号');
       canaryIndex = null;
+      sigBefore = { ...sigBefore, profileCanaryLoaded: null };
     }
 
     if (probeMain) await runInsertionProbe();
@@ -365,6 +401,7 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
         afterMode: async (m: ModeRecord) => {
           out.line(`${m.target}：读回 ${m.readbackMode}${m.ok ? '' : '（与目标不符）'}`);
           const from = m.confirmedAt!;
+          if (m.ok) await probeMatrix(m.target);
           if (m.target === 'BLOCKED' && !ctx.args.booleans['no-kill-test']) {
             try {
               obs.killResults = await killSafariConnections(session.adapter, { processPaths, verifyHost, now, bestEffort: false });
@@ -419,14 +456,16 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   const kept = all
     .filter((r) => (r.processPath !== null && safariSet.has(r.processPath)) || testHosts.has((r.remoteHost ?? '').toLowerCase()))
     .map((r) => ({ ...r, remoteHost: testHosts.has((r.remoteHost ?? '').toLowerCase()) ? r.remoteHost : null }));
-  dir.writeJson(`entry/${strategy}-${seqStart}.json`, { strategy, run, windows, kept, ...obs, restart, sigBefore, sigAfter, insertionNote });
+  dir.writeJson(`entry/${strategy}-${seqStart}.json`, { strategy, run, windows, kept, ...obs, restart, sigBefore, sigAfter, insertionNote, controlPaths: controls, ruleMatch: matchRecords });
 
   const observed: ObservedRequest[] = kept.map((r) => ({ at: r.startedAt!.getTime(), processPath: r.processPath, host: r.remoteHost, protocol: r.protocol, policy: r.policyName }));
   const window = run ? analyzeEntryWindow(run.timeline, observed, { processPaths, verifyHost, from: seqStart, to: seqEnd }) : { checked: 0, unclassified: 0, violations: [] };
   const modesOk = run !== null && !run.stoppedEarly && run.modes.length === SEQUENCE.length && run.modes.every((m) => m.ok);
   const sb = sigBefore as ReloadSignals | null;
   const sa = sigAfter as ReloadSignals | null;
-  const reload = sb && sa ? compareSignals(sb, sa) : { reloaded: null, reasons: [] as string[] };
+  const reload = sb && sa ? compareSignals(sb, sa) : { reloaded: null, reasons: [] as string[], processRestarted: false, engineRestarted: null };
+  const matrix = judgeMatchMatrix(matchRecords, processPaths);
+  const matchNote = (n: number, bad: readonly string[]): string => `核对 ${n} 条${matrix.errors > 0 ? `，读取失败 ${matrix.errors} 条` : ''}${bad.length > 0 ? `，不符 ${bad.length} 条：${bad.slice(0, 3).join('；')}` : ''}`;
   const h3Observed = obs.h3Observed;
   const imp = trafficImpact(traffic.samples, seqStart, seqEnd);
   const chrome = chromeImpact(dir, seqStart, seqEnd);
@@ -478,7 +517,20 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
     check('Safari 测试页在各模式下的结果符合预期', pageExpect(), 'BLOCKED 全部失败；VERIFY_ONLY 只有检测服务成功；ACTIVE 经过目标节点；NORMAL 按原规则'),
     check('Chrome 不受影响', chrome === null ? null : chrome.failures === 0 && chrome.wsCloses === 0, chrome === null ? 'Chrome 测试页没有上报' : `失败 ${chrome.failures}，WebSocket 断开 ${chrome.wsCloses}`),
     check('其他应用长连接与新请求不受影响', trafficUnaffected(imp), describeImpact(imp)),
-    check('切换位不发生配置重载', reload.reloaded === null ? null : !reload.reloaded, reload.reasons.join('、')),
+    check('切换不发生配置重载或引擎重启', reload.reloaded === null ? null : !reload.reloaded, reload.reasons.join('、') || (sb?.profileCanaryLoaded === null ? '配置 canary 不可用：无法确认没有配置重载' : '')),
+    check(
+      'rule match：Safari 的 TCP、UDP、QUIC 在各模式下得到预期结果',
+      !matchAvailable ? null : matrix.errors > 0 || matrix.safari.total === 0 ? (matrix.safari.mismatches.length > 0 ? false : null) : matrix.safari.mismatches.length === 0,
+      !matchAvailable ? 'matchRule 没有可用实现' : matchNote(matrix.safari.total, matrix.safari.mismatches),
+    ),
+    check(
+      'rule match：Chrome 从不命中本应用入口规则或 SFE-ROUTE',
+      !matchAvailable ? null : matrix.control.hits.length > 0 ? false : matrix.control.total === 0 || matrix.errors > 0 ? null : true,
+      !matchAvailable ? 'matchRule 没有可用实现' : `${matchNote(matrix.control.total, matrix.control.hits)}；对照路径 ${controls.length} 个`,
+    ),
+    ...(strategy === 'temp_rule'
+      ? [check('新临时规则的插入位置已实测', ops.state.tempRuleInsertion === null ? null : true, `插入位置 ${ops.state.tempRuleInsertion ?? '未测得'}（文档只写“Add a temporary rule with the highest priority”）`)]
+      : []),
     check('AND(进程,域名) 规则可用（VERIFY_ONLY 下检测请求经 SFE-ROUTE）', verifyRouted.length > 0 ? true : null, `${verifyRouted.length} 条`),
     check('AND(进程,UDP) 规则可用（UDP 被拒绝）', udpActive.length === 0 ? null : udpRejected.length === udpActive.length, `${udpRejected.length}/${udpActive.length} 条`),
     ...(checksPrecedence.length > 0 ? checksPrecedence : [check('入口优先于模块 DIRECT 规则与用户临时规则', null, '未运行 --precedence-test temp,module')]),
@@ -546,7 +598,11 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
         command: 'entry',
         at,
         checks: [
-          check('Surge 确实重启', rs.startChanged, rs.startChanged === null ? '读不到进程启动时间' : ''),
+          check(
+            'Surge 确实重启',
+            rs.startChanged === true || rs.engineRestarted === true ? true : rs.startChanged === null && rs.engineRestarted === null ? null : false,
+            `进程启动时间${rs.startChanged === null ? '读不到' : rs.startChanged ? '变化' : '不变'}；引擎运行时长${rs.engineRestarted === null ? '读不到' : rs.engineRestarted ? '回落' : '没有回落'}`,
+          ),
           check('重启后入口规则去留已记录', rs.readback !== null, `读回 ${rs.readback ?? '读不到'}；本应用临时规则${rs.ourRulesPresent === null ? '无法读取' : rs.ourRulesPresent ? '仍在' : '已消失'}`),
           check('控制器读回与实际去留一致（丢失时为 UNKNOWN）', consistent),
         ],

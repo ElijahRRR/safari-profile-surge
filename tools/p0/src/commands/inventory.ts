@@ -1,6 +1,8 @@
 // inventory（只读）：系统与 Safari 版本、运行中 Surge 实例的版本（与服务同一读取器，证据见 inventory/surge-instance.json；
-// 磁盘上 Surge.app 的版本只作旁证）、CLI 签名与帮助、各读原语经 CLI/HTTP 是否可用、外部资源、
-// 当前配置名、临时规则、接管与出站、自动重载、Safari/WebKit 进程候选、配置目录是否在同步位置。
+// 磁盘上 Surge.app 的版本只作旁证）及其与 `surge-cli --raw version` 的交叉核对（证据见 inventory/surge-version.json；
+// 最低支持 6.10.0（12500）、Controller 协议 22）、CLI 签名与帮助（顶层 --help 加上 CLI_HELP_TOPICS 的逐条
+// `help <command>`，取词的并集）、各读原语经 CLI/HTTP 是否可用、外部资源、当前配置名、临时规则、接管与出站、
+// 自动重载、Safari/WebKit 进程候选、配置目录是否在同步位置。
 // 写入 inventory.json，打印表格与建议的 adapterMechanism。盘点从不调用任何写原语（写入守卫全部拒绝）。
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
@@ -13,9 +15,12 @@ import {
   listRelativeReferences,
   listRemoteSourceHosts,
   parseHttpApiLine,
+  SURGE_MINIMUM,
+  SURGE_VERSION_CHECK_FAILURE_TEXT,
   serviceInstanceResult,
   serviceLimitsExceeded,
   type SurgeAdapter,
+  type SurgeVersionCheck,
 } from '../deps.js';
 import { refused, type ExitCode } from '../errors.js';
 import { check, writeResult } from '../results.js';
@@ -23,28 +28,42 @@ import { classifyLocationRisk, findGitWorkTree } from '../run-dir.js';
 import { saveState, type InventorySummary } from '../state.js';
 import {
   ACTIVE_PRIMITIVES,
+  CLI_HELP_TOPICS,
   HTTP_NOT_IMPLEMENTED,
   READ_PRIMITIVES,
   allMechanism,
+  classifyTopicHelp,
   cliAvailability,
   createGuardedAdapter,
   createP0Adapter,
   describeLocation,
   emptyGuard,
   errorCode,
+  helpTopicFile,
   parseCliHelp,
   proposeMechanism,
+  unionHelpWords,
   type CliAvailability,
+  type HelpTopicStatus,
   type Primitive,
   type ProbeOutcome,
   type ReadPrimitive,
 } from '../surge-access.js';
 import { SAFARI_APP, SURGE_APP, appVersion, listProcesses, surgeProcesses, swVers, webkitSafariCandidates } from '../system.js';
 import { TEST_PROFILE_NAME } from '../test-profile.js';
-import { createRun, fmtBool, measureContext, openRun, printResult, profileNameOf, readSurgeInstance, resolveCli, tryRead, type Ctx } from './common.js';
+import { createRun, crossCheckVersion, fmtBool, measureContext, openRun, printResult, profileNameOf, readSurgeInstance, resolveCli, tryRead, type Ctx } from './common.js';
 import { instanceEvidence, instanceSummaryText, printInstanceReport, warnOnDiskDifference, warnServiceLimits } from './instance.js';
 
-const HELP_LINE_RE = /temp|rule|resource|policy|polic|request|dump|version|check|select|kill|profile|group|test/i;
+const HELP_LINE_RE = /temp|rule|resource|policy|polic|request|dump|version|check|select|kill|profile|group|test|status|feature|mode|match|performance/i;
+
+const HELP_TOPIC_STATUS_TEXT: Record<HelpTopicStatus, string> = { ok: '已读取', interactive: '进入交互模式（不采用）', unsupported: 'Unknown command（不采用）', failed: '失败或没有输出（不采用）' };
+
+/** 版本交叉核对的一行说明（与服务同一规则）。 */
+export function versionCheckText(check: SurgeVersionCheck | null): string {
+  if (check === null) return '运行实例不可读，未核对';
+  if (!check.ok) return `未通过：${SURGE_VERSION_CHECK_FAILURE_TEXT[check.reason]}`;
+  return `通过：${check.version}（${check.build}）· Controller 协议 ${check.controllerProtocol} · Core ${check.coreVersion}`;
+}
 
 interface ProbeContext {
   group: string | null;
@@ -63,6 +82,9 @@ async function probe(adapter: SurgeAdapter, p: ReadPrimitive, c: ProbeContext): 
         return adapter.getPolicyDetail(c.policy!);
       case 'checkProfile':
         return adapter.checkProfile(c.profilePath!);
+      case 'matchRule':
+        // 只读求值（“without creating a connection”）：合成的主机与进程，只证明命令与输出可以解析；入口的运行时读回另行证明。
+        return adapter.matchRule({ host: 'p0-inventory.invalid', processPath: '/usr/bin/true' });
       default:
         return (adapter[p] as () => Promise<unknown>)();
     }
@@ -104,6 +126,8 @@ function summarizeValue(p: ReadPrimitive, v: unknown): unknown {
       }));
     case 'checkProfile':
       return { ok: (v as { ok: boolean }).ok };
+    case 'matchRule':
+      return { hasRule: typeof (v as { rule?: unknown }).rule === 'string', hasPolicy: typeof (v as { policy?: unknown }).policy === 'string' };
     default:
       return v;
   }
@@ -132,17 +156,33 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   const webkit = webkitSafariCandidates(procs);
   dir.writeJson('inventory/processes.json', { at: now().toISOString(), webkitSafariCandidates: webkit, surge: surgeProcesses(procs) });
 
-  // CLI：签名校验通过才执行；帮助原文存运行目录。帮助参数若进入交互模式，命令词按空处理（不探测任何 CLI 原语）。
+  // CLI：签名校验通过才执行；帮助原文存运行目录。顶层帮助若进入交互模式，命令词按空处理（不读逐条帮助，不探测任何
+  // CLI 原语）。否则再逐条读取 `help <command>`（6.9.0 起顶层帮助只列命令组），可用的输出与顶层帮助取词的并集。
   const cli = await resolveCli(ctx, state);
   let words = new Set<string>();
   let helpInteractive = false;
+  const helpTopics: Record<string, HelpTopicStatus> = {};
   if (cli.ok) {
     const r = await exec(cli.path, ['--help'], { timeoutMs: 15_000 });
     const help = `${r.stdout}\n${r.stderr}`;
     dir.writeAtomic('inventory/surge-cli-help.txt', help);
     ({ words, interactive: helpInteractive } = parseCliHelp(help));
-    if (helpInteractive) out.warn('surge-cli --help 进入了交互模式：帮助中的命令按空处理，本次不经 CLI 探测任何原语（原文见 inventory/surge-cli-help.txt）');
-    const relevant = help.split(/\r?\n/).filter((l) => HELP_LINE_RE.test(l)).slice(0, 40);
+    const texts: string[] = [help];
+    if (helpInteractive) {
+      out.warn('surge-cli --help 进入了交互模式：帮助中的命令按空处理，本次不读取逐条帮助、不经 CLI 探测任何原语（原文见 inventory/surge-cli-help.txt）');
+    } else {
+      for (const topic of CLI_HELP_TOPICS) {
+        const t = await exec(cli.path, ['help', ...topic], { timeoutMs: 15_000 });
+        const status = classifyTopicHelp(t);
+        helpTopics[topic.join(' ')] = status;
+        dir.writeAtomic(`inventory/surge-cli-help/${helpTopicFile(topic)}`, `${t.stdout}\n${t.stderr}`);
+        if (status === 'ok') texts.push(t.stdout);
+      }
+      words = unionHelpWords(texts);
+      const skipped = Object.entries(helpTopics).filter(([, v]) => v !== 'ok');
+      if (skipped.length > 0) out.warn(`以下命令帮助不可用，其中的词没有采用：${skipped.map(([k, v]) => `help ${k}（${HELP_TOPIC_STATUS_TEXT[v]}）`).join('、')}`);
+    }
+    const relevant = [...new Set(texts.flatMap((t) => t.split(/\r?\n/)).filter((l) => HELP_LINE_RE.test(l)))].slice(0, 120);
     dir.writeAtomic('inventory/surge-cli-help-relevant.txt', `${relevant.join('\n')}\n`);
   }
 
@@ -226,6 +266,15 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   }
   const httpUsable = httpProbes.getCurrentProfile?.status === 'ok' || httpProbes.listPolicies?.status === 'ok';
   const proposal = proposeMechanism(cliProbes, httpProbes, cliHelp, httpUsable);
+  // 运行实例与 `surge-cli --raw version` 的交叉核对（只读；帮助中没有 version 时不执行，按读不到处理）。
+  const versionCheck = await crossCheckVersion(cliAdapter && cliHelp.getVersion === 'in_help' ? { adapter: cliAdapter } : null, instance);
+  dir.writeJson('inventory/surge-version.json', {
+    at: now().toISOString(),
+    minimum: SURGE_MINIMUM,
+    instance: svc.ok ? { version: svc.instance.version, build: svc.instance.build } : null,
+    cli: values.getVersion ?? null,
+    check: versionCheck,
+  });
 
   const takeover = (values.getTakeoverState as TakeoverState | undefined) ?? null;
   const currentProfile = (values.getCurrentProfile as { name: string } | undefined)?.name ?? null;
@@ -236,6 +285,12 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     surgeApp,
     surgeVersion: svc.ok ? { version: svc.instance.version, build: svc.instance.build } : { version: null, build: null },
     surgeInstance: { ok: svc.ok, reason: svc.ok ? null : svc.reason },
+    surgeVersionCheck:
+      versionCheck === null
+        ? null
+        : versionCheck.ok
+          ? { ok: true, reason: null, controllerProtocol: versionCheck.controllerProtocol, coreVersion: versionCheck.coreVersion }
+          : { ok: false, reason: versionCheck.reason, controllerProtocol: null, coreVersion: null },
     cliVerified: { ok: cli.ok, reason: cli.reason },
     httpApi: httpApiInfo,
     currentProfileName: currentProfile,
@@ -250,6 +305,7 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     profile: profileInfo,
     cliHelp,
     cliHelpInteractive: helpInteractive,
+    cliHelpTopics: helpTopics,
     surgeInstance: { ok: svc.ok, reason: svc.ok ? null : svc.reason, cached: instance.cached, serviceLimitsExceeded: serviceLimitsExceeded(instance), evidence: 'inventory/surge-instance.json' },
     probes: { cli: cliProbes, http: httpProbes },
     values: Object.fromEntries(Object.entries(values).map(([k, v]) => [k, summarizeValue(k as ReadPrimitive, v)])),
@@ -267,8 +323,14 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     ['macOS', `${macos.productVersion ?? '读不到'}（${macos.buildVersion ?? '读不到'}）`],
     ['Safari', `${safari.version ?? '读不到'}（${safari.build ?? '读不到'}）`],
     ['运行中的 Surge', instanceSummaryText(instance)],
+    ['版本交叉核对（surge-cli --raw version）', versionCheckText(versionCheck)],
     ['Surge.app（磁盘，旁证）', `${surgeApp.version ?? '读不到'}（${surgeApp.build ?? '读不到'}）`],
-    ['Surge CLI', cli.ok ? `签名校验通过（${cli.reason}）${helpInteractive ? '；--help 进入交互模式，命令按空处理' : ''}` : `不可用（${cli.reason}）`],
+    [
+      'Surge CLI',
+      cli.ok
+        ? `签名校验通过（${cli.reason}）${helpInteractive ? '；--help 进入交互模式，命令按空处理' : `；逐条帮助 ${Object.values(helpTopics).filter((v) => v === 'ok').length}/${CLI_HELP_TOPICS.length} 条可用`}`
+        : `不可用（${cli.reason}）`,
+    ],
     ['http-api', httpApiInfo.configured ? (httpApiInfo.loopbackOnly ? '已配置，只监听回环' : '已配置，绑定非回环地址（不使用）') : profilePath ? '未配置' : '未提供 --profile'],
     ['当前配置', currentProfile ?? '读不到'],
     ['配置目录', profileInfo ? (profileInfo.directoryRisk === null ? '无法确认真实位置' : String(profileInfo.directoryRisk)) : '未提供 --profile'],
@@ -281,6 +343,8 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   warnServiceLimits(out, instance);
   if (!instance.result.ok) {
     out.warn('无法确认运行中 Surge 的版本：能力上下文中的版本与构建号为空，依赖 Surge 版本的能力不能提议。逐条检查见下表与 inventory/surge-instance.json');
+  } else if (versionCheck !== null && !versionCheck.ok) {
+    out.warn(`版本交叉核对未通过（${SURGE_VERSION_CHECK_FAILURE_TEXT[versionCheck.reason]}）：能力上下文中的版本与构建号为空，依赖 Surge 版本的能力不能提议；证据见 inventory/surge-version.json`);
   }
   if (profileInfo) {
     const sfe = profileInfo.sfeFilesInDirectory as string[];

@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ENTRY_RULESET_FILES, NODE_RESOURCE_FILE } from '@sfe/contract';
+import { ENTRY_PLACEHOLDER_RULE, ENTRY_RULESET_FILES, ENTRY_WITNESS_PROCESS_PATH, NODE_RESOURCE_FILE } from '@sfe/contract';
 import { describe, expect, it } from 'vitest';
 import {
   FAKE_CHROME_PATH,
@@ -24,9 +24,12 @@ import {
   PRECEDENCE_MODULE_FILE,
   TEST_NODES,
   TEST_PROFILE_FILE,
+  armProfileCanary,
   buildTestProfile,
   bypassWarnings,
   canaryHost,
+  profileCanaryHost,
+  profileCanaryRule,
   profileRuleLines,
   testNodeResource,
 } from '../src/test-profile.js';
@@ -80,9 +83,10 @@ describe('buildTestProfile', () => {
     ]);
     const lines = r.profileText.split('\n');
     const endEntry = lines.indexOf('# SFE-END entry');
-    expect(lines.slice(endEntry + 1, endEntry + 6)).toEqual([
+    expect(lines.slice(endEntry + 1, endEntry + 7)).toEqual([
       '# P0-TEST-BEGIN rule',
       `RULE-SET,${CANARY_FILE},P0-Canary`,
+      'DOMAIN,p0.pcanary.p0.example.test,P0-Canary',
       `DOMAIN,${CHAIN_HOST},SFE-ROUTE`,
       'DOMAIN-SUFFIX,p0.example.test,P0-Plain',
       '# P0-TEST-END rule',
@@ -197,7 +201,13 @@ describe('buildTestProfile', () => {
     expect(Object.keys(r.files).sort()).toEqual([CANARY_FILE, ...Object.values(ENTRY_RULESET_FILES), NODE_RESOURCE_FILE].sort());
     expect(r.files[NODE_RESOURCE_FILE]).toContain(`${TEST_NODES.a} = socks5, 127.0.0.1, 18081, username=p0-a`);
     expect(r.files[NODE_RESOURCE_FILE]).toContain('underlying-proxy=P0-Front');
-    for (const f of Object.values(ENTRY_RULESET_FILES)) expect(r.files[f]).toContain('DOMAIN,sfe-disabled.invalid');
+    for (const f of Object.values(ENTRY_RULESET_FILES)) {
+      expect(r.files[f]).toContain(ENTRY_PLACEHOLDER_RULE);
+      // 占位与见证规则只匹配合成见证进程：DOMAIN 规则按主机名匹配任何进程（rules/domain.html），不限定进程的写法会经 SFE-ROUTE
+      const lines = r.files[f]!.split('\n').filter((l) => l.includes('.invalid'));
+      expect(lines).toHaveLength(2);
+      for (const l of lines) expect(l.startsWith(`AND,((PROCESS-NAME,${ENTRY_WITNESS_PROCESS_PATH}),(DOMAIN,`)).toBe(true);
+    }
     expect(r.moduleText).toContain('DOMAIN,api.ipify.org,DIRECT');
     expect(PRECEDENCE_MODULE_FILE.endsWith('.sgmodule')).toBe(true);
   });
@@ -239,10 +249,12 @@ describe('generated test profile on FakeSurge', () => {
     expect(surge.simulateRequest({ processPath: FAKE_CHROME_PATH, host: ECHO_HOST, protocol: 'tcp' }).policyName).toBe('P0-Plain');
     expect(surge.simulateRequest({ processPath: FAKE_CHROME_PATH, host: canaryHost(0), protocol: 'tcp' }).policyName).toBe('P0-Canary');
     expect(surge.simulateRequest({ processPath: FAKE_CHROME_PATH, host: canaryHost(1), protocol: 'tcp' }).policyName).toBe('P0-Plain');
+    expect(surge.simulateRequest({ processPath: FAKE_CHROME_PATH, host: profileCanaryHost(0), protocol: 'tcp' }).policyName).toBe('P0-Canary');
+    expect(surge.simulateRequest({ processPath: FAKE_CHROME_PATH, host: profileCanaryHost(1), protocol: 'tcp' }).policyName).toBe('P0-Plain');
     expect(surge.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: CHAIN_HOST, protocol: 'tcp' }).policyName).toBe('SFE-ROUTE');
   });
 
-  it('is readable as NORMAL by the service ruleset strategy and a refresh adds members', async () => {
+  it('is readable as NORMAL by the service ruleset strategy; new members load only when Surge re-reads the local file (update skips it)', async () => {
     const { dir, surge } = setup();
     const files = createProfileFiles({ directory: dir, hmacKey: Buffer.alloc(32, 1) });
     const ownership = createMemoryEntryOwnership(await ownedRulesetRecords(files));
@@ -256,10 +268,40 @@ describe('generated test profile on FakeSurge', () => {
     });
     expect((await controller.read()).mode).toBe('NORMAL');
     writeFileSync(join(dir, NODE_RESOURCE_FILE), testNodeResource(['a', 'b', 'c'], PORTS, PW, 2));
-    const key = (await surge.listExternalResources()).find((x) => x.location.endsWith(NODE_RESOURCE_FILE))!.key;
+    const res = (await surge.listExternalResources()).find((x) => x.location.endsWith(NODE_RESOURCE_FILE))!;
+    expect(res).toMatchObject({ type: 'policy-group', local: true, lastUpdatedAt: null, fromModule: null });
     expect(await surge.getGroupMembers('SFE-ROUTE')).toHaveLength(3);
-    await surge.updateExternalResource(key);
+    // Surge 6.10：“Local resources are skipped.”——update 不重新读取本地文件，结果不算刷新
+    expect(await surge.updateExternalResource(res.key)).toEqual({ key: res.key, refreshed: false, outcome: 'skipped' });
+    expect(await surge.getGroupMembers('SFE-ROUTE')).toHaveLength(3);
+    // 本地 policy-path 被监视时（文档没有写明，P0 测量）新成员才出现
+    surge.watchLocalPolicyPaths = true;
     expect(await surge.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', TEST_NODES.a, TEST_NODES.b, TEST_NODES.c]);
     expect(surge.reloadCount).toBe(0);
+  });
+
+  it('the profile canary is read only on a profile reload, never by the file watcher', async () => {
+    const { dir, surge } = setup();
+    const text = buildTestProfile(SOURCE, opts).profileText;
+    writeFileSync(join(dir, TEST_PROFILE_FILE), armProfileCanary(text, 42));
+    expect(surge.simulateRequest({ processPath: FAKE_CHROME_PATH, host: profileCanaryHost(42), protocol: 'tcp' }).policyName).toBe('P0-Plain');
+    await surge.reloadProfile();
+    expect(surge.simulateRequest({ processPath: FAKE_CHROME_PATH, host: profileCanaryHost(42), protocol: 'tcp' }).policyName).toBe('P0-Canary');
+  });
+});
+
+describe('armProfileCanary', () => {
+  it('replaces only the profile canary line', () => {
+    const text = buildTestProfile(SOURCE, opts).profileText;
+    const armed = armProfileCanary(text, 7);
+    expect(armed).toBe(text.replace(profileCanaryRule(0), profileCanaryRule(7)));
+    expect(armProfileCanary(armed, 8)).toBe(text.replace(profileCanaryRule(0), profileCanaryRule(8)));
+    expect(profileCanaryRule(7)).toBe('DOMAIN,p7.pcanary.p0.example.test,P0-Canary');
+  });
+
+  it('refuses a profile without exactly one canary line (changed outside the tool)', () => {
+    const text = buildTestProfile(SOURCE, opts).profileText;
+    expect(refusal(() => armProfileCanary(text.replace(profileCanaryRule(0), ''), 1)).code).toBe('refused');
+    expect(refusal(() => armProfileCanary(text.replace(profileCanaryRule(0), `${profileCanaryRule(0)}\n${profileCanaryRule(3)}`), 1)).code).toBe('refused');
   });
 });

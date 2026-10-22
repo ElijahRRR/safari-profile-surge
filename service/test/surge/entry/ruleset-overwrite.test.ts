@@ -7,11 +7,11 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFil
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import { ENTRY_MODE_BITS, ENTRY_RULESET_FILES, SfeError, type KnownEntryMode } from '@sfe/contract';
+import { ENTRY_MODE_BITS, ENTRY_PLACEHOLDER_RULE, ENTRY_RULESET_FILES, SfeError, type KnownEntryMode } from '@sfe/contract';
 import type { EntryController, EntryTransitionOptions } from '../../../src/ports.js';
 import { FAKE_SAFARI_PATH, FAKE_VERIFY_HOST, FakeSurge, createFakeSurgeEnvironment } from '../../../src/surge/fake.js';
 import { createProfileFiles, type ManagedProfileFiles } from '../../../src/surge/files.js';
-import { entryRuleSetFileContent, nodeLine, resourceFile } from '../../../src/surge/generate.js';
+import { nodeLine, parseEntryRuleSetFile, resourceFile } from '../../../src/surge/generate.js';
 import { createMemoryEntryOwnership, type MemoryEntryOwnership } from '../../../src/surge/entry/ownership.js';
 import { createRulesetStrategy, ownedRulesetRecords } from '../../../src/surge/entry/ruleset-strategy.js';
 import { modeOfSemantic, type EntrySemantic, type Outcome } from '../../../src/surge/entry/common.js';
@@ -50,9 +50,9 @@ interface Setup {
 
 async function setup(start: KnownEntryMode): Promise<Setup> {
   createFakeSurgeEnvironment(dir);
-  const fake = new FakeSurge({ directory: dir, autoReload: false });
+  // 节点文件在构造前写好：假 Surge 加载配置时读入（Surge 6.10 的 updateExternalResource 跳过本地资源）。
   writeFileSync(join(dir, 'sfe-nodes.list'), resourceFile(1, [nodeLine({ name: NODE, host: '203.0.113.10', port: 1080, username: null, password: null, front: 'Front-A' })]));
-  await fake.updateExternalResource('policy-path:sfe-nodes.list');
+  const fake = new FakeSurge({ directory: dir, autoReload: false });
   await fake.selectGroupPolicy('SFE-ROUTE', NODE);
   const files = createProfileFiles({ directory: dir, hmacKey: 'example-hmac-key' });
   const ownership = createMemoryEntryOwnership(await ownedRulesetRecords(files));
@@ -91,8 +91,9 @@ describe('ruleset_resource: externally modified app-owned entry files', () => {
     expect(rb.evidence.some((e) => e.includes('已改写被外部修改的本应用入口规则集文件'))).toBe(true);
     assertNoWindow(s.seen, 'ACTIVE', 'BLOCKED');
     expect(observedMode(s.fake)).toBe('BLOCKED');
-    // 改写后的内容与记录一致：不再是外部修改
-    expect(await s.files.digest(ENTRY_RULESET_FILES.active)).toBe(s.files.digestContent(entryRuleSetFileContent('active', false, CFG)));
+    // 改写后的内容（带新的见证）与记录一致：不再是外部修改
+    expect(parseEntryRuleSetFile('active', readFileSync(path('active'), 'utf8')).bodies).toEqual([ENTRY_PLACEHOLDER_RULE]);
+    expect(readFileSync(path('active'), 'utf8')).not.toContain('# note');
     expect(s.ownership.records().find((r) => r.identity === ENTRY_RULESET_FILES.active)).toMatchObject({ state: 'present', digest: await s.files.digest(ENTRY_RULESET_FILES.active) });
     expect((await s.ctrl.read()).mode).toBe('BLOCKED');
     expect((await s.ctrl.read()).changedOwnedFiles).toEqual([]);
@@ -136,7 +137,8 @@ describe('ruleset_resource: externally modified app-owned entry files', () => {
     expect((await s.ctrl.read()).mode).toBe('UNKNOWN');
     expect((await s.ctrl.transition('NORMAL', () => s.seen.push(observedMode(s.fake)), UNDO)).mode).toBe('NORMAL');
     assertNoWindow(s.seen, 'BLOCKED', 'NORMAL');
-    expect(readFileSync(path('udp'), 'utf8')).toBe(entryRuleSetFileContent('udp', false, CFG));
+    expect(parseEntryRuleSetFile('udp', readFileSync(path('udp'), 'utf8'))).toMatchObject({ bodies: [ENTRY_PLACEHOLDER_RULE] });
+    expect(parseEntryRuleSetFile('udp', readFileSync(path('udp'), 'utf8')).witness).not.toBeNull();
     expect(observedMode(s.fake)).toBe('NORMAL');
   });
 

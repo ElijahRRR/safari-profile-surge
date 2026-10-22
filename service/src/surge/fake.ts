@@ -1,6 +1,18 @@
-// 假 Surge：引擎测试与演示模式使用。工作配置从目录读取；“已加载状态”与文件分开——
-// policy-path 成员与 RULE-SET 内容只在 updateExternalResource(key) 或 reloadProfile() 时（重新）加载，
-// 可选的 autoReload 在文件变化时整体重载并计数。演示中的“已生效”不代表任何网络事实。
+// 假 Surge：引擎测试与演示模式使用，按 Surge Mac 6.10.0 的文档语义建模（不代表任何网络事实）。工作配置从目录读取；
+// “已加载状态”与文件分开：
+// - updateExternalResource(key) 跳过本地资源，从不重新读取本地文件（HTTP API 文档：“Local resources are skipped.”），
+//   本地资源没有更新时间（“Local resources have no `updatedAt` field.”），报告 local: true；远端资源只推进更新时间；
+// - 本地 RULE-SET 文件变化后由文件监视自动重新加载（规则集文档：“Local files are watched and reloaded automatically when
+//   they change.”），只重新加载该规则集、不重载配置，延迟可配置（localWatchLatencyMs）；
+// - 本地 policy-path 文件是否被监视没有写入文档：watchLocalPolicyPaths 是测试参数，缺省关闭（成员只在 reloadProfile 时变化）；
+// - 资源类型按文档记为 policy-group / ruleset；新临时规则排在最前（“Add a temporary rule with the highest priority”，
+//   多条之间的顺序未写入文档，tempRuleInsertion 可改）；
+// - matchRule 与 simulateRequest 用同一套求值（模块规则 → 临时规则 → 配置规则）；
+// - getVersion 报告版本、构建号、Core 版本与 Controller 协议号（缺省 6.10.0 / 12500）；
+// - `rule match` 与 `rule temp add/remove` 是 Mac 6.9.0+、协议 ≥20 的命令：低于它们时回答 Unknown command（随包技能：
+//   “An older core answers `Unknown command`”）；`--raw dump temp-rule` 与 `--raw dump rule` 不受影响。改版本用
+//   changeVersion（升级或降级需要退出并重新打开 Surge，临时规则随之丢弃）。
+// 可选的 autoReload 模拟“配置被外部修改时自动重载”：任一被引用文件变化后整体重载并计数。
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -21,13 +33,19 @@ import type {
   SurgePolicyTestResult,
   SurgeProfileInfo,
   SurgeRequestRecord,
+  SurgeResourceUpdateResult,
+  SurgeRuleMatchInput,
+  SurgeRuleMatchResult,
   SurgeRuleRecord,
   SurgeRuntimeInfo,
   SurgeVersion,
 } from '../ports.js';
+import { unsupportedCommandError } from './cli-adapter.js';
+import { ruleMatchArgs } from './cli-commands.js';
+import { unrecognized } from './parse-output.js';
 import { ENTRY_BITS_IN_ORDER, entryRuleSetFileContent, entryRuleSetBlockLines, groupBlockLines, resourceFile } from './generate.js';
-import { SURGE_PRIMITIVES, type MechanismMap } from './primitives.js';
-import { SURGE_APP_BUNDLE, SURGE_BUNDLE_IDS, type RunningInstanceFailure, type RunningInstanceResult } from './running-instance.js';
+import { SURGE_PRIMITIVES, type MechanismMap, type SurgePrimitive } from './primitives.js';
+import { SURGE_APP_BUNDLE, SURGE_BUNDLE_IDS, compareSurgeVersions, type RunningInstanceFailure, type RunningInstanceResult } from './running-instance.js';
 import { SURGE_BUILD_RE, SURGE_VERSION_RE } from './capability-gate.js';
 import { findSections, parseProfile } from './profile.js';
 import { parseProxyLine } from './proxy-line.js';
@@ -53,8 +71,16 @@ export interface FakeSurgeOptions {
   autoReload?: boolean;
   /** getAutoReloadSetting 报告的值；缺省等于 autoReload。 */
   reportedAutoReload?: boolean | null;
-  /** 新临时规则插入位置。 */
+  /** 新临时规则插入位置；缺省 head（文档：“Add a temporary rule with the highest priority”）。 */
   tempRuleInsertion?: 'head' | 'tail';
+  /** 本地文件变化后到监视器重新加载之间的延迟（毫秒，按 now 计）；缺省 0：变化后的下一次调用即重新加载。 */
+  localWatchLatencyMs?: number;
+  /** 本地 policy-path 文件是否像本地 RULE-SET 一样被监视（文档未说明，缺省关闭）。 */
+  watchLocalPolicyPaths?: boolean;
+  /** getVersion 报告的 Controller 协议号（合成值；真实值由 P0 读取）。 */
+  controllerProtocol?: number;
+  /** getVersion 报告的 Core 版本（合成值）。 */
+  coreVersion?: number;
   /** 外部节点的 underlying-proxy 缺失时：跳过节点，或（危险情形）直接连接。 */
   frontResolution?: 'skip' | 'direct';
   /** 重载配置时是否清空临时规则（P0 待测，缺省保留）。 */
@@ -83,14 +109,18 @@ interface LoadedGroup {
 
 interface LoadedResource {
   key: string;
-  type: 'policy-path' | 'ruleset';
+  /** HTTP API 文档的资源类型（policy-path 的类型是 policy-group）。 */
+  type: 'policy-group' | 'ruleset';
   value: string;
   location: string;
   local: boolean;
   content: string | null;
   conditions: RuleCondition[];
+  /** 只有远端资源有；本地资源始终为 null。 */
   lastUpdatedAt: Date | null;
   error: string | null;
+  /** 监视器第一次看到文件与已加载内容不同的时刻（毫秒）；没有待处理的变化为 null。 */
+  changeSeenAt: number | null;
 }
 
 export interface SimulatedRequest extends SurgeRequestRecord {
@@ -128,12 +158,18 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   autoReload: boolean;
   reportedAutoReload: boolean | null | undefined;
   tempRuleInsertion: 'head' | 'tail';
+  localWatchLatencyMs: number;
+  watchLocalPolicyPaths: boolean;
+  /** 文件监视器重新加载单个资源的记录（不是配置重载，不计入 reloadCount）。 */
+  readonly watcherReloads: Array<{ key: string; at: Date }> = [];
   frontResolution: 'skip' | 'direct';
   reloadClearsTempRules: boolean;
   reachable = true;
   /** 运行实例（HostInfo.surgeInstance）报告的版本与构建号；格式不对时运行实例读取失败。 */
   version: string;
   build: string | null;
+  controllerProtocol: number;
+  coreVersion: number;
   /** 模拟运行实例读取失败（例如 modified_after_start）；null 表示按 version/build 正常报告。 */
   instanceFailure: RunningInstanceFailure | null = null;
   /** runningInstance() 的调用次数（不是 Surge 原语，不计入 calls）。 */
@@ -165,11 +201,16 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     this.profileFileName = opts.profileFileName ?? `${WORKING_PROFILE_NAME}.conf`;
     this.autoReload = opts.autoReload ?? false;
     this.reportedAutoReload = opts.reportedAutoReload;
-    this.tempRuleInsertion = opts.tempRuleInsertion ?? 'tail';
+    this.tempRuleInsertion = opts.tempRuleInsertion ?? 'head';
+    this.localWatchLatencyMs = opts.localWatchLatencyMs ?? 0;
+    this.watchLocalPolicyPaths = opts.watchLocalPolicyPaths ?? false;
     this.frontResolution = opts.frontResolution ?? 'skip';
     this.reloadClearsTempRules = opts.reloadClearsTempRules ?? false;
-    this.version = opts.version ?? '6.5.0';
-    this.build = opts.build === undefined ? '10960' : opts.build;
+    this.version = opts.version ?? '6.10.0';
+    this.build = opts.build === undefined ? '12500' : opts.build;
+    // 合成值：6.10 随包技能写明 `plugin` 需要协议 ≥24 且 6.10 带有 plugin 命令；真实协议号由 P0 读取。
+    this.controllerProtocol = opts.controllerProtocol ?? 24;
+    this.coreVersion = opts.coreVersion ?? 6100;
     this.now = opts.now ?? (() => new Date());
     this.startedAt = this.now();
     this.currentProfile = { name: this.profileFileName.replace(/\.conf$/, ''), path: this.profilePath };
@@ -206,6 +247,22 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     this.checkResults.set(resolve(path), result);
   }
 
+  /**
+   * 升级或降级 Surge：改版本需要退出并重新打开 Surge，等同于 restart()（临时规则“are discarded when Surge stops”）。
+   * 只改字段而不重启的测试会让旧版本仍然保留新版本添加的临时规则，与真实情形不符。
+   */
+  changeVersion(v: { version: string; build: string | null; controllerProtocol?: number }): void {
+    this.version = v.version;
+    this.build = v.build;
+    if (v.controllerProtocol !== undefined) this.controllerProtocol = v.controllerProtocol;
+    this.restart();
+  }
+
+  /** `rule match`、`rule temp add/remove`：Mac 6.9.0+、协议 ≥20；更旧的 Surge 回答 Unknown command。 */
+  private requireRuleCommands(primitive: SurgePrimitive): void {
+    if (compareSurgeVersions(this.version, '6.9.0') < 0 || this.controllerProtocol < 20) throw unsupportedCommandError(primitive);
+  }
+
   /** Surge 重启：临时规则清空、整体加载、启动时间变化、活动连接清空。 */
   restart(): void {
     this.temps = [];
@@ -225,17 +282,42 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   }
 
   checkFileChanges(): boolean {
-    if (!this.autoReload) return false;
-    for (const [path, snapshot] of this.watched) {
-      if (readOrNull(path) !== snapshot) {
-        this.reloadCount++;
-        this.autoReloadCount++;
-        this.loadAll();
-        if (this.reloadClearsTempRules) this.temps = [];
-        return true;
+    if (this.autoReload) {
+      for (const [path, snapshot] of this.watched) {
+        if (readOrNull(path) !== snapshot) {
+          this.reloadCount++;
+          this.autoReloadCount++;
+          this.loadAll();
+          if (this.reloadClearsTempRules) this.temps = [];
+          return true;
+        }
       }
     }
+    this.runWatchers();
     return false;
+  }
+
+  /**
+   * 本地文件监视：本地 RULE-SET（以及打开 watchLocalPolicyPaths 时的本地 policy-path）在文件内容与已加载内容不同、
+   * 且距第一次看到变化已过 localWatchLatencyMs 时，只重新加载该资源（不是配置重载，临时规则与选择不变）。
+   */
+  private runWatchers(): void {
+    const t = this.now().getTime();
+    let nodesChanged = false;
+    for (const res of this.resources.values()) {
+      if (!res.local || (res.type === 'policy-group' && !this.watchLocalPolicyPaths)) continue;
+      const current = readOrNull(res.location);
+      if (current === res.content) {
+        res.changeSeenAt = null;
+        continue;
+      }
+      if (res.changeSeenAt === null) res.changeSeenAt = t;
+      if (t - res.changeSeenAt < this.localWatchLatencyMs) continue;
+      this.loadResource(res);
+      this.watcherReloads.push({ key: res.key, at: new Date(t) });
+      if (res.type === 'policy-group') nodesChanged = true;
+    }
+    if (nodesChanged) this.rebuildExternalNodes();
   }
 
   /**
@@ -244,20 +326,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
    */
   simulateRequest(req: { processPath: string | null; host: string; protocol: 'tcp' | 'udp'; longLived?: boolean }): SimulatedRequest {
     this.checkFileChanges();
-    const facts = { processPath: req.processPath, host: req.host, protocol: req.protocol };
-    const ctx = { ruleSet: (value: string) => this.resources.get(`ruleset:${value}`)?.conditions ?? null };
-    let matchedRule = 'FINAL,DIRECT';
-    let policy = 'DIRECT';
-    const ordered = [...this.modules.map((m) => m.text), ...this.temps, ...this.profileRules];
-    for (const text of ordered) {
-      const r = parseRule(text);
-      if (!r || !r.policy) continue;
-      if (evaluateCondition(r.condition, facts, ctx)) {
-        matchedRule = text;
-        policy = r.policy;
-        break;
-      }
-    }
+    const { rule: matchedRule, policy } = this.evaluate({ processPath: req.processPath, host: req.host, protocol: req.protocol });
     const resolved = this.resolvePolicy(policy, 0);
     const rec: SimulatedRequest = {
       id: String(this.nextId++),
@@ -277,6 +346,18 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     if (this.recent.length > 500) this.recent.shift();
     if (req.longLived && !resolved.rejected) this.active.set(rec.id, rec);
     return { ...rec, chain: [...rec.chain] };
+  }
+
+  /** 规则求值：模块规则 → 临时规则 → 配置规则（RULE-SET 用已加载的内容），第一条命中的规则决定策略。 */
+  private evaluate(facts: { processPath: string | null; host: string; protocol: 'tcp' | 'udp' }): { rule: string; policy: string } {
+    const ctx = { ruleSet: (value: string) => this.resources.get(`ruleset:${value}`)?.conditions ?? null };
+    const ordered = [...this.modules.map((m) => m.text), ...this.temps, ...this.profileRules];
+    for (const text of ordered) {
+      const r = parseRule(text);
+      if (!r || !r.policy) continue;
+      if (evaluateCondition(r.condition, facts, ctx)) return { rule: text, policy: r.policy };
+    }
+    return { rule: 'FINAL,DIRECT', policy: 'DIRECT' };
   }
 
   // ---------- 加载 ----------
@@ -310,7 +391,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
         else if (part.slice(0, eq).trim().toLowerCase() === 'policy-path') {
           const value = part.slice(eq + 1).trim();
           group.policyPaths.push(value);
-          this.registerResource('policy-path', value, previous);
+          this.registerResource('policy-group', value, previous);
         }
       }
       this.groups.set(group.name, group);
@@ -326,8 +407,9 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     this.rebuildExternalNodes();
   }
 
-  private registerResource(type: 'policy-path' | 'ruleset', value: string, previous: Map<string, LoadedResource>): void {
-    const key = `${type}:${value}`;
+  /** 资源 key 是不透明的合成值（真实 Surge 的 key 由它自己生成）：policy-path:<值> 与 ruleset:<值>。 */
+  private registerResource(type: 'policy-group' | 'ruleset', value: string, previous: Map<string, LoadedResource>): void {
+    const key = `${type === 'policy-group' ? 'policy-path' : 'ruleset'}:${value}`;
     if (this.resources.has(key)) return;
     const local = !/^[a-z][a-z0-9+.-]*:\/\//i.test(value);
     const prev = previous.get(key);
@@ -339,8 +421,9 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
       local,
       content: null,
       conditions: [],
-      lastUpdatedAt: prev?.lastUpdatedAt ?? null,
+      lastUpdatedAt: local ? null : (prev?.lastUpdatedAt ?? null),
       error: null,
+      changeSeenAt: null,
     });
   }
 
@@ -351,6 +434,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
 
   private loadResource(res: LoadedResource): void {
     if (!res.local) {
+      // 假 Surge 不下载任何东西：远端资源没有内容。
       res.content = '';
       res.conditions = [];
       return;
@@ -358,8 +442,8 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     const content = readOrNull(res.location);
     this.watched.set(res.location, content);
     res.content = content;
+    res.changeSeenAt = null;
     res.error = content === null ? 'file not found' : null;
-    res.lastUpdatedAt = this.bumpTime(res.lastUpdatedAt);
     res.conditions =
       res.type === 'ruleset' && content !== null
         ? content
@@ -373,7 +457,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   private rebuildExternalNodes(): void {
     this.externalNodes.clear();
     for (const res of this.resources.values()) {
-      if (res.type !== 'policy-path' || res.content === null) continue;
+      if (res.type !== 'policy-group' || res.content === null) continue;
       for (const line of res.content.split(/\r?\n/)) {
         if (isCommentLine(line)) continue;
         const p = parseProxyLine(line);
@@ -468,12 +552,19 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     return { ok: true, instance: { pid: 404, startedAt, bundlePath: SURGE_APP_BUNDLE, bundleId: SURGE_BUNDLE_IDS[0]!, version: this.version, build: this.build } };
   }
 
+  /** 与 `surge-cli --raw version` 的解析一致：缺少构建号或格式不对时输出无法识别（失败即关闭）。 */
   getVersion(): Promise<SurgeVersion> {
-    return this.invoke('getVersion', () => ({ version: this.version, build: this.build }));
+    return this.invoke('getVersion', () => {
+      if (this.build === null || !SURGE_VERSION_RE.test(this.version) || !SURGE_BUILD_RE.test(this.build)) throw unrecognized('Surge 版本');
+      return { version: this.version, build: this.build, coreVersion: this.coreVersion, controllerProtocol: this.controllerProtocol };
+    });
   }
 
   getRuntimeInfo(): Promise<SurgeRuntimeInfo> {
-    return this.invoke('getRuntimeInfo', () => ({ startedAt: new Date(this.startedAt) }));
+    return this.invoke('getRuntimeInfo', () => ({
+      startedAt: new Date(this.startedAt),
+      uptimeSeconds: Math.max(0, Math.floor((this.now().getTime() - this.startedAt.getTime()) / 1000)),
+    }));
   }
 
   getCurrentProfile(): Promise<SurgeProfileInfo> {
@@ -561,6 +652,16 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     ]);
   }
 
+  /** 与 `rule match` 相同：按当前有效规则求值一次，不建立连接、不记录请求。参数校验与 CLI 相同。 */
+  matchRule(input: SurgeRuleMatchInput): Promise<SurgeRuleMatchResult> {
+    return this.invoke('matchRule', () => {
+      this.requireRuleCommands('matchRule');
+      ruleMatchArgs(input);
+      const protocol = input.protocol === 'UDP' || input.protocol === 'QUIC' ? 'udp' : 'tcp';
+      return this.evaluate({ processPath: input.processPath, host: input.host, protocol });
+    });
+  }
+
   listActiveRequests(): Promise<SurgeRequestRecord[]> {
     return this.invoke('listActiveRequests', () => [...this.active.values()].map(({ chain: _c, frontMissing: _f, ...r }) => ({ ...r })));
   }
@@ -584,18 +685,24 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
         key: r.key,
         type: r.type,
         location: r.location,
-        lastUpdatedAt: r.lastUpdatedAt ? new Date(r.lastUpdatedAt) : null,
+        lastUpdatedAt: !r.local && r.lastUpdatedAt ? new Date(r.lastUpdatedAt) : null,
         error: r.error,
+        local: r.local,
+        updating: false,
+        fromModule: null,
       })),
     );
   }
 
-  updateExternalResource(key: string): Promise<void> {
+  /** 单个 key：本地资源被跳过（不重新读取文件，结果不算刷新）；远端资源推进更新时间；不存在的 key 失败（HTTP 400）。 */
+  updateExternalResource(key: string): Promise<SurgeResourceUpdateResult> {
     return this.invoke('updateExternalResource', () => {
       const res = this.resources.get(key);
       if (!res) throw commandFailed('更新外部资源失败：资源不存在');
-      this.loadResource(res);
-      if (res.type === 'policy-path') this.rebuildExternalNodes();
+      if (res.local) return { key, refreshed: false, outcome: 'skipped' as const };
+      res.lastUpdatedAt = this.bumpTime(res.lastUpdatedAt);
+      res.error = null;
+      return { key, refreshed: true, outcome: 'downloaded' as const };
     });
   }
 
@@ -605,6 +712,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
 
   addTempRule(rule: string): Promise<void> {
     return this.invoke('addTempRule', () => {
+      this.requireRuleCommands('addTempRule');
       if (this.temps.includes(rule)) throw commandFailed('添加临时规则失败：规则已存在');
       if (!parseRule(rule)) throw commandFailed('添加临时规则失败：规则无法解析');
       if (this.tempRuleInsertion === 'head') this.temps.unshift(rule);
@@ -614,6 +722,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
 
   removeTempRule(rule: string): Promise<void> {
     return this.invoke('removeTempRule', () => {
+      this.requireRuleCommands('removeTempRule');
       const i = this.temps.indexOf(rule);
       if (i < 0) throw commandFailed('删除临时规则失败：规则不存在');
       this.temps.splice(i, 1);

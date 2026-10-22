@@ -3,7 +3,8 @@
 import { readFileSync } from 'node:fs';
 import { CAPABILITY_CRITERIA, CAPABILITY_KEYS, CAPABILITY_LABELS } from '@sfe/contract';
 import { describe, expect, it } from 'vitest';
-import { SERVICE_CODESIGN_TIMEOUT_MS, SERVICE_INSTANCE_READ_BUDGET_MS } from '../src/deps.js';
+import { SERVICE_CODESIGN_TIMEOUT_MS, SERVICE_INSTANCE_READ_BUDGET_MS, SURGE_MINIMUM } from '../src/deps.js';
+import { CLI_HELP_TOPICS } from '../src/surge-access.js';
 
 const read = (name: string): string => readFileSync(new URL(`../../../docs/${name}`, import.meta.url), 'utf8');
 
@@ -71,6 +72,48 @@ describe('docs/P0-RUNBOOK.md', () => {
     expect(v6).toContain('--raw-dir <目录>');
   });
 
+  it('targets Surge Mac 6.10.0 (12500) with the documented minimum, and V8 is the surge-cli --raw version cross-check', () => {
+    expect(text).toContain('Surge Mac 6.10.0 (12500)');
+    expect(text).toContain(`最低支持 ${SURGE_MINIMUM.version}、构建 ≥ ${SURGE_MINIMUM.build}、Controller 协议 ≥ ${SURGE_MINIMUM.controllerProtocol}`);
+    const row = (n: number) => text.split('\n').find((l) => l.startsWith(`| V${n} |`))!;
+    expect(row(8)).toContain('| V8 | 版本交叉核对 |');
+    expect(row(8)).toContain('--raw version');
+    expect(row(8)).toContain('inventory/surge-version.json');
+    // --version 只记录现在的行为，产品与工具从不使用；不再期望它打印交互模式提示
+    expect(row(8)).toContain('产品与工具从不使用');
+    expect(text).not.toContain('`--version` 在 2 秒内结束并打印交互模式提示');
+    // V7 的期望文字来自 6.10 的发布说明与包内文字
+    expect(row(7)).toContain("Surge isn't running on the local machine. Use --remote to specify a remote target.");
+    expect(row(7)).toContain('Command errors are now written to standard error and produce a non-zero exit status.');
+    expect(text).not.toContain('不借用新版本文档中的能力');
+  });
+
+  it('describes the per-command help that inventory reads', () => {
+    for (const topic of CLI_HELP_TOPICS) expect(text).toContain(`\`help ${topic.join(' ')}\``);
+    expect(text).toContain('inventory/surge-cli-help/');
+    expect(text).toContain('`--check/-c` 这样的写法按 `--check` 识别');
+  });
+
+  it('measures the documented local-file watcher instead of a targeted update, and the 6.9+ reload escalation', () => {
+    for (const quote of [
+      'Local resources are skipped.',
+      'Local files are watched and reloaded automatically when they change.',
+      'Automatically performs a full engine restart if a change requires one.',
+      '`PROTOCOL,UDP` also matches QUIC and STUN connections.',
+      'Add a temporary rule with the highest priority',
+    ]) {
+      expect(text).toContain(quote);
+    }
+    // 配置 canary 与引擎运行时长取代规则集 canary 作为重载/重启信号
+    const signals = text.slice(text.indexOf('### 1.4'), text.indexOf('### 1.5'));
+    expect(signals).toContain('配置 canary');
+    expect(signals).toContain('引擎运行时长');
+    // 旧机制的说法已移除
+    for (const stale of ['temp-rule add', '按 key 定向刷新', '定向刷新被重新读取', 'updateExternalResource(key) 后改变匹配', '资源更新时间前进']) expect(text).not.toContain(stale);
+    expect(text).toContain('不要为了测试运行 `restart-engine`');
+    expect(text).toContain('### 1.6 文档没有写明、要在测试 Mac 上实测的行为（TODO(P0)）');
+  });
+
   it('documents the overall order and the manual profile switch', () => {
     for (const cmd of ['inventory', 'instance', 'test-servers', 'make-test-profile', 'attribution', 'entry', 'refresh', 'continuity', 'chain', 'charset', 'preflight', 'checklist', 'propose', 'rollback']) {
       expect(text).toContain(cmd);
@@ -107,7 +150,55 @@ describe('docs/ACCEPTANCE.md', () => {
   });
 
   it('lists the known limitations', () => {
-    for (const s of ['免费 Apple ID 签名', '接管与出站模式可读性', '页面登录身份', '不关闭，直接继续']) expect(text).toContain(s);
+    for (const s of ['免费 Apple ID 签名', '接管与出站模式可读性', '页面登录身份', '不关闭，直接继续', '最低 Surge 版本', '维护重载']) expect(text).toContain(s);
+  });
+
+  it('records the 6.10 version cross-check and the measured watcher behaviour in the environment table', () => {
+    for (const row of ['| 版本交叉核对（surge-cli --raw version 一致、Controller 协议 ≥ 22） | 未验证 |', '| 本地 policy-path 是否被自动重新读取及延迟（3.12 实测） | 未验证 |', '| 新临时规则的插入位置（entry 插入探测） | 未验证 |']) {
+      expect(text).toContain(row);
+    }
+  });
+});
+
+describe('docs/ARCHITECTURE.md §0', () => {
+  const text = read('ARCHITECTURE.md');
+  const s0 = text.slice(text.indexOf('## 0.'), text.indexOf('## 1.'));
+
+  it('records the deviations from the design docs: minimum Surge, local-file refresh mechanism, reload semantics, temp_rule texts', () => {
+    for (const s of ['**最低 Surge（用户决定', '**节点发布机制（用户决定', '**入口规则（偏离', '**本地文件的重新读取与 P0 测量（偏离', '**reload 语义（6.9.0 起', '**临时规则命令（偏离固定工作配置设计 §3']) {
+      expect(s0).toContain(s);
+    }
+    // 契约措辞已改写：不再说“待文档步骤改写”
+    expect(s0).not.toContain('待文档步骤改写');
+    expect(text).not.toContain('6.5 没有版本命令');
+  });
+
+  it('records the normal-mode conflict when rule match is unavailable instead of claiming normal mode is unaffected', () => {
+    expect(s0).toContain('**进入普通模式与 `rule match`（需要指出的冲突');
+    expect(s0).toContain('entry_unverified');
+    expect(s0).not.toContain('进入普通模式不受影响');
+    // CAPABILITY_PRIMITIVES 已调整：不再说仍列 updateExternalResource、没有 matchRule
+    expect(s0).not.toContain('仍列 `updateExternalResource`、没有 `matchRule`');
+  });
+
+  it('§5.5 scopes the witness and placeholder rules to the synthetic process and quotes the domain-rule doc', () => {
+    expect(text).toContain('`AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-<位>-<标记>.invalid))`');
+    expect(text).toContain('Domain rules match the hostname of a request. They are the most common rule types and never trigger a DNS lookup');
+    expect(text).not.toContain('`.invalid` 永不解析，真实请求不会命中');
+  });
+});
+
+describe('README.md and docs/DEVELOPMENT.md (read first per CLAUDE.md)', () => {
+  const readme = readFileSync(new URL('../../../README.md', import.meta.url), 'utf8');
+  const dev = read('DEVELOPMENT.md');
+
+  it('state the 6.10 minimum and node publishing by file watch, not the 6.5 target or a targeted refresh', () => {
+    expect(readme).toContain('最低支持 Surge for Mac 6.10.0（构建 ≥ 12500、Controller 协议 ≥ 22');
+    expect(dev).toContain('最低支持 Surge for Mac 6.10.0（构建 ≥ 12500、Controller 协议 ≥ 22）');
+    for (const t of [readme, dev]) {
+      expect(t).toContain('external-resource update');
+      for (const stale of ['本次设计调研的目标版本为 Surge 6.5.0', '定向刷新并读回', '当前仅有 Surge 6.5 的只读命令', '节点资源定向刷新 |', '定向节点刷新']) expect(t).not.toContain(stale);
+    }
   });
 });
 
@@ -118,6 +209,14 @@ describe('docs/INSTALL.md', () => {
     for (const s of ['xcodegen generate', 'Personal Team', '注册后台服务', 'www.amazon.com', '日常-Safari环境', '先进入普通模式', 'com.sfe.proxy', 'bridge.token', '同一用户的本机进程']) {
       expect(text).toContain(s);
     }
+  });
+
+  it('states the minimum Surge version and that getVersion, matchRule and getCurrentProfile must be mapped to cli', () => {
+    expect(text).toContain('Surge for Mac 6.10.0（构建 12500）或更高');
+    expect(text).toContain('`getVersion` 必须映射为 `cli`');
+    expect(text).toContain('`matchRule` 也必须映射为 `cli`');
+    expect(text).toContain('`getCurrentProfile` 必须映射为 `cli`');
+    expect(text).not.toContain('开发调研时为 6.5.0');
   });
 
   it('never instructs the tool to switch profiles or bulk-delete certificates', () => {

@@ -2,7 +2,8 @@ import { describe, expect, test } from 'vitest';
 import type { SurgeRequestRecord, SurgeRuleRecord } from '../../src/ports.js';
 import { classifyPrecedence, classifyPrecedenceAt, hasBlockingIssue } from '../../src/surge/precedence.js';
 import { findVerificationRequest } from '../../src/surge/correlate.js';
-import { tempRuleText } from '../../src/surge/generate.js';
+import { TEMP_ENTRY_KINDS, tempRuleText, type TempEntryKind } from '../../src/surge/generate.js';
+import { TEMP_KIND_COVER } from '../../src/surge/entry/common.js';
 
 const SAFARI = '/Applications/Safari.app/Contents/MacOS/Safari';
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -85,7 +86,12 @@ describe('classifyPrecedence', () => {
 
 describe('classifyPrecedence: temp_rule entries with a user rule between them', () => {
   const cfg = { processPaths: [SAFARI], verifyHost: 'verify.example.test', siteHosts: ['www.example.test'] };
-  const t = (bit: 'udp' | 'verify' | 'block' | 'active') => rule(tempRuleText(bit, cfg), 'temp_rule');
+  const t = (kind: TempEntryKind) => rule(tempRuleText(kind, cfg), 'temp_rule');
+  /** 与 temp_rule 策略相同：当前文本能证明覆盖的类别（条件互不相交，按累计覆盖找边界）。 */
+  const coverageOf = (r: SurgeRuleRecord) => {
+    const k = TEMP_ENTRY_KINDS.find((kind) => tempRuleText(kind, cfg) === r.text);
+    return k ? TEMP_KIND_COVER[k].classes : null;
+  };
   /** 旧版本格式的本应用规则：Safari 访问 example.test 经 SFE-ROUTE（不是覆盖 Safari 全部流量的规则）。 */
   const LEGACY = rule(`AND,((PROCESS-NAME,${SAFARI}),(DOMAIN-SUFFIX,example.test)),SFE-ROUTE`, 'temp_rule');
   const ours = (...rs: SurgeRuleRecord[]) => ({ ...ctx, isOurRule: (r: SurgeRuleRecord) => rs.some((o) => o.text === r.text) });
@@ -126,8 +132,21 @@ describe('classifyPrecedence: temp_rule entries with a user rule between them', 
     // block 覆盖 Safari 的全部流量：之后的用户规则与本应用规则都到不了
     const rules = [t('block'), user('DOMAIN-SUFFIX,example.test,DIRECT'), t('udp'), user('PROCESS-NAME,Safari,DIRECT')];
     expect(classifyPrecedence(rules, ours(t('block'), t('udp')))).toEqual([]);
-    const active = [t('udp'), t('active'), user('DOMAIN-SUFFIX,example.test,DIRECT'), t('block')];
-    expect(classifyPrecedence(active, ours(t('udp'), t('active'), t('block')))).toEqual([]);
+  });
+
+  test('…and after our rules that together cover all Safari traffic (udp + active, udp + verify + blockOther)', () => {
+    const direct = user('DOMAIN-SUFFIX,example.test,DIRECT');
+    const active = [t('udp'), t('active'), direct, t('block')];
+    expect(classifyPrecedence(active, { ...ours(t('udp'), t('active'), t('block')), coverageOf })).toEqual([]);
+    const verifyOnly = [t('verify'), t('udp'), t('blockOther'), direct, t('active')];
+    expect(classifyPrecedence(verifyOnly, { ...ours(t('udp'), t('verify'), t('blockOther'), t('active')), coverageOf })).toEqual([]);
+    // 还没有覆盖全部（缺 blockOther）：之后的用户规则仍可能被其他主机的 TCP 到达
+    const partial = [t('udp'), t('verify'), direct, t('blockOther')];
+    expect(classifyPrecedence(partial, { ...ours(t('udp'), t('verify'), t('blockOther')), coverageOf })).toEqual([
+      { rule: direct.text, source: 'temp_rule', severity: 'blocking' },
+    ]);
+    // 没有覆盖信息时（例如 ruleset_resource 的 RULE-SET）只认匹配 Safari 全部流量的单条规则：保守地继续检查
+    expect(classifyPrecedence(active, ours(t('udp'), t('active'), t('block')))).toEqual([{ rule: direct.text, source: 'temp_rule', severity: 'blocking' }]);
   });
 });
 

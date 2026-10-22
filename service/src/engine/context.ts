@@ -3,6 +3,7 @@
 
 import { dirname, resolve } from 'node:path';
 import {
+  CAPABILITY_CONTEXT_DEPS,
   CAPABILITY_KEYS,
   SITES,
   SITE_CODES,
@@ -29,6 +30,7 @@ import type {
   Scrubber,
   SecretStore,
   SurgeAdapter,
+  SurgeVersion,
 } from '../ports.js';
 import { SecretRefManager } from '../secrets/secret-ref-manager.js';
 import { loadPepper, pepperKey } from '../secrets/pepper.js';
@@ -39,7 +41,16 @@ import type { EntryConfig } from '../surge/entry/common.js';
 import type { EntryOwnership } from '../surge/entry/ownership.js';
 import { parseHttpApiLine } from '../surge/http-adapter.js';
 import { SURGE_BUILD_RE, SURGE_VERSION_RE } from '../surge/capability-gate.js';
-import { RUNNING_INSTANCE_FAILURE_TEXT, SERVICE_INSTANCE_READ_BUDGET_MS, isRunningInstanceFailure, type RunningInstanceResult } from '../surge/running-instance.js';
+import { isUnsupportedCommandError } from '../surge/cli-adapter.js';
+import {
+  RUNNING_INSTANCE_FAILURE_TEXT,
+  SERVICE_INSTANCE_READ_BUDGET_MS,
+  SURGE_VERSION_CHECK_FAILURE_TEXT,
+  crossCheckSurgeVersion,
+  isRunningInstanceFailure,
+  meetsSurgeMinimumVersion,
+  type RunningInstanceResult,
+} from '../surge/running-instance.js';
 import type { SurgePrimitive } from '../surge/primitives.js';
 import { classifyDirectoryRisk } from '../util/secure-files.js';
 import { emptySurgeFacts, type SurgeFacts, type SurgeVersionIssue } from '../domain/views.js';
@@ -53,8 +64,8 @@ import { readFile } from 'node:fs/promises';
 
 /**
  * 可达性检测使用的只读原语，按顺序取第一个已映射到 cli、http 或 fake 的。选择在引擎创建时静态完成，从不按成败
- * 换用另一个，也从不使用 getVersion（Surge 6.5 的命令行工具没有版本命令）。原语只有在 P0 实测读取成功后才会被映射；
- * 只配置 HTTP API 时落到 getCurrentProfile 或 listPolicies。
+ * 换用另一个。getVersion 不用于可达性：它只是版本的旁证（与运行实例交叉核对，见 readVersion），版本读不到不等于
+ * 无法连接。原语只有在 P0 实测读取成功后才会被映射；只配置 HTTP API 时落到 getCurrentProfile 或 listPolicies。
  * 不含 listTempRules：`--raw dump temp-rule` 的空输出就是“没有临时规则”，与 Surge 未运行时可能的空输出无法区分，
  * 不能证明连接（HTTP 实现也没有它）。TODO(P0)：V7 记录 Surge 未运行时的输出后再评估。
  */
@@ -97,8 +108,57 @@ export const DEFAULT_INSTANCE_READ_BUDGET_MS = SERVICE_INSTANCE_READ_BUDGET_MS;
 
 const INSTANCE_READ_TIMED_OUT = Symbol('instance-read-timed-out');
 
-export function versionUnknownMessage(issue: SurgeVersionIssue): string {
-  return `无法确认运行中的 Surge 版本（${RUNNING_INSTANCE_FAILURE_TEXT[issue]}）：依赖 Surge 版本的能力按待验证处理`;
+/**
+ * 版本不被接受时的提示。低于最低支持版本（6.10.0 / 12500 / Controller 协议 22）单独说明：依赖版本的动作拒绝，
+ * 进入普通模式仍可用，但低于 6.9 时 rule match 不可用、入口撤销无法经运行时确认（ARCHITECTURE §0 的冲突）；
+ * detected 是运行实例报告的版本与构建号（只用于说明，不进入能力上下文）。
+ */
+export function versionUnknownMessage(issue: SurgeVersionIssue, detected: { version: string; build: string } | null = null): string {
+  if (issue === 'surge_version_unsupported') {
+    const running = detected ? `运行中的 Surge 为 ${detected.version}（${detected.build}）。` : '';
+    return `${running}${SURGE_VERSION_CHECK_FAILURE_TEXT.surge_version_unsupported}：发布、切换出口、维护写入等依赖 Surge 版本的动作已停用；进入普通模式仍可用（低于 6.9 的 Surge 不支持 rule match，入口撤销只能按写入与等待完成，标为“入口规则未能读回确认”）`;
+  }
+  const text = isRunningInstanceFailure(issue) ? RUNNING_INSTANCE_FAILURE_TEXT[issue] : SURGE_VERSION_CHECK_FAILURE_TEXT[issue];
+  return `无法确认运行中的 Surge 版本（${text}）：依赖 Surge 版本的能力按待验证处理`;
+}
+
+/**
+ * 引擎启动时间的容差（毫秒）：startedAt 由“读取时刻 − 运行时长”换算到整秒（surge/cli-commands.ts、http-adapter.ts），
+ * 两次读取之间可能相差约 1 秒，再加上命令执行的延迟。超过容差的向后移动才算重启。
+ */
+export const SURGE_START_JITTER_MS = 2_000;
+
+export interface SurgeRuntimeSample {
+  startedAt: string | null;
+  uptimeSeconds: number | null;
+}
+
+/** 读一次引擎运行时长与启动时间（getRuntimeInfo）；读不到或两项都无法识别时为 null。只读。 */
+export async function readRuntimeSample(surge: Pick<SurgeAdapter, 'getRuntimeInfo'>): Promise<SurgeRuntimeSample | null> {
+  try {
+    const info = await surge.getRuntimeInfo();
+    const startedAt = info.startedAt instanceof Date && Number.isFinite(info.startedAt.getTime()) ? info.startedAt.toISOString() : null;
+    const uptimeSeconds = typeof info.uptimeSeconds === 'number' && Number.isFinite(info.uptimeSeconds) && info.uptimeSeconds >= 0 ? info.uptimeSeconds : null;
+    return startedAt === null && uptimeSeconds === null ? null : { startedAt, uptimeSeconds };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 两次读取之间引擎是否重启（surge_restarted、发布读回的提示、维护重载后的报告共用）：运行时长变小，或启动时间向后
+ * 移动超过 SURGE_START_JITTER_MS。只重启引擎（restart-engine，或 6.9+ 的重载自动升级为完整重启）时进程不变，
+ * 运行实例的进程启动时间看不出来，所以只看引擎运行时长（Mac 6.9.0+：`dump performance` 的 uptime、/v1/metrics 的
+ * surge_uptime_seconds）。任一次读不到时为 false：不能证明重启（调用方按各自的规则处理“读不到”）。
+ */
+export function surgeRestartedBetween(prev: SurgeRuntimeSample | null, next: SurgeRuntimeSample | null): boolean {
+  if (!prev || !next) return false;
+  if (prev.uptimeSeconds !== null && next.uptimeSeconds !== null && next.uptimeSeconds < prev.uptimeSeconds) return true;
+  if (prev.startedAt === null || next.startedAt === null) return false;
+  const a = Date.parse(prev.startedAt);
+  const b = Date.parse(next.startedAt);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return prev.startedAt !== next.startedAt;
+  return b - a > SURGE_START_JITTER_MS;
 }
 
 export interface HostInfo {
@@ -164,7 +224,23 @@ export interface AppServiceDeps {
   livenessPrimitive?: LivenessPrimitive | null;
   /** 运行实例读取的总时限（毫秒，缺省 DEFAULT_INSTANCE_READ_BUDGET_MS）。 */
   instanceReadBudgetMs?: number;
+  /**
+   * 写入本地节点资源后等待 Surge 自动重新读取（文件监视）的时限与轮询间隔（毫秒，缺省 DEFAULT_RESOURCE_RELOAD_WAIT）。
+   * 外部资源更新会跳过本地文件（HTTP API 文档：“Local resources are skipped.”），发布从不把它当作刷新。
+   */
+  resourceReloadWait?: { timeoutMs: number; pollMs: number };
+  /**
+   * ruleset_resource 每一步等待文件监视加载入口规则集文件的时限与轮询间隔（毫秒，缺省 DEFAULT_RULESET_WATCH）；撤销入口时
+   * rule match 不可用的退路按时限等满（见 ruleset-strategy.ts 的 UnwitnessedUndo）。
+   */
+  rulesetWatch?: { timeoutMs: number; pollMs: number };
 }
+
+/**
+ * 写入本地节点资源后等待 Surge 重新读取的缺省时限与轮询间隔（毫秒）。等待在执行器通道上进行，排队的操作（包括进入普通
+ * 模式）要等它结束：发布与回滚各最多等这么久。TODO(P0)：按 policy_path_reread 实测的监视延迟调整。
+ */
+export const DEFAULT_RESOURCE_RELOAD_WAIT = { timeoutMs: 10_000, pollMs: 500 } as const;
 
 export interface EngineKeys {
   pepper: Buffer;
@@ -334,6 +410,7 @@ export class Engine {
       config,
       operationId,
       autoReloadCondition: () => this.autoReloadCondition(),
+      ...(this.deps.rulesetWatch ? { watch: this.deps.rulesetWatch } : {}),
     });
   }
 
@@ -352,9 +429,10 @@ export class Engine {
    * 必须按当前版本判定，不能沿用启动时的值。
    *
    * 可达性只看固定的检测原语（livenessPrimitive）一次读取是否解析成功；其他任何结果都是不可达（失败即关闭），
-   * 不可达时不再读取其他事实。版本与构建号只来自运行中的 Surge 实例（host.surgeInstance），与可达性无关：
-   * 无法证明时为 null，原因记在 versionIssue，依赖版本的能力按待验证处理。从不调用 getVersion。
-   * 提示按优先级取第一条：无法连接 > 不是工作配置 > 版本无法确认 > 目录位置无法确认。
+   * 不可达时不再读取其他事实。版本与构建号来自运行中的 Surge 实例（host.surgeInstance），并与 `surge-cli --raw version`
+   * 交叉核对（readVersion），与可达性无关：无法证明、两者不一致或低于最低支持版本时为 null，原因记在 versionIssue，
+   * 依赖版本的能力按待验证处理、相应动作拒绝；进入普通模式不依赖版本。
+   * 提示按优先级取第一条：无法连接 > 版本低于最低支持版本 > 不是工作配置 > 版本无法确认 > 目录位置无法确认。
    */
   async readBasicFacts(): Promise<SurgeFacts> {
     await this.refreshHostFacts();
@@ -374,16 +452,13 @@ export class Engine {
       return facts;
     }
     facts.reachable = true;
-    const versionIssue = await this.readVersion(facts);
+    const { issue: versionIssue, detected } = await this.readVersion(facts);
     facts.versionIssue = versionIssue;
     this.noteVersionIssue(versionIssue);
     const wp = this.workingProfile();
-    try {
-      const info = await this.surge.getRuntimeInfo();
-      facts.startedAt = info.startedAt ? info.startedAt.toISOString() : null;
-    } catch {
-      facts.startedAt = null;
-    }
+    const runtime = await readRuntimeSample(this.surge);
+    facts.startedAt = runtime?.startedAt ?? null;
+    facts.uptimeSeconds = runtime?.uptimeSeconds ?? null;
     try {
       const p = await this.surge.getCurrentProfile();
       facts.currentProfileName = p.name;
@@ -420,8 +495,9 @@ export class Engine {
         facts.httpApi = { configured: false, loopbackOnly: null };
       }
     }
+    if (facts.message === null && versionIssue === 'surge_version_unsupported') facts.message = versionUnknownMessage(versionIssue, detected);
     if (facts.message === null && facts.onWorkingProfile === false) facts.message = 'Surge 当前配置不是固定工作配置';
-    if (facts.message === null && versionIssue !== null) facts.message = versionUnknownMessage(versionIssue);
+    if (facts.message === null && versionIssue !== null) facts.message = versionUnknownMessage(versionIssue, detected);
     if (facts.message === null && directoryUnknown) facts.message = '无法确认固定工作配置所在目录的真实位置：可能位于同步或受保护位置，请检查目录权限与链接';
     this.facts = facts;
     return facts;
@@ -444,11 +520,17 @@ export class Engine {
   }
 
   /**
-   * 运行中 Surge 的版本与构建号（只决定版本，从不决定可达性）：来自运行实例读取，版本与构建号一起接受或一起为 null。
-   * 读取器已经校验过格式；这里再按 A0 的格式核对一次（注入的实现返回其他值时按 version_malformed）。
-   * 总时限（instanceReadBudgetMs）到达时不再等待，按 read_failed。
+   * 运行中 Surge 的版本、构建号与 Controller 协议号（只决定版本，从不决定可达性），一起接受或一起为 null：
+   * 1. 运行实例读取（证明磁盘上的包就是运行中的那一份）；读取器已经校验过格式，这里再按 A0 的格式核对一次（注入的实现
+   *    返回其他值时按 version_malformed）。总时限（instanceReadBudgetMs）到达时不再等待，按 read_failed。
+   * 2. 运行实例低于最低支持版本（6.10.0 / 12500）→ surge_version_unsupported，不再调用 CLI。
+   * 3. `surge-cli --raw version`（Mac 6.8.0+；手册：“Show Surge, Core, Controller protocol, operating-system, and device
+   *    versions.”）与运行实例交叉核对（surge/running-instance.ts 的 crossCheckSurgeVersion）：版本或构建号不同 →
+   *    cli_bundle_mismatch；命令不被支持（旧核心回答 Unknown command、6.5 进入交互模式）或协议 < 22 →
+   *    surge_version_unsupported；读不到（未映射、无法连接、输出无法识别）→ cli_version_unreadable。
+   * detected 是运行实例报告的版本与构建号（只用于提示文字）。
    */
-  private async readVersion(facts: SurgeFacts): Promise<SurgeVersionIssue | null> {
+  private async readVersion(facts: SurgeFacts): Promise<{ issue: SurgeVersionIssue | null; detected: { version: string; build: string } | null }> {
     let r: RunningInstanceResult;
     let cancelBudget: () => void = () => undefined;
     const budget = new Promise<typeof INSTANCE_READ_TIMED_OUT>((resolve) => {
@@ -459,27 +541,49 @@ export class Engine {
       const v = await Promise.race([read, budget]);
       if (v === INSTANCE_READ_TIMED_OUT) {
         this.noteLateInstanceRead(read);
-        return 'read_failed';
+        return { issue: 'read_failed', detected: null };
       }
       this.lastLateInstanceFailure = null;
       r = v;
     } catch {
-      return 'read_failed';
+      return { issue: 'read_failed', detected: null };
     } finally {
       cancelBudget();
     }
-    if (typeof r !== 'object' || r === null) return 'read_failed';
+    if (typeof r !== 'object' || r === null) return { issue: 'read_failed', detected: null };
     if (r.ok !== true) {
       const reason: unknown = (r as { reason?: unknown }).reason;
-      return isRunningInstanceFailure(reason) ? reason : 'read_failed';
+      return { issue: isRunningInstanceFailure(reason) ? reason : 'read_failed', detected: null };
     }
     const inst: { version?: unknown; build?: unknown } = typeof r.instance === 'object' && r.instance !== null ? r.instance : {};
     if (typeof inst.version !== 'string' || !SURGE_VERSION_RE.test(inst.version) || typeof inst.build !== 'string' || !SURGE_BUILD_RE.test(inst.build)) {
-      return 'version_malformed';
+      return { issue: 'version_malformed', detected: null };
     }
-    facts.version = inst.version;
-    facts.build = inst.build;
-    return null;
+    const detected = { version: inst.version, build: inst.build };
+    if (!meetsSurgeMinimumVersion(detected)) return { issue: 'surge_version_unsupported', detected };
+    const check = crossCheckSurgeVersion(detected, await this.readCliVersion());
+    if (!check.ok) return { issue: check.reason, detected };
+    facts.version = check.version;
+    facts.build = check.build;
+    facts.controllerProtocol = check.controllerProtocol;
+    return { issue: null, detected };
+  }
+
+  /**
+   * `surge-cli --raw version` 的结果：'unsupported' 表示命令不被支持（Unknown command 或交互模式提示）；
+   * 读不到或结构不对为 null。只保留版本、构建号、Core 版本与 Controller 协议号（适配器已丢弃系统与设备字段）。
+   */
+  private async readCliVersion(): Promise<SurgeVersion | 'unsupported' | null> {
+    let v: unknown;
+    try {
+      v = await this.surge.getVersion();
+    } catch (err) {
+      return isUnsupportedCommandError(err) ? 'unsupported' : null;
+    }
+    if (typeof v !== 'object' || v === null) return null;
+    const o = v as Record<string, unknown>;
+    if (typeof o.version !== 'string' || typeof o.build !== 'string' || typeof o.controllerProtocol !== 'number' || typeof o.coreVersion !== 'number') return null;
+    return { version: o.version, build: o.build, controllerProtocol: o.controllerProtocol, coreVersion: o.coreVersion };
   }
 
   /**
@@ -568,7 +672,18 @@ export class Engine {
     const views = this.capabilityViews();
     const miss = missingFrom(views, keys);
     if (miss.length === 0) return;
-    throw capabilityError(views, miss, action);
+    throw capabilityError(views, miss, action, this.versionGateNote(miss));
+  }
+
+  /**
+   * 缺失项中有依赖 Surge 版本的能力、且版本因低于最低支持版本或无法确认而不被接受时，给门槛错误附上的原因说明
+   * （否则为 null）：能力记录本身可能已通过，拒绝的原因是当前 Surge 版本。
+   */
+  versionGateNote(miss: readonly CapabilityKey[]): string | null {
+    const issue = this.facts.versionIssue;
+    if (!this.facts.reachable || issue === null) return null;
+    if (!miss.some((k) => CAPABILITY_CONTEXT_DEPS[k].includes('surgeVersion'))) return null;
+    return versionUnknownMessage(issue);
   }
 
   // ---------- 操作 ----------
@@ -631,15 +746,21 @@ export class Engine {
   }
 }
 
+/**
+ * Surge 当前配置是否是固定工作配置：只按绝对路径比较。没有路径时不是（文档：`status` 的 profile-path 是当前配置的绝对
+ * 路径，“profiles that do not originate from a local file report no path”；工作配置总是本地文件），从不只按名称认定。
+ */
 export function profileMatches(p: { name: string; path: string | null }, wp: { path: string; name: string }): boolean {
-  if (p.path) return resolve(p.path) === resolve(wp.path);
-  return p.name === wp.name;
+  if (typeof p.path !== 'string' || p.path === '') return false;
+  return resolve(p.path) === resolve(wp.path);
 }
 
-export function capabilityError(views: readonly CapabilityView[], miss: readonly CapabilityKey[], action: string): SfeError {
+/** versionNote：当前 Surge 版本不被接受时的说明（Engine.versionGateNote），放在缺失能力之前。 */
+export function capabilityError(views: readonly CapabilityView[], miss: readonly CapabilityKey[], action: string, versionNote: string | null = null): SfeError {
   const items = views.filter((v) => miss.includes(v.key));
   const labels = items.map((v) => v.label).join('、');
-  return new SfeError('CAPABILITY_UNVERIFIED', `${action}失败：${labels}尚未通过实测`, {
+  const message = versionNote ? `${action}失败：${versionNote}；${labels}在当前 Surge 版本下尚未通过实测` : `${action}失败：${labels}尚未通过实测`;
+  return new SfeError('CAPABILITY_UNVERIFIED', message, {
     details: { missing: items.map((v) => ({ key: v.key, staleReasons: v.staleReasons })) },
   });
 }

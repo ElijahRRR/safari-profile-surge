@@ -8,7 +8,7 @@ import type { RouteStateRecord } from '../db/index.js';
 import { ATTENTION_WARNINGS, evaluateControl, type ControlEvaluation } from '../domain/route-rules.js';
 import { buildSurgeStatus } from '../domain/views.js';
 import { entryBlockIsFirstRule, parseProfile } from '../surge/profile.js';
-import type { Engine } from './context.js';
+import { surgeRestartedBetween, type Engine } from './context.js';
 import { checkSegments } from './ownership.js';
 import { expireSafariProbe } from './handlers/probes.js';
 
@@ -117,6 +117,8 @@ async function readExtraFacts(engine: Engine): Promise<ExtraFacts> {
 
 export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<ReconcileResult> {
   const { repos } = engine;
+  // 上一次读取的引擎运行时长：与本次比较，运行时长变小即重启（另与持久的启动时间比较，见 surgeRestartedBetween）
+  const previousUptime = engine.facts.uptimeSeconds;
   const facts = await engine.readBasicFacts();
   const before = repos.routeState.get();
   // 与路由状态同步读取负责过渡阶段的操作：读取 Surge 期间它可能刚好完成（例如核对通过、提交 ACTIVE），
@@ -170,7 +172,12 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
       add('surge_unreachable');
       notes.push('无法连接 Surge');
     } else {
-      if (facts.startedAt && before.surgeStartedAt && facts.startedAt !== before.surgeStartedAt) {
+      // 引擎重启（含只重启引擎、进程不变：restart-engine 或 6.9+ 重载自动升级为完整重启）会清空临时规则与连接：
+      // 引擎启动时间向后移动超过容差，或运行时长变小（getRuntimeInfo：`dump performance` 的 uptime）。
+      if (
+        surgeRestartedBetween({ startedAt: before.surgeStartedAt, uptimeSeconds: null }, { startedAt: facts.startedAt, uptimeSeconds: null }) ||
+        surgeRestartedBetween({ startedAt: null, uptimeSeconds: previousUptime }, { startedAt: null, uptimeSeconds: facts.uptimeSeconds })
+      ) {
         add('surge_restarted');
         expireActive = true;
         notes.push('Surge 已重启');

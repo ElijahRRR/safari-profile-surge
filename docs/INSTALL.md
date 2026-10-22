@@ -1,6 +1,6 @@
 # 安装、首次运行、卸载与回退
 
-日期：2026-10-21。适用：macOS 14（Safari 17）或更高、Surge for Mac（开发调研时为 6.5.0，以本机实测为准）。本文件只描述步骤；网络能力是否成立以 docs/P0-RUNBOOK.md 的实测与网页后台确认为准，未确认的能力对应的动作会被拒绝。
+日期：2026-10-22。适用：macOS 14（Safari 17）或更高、Surge for Mac 6.10.0（构建 12500）或更高（Controller 协议 ≥ 22；不支持 6.5）。低于最低版本、读不到版本或运行中的版本与 `surge-cli --raw version` 不一致时，发布、激活与维护写入都被拒绝，只有进入普通模式可用。本文件只描述步骤；网络能力是否成立以 docs/P0-RUNBOOK.md 的实测与网页后台确认为准，未确认的能力对应的动作会被拒绝。
 
 ## 1. 构建
 
@@ -66,7 +66,7 @@ npm run check      # 类型检查、离线测试、构建与仓库秘密扫描
 顺序固定，前一步没有完成不要做下一步。
 
 1. **P0 实测**：按 docs/P0-RUNBOOK.md 在测试配置上完成实测（只用空白测试场景与本机测试代理），测完**手动**切回原配置、删除测试文件。
-2. **原语映射**：把 P0 确认的映射写入 `install.json` 的 `adapterMechanism`（保持 0600），重启后台服务（菜单「停止后台服务」→「注册后台服务」）。
+2. **原语映射**：把 P0 确认的映射写入 `install.json` 的 `adapterMechanism`（保持 0600），重启后台服务（菜单「停止后台服务」→「注册后台服务」）。`getVersion` 必须映射为 `cli`：服务用 `surge-cli --raw version` 与运行中的 Surge 交叉核对版本，没有映射时版本按读不到处理（依赖版本的动作被拒绝）。`matchRule` 也必须映射为 `cli`（`surge-cli --raw rule match …`，Mac 6.9.0+；HTTP API 没有对应接口）：两种入口策略的每一步与每次读回都用它确认 Surge 的实际规则求值（ruleset_resource 的见证、Safari 与 Chrome 探测），没有映射时激活被拒绝（`runtime_entry_modes` 的验证上下文包含它），进入普通模式只能按退路完成并标为“入口规则未能读回确认”。`getCurrentProfile` 必须映射为 `cli`（`surge-cli --raw status` 的 `profile-path`）：服务只按完整路径判断 Surge 是否在固定工作配置上，HTTP 不提供路径，映射为 `http` 时始终视为不在工作配置上（依赖它的动作被拒绝）。早先安装生成的 `install.json` 不会自动补上新原语（App 从不覆盖已有映射，缺少的键按 `unavailable` 处理）：升级后按 P0 重新确认并写入 `matchRule`。`updateExternalResource` 即使映射了也从不用于刷新本应用的本地文件（Surge 跳过本地资源）：节点发布依赖 Surge 自动重新读取 `sfe-nodes.list`，P0 的 policy_path_reread 未确认之前新节点保持“已保存，待部署”。
 3. **确认能力**：菜单「打开管理后台」（或 `sfe open`），在「能力门槛」页逐条核对 P0 提交的提议（上下文、脱敏摘要、逐协议覆盖、进程路径、入口策略）并确认。确认新的进程路径或入口策略要求入口为 NORMAL。
 4. **初始化工作配置**：在「发布与 Surge」页运行初始化向导：
    - 预览只读：备份当前活动配置、它引用的本地文件与可读的运行开关到数据目录 `backups/`（0700/0600）；检测远端托管头与远端来源、配置目录是否在 iCloud/同步位置（默认拒绝）、名称与文件冲突、http-api 绑定、自动重载与接管状态；构造候选并 `--check`。

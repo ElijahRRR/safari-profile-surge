@@ -2,7 +2,9 @@ import { describe, expect, test } from 'vitest';
 import {
   CAPABILITY_CONTEXT_DEPS,
   CAPABILITY_CONTEXT_FIELDS,
+  CAPABILITY_GATES,
   CAPABILITY_KEYS,
+  CAPABILITY_PRIMITIVES,
   SfeError,
   type CapabilityContext,
   type CapabilityKey,
@@ -136,13 +138,31 @@ describe('context comparison rules', () => {
     expect(contextFieldMatches('runtime_entry_modes', 'adapterMechanism', MECH, changed)).toBe(false);
     expect(contextFieldMatches('independent_node_preflight', 'adapterMechanism', MECH, changed)).toBe(true);
   });
+  test('the fingerprint tracks the primitives the product calls: matchRule is in it, updateExternalResource (local resources are skipped) is in none', () => {
+    const full = JSON.parse(MECH) as Record<string, string>;
+    const withMatch = JSON.stringify({ ...full, matchRule: 'cli', getAutoReloadSetting: 'unavailable' });
+    // install.json 中 matchRule 改为 unavailable（或 http：HTTP 没有 rule match）→ 入口能力过期，激活在写入前被拒绝
+    for (const m of ['unavailable', 'http']) {
+      const changed = JSON.stringify({ ...JSON.parse(withMatch), matchRule: m });
+      expect(contextFieldMatches('runtime_entry_modes', 'adapterMechanism', withMatch, changed), m).toBe(false);
+      expect(contextFieldMatches('auto_reload_atomic_replace', 'adapterMechanism', withMatch, changed), m).toBe(false);
+    }
+    // updateExternalResource 的映射变化不影响任何能力（发布与入口从不调用它）
+    const noUpdate = JSON.stringify({ ...JSON.parse(withMatch), updateExternalResource: 'unavailable' });
+    for (const key of CAPABILITY_KEYS) expect(contextFieldMatches(key, 'adapterMechanism', withMatch, noUpdate), key).toBe(true);
+    for (const prims of Object.values(CAPABILITY_PRIMITIVES)) expect(prims).not.toContain('updateExternalResource');
+    // 发布写入前要求可读回的原语（publish.ts）都由发布门槛中的某项能力记录
+    const publishPrims = new Set(CAPABILITY_GATES.publish.flatMap((k) => [...(CAPABILITY_PRIMITIVES[k] ?? [])]));
+    for (const p of ['getGroupMembers', 'getGroupSelection', 'listExternalResources', 'selectGroupPolicy']) expect(publishPrims.has(p), p).toBe(true);
+  });
+
   test('recorded fingerprint form compares equal to the full current map', () => {
     const recorded = mechanismFingerprint('takeover_state_readable', JSON.parse(MECH));
     expect(recorded).toBe('{"getTakeoverState":"http"}');
     expect(contextFieldMatches('takeover_state_readable', 'adapterMechanism', recorded, MECH)).toBe(true);
   });
   test('fingerprint is canonical and marks missing primitives unavailable', () => {
-    expect(mechanismFingerprint('connection_continuity', { selectGroupPolicy: 'http' })).toBe('{"selectGroupPolicy":"http","updateExternalResource":"unavailable"}');
+    expect(mechanismFingerprint('connection_continuity', { selectGroupPolicy: 'http' })).toBe('{"getGroupMembers":"unavailable","selectGroupPolicy":"http"}');
     expect(mechanismFingerprint('native_profile_id', { selectGroupPolicy: 'http' })).toBe('{}');
   });
 });

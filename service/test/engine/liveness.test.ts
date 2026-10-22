@@ -1,6 +1,7 @@
-// Surge 可达性不再经 getVersion（Surge 6.5 的 surge-cli 没有版本命令，--version 进入交互模式）：引擎按 mechanism()
-// 静态选定一个只读检测原语，只有它解析成功才算可达，其余一律不可达（失败即关闭）。版本与可达性无关：只来自运行中的
-// Surge 实例（HostInfo.surgeInstance，夹具中是 FakeSurge.runningInstance），无法证明时为 null。
+// Surge 可达性不经 getVersion：引擎按 mechanism() 静态选定一个只读检测原语，只有它解析成功才算可达，其余一律不可达
+// （失败即关闭）。版本与可达性无关：来自运行中的 Surge 实例（HostInfo.surgeInstance，夹具中是 FakeSurge.runningInstance），
+// 并与 `surge-cli --raw version`（getVersion，Mac 6.8.0+）交叉核对；无法证明、不一致或低于最低支持版本时为 null。
+// getVersion 只是旁证：运行实例读不到时不调用它，它能用也不能让版本或可达性成立。
 // 见 docs/ARCHITECTURE.md §5.2、§6.6。只用合成数据。
 
 import { symlinkSync } from 'node:fs';
@@ -17,7 +18,7 @@ import { createCliAdapter, type ExecFn } from '../../src/surge/cli-adapter.js';
 import { createCompositeAdapter } from '../../src/surge/composite.js';
 import type { RunningInstanceFailure } from '../../src/surge/running-instance.js';
 import { SURGE_PRIMITIVES, capabilityUnverified, type MechanismMap } from '../../src/surge/primitives.js';
-import { PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, rid, safariOutcome, type Harness } from './harness.js';
+import { PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, rid, safariOutcome, type Harness } from './harness.js';
 
 let h: Harness | undefined;
 afterEach(async () => {
@@ -46,9 +47,9 @@ function instanceUnreadable(hh: Harness, reason: RunningInstanceFailure = 'unava
   hh.fake.instanceFailure = reason;
 }
 
-/** getVersion 原语即使“能用”也从不被调用（6.5 的 CLI 原语表与 HTTP 实现都没有它）。 */
+/** getVersion 原语“能用”但报告与运行实例不同的版本：它从不单独决定版本或可达性。 */
 function versionPrimitiveWorks(hh: Harness): void {
-  hh.fake.getVersion = async () => ({ version: '9.9.9', build: '99999' });
+  hh.fake.getVersion = async () => ({ version: '9.9.9', build: '99999', coreVersion: 9990, controllerProtocol: 99 });
 }
 
 function logEntries(hh: Harness): Array<Record<string, unknown>> {
@@ -112,6 +113,7 @@ describe('reachability without getVersion', () => {
     h = await createHarness({ livenessPrimitive: 'auto' });
     instanceUnreadable(h);
     const live = h.fake.calls.listExternalResources ?? 0;
+    const versionReads = h.fake.calls.getVersion ?? 0;
     const st = await h.app.refreshSurge(WEB);
     expect(st).toMatchObject({
       reachable: true,
@@ -125,7 +127,8 @@ describe('reachability without getVersion', () => {
     expect(st.message).toBe('无法确认运行中的 Surge 版本（没有可用的运行实例读取）：依赖 Surge 版本的能力按待验证处理');
     expect(h.app.engine.facts.versionIssue).toBe('unavailable');
     expect((h.fake.calls.listExternalResources ?? 0) - live).toBeGreaterThanOrEqual(1);
-    expect(h.fake.calls.getVersion ?? 0).toBe(0);
+    // 运行实例读不到时不再向 CLI 要版本（它只是旁证）
+    expect(h.fake.calls.getVersion ?? 0).toBe(versionReads);
     // 失败即关闭：依赖版本的能力全部待验证，其余保持
     expect(h.app.engine.capabilityContext()).toMatchObject({ surgeVersion: null, surgeBuild: null });
     for (const v of await h.app.listCapabilities()) expect(v.effectiveStatus, v.key).toBe(VERSION_KEYS.includes(v.key) ? 'unverified' : 'supported');
@@ -136,25 +139,36 @@ describe('reachability without getVersion', () => {
     ['SURGE_COMMAND_FAILED', new SfeError('SURGE_COMMAND_FAILED', '执行 Surge 命令失败：模拟失败')],
     ['CAPABILITY_UNVERIFIED', capabilityUnverified('getVersion')],
     ['a plain error', new Error('boom')],
-  ] as const)('getVersion failing with %s is never called and decides neither reachability nor the version', async (_name, error) => {
+  ] as const)('getVersion failing with %s: still reachable, but the version cannot be cross-checked → null (cli_version_unreadable)', async (_name, error) => {
     h = await createHarness();
     h.fake.getVersion = async () => {
       throw error;
     };
     const st = await h.app.refreshSurge(WEB);
-    expect(st).toMatchObject({ reachable: true, version: '6.5.0', build: '10960', onWorkingProfile: true, message: null });
-    expect(h.app.engine.facts.versionIssue).toBeNull();
-    expect(h.fake.calls.getVersion ?? 0).toBe(0);
+    expect(st).toMatchObject({ reachable: true, version: null, build: null, onWorkingProfile: true, message: versionUnknownMessage('cli_version_unreadable') });
+    expect(st.message).toBe('无法确认运行中的 Surge 版本（无法通过 surge-cli 读取 Surge 版本与 Controller 协议）：依赖 Surge 版本的能力按待验证处理');
+    expect(h.app.engine.facts.versionIssue).toBe('cli_version_unreadable');
+    expect(h.app.engine.capabilityContext()).toMatchObject({ surgeVersion: null, surgeBuild: null });
   });
 
-  test('a working getVersion is not a version source: an unreadable running instance still gives version null', async () => {
+  test('a working getVersion is not a version source: an unreadable running instance still gives version null (getVersion not consulted)', async () => {
     h = await createHarness();
     versionPrimitiveWorks(h);
     instanceUnreadable(h, 'modified_after_start');
+    const versionReads = h.fake.calls.getVersion ?? 0;
     const st = await h.app.refreshSurge(WEB);
     expect(st).toMatchObject({ reachable: true, version: null, build: null, message: versionUnknownMessage('modified_after_start') });
     expect(st.message).toBe('无法确认运行中的 Surge 版本（Surge 启动后包被更新或修改，请重新打开 Surge）：依赖 Surge 版本的能力按待验证处理');
-    expect(h.fake.calls.getVersion ?? 0).toBe(0);
+    expect(h.fake.calls.getVersion ?? 0).toBe(versionReads);
+  });
+
+  test('a getVersion that disagrees with the running instance gives version null (cli_bundle_mismatch)', async () => {
+    h = await createHarness();
+    versionPrimitiveWorks(h);
+    const st = await h.app.refreshSurge(WEB);
+    expect(st).toMatchObject({ reachable: true, version: null, build: null, message: versionUnknownMessage('cli_bundle_mismatch') });
+    expect(st.message).toContain('surge-cli 报告的 Surge 版本与运行中的 Surge.app 不一致');
+    expect(h.app.engine.facts.versionIssue).toBe('cli_bundle_mismatch');
   });
 
   test('a running-instance reader that throws gives read_failed, without echoing the error', async () => {
@@ -319,13 +333,13 @@ describe('version facts', () => {
     let st = await h.app.refreshSurge(WEB);
     expect(st).toMatchObject({ reachable: true, version: null, build: null, message: versionUnknownMessage('plist_unreadable') });
     expect(h.app.engine.facts.versionIssue).toBe('plist_unreadable');
-    h.fake.version = '6.5.1';
-    h.fake.build = '10999';
+    h.fake.version = '6.10.1';
+    h.fake.build = '12510';
     st = await h.app.refreshSurge(WEB);
-    expect(st).toMatchObject({ reachable: true, version: '6.5.1', build: '10999', message: null });
+    expect(st).toMatchObject({ reachable: true, version: '6.10.1', build: '12510', message: null });
     expect(h.app.engine.facts.versionIssue).toBeNull();
-    expect(h.app.engine.capabilityContext()).toMatchObject({ surgeVersion: '6.5.1', surgeBuild: '10999' });
-    expect(h.fake.calls.getVersion ?? 0).toBe(0);
+    expect(h.app.engine.facts.controllerProtocol).toBe(h.fake.controllerProtocol);
+    expect(h.app.engine.capabilityContext()).toMatchObject({ surgeVersion: '6.10.1', surgeBuild: '12510' });
   });
 
   test('message order: not on the working profile > version unknown > profile directory unknown', async () => {
@@ -386,13 +400,13 @@ describe('consumers of the facts fail closed', () => {
     h.fake.listPolicies = async () => {
       throw new SfeError('SURGE_COMMAND_FAILED', '执行 Surge 命令失败：命令行工具不支持该命令（进入了交互模式）');
     };
-    const writes = counts(h, WRITES);
+    const writes = { ...counts(h, WRITES), ...entryWrites(h.fake) };
     await h.app.runPeriodicReconcile();
     const route = h.repos.routeState.get();
     expect(route.warnings).toContain('surge_unreachable');
     expect(route.phase).toBe('attention');
     expect(h.app.engine.facts).toMatchObject({ reachable: false, message: LIVENESS_FAILURE_TEXT.unconfirmed });
-    expect(counts(h, WRITES)).toEqual(writes);
+    expect({ ...counts(h, WRITES), ...entryWrites(h.fake) }).toEqual(writes);
     const state = (await h.native(PROFILE_A, { type: 'getCurrentState' })) as { ok: boolean; data: { ordersAllowed: boolean; ordersBlockedReason: string | null } };
     expect(state.data.ordersAllowed).toBe(false);
     expect(state.data.ordersBlockedReason).toBe('无法连接 Surge');
@@ -409,12 +423,13 @@ describe('consumers of the facts fail closed', () => {
 
   test('temp_rule: a failing liveness read does not stop entering normal mode from undoing the entry', async () => {
     h = await createHarness({ entryStrategy: 'temp_rule', livenessPrimitive: 'listPolicies' });
-    // 夹具的临时规则插在末尾：激活停在 BLOCKED（受管理、非 NORMAL 的入口状态）
+    // 激活后入口不是 NORMAL、本应用的临时规则在 Surge 中（停在 BLOCKED 或等待实测的 VERIFY_ONLY 都可以：
+    // 这里只关心进入普通模式能否撤销入口，不关心入口策略走到哪一步）
     const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await bind(h, PROFILE_A, envId);
     await h.app.activate(envId, { request_id: rid('act') }, WEB);
     await h.idle();
-    expect(h.repos.routeState.get().entryMode).toBe('BLOCKED');
+    expect(['BLOCKED', 'VERIFY_ONLY']).toContain(h.repos.routeState.get().entryMode);
     expect(h.fake.tempRules.length).toBeGreaterThan(0);
     h.fake.listPolicies = async () => {
       throw new SfeError('SURGE_UNREACHABLE', '连接 Surge 失败：模拟不可达');

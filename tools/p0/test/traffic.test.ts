@@ -109,6 +109,19 @@ describe('reload impact uses the whole observation window', () => {
     expect(restart.evidence).toBeNull();
   });
 
+  it('a reload that escalates to a full engine restart (6.9+) is evidence of the reload, and its impact is measured', () => {
+    const marks = [{ t: 50_000, label: 'reload', source: 'operator' as const }];
+    // 引擎重启：全部连接关闭、临时规则清空；进程启动时间不变
+    const samples = [...steady(0, 100_000), { t: 50_100, kind: 'stream_end' as const, ok: false, reason: 'reset' }];
+    const r = assessReload(samples, marks, { start: 0, end: 100_000 }, { ...opts, signals: { reloaded: true, restarted: false, engineRestarted: true, reasons: ['引擎运行时长回落（引擎重启）', '临时规则减少 1 条'] } });
+    expect(r.evidence).toBe(true);
+    expect(r.evidenceNote).toContain('升级为完整引擎重启');
+    expect(r.unaffected).toBe(false);
+    // 进程本身重启（退出重开）仍不算同一配置重载
+    const quit = assessReload(samples, marks, { start: 0, end: 100_000 }, { ...opts, signals: { reloaded: true, restarted: true, engineRestarted: true, reasons: [] } });
+    expect(quit.evidence).toBeNull();
+  });
+
   it('a dirty baseline or other changes make the measurement incomplete', () => {
     const marks = [{ t: 60_000, label: 'reload', source: 'operator' as const }];
     const sig = { reloaded: true, restarted: false, reasons: ['x'] };

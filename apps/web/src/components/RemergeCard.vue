@@ -14,6 +14,13 @@ import { newRequestId } from '../lib/request-id';
 
 const { api, store, toasts, accepted } = useConsole();
 
+/**
+ * 与服务端 RELOAD_FULL_RESTART_NOTICE（service/src/engine/maintenance.ts）同一段说明：surge-cli 6.10 的 reload 说明
+ * “Automatically performs a full engine restart if a change requires one.”，完整重启关闭全部连接并清空临时规则。
+ */
+const RELOAD_FULL_RESTART_NOTICE =
+  'Surge 6.9 起重载只应用变化的部分，但在修改需要时会自动执行完整的引擎重启（文档：“Automatically performs a full engine restart if a change requires one.”）：完整重启会关闭全部连接并清空临时规则与缓存，哪些修改会触发它没有写入文档';
+
 const preview = ref<RemergePreviewResponse | null>(null);
 const loading = ref(false);
 const committing = ref(false);
@@ -75,8 +82,8 @@ async function rerun() {
     <div class="card-body space-y-5">
       <template v-if="preview">
         <MaintenancePreview :preview="preview" />
-        <NoticeBox v-if="preview.requiresReload" tone="warning" title="需要重载同一配置">
-          写入后需要重载工作配置才能生效。{{ preview.measuredReloadImpact ? `P0 测得的影响：${preview.measuredReloadImpact}` : '重载影响尚未测量。' }}请选择对其他应用影响最小的时间提交。
+        <NoticeBox v-if="preview.requiresReload" tone="warning" title="需要重载同一配置" data-test="reload-notice">
+          写入后需要重载工作配置才能生效。{{ preview.measuredReloadImpact ? `P0 测得的影响：${preview.measuredReloadImpact}` : '重载影响尚未测量。' }}{{ RELOAD_FULL_RESTART_NOTICE }}。请选择对其他应用影响最小的时间提交。
         </NoticeBox>
         <NoticeBox v-if="blockedReason" tone="danger">不能提交：{{ blockedReason }}。</NoticeBox>
         <MissingCapabilities v-if="writesProfile && !gate.met" :missing="gate.missing" />

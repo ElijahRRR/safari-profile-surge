@@ -14,6 +14,9 @@ afterEach(async () => {
   await h?.close();
 });
 
+/** 入口规则集文件被 Surge 文件监视重新加载的次数（ruleset_resource 每一步写入一个文件；从不调用外部资源更新）。 */
+const entryReloads = (): number => h.fake.watcherReloads.filter((r) => r.key.startsWith('ruleset:sfe-entry-')).length;
+
 async function startSwitch(env: string, extra: Partial<ActivateRequest> = {}): Promise<string> {
   const route = h.repos.routeState.get();
   const req: ActivateRequest = { request_id: rid('act'), old_session_policy: 'closed_confirmed', confirmed_environment_id: route.activeEnvironmentId, ...extra };
@@ -30,7 +33,7 @@ describe('step 13: gates re-checked before ACTIVE', () => {
     const opId = await startSwitch(env);
     expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
     h.revoke(['safari_process_attribution']);
-    const updates = h.fake.calls.updateExternalResource ?? 0;
+    const updates = entryReloads();
     await verify(h, PROFILE_A, opId);
     const op = h.repos.operations.get(opId)!;
     expect(op.phase).toBe('FAILED');
@@ -40,7 +43,8 @@ describe('step 13: gates re-checked before ACTIVE', () => {
     expect(route).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: null });
     expect(h.repos.environments.get(env)!.lastVerifiedProxyRevision).toBeNull();
     // 只写回阻断（verify 位），从不写入 ACTIVE；Safari 全部拒绝
-    expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(1);
+    expect(entryReloads() - updates).toBe(1);
+    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
     expect(safariOutcome(h).failed).toBe(true);
     expect(safariOutcome(h, FAKE_VERIFY_HOST).failed).toBe(true);
   });
@@ -70,13 +74,13 @@ describe('step 13: gates re-checked before ACTIVE', () => {
     const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await bind(h, PROFILE_A, env);
     h.host.safariVersion = '19.1';
-    const updates = h.fake.calls.updateExternalResource ?? 0;
+    const updates = entryReloads();
     const opId = await startSwitch(env);
     const op = h.repos.operations.get(opId)!;
     expect(op.phase).toBe('FAILED');
     expect(op.error?.code).toBe('CAPABILITY_UNVERIFIED');
     expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', activeEnvironmentId: null });
-    expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(0);
+    expect(entryReloads() - updates).toBe(0);
   });
 
   test('fact-derived warnings come back right after the commit (no wait for the next periodic reconcile)', async () => {
@@ -289,7 +293,8 @@ describe('an interrupted switch never becomes the "previous route" of the next a
     h.repos.operations.update(opB, { phase: 'FAILED', status: 'failed', error: { code: 'INTERNAL', message: '执行失败：内部错误' } });
     await h.app.runPeriodicReconcile();
     expect(h.repos.routeState.get().phase).toBe('attention');
-    h.fake.failNext('updateExternalResource');
+    // 普通模式读取入口时 Surge 调用失败（入口策略从不调用外部资源更新）
+    h.fake.failNext('listExternalResources');
     const n = await h.app.enterNormal({ request_id: rid('normal'), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
     await h.idle();
     expect(h.repos.operations.get(n.operation_id)!.phase).toBe('FAILED');
@@ -306,14 +311,15 @@ describe('an externally edited app-owned entry file is never silently overwritte
     const file = join(h.surgeDir, ENTRY_RULESET_FILES.active);
     appendFileSync(file, '# user note\n');
     const before = h.repos.routeState.get();
-    const updates = h.fake.calls.updateExternalResource ?? 0;
+    const writes = h.fake.watcherReloads.filter((r) => r.key.startsWith('ruleset:sfe-entry-') && !r.key.endsWith(ENTRY_RULESET_FILES.active)).length;
     const opId = await startSwitch(env);
     const op = h.repos.operations.get(opId)!;
     expect(op.phase).toBe('FAILED');
     expect(op.error?.code).toBe('BASELINE_CHANGED');
     expect((op.error?.details as { files: string[] }).files).toEqual([ENTRY_RULESET_FILES.active]);
     expect(h.repos.routeState.get()).toMatchObject({ phase: 'idle', entryMode: 'NORMAL', routeEpoch: before.routeEpoch, activeEnvironmentId: null });
-    expect(h.fake.calls.updateExternalResource ?? 0).toBe(updates);
+    // 没有写入任何入口规则集文件（被编辑的 active 文件由文件监视加载，是用户的修改，不是本应用的写入）
+    expect(h.fake.watcherReloads.filter((r) => r.key.startsWith('ruleset:sfe-entry-') && !r.key.endsWith(ENTRY_RULESET_FILES.active)).length).toBe(writes);
     expect(readFileSync(file, 'utf8')).toContain('# user note');
     // 普通模式（撤销入口）改写它并在操作中记录；之后激活照常进行
     const n = await h.app.enterNormal({ request_id: rid('normal') }, WEB);

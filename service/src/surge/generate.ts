@@ -5,6 +5,7 @@ import { isIP } from 'node:net';
 import {
   ENTRY_PLACEHOLDER_RULE,
   ENTRY_RULESET_FILES,
+  ENTRY_WITNESS_PROCESS_PATH,
   NODE_RESOURCE_FILE,
   ROUTE_GROUP_NAME,
   SfeError,
@@ -13,7 +14,7 @@ import {
   type FieldError,
 } from '@sfe/contract';
 import { isSurgeReferenceName, isSurgeSafeCredential, validateHost, validatePort } from '../domain/validate.js';
-import { BUILTIN_POLICIES } from './rules.js';
+import { BUILTIN_POLICIES, isCommentLine, normalizeRuleText } from './rules.js';
 
 export type EntryBit = keyof EntryBits;
 
@@ -156,6 +157,7 @@ function processExpr(paths: readonly string[]): string {
 /**
  * 规则集文件中某一位的规则正文（不带策略）。关闭的位写占位规则而不是空文件。
  * udp: AND,((进程),(PROTOCOL,UDP))；verify: AND,((进程),(DOMAIN,检测主机))；block/active: 每个路径一行 PROCESS-NAME。
+ * 规则集的先后由工作配置中四条 RULE-SET 的顺序固定（udp > verify > block > active），所以这些条件可以相交。
  */
 export function entryRules(bit: EntryBit, on: boolean, opts: EntryRuleOptions): string[] {
   assertEntryOptions(opts);
@@ -172,9 +174,61 @@ export function entryRules(bit: EntryBit, on: boolean, opts: EntryRuleOptions): 
   }
 }
 
-/** 入口规则集文件的完整内容。 */
-export function entryRuleSetFileContent(bit: EntryBit, on: boolean, opts: EntryRuleOptions): string {
-  return [`# SFE managed entry rule set · ${bit}`, ...entryRules(bit, on, opts), ''].join('\n');
+// ---------- 规则集文件的见证规则（ruleset_resource） ----------
+
+/**
+ * 见证规则：每个入口规则集文件带一条只匹配合成进程（ENTRY_WITNESS_PROCESS_PATH）请求合成主机
+ * `sfe-entry-<位>-<标记>.invalid` 的规则 `AND,((PROCESS-NAME,<合成进程>),(DOMAIN,<见证主机>))`。必须限定进程：
+ * 规则文档写明“Domain rules match the hostname of a request … never trigger a DNS lookup”（rules/domain.html），
+ * “.invalid” 不解析并不妨碍按主机名匹配，而规则集文件继承 RULE-SET 行的策略（verify/active 为 SFE-ROUTE）——
+ * 不限定进程时 Chrome 或任何网页请求这一主机都会经买家出口发出；初始化写入的固定标记 off 又是公开的。
+ * 每次写入换一个随机标记；用 `rule match <见证主机> process-path=<合成进程>` 读回命中的是不是该位的 RULE-SET，就能证明
+ * Surge 已加载的正是这一版内容——即使这一位被更前面的入口规则遮住、Safari 的探测看不出差别（例如 block 打开时的 active）。
+ * 文档依据：本地规则集“Local files are watched and reloaded automatically when they change.”（规则集文档）；
+ * `rule match`“Evaluate the active rule set without creating a connection”、“process-path=<path> Source process path;
+ * affects PROCESS-NAME rules”（CLI 帮助，Mac 6.9.0+）；逻辑规则“AND,((Rule1),(Rule2),...),Policy”，规则集文件中的规则
+ * 不带策略（规则文档）。
+ */
+export const ENTRY_WITNESS_OFF_TOKEN = 'off';
+const WITNESS_TOKEN_RE = /^[0-9a-z]{2,32}$/;
+const escapeRe = (t: string): string => t.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+/** 规范化之后（normalizeRuleText）的见证行。 */
+const WITNESS_LINE_RE = new RegExp(
+  `^AND,\\(\\(PROCESS-NAME,${escapeRe(ENTRY_WITNESS_PROCESS_PATH)}\\),\\(DOMAIN,sfe-entry-(udp|verify|block|active)-([0-9a-z]{2,32})\\.invalid\\)\\)$`,
+);
+
+export function entryWitnessHost(bit: EntryBit, token: string): string {
+  if (!WITNESS_TOKEN_RE.test(token)) throw new SfeError('VALIDATION_FAILED', '生成入口规则失败：见证标记不合法');
+  return `sfe-entry-${bit}-${token}.invalid`;
+}
+
+/** 某一位带 token 的见证规则（规则集文件中的一行，不带策略）。 */
+export function entryWitnessRule(bit: EntryBit, token: string): string {
+  return `AND,((PROCESS-NAME,${ENTRY_WITNESS_PROCESS_PATH}),(DOMAIN,${entryWitnessHost(bit, token)}))`;
+}
+
+/** 解析入口规则集文件：见证标记（没有或不止一条时为 null）与其余规则行（不含注释与见证行，已规范化空白）。 */
+export function parseEntryRuleSetFile(bit: EntryBit, content: string): { witness: string | null; bodies: string[] } {
+  const lines = content
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => !isCommentLine(l))
+    .map(normalizeRuleText);
+  const witnesses = lines.flatMap((l) => {
+    const m = WITNESS_LINE_RE.exec(l);
+    return m && m[1] === bit ? [m[2]!] : [];
+  });
+  return { witness: witnesses.length === 1 ? witnesses[0]! : null, bodies: lines.filter((l) => !WITNESS_LINE_RE.test(l)) };
+}
+
+/**
+ * 入口规则集文件的完整内容。witness：见证标记；省略时关闭的位用固定标记 off（初始化写入的占位文件因此也可读回），
+ * 打开的位不带见证（之后的切换会带随机标记重写）；null 表示不写见证行（旧格式，测试用）。
+ */
+export function entryRuleSetFileContent(bit: EntryBit, on: boolean, opts: EntryRuleOptions, witness?: string | null): string {
+  const token = witness === undefined ? (on ? null : ENTRY_WITNESS_OFF_TOKEN) : witness;
+  const witnessLine = token === null ? [] : [entryWitnessRule(bit, token)];
+  return [`# SFE managed entry rule set · ${bit}`, ...witnessLine, ...entryRules(bit, on, opts), ''].join('\n');
 }
 
 /** 工作配置 [Rule] 中 entry 受管理段的四条 RULE-SET（ruleset_resource 策略）。 */
@@ -182,9 +236,86 @@ export function entryRuleSetBlockLines(): string[] {
   return ENTRY_BITS_IN_ORDER.map((bit) => `RULE-SET,${ENTRY_RULESET_FILES[bit]},${ENTRY_BIT_POLICY[bit]}`);
 }
 
-/** temp_rule 策略中某一位对应的唯一一条临时规则（正文 + 策略）。 */
-export function tempRuleText(bit: EntryBit, opts: EntryRuleOptions): string {
+// ---------- temp_rule：条件互不相交的临时规则 ----------
+
+/**
+ * temp_rule 的五种临时规则。文档：“rule temp add <rule> Add a temporary rule with the highest priority”——新规则排在最前，
+ * 多条临时规则之间的顺序没有写入文档。所以这些规则的条件按 Safari 流量的四类（TCP/UDP × 检测主机/其他主机）划分：
+ * 任一模式的规则集合里，条件相交的两条规则策略相同，模式只取决于存在哪些规则，与先后无关。
+ *
+ * | 种类 | 条件 | 策略 | 覆盖 |
+ * |---|---|---|---|
+ * | block | 进程 | REJECT | 全部 |
+ * | udp | AND(进程, PROTOCOL,UDP) | REJECT | UDP（含 QUIC/STUN：“`PROTOCOL,UDP` also matches QUIC and STUN connections.”） |
+ * | verify | AND(进程, NOT(PROTOCOL,UDP), DOMAIN,检测主机) | SFE-ROUTE | 检测主机的非 UDP |
+ * | active | AND(进程, NOT(PROTOCOL,UDP)) | SFE-ROUTE | 全部非 UDP |
+ * | blockOther | AND(进程, NOT(PROTOCOL,UDP), NOT(DOMAIN,检测主机)) | REJECT | 其他主机的非 UDP |
+ *
+ * 各模式的规则：NORMAL 无；BLOCKED {block}；VERIFY_ONLY {udp, verify, blockOther}；ACTIVE {udp, active}。
+ * 逻辑规则语法见规则文档（“AND,((Rule1),(Rule2),...),Policy”、“NOT,((Rule1)),Policy”，NOT 只接受一个子规则，可以嵌套）；
+ * PROCESS-NAME 以 “/” 开头为完整路径模式。
+ * 切换中的单条增删可能短暂出现两条相交、策略不同的规则（先加后删）：规划保证任何先后下的结果都在允许的模式之内
+ * （见 entry/plan.ts planTempKinds）。
+ */
+export type TempEntryKind = EntryBit | 'blockOther';
+
+/** 规范顺序（证据、计划平局时的次序）；不是有效规则中的先后。 */
+export const TEMP_ENTRY_KINDS: readonly TempEntryKind[] = ['block', 'udp', 'verify', 'active', 'blockOther'];
+
+export const TEMP_ENTRY_KIND_POLICY: Record<TempEntryKind, string> = { ...ENTRY_BIT_POLICY, blockOther: 'REJECT' };
+
+/** 每个已知模式对应的临时规则集合。 */
+export const TEMP_ENTRY_MODE_KINDS: Record<'NORMAL' | 'BLOCKED' | 'VERIFY_ONLY' | 'ACTIVE', readonly TempEntryKind[]> = {
+  NORMAL: [],
+  BLOCKED: ['block'],
+  VERIFY_ONLY: ['udp', 'verify', 'blockOther'],
+  ACTIVE: ['udp', 'active'],
+};
+
+/** 种类在 EntryStep / 撤销清理报告中对应的位（blockOther 是 VERIFY_ONLY 中的“阻断”）。 */
+export function entryBitOfTempKind(kind: TempEntryKind): EntryBit {
+  return kind === 'blockOther' ? 'block' : kind;
+}
+
+const NOT_UDP = '(NOT,((PROTOCOL,UDP)))';
+
+/** temp_rule 策略中某一种对应的唯一一条临时规则（正文 + 策略）。 */
+export function tempRuleText(kind: TempEntryKind, opts: EntryRuleOptions): string {
   assertEntryOptions(opts);
-  const body = bit === 'block' || bit === 'active' ? processExpr(opts.processPaths) : entryRules(bit, true, opts)[0]!;
-  return `${body},${ENTRY_BIT_POLICY[bit]}`;
+  const proc = processExpr(opts.processPaths);
+  let body: string;
+  switch (kind) {
+    case 'block':
+      body = proc;
+      break;
+    case 'udp':
+      body = `AND,((${proc}),(PROTOCOL,UDP))`;
+      break;
+    case 'verify':
+      body = `AND,((${proc}),${NOT_UDP},(DOMAIN,${opts.verifyHost}))`;
+      break;
+    case 'active':
+      body = `AND,((${proc}),${NOT_UDP})`;
+      break;
+    case 'blockOther':
+      body = `AND,((${proc}),${NOT_UDP},(NOT,((DOMAIN,${opts.verifyHost}))))`;
+      break;
+  }
+  return `${body},${TEMP_ENTRY_KIND_POLICY[kind]}`;
+}
+
+/** 本策略可能添加的全部临时规则（P0 工具据此登记意图）。 */
+export function tempEntryRuleTexts(opts: EntryRuleOptions): string[] {
+  return TEMP_ENTRY_KINDS.map((k) => tempRuleText(k, opts));
+}
+
+/**
+ * 旧版本（6.5 时期、按顺序设计）的 verify/active 临时规则：verify 不排除 UDP，active 匹配 Safari 全部流量。
+ * 只用于识别遗留规则（撤销入口时清理）与测试；从不写入。
+ */
+export function legacyTempRuleText(kind: 'verify' | 'active', opts: EntryRuleOptions): string {
+  assertEntryOptions(opts);
+  const proc = processExpr(opts.processPaths);
+  const body = kind === 'verify' ? `AND,((${proc}),(DOMAIN,${opts.verifyHost}))` : proc;
+  return `${body},${ENTRY_BIT_POLICY[kind]}`;
 }

@@ -1,7 +1,8 @@
-// 优先级检查与 temp_rule 策略：尾部插入时用户临时规则可能夹在本应用入口规则之间（udp 与 block、udp 与 active，
+// 优先级检查与 temp_rule 策略：尾部插入时用户临时规则可能夹在本应用入口规则之间（udp 与 active、block 之前，
 // 或撤销清理之前夹在旧规则与当前 block 之间）。读回必须把它列为优先级问题，不能宣称 BLOCKED/ACTIVE 受控；
 // 会让 Safari 流量落到它的写入（激活、回滚的阻断与撤销清理）在写入之前按插入位置预测并拒绝；
-// 普通模式（towardNormal）仍能撤销本应用入口（§5.2、§5.5）。只用合成数据。
+// 普通模式（towardNormal）仍能撤销本应用入口（§5.2、§5.5）。本应用规则之间的先后与模式无关（条件互不相交），
+// 但其他规则的位置仍取决于插入位置。只用合成数据。
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { ENTRY_MODE_BITS, SfeError, type KnownEntryMode } from '@sfe/contract';
 import type { EntryController } from '../../src/ports.js';
 import { FAKE_SAFARI_PATH, FAKE_VERIFY_HOST, FakeSurge, createFakeSurgeEnvironment } from '../../src/surge/fake.js';
-import { ENTRY_BITS_IN_ORDER, nodeLine, resourceFile, tempRuleText } from '../../src/surge/generate.js';
+import { TEMP_ENTRY_MODE_KINDS, nodeLine, resourceFile, tempRuleText } from '../../src/surge/generate.js';
 import { createMemoryEntryOwnership, type MemoryEntryOwnership } from '../../src/surge/entry/ownership.js';
 import { createTempRuleStrategy, type TempRuleInsertion } from '../../src/surge/entry/temp-rule-strategy.js';
 
@@ -57,20 +58,19 @@ async function setup(opts: {
   // 每次一个独立的配置目录（同一测试可以比较不同的插入位置）
   const surgeDir = mkdtempSync(join(dir, 'surge-'));
   createFakeSurgeEnvironment(surgeDir, { entryStrategy: 'temp_rule' });
-  const fake = new FakeSurge({ directory: surgeDir, tempRuleInsertion: 'tail' });
+  // 节点文件在构造前写好：假 Surge 加载配置时读入（Surge 6.10 的 updateExternalResource 跳过本地资源）。
   writeFileSync(
     join(surgeDir, 'sfe-nodes.list'),
     resourceFile(1, [nodeLine({ name: NODE, host: '203.0.113.10', port: 1080, username: null, password: null, front: 'Front-A' })]),
   );
-  await fake.updateExternalResource('policy-path:sfe-nodes.list');
+  const fake = new FakeSurge({ directory: surgeDir, tempRuleInsertion: 'tail' });
   await fake.selectGroupPolicy('SFE-ROUTE', NODE);
   const ownership = createMemoryEntryOwnership();
-  const bits = ENTRY_MODE_BITS[opts.start];
   const add = async (text: string, recorded: boolean): Promise<void> => {
     await fake.addTempRule(text);
     if (recorded) await ownership.confirm('temp_rule', text, 'present');
   };
-  for (const bit of ENTRY_BITS_IN_ORDER) if (bits[bit]) await add(tempRuleText(bit, CFG), true);
+  for (const kind of TEMP_ENTRY_MODE_KINDS[opts.start]) await add(tempRuleText(kind, CFG), true);
   for (const x of opts.extra ?? []) await add(x.text, x.recorded);
   fake.tempRuleInsertion = opts.fakeInsertion ?? 'tail';
   const config = opts.config ?? CFG;
@@ -98,11 +98,11 @@ async function failure(p: Promise<unknown>): Promise<SfeError> {
 describe('temp_rule: a user rule that tail insertion would put ahead of an app entry rule', () => {
   test('ACTIVE + a user rule at the tail → BLOCKED (activation or rollback) is refused before any write: Safari never falls to the user rule', async () => {
     const { fake, ctrl, writes } = await setup({ start: 'ACTIVE', extra: [{ text: USER_DIRECT, recorded: false }] });
-    // ACTIVE：active 覆盖 Safari 全部流量，之后的用户规则到不了
+    // ACTIVE：udp 与 active 合起来覆盖 Safari 全部流量，之后的用户规则到不了
     expect(await ctrl.read()).toMatchObject({ mode: 'ACTIVE', precedenceIssues: [] });
     const before = fake.tempRules;
     for (const opts of [undefined, UNDO]) {
-      // 加入 block（尾部，排在用户规则之后）再移除 active，会让站点经用户规则直连：写入之前拒绝
+      // 加入 block（尾部，排在用户规则之后）再移除 active，会让站点的 TCP 经用户规则直连：写入之前拒绝
       const err = await failure(ctrl.transition('BLOCKED', undefined, opts));
       expect(err.code).toBe('PRECEDENCE_VIOLATION');
       expect(err.details).toMatchObject({ lastConfirmedBits: ENTRY_MODE_BITS.ACTIVE, insertion: 'tail', to: 'BLOCKED' });
@@ -116,10 +116,10 @@ describe('temp_rule: a user rule that tail insertion would put ahead of an app e
     expect(fake.tempRules).toEqual([USER_DIRECT]);
   });
 
-  test('normal mode’s intermediate block (towardNormal) still goes ahead: the readback reports the user rule between udp and block, then NORMAL', async () => {
+  test('normal mode’s intermediate block (towardNormal) still goes ahead: the readback reports the user rule ahead of the block, then NORMAL', async () => {
     const { fake, ctrl } = await setup({ start: 'ACTIVE', extra: [{ text: USER_DIRECT, recorded: false }] });
     const err = await failure(ctrl.transition('BLOCKED', undefined, TOWARD_NORMAL));
-    expect(fake.tempRules).toEqual([tempRuleText('udp', CFG), USER_DIRECT, tempRuleText('block', CFG)]);
+    expect(fake.tempRules).toEqual([USER_DIRECT, tempRuleText('block', CFG)]);
     // 实际：Safari 访问站点经用户规则直连（NORMAL 同样如此），所以读回不能宣称 BLOCKED
     expect(safari(fake, SITE)).toEqual({ rule: USER_DIRECT, policy: 'DIRECT' });
     expect(err.code).toBe('PRECEDENCE_VIOLATION');
@@ -140,7 +140,7 @@ describe('temp_rule: a user rule that tail insertion would put ahead of an app e
     expect(err.details).toMatchObject({ lastConfirmedBits: ENTRY_MODE_BITS.BLOCKED, insertion: 'tail', to: 'ACTIVE' });
     expect(err.details!.precedenceIssues).toEqual([{ rule: user, source: 'temp_rule', severity: 'blocking' }]);
     expect(writes()).toBe(0);
-    expect(fake.tempRules).toEqual([tempRuleText('udp', CFG), tempRuleText('block', CFG), user]);
+    expect(fake.tempRules).toEqual([tempRuleText('block', CFG), user]);
     // 检测主机与站点都仍被拒绝：不会出现“检测主机经 SFE-ROUTE、站点直连”的假通过
     expect(safari(fake, FAKE_VERIFY_HOST).policy).toBe('REJECT');
     expect(safari(fake, SITE).policy).toBe('REJECT');
@@ -165,18 +165,45 @@ describe('temp_rule: a user rule that tail insertion would put ahead of an app e
     expect(rb.precedenceIssues).toEqual([{ rule: user, source: 'temp_rule', severity: 'blocking' }]);
   });
 
-  test('a user rule after the block (Safari never reaches it) is not an issue, even with app rules after it', async () => {
+  test('a user rule after the block (Safari never reaches it) is not an issue', async () => {
     const { fake, ctrl } = await setup({
       start: 'NORMAL',
       extra: [
         { text: tempRuleText('block', CFG), recorded: true },
         { text: USER_DIRECT, recorded: false },
-        { text: tempRuleText('udp', CFG), recorded: true },
       ],
     });
     expect(safari(fake, SITE).policy).toBe('REJECT');
     expect(safari(fake, SITE, 'udp').policy).toBe('REJECT');
     expect(await ctrl.read()).toMatchObject({ mode: 'BLOCKED', precedenceIssues: [] });
+  });
+
+  test('…nor one after app rules that together cover all Safari traffic, even with app rules after it', async () => {
+    // udp（UDP）+ active（非 UDP）已覆盖 Safari 全部流量：之后的用户规则与本应用规则都到不了
+    const { fake, ctrl } = await setup({
+      start: 'NORMAL',
+      extra: [
+        { text: tempRuleText('udp', CFG), recorded: true },
+        { text: tempRuleText('active', CFG), recorded: true },
+        { text: USER_DIRECT, recorded: false },
+      ],
+    });
+    expect(safari(fake, SITE).policy).toBe('SFE-ROUTE');
+    expect(await ctrl.read()).toMatchObject({ mode: 'ACTIVE', precedenceIssues: [] });
+  });
+
+  test('VERIFY_ONLY → ACTIVE with a user rule at the tail: refused under tail insertion, allowed under head insertion', async () => {
+    const user = `DOMAIN,${SITE},DIRECT`;
+    // 尾部：新 active 排在用户规则之后，移除 blockOther 后站点的 TCP 先到用户规则
+    const a = await setup({ start: 'VERIFY_ONLY', extra: [{ text: user, recorded: false }] });
+    expect(await a.ctrl.read()).toMatchObject({ mode: 'VERIFY_ONLY', precedenceIssues: [] });
+    const err = await failure(a.ctrl.transition('ACTIVE'));
+    expect(err.code).toBe('PRECEDENCE_VIOLATION');
+    expect(a.writes()).toBe(0);
+    // 头部：新 active 排在用户规则之前
+    const b = await setup({ start: 'VERIFY_ONLY', extra: [{ text: user, recorded: false }], fakeInsertion: 'head', strategyInsertion: 'head' });
+    expect((await b.ctrl.transition('ACTIVE')).mode).toBe('ACTIVE');
+    expect(safari(b.fake, SITE).policy).toBe('SFE-ROUTE');
   });
 });
 
@@ -262,7 +289,7 @@ describe('temp_rule undo cleanup toward BLOCKED with a user rule between app rul
     const { fake, ctrl } = await setup({ start: 'NORMAL', extra, fakeInsertion: 'head', strategyInsertion: 'head' });
     const blocked = await ctrl.transition('BLOCKED', undefined, UNDO);
     expect(blocked).toMatchObject({ mode: 'BLOCKED', precedenceIssues: [] });
-    expect(fake.tempRules).toEqual([tempRuleText('udp', CFG), tempRuleText('block', CFG), USER_DIRECT]);
+    expect(fake.tempRules).toEqual([tempRuleText('block', CFG), USER_DIRECT]);
     for (const protocol of ['tcp', 'udp'] as const) expect(safari(fake, SITE, protocol).policy).toBe('REJECT');
   });
 });

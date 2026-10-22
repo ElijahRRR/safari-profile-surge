@@ -2,6 +2,8 @@
 // （SFE-ROUTE + 四条入口 RULE-SET，文件名与正式一致，便于证明真实的 key/位置识别），
 // 本机测试节点（前置、坏前置、普通出口、canary 出口）和测试规则；源配置已有受管理段时整段替换，
 // 从不引用真实环境节点。测试凭据是合成的，只对本机测试服务有效。
+// 两种 canary：规则集 canary（p0-canary.list，本地规则集，由 Surge 的文件监视自动重新读取——refresh 测量它的延迟与
+// 影响）与配置 canary（测试配置 [Rule] 中的一行，只在配置重载时被读取——作为“是否发生了配置重载”的信号）。
 
 import {
   ENTRY_RULESET_FILES,
@@ -40,6 +42,8 @@ export const ECHO_HOST = `echo.${TEST_DOMAIN}`;
 export const CHAIN_HOST = `chain.${TEST_DOMAIN}`;
 export const CANARY_SUFFIX = `canary.${TEST_DOMAIN}`;
 export const CANARY_FILE = 'p0-canary.list';
+/** 配置 canary 的主机后缀（与规则集 canary 的后缀不同，互不命中）。 */
+export const PROFILE_CANARY_SUFFIX = `pcanary.${TEST_DOMAIN}`;
 export const PRECEDENCE_MODULE_FILE = 'SFE-P0-precedence.sgmodule';
 /** 只用于生成占位规则集内容（关闭的位不含路径）。 */
 export const PLACEHOLDER_PROCESS_PATH = '/Applications/Safari.app/Contents/MacOS/Safari';
@@ -120,6 +124,31 @@ export function canaryHost(n: number): string {
   return `c${n}.${CANARY_SUFFIX}`;
 }
 
+export function profileCanaryHost(n: number): string {
+  if (!Number.isSafeInteger(n) || n < 0) throw new RangeError('canary index');
+  return `p${n}.${PROFILE_CANARY_SUFFIX}`;
+}
+
+/** 测试配置 [Rule] 中的配置 canary 行：只有这一行的主机经 P0-Canary，同后缀的其他主机按后缀规则经 P0-Plain。 */
+export function profileCanaryRule(n: number): string {
+  return `DOMAIN,${profileCanaryHost(n)},${TEST_PROXIES.canary}`;
+}
+
+const PROFILE_CANARY_LINE_RE = new RegExp(`^DOMAIN,p\\d+\\.${PROFILE_CANARY_SUFFIX.replace(/\./g, '\\.')},${TEST_PROXIES.canary}$`);
+
+/**
+ * 布置配置 canary：把测试配置中唯一的配置 canary 行改为第 n 号（其余内容逐字节不变）。找不到或不止一行时拒绝
+ * （测试配置被外部修改过）。调用方按本工具记录的摘要原子替换测试配置；自动重载关闭时 Surge 不会因此重新读取主配置。
+ */
+export function armProfileCanary(profileText: string, n: number): string {
+  const rule = profileCanaryRule(n);
+  const parsed = parseProfile(profileText);
+  const idx = parsed.lines.map((l, i) => (PROFILE_CANARY_LINE_RE.test(l.text.trim()) ? i : -1)).filter((i) => i >= 0);
+  if (idx.length !== 1) throw refused('布置配置 canary 失败：测试配置中没有唯一的配置 canary 规则（测试配置可能被外部修改）');
+  parsed.lines[idx[0]!]!.text = rule;
+  return serializeProfile(parsed.lines);
+}
+
 export function entryFilesForBits(bits: EntryBits, processPaths: readonly string[], verifyHost: string): Record<string, string> {
   const opts = { processPaths: processPaths.length > 0 ? processPaths : [PLACEHOLDER_PROCESS_PATH], verifyHost };
   return Object.fromEntries(ENTRY_BITS_IN_ORDER.map((bit) => [ENTRY_RULESET_FILES[bit], entryRuleSetFileContent(bit, bits[bit], opts)]));
@@ -137,6 +166,7 @@ function testProxyLines(ports: TestPorts, password: string): string[] {
 function testRuleLines(): string[] {
   return [
     `RULE-SET,${CANARY_FILE},${TEST_PROXIES.canary}`,
+    profileCanaryRule(0),
     `DOMAIN,${CHAIN_HOST},${ROUTE_GROUP_NAME}`,
     `DOMAIN-SUFFIX,${TEST_DOMAIN},${TEST_PROXIES.plain}`,
   ];

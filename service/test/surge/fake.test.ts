@@ -44,30 +44,71 @@ describe('environment and loading', () => {
       ['policy-path:sfe-nodes.list', 'ruleset:sfe-entry-active.list', 'ruleset:sfe-entry-block.list', 'ruleset:sfe-entry-udp.list', 'ruleset:sfe-entry-verify.list'].sort(),
     );
     expect(res.every((r) => r.location.startsWith(dir) && r.error === null)).toBe(true);
+    // Surge Mac 6.10 HTTP API 文档的字段：类型 policy-group / ruleset；本地资源 local: true 且没有更新时间
+    expect(res.find((r) => r.key === 'policy-path:sfe-nodes.list')).toMatchObject({ type: 'policy-group', local: true, lastUpdatedAt: null, updating: false, fromModule: null });
+    expect(res.filter((r) => r.type === 'ruleset').every((r) => r.local === true && r.lastUpdatedAt === null)).toBe(true);
     expect(fake.mechanism()).toEqual(Object.fromEntries(SURGE_PRIMITIVES.map((p) => [p, 'fake'])));
   });
 });
 
-describe('groups and selection', () => {
-  test('file changes are not loaded until the resource is updated by key', async () => {
+describe('external resources follow the documented 6.10 semantics', () => {
+  test('updateExternalResource skips local resources: no re-read, no update time, not a refresh', async () => {
+    createFakeSurgeEnvironment(dir);
+    const fake = new FakeSurge({ directory: dir });
+    writeNodes([node(1)]);
+    await expect(fake.updateExternalResource('policy-path:sfe-nodes.list')).resolves.toEqual({ key: 'policy-path:sfe-nodes.list', refreshed: false, outcome: 'skipped' });
+    expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT']);
+    expect((await fake.listExternalResources()).find((r) => r.key === 'policy-path:sfe-nodes.list')!.lastUpdatedAt).toBeNull();
+    writeFileSync(join(dir, ENTRY_RULESET_FILES.block), entryRuleSetFileContent('block', true, OPTS));
+    await expect(fake.updateExternalResource('ruleset:sfe-entry-block.list')).resolves.toMatchObject({ refreshed: false, outcome: 'skipped' });
+    await expect(fake.updateExternalResource('ruleset:missing.list')).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED' });
+    expect(fake.reloadCount).toBe(0);
+  });
+
+  test('a remote resource is downloaded by key: its update time advances', async () => {
+    createFakeSurgeEnvironment(dir, { userRules: ['RULE-SET,https://rules.example.test/user.list,DIRECT'] });
+    let t = Date.parse('2026-10-22T00:00:00Z');
+    const fake = new FakeSurge({ directory: dir, now: () => new Date(t) });
+    const key = 'ruleset:https://rules.example.test/user.list';
+    expect((await fake.listExternalResources()).find((r) => r.key === key)).toMatchObject({ local: false, lastUpdatedAt: null });
+    t += 5_000;
+    await expect(fake.updateExternalResource(key)).resolves.toEqual({ key, refreshed: true, outcome: 'downloaded' });
+    expect((await fake.listExternalResources()).find((r) => r.key === key)!.lastUpdatedAt).toEqual(new Date(t));
+  });
+
+  test('local policy-path files are not watched by default (undocumented); members change only on a profile reload', async () => {
     createFakeSurgeEnvironment(dir);
     const fake = new FakeSurge({ directory: dir });
     writeNodes([node(1)]);
     expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT']);
-    await fake.updateExternalResource('policy-path:sfe-nodes.list');
+    expect(fake.watcherReloads).toEqual([]);
+    await fake.reloadProfile();
     expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', 'SFE-N-E0001-US01-v001']);
-    expect(fake.calls.reloadProfile).toBeUndefined();
-    expect(fake.reloadCount).toBe(0);
   });
 
+  test('with watchLocalPolicyPaths a local policy-path reloads after the latency, without a profile reload', async () => {
+    createFakeSurgeEnvironment(dir);
+    let t = 1_000_000;
+    const fake = new FakeSurge({ directory: dir, watchLocalPolicyPaths: true, localWatchLatencyMs: 2_000, now: () => new Date(t) });
+    writeNodes([node(1)]);
+    expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT']);
+    t += 1_999;
+    expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT']);
+    t += 1;
+    expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', 'SFE-N-E0001-US01-v001']);
+    expect(fake.watcherReloads).toEqual([{ key: 'policy-path:sfe-nodes.list', at: new Date(t) }]);
+    expect(fake.reloadCount).toBe(0);
+  });
+});
+
+// 以下用 watchLocalPolicyPaths 让节点文件的变化在下一次调用时生效（是否被监视由 P0 实测，见上）。
+describe('groups and selection', () => {
   test('select falls back to the first member (REJECT) when the selection disappears', async () => {
     createFakeSurgeEnvironment(dir);
-    const fake = new FakeSurge({ directory: dir });
+    const fake = new FakeSurge({ directory: dir, watchLocalPolicyPaths: true });
     writeNodes([node(1), node(2)]);
-    await fake.updateExternalResource('policy-path:sfe-nodes.list');
     await fake.selectGroupPolicy('SFE-ROUTE', 'SFE-N-E0001-US01-v002');
     writeNodes([node(1)], 2);
-    await fake.updateExternalResource('policy-path:sfe-nodes.list');
     expect(await fake.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
     const r = fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: FAKE_VERIFY_HOST, protocol: 'tcp' });
     expect(r.policyName).toBe('DIRECT');
@@ -75,23 +116,20 @@ describe('groups and selection', () => {
 
   test('selection is kept across updates while the node remains', async () => {
     createFakeSurgeEnvironment(dir);
-    const fake = new FakeSurge({ directory: dir });
+    const fake = new FakeSurge({ directory: dir, watchLocalPolicyPaths: true });
     writeNodes([node(1)]);
-    await fake.updateExternalResource('policy-path:sfe-nodes.list');
     await fake.selectGroupPolicy('SFE-ROUTE', 'SFE-N-E0001-US01-v001');
     writeNodes([node(1), node(2)], 2);
-    await fake.updateExternalResource('policy-path:sfe-nodes.list');
     expect(await fake.getGroupSelection('SFE-ROUTE')).toBe('SFE-N-E0001-US01-v001');
     await expect(fake.selectGroupPolicy('SFE-ROUTE', 'Front-A')).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED' });
   });
 
   test('policy detail redacts credentials and reports the front', async () => {
     createFakeSurgeEnvironment(dir);
-    const fake = new FakeSurge({ directory: dir });
+    const fake = new FakeSurge({ directory: dir, watchLocalPolicyPaths: true });
     const d = await fake.getPolicyDetail('Front-A');
     expect(d.redactedRaw).not.toContain('example-pass');
     writeNodes([node(1)]);
-    await fake.updateExternalResource('policy-path:sfe-nodes.list');
     expect(await fake.getPolicyDetail('SFE-N-E0001-US01-v001')).toMatchObject({ server: '203.0.113.11', port: 1080, underlyingProxy: 'Front-A' });
   });
 });
@@ -99,17 +137,15 @@ describe('groups and selection', () => {
 describe('front resolution', () => {
   test("'skip' drops nodes whose front is missing", async () => {
     createFakeSurgeEnvironment(dir);
-    const fake = new FakeSurge({ directory: dir, frontResolution: 'skip' });
+    const fake = new FakeSurge({ directory: dir, frontResolution: 'skip', watchLocalPolicyPaths: true });
     writeNodes([node(1, 'Missing-Front')]);
-    await fake.updateExternalResource('policy-path:sfe-nodes.list');
     expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT']);
   });
 
   test("'direct' keeps the node and its traffic bypasses the front (the dangerous case)", async () => {
     createFakeSurgeEnvironment(dir, { userRules: ['DOMAIN-SUFFIX,example.test,SFE-ROUTE'] });
-    const fake = new FakeSurge({ directory: dir, frontResolution: 'direct' });
+    const fake = new FakeSurge({ directory: dir, frontResolution: 'direct', watchLocalPolicyPaths: true });
     writeNodes([node(1, 'Missing-Front')]);
-    await fake.updateExternalResource('policy-path:sfe-nodes.list');
     await fake.selectGroupPolicy('SFE-ROUTE', 'SFE-N-E0001-US01-v001');
     const r = fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp' });
     expect(r.frontMissing).toBe(true);
@@ -119,9 +155,8 @@ describe('front resolution', () => {
 
   test('with the front present the chain goes through it', async () => {
     createFakeSurgeEnvironment(dir, { userRules: ['DOMAIN-SUFFIX,example.test,SFE-ROUTE'] });
-    const fake = new FakeSurge({ directory: dir });
+    const fake = new FakeSurge({ directory: dir, watchLocalPolicyPaths: true });
     writeNodes([node(1)]);
-    await fake.updateExternalResource('policy-path:sfe-nodes.list');
     await fake.selectGroupPolicy('SFE-ROUTE', 'SFE-N-E0001-US01-v001');
     const r = fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp' });
     expect(r).toMatchObject({ policyName: 'SFE-ROUTE', leafPolicyName: 'SFE-N-E0001-US01-v001', frontMissing: false, chain: ['SFE-ROUTE', 'SFE-N-E0001-US01-v001', 'Front-A'] });
@@ -129,12 +164,13 @@ describe('front resolution', () => {
 });
 
 describe('rule evaluation', () => {
+  /** 写入入口规则集文件：本地 RULE-SET 由文件监视在下一次调用时重新加载（缺省延迟 0）。 */
   const loadEntry = async (fake: FakeSurge, bits: Partial<Record<keyof typeof ENTRY_RULESET_FILES, boolean>>) => {
     for (const [bit, on] of Object.entries(bits)) {
       const b = bit as keyof typeof ENTRY_RULESET_FILES;
       writeFileSync(join(dir, ENTRY_RULESET_FILES[b]), entryRuleSetFileContent(b, Boolean(on), OPTS));
-      await fake.updateExternalResource(`ruleset:${ENTRY_RULESET_FILES[b]}`);
     }
+    await fake.listRules();
   };
 
   test('UDP rule rejects Safari UDP while TCP continues to user rules', async () => {
@@ -146,13 +182,36 @@ describe('rule evaluation', () => {
     expect(fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'udp' }).policyName).toBe('DIRECT');
   });
 
-  test('ruleset content changes take effect only after updateExternalResource', async () => {
+  test('a local rule set change is applied by the file watcher after the latency, only for that rule set and without a profile reload', async () => {
     createFakeSurgeEnvironment(dir);
-    const fake = new FakeSurge({ directory: dir });
+    let t = 5_000_000;
+    const fake = new FakeSurge({ directory: dir, localWatchLatencyMs: 500, now: () => new Date(t) });
+    await fake.addTempRule('DOMAIN,kept.example.test,REJECT');
     writeFileSync(join(dir, ENTRY_RULESET_FILES.block), entryRuleSetFileContent('block', true, OPTS));
     expect(fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp' }).policyName).toBe('DIRECT');
+    // update(key) 不会让本地文件提前生效
     await fake.updateExternalResource('ruleset:sfe-entry-block.list');
-    expect(fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp' }).policyName).toBe('REJECT');
+    expect(fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp' }).policyName).toBe('DIRECT');
+    t += 500;
+    expect(fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp' })).toMatchObject({ policyName: 'REJECT', rule: 'RULE-SET,sfe-entry-block.list,REJECT' });
+    expect(fake.watcherReloads.map((w) => w.key)).toEqual(['ruleset:sfe-entry-block.list']);
+    expect(fake.reloadCount).toBe(0);
+    expect(fake.tempRules).toEqual(['DOMAIN,kept.example.test,REJECT']);
+  });
+
+  test('rule match evaluates like a request (same order, same rule sets) without recording one; Chrome is not matched by Safari rules', async () => {
+    createFakeSurgeEnvironment(dir);
+    const fake = new FakeSurge({ directory: dir });
+    await loadEntry(fake, { udp: true, block: true });
+    expect(await fake.matchRule({ host: 'www.example.test', processPath: FAKE_SAFARI_PATH, protocol: 'UDP' })).toEqual({ rule: 'RULE-SET,sfe-entry-udp.list,REJECT', policy: 'REJECT' });
+    expect(await fake.matchRule({ host: 'www.example.test', processPath: FAKE_SAFARI_PATH, protocol: 'QUIC' })).toEqual({ rule: 'RULE-SET,sfe-entry-udp.list,REJECT', policy: 'REJECT' });
+    expect(await fake.matchRule({ host: 'www.example.test', processPath: FAKE_SAFARI_PATH })).toEqual({ rule: 'RULE-SET,sfe-entry-block.list,REJECT', policy: 'REJECT' });
+    expect(await fake.matchRule({ host: 'www.example.test', processPath: FAKE_CHROME_PATH, protocol: 'UDP' })).toEqual({ rule: 'FINAL,DIRECT', policy: 'DIRECT' });
+    expect(await fake.matchRule({ host: 'daily.example.test', processPath: FAKE_CHROME_PATH })).toEqual({ rule: 'DOMAIN-SUFFIX,daily.example.test,Daily', policy: 'Daily' });
+    const sim = fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp' });
+    expect(await fake.matchRule({ host: 'www.example.test', processPath: FAKE_SAFARI_PATH, protocol: 'TCP' })).toEqual({ rule: sim.rule, policy: sim.policyName });
+    expect(await fake.listRecentRequests()).toHaveLength(1);
+    await expect(fake.matchRule({ host: 'https://www.example.test/', processPath: FAKE_SAFARI_PATH })).rejects.toMatchObject({ code: 'VALIDATION_FAILED' });
   });
 
   test('module rules precede temp rules, which precede profile rules', async () => {
@@ -166,13 +225,13 @@ describe('rule evaluation', () => {
     expect((await fake.listRules()).map((r) => r.source).slice(0, 3)).toEqual(['module', 'temp_rule', 'profile']);
   });
 
-  test('temp rule insertion position is configurable', async () => {
+  test('a new temp rule takes the highest priority by default; the position stays configurable (undocumented among temp rules)', async () => {
     createFakeSurgeEnvironment(dir, { entryStrategy: 'temp_rule' });
-    const head = new FakeSurge({ directory: dir, tempRuleInsertion: 'head' });
+    const head = new FakeSurge({ directory: dir });
     await head.addTempRule('DOMAIN,a.example.test,REJECT');
     await head.addTempRule('DOMAIN,b.example.test,REJECT');
     expect(head.tempRules).toEqual(['DOMAIN,b.example.test,REJECT', 'DOMAIN,a.example.test,REJECT']);
-    const tail = new FakeSurge({ directory: dir });
+    const tail = new FakeSurge({ directory: dir, tempRuleInsertion: 'tail' });
     await tail.addTempRule('DOMAIN,a.example.test,REJECT');
     await tail.addTempRule('DOMAIN,b.example.test,REJECT');
     expect(tail.tempRules).toEqual(['DOMAIN,a.example.test,REJECT', 'DOMAIN,b.example.test,REJECT']);
@@ -262,17 +321,17 @@ describe('lifecycle and fault injection', () => {
 
   test('the simulated running instance reports version and build all-or-nothing and is not a Surge primitive call', async () => {
     createFakeSurgeEnvironment(dir);
-    const fake = new FakeSurge({ directory: dir, version: '6.5.0', build: '10960', now: () => new Date('2026-10-21T09:00:00.700Z') });
+    const fake = new FakeSurge({ directory: dir, now: () => new Date('2026-10-21T09:00:00.700Z') });
     expect(await fake.runningInstance()).toEqual({
       ok: true,
-      instance: { pid: 404, startedAt: '2026-10-21T09:00:00.000Z', bundlePath: '/Applications/Surge.app', bundleId: 'com.nssurge.surge-mac', version: '6.5.0', build: '10960' },
+      instance: { pid: 404, startedAt: '2026-10-21T09:00:00.000Z', bundlePath: '/Applications/Surge.app', bundleId: 'com.nssurge.surge-mac', version: '6.10.0', build: '12500' },
     });
     fake.build = null;
     expect(await fake.runningInstance()).toEqual({ ok: false, reason: 'plist_unreadable' });
-    fake.build = '10960';
+    fake.build = '12500';
     fake.version = '127.0.0.1';
     expect(await fake.runningInstance()).toEqual({ ok: false, reason: 'version_malformed' });
-    fake.version = '6.5.0';
+    fake.version = '6.10.0';
     fake.instanceFailure = 'modified_after_start';
     expect(await fake.runningInstance()).toEqual({ ok: false, reason: 'modified_after_start' });
     fake.instanceFailure = null;
@@ -282,10 +341,28 @@ describe('lifecycle and fault injection', () => {
     expect(fake.calls).toEqual({});
   });
 
+  test('version reporting: 6.10.0 (12500) by default with a controller protocol; fails closed like the CLI parser without a build', async () => {
+    createFakeSurgeEnvironment(dir);
+    const fake = new FakeSurge({ directory: dir });
+    expect(await fake.getVersion()).toEqual({ version: '6.10.0', build: '12500', coreVersion: 6100, controllerProtocol: 24 });
+    const old = new FakeSurge({ directory: dir, version: '6.9.1', build: '12290', controllerProtocol: 22, coreVersion: 6091 });
+    expect(await old.getVersion()).toEqual({ version: '6.9.1', build: '12290', coreVersion: 6091, controllerProtocol: 22 });
+    old.build = null;
+    await expect(old.getVersion()).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED' });
+  });
+
+  test('runtime info reports the engine start and uptime in seconds', async () => {
+    createFakeSurgeEnvironment(dir);
+    let t = Date.parse('2026-10-22T00:00:00Z');
+    const fake = new FakeSurge({ directory: dir, now: () => new Date(t) });
+    t += 90_500;
+    expect(await fake.getRuntimeInfo()).toEqual({ startedAt: new Date('2026-10-22T00:00:00Z'), uptimeSeconds: 90 });
+  });
+
   test('version, profile and takeover state are settable', async () => {
     createFakeSurgeEnvironment(dir);
-    const fake = new FakeSurge({ directory: dir, version: '6.5.0', build: '10960' });
-    expect(await fake.getVersion()).toEqual({ version: '6.5.0', build: '10960' });
+    const fake = new FakeSurge({ directory: dir, version: '6.10.1', build: '12510' });
+    expect(await fake.getVersion()).toMatchObject({ version: '6.10.1', build: '12510' });
     expect((await fake.getCurrentProfile()).name).toBe('日常-Safari环境');
     fake.takeover = { enhancedMode: false, systemProxy: true, outboundMode: 'direct', checkedAt: null };
     expect(await fake.getTakeoverState()).toMatchObject({ enhancedMode: false, outboundMode: 'direct' });

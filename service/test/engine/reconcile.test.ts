@@ -1,7 +1,8 @@
 import { readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, grantForCurrentHost, rid, verify, type Harness } from './harness.js';
+import { SURGE_START_JITTER_MS, surgeRestartedBetween } from '../../src/engine/context.js';
+import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, grantForCurrentHost, rid, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -9,7 +10,8 @@ afterEach(async () => {
 });
 
 const WRITE_PRIMITIVES = ['updateExternalResource', 'selectGroupPolicy', 'addTempRule', 'removeTempRule', 'killRequest', 'reloadProfile'];
-const writes = () => Object.fromEntries(WRITE_PRIMITIVES.map((k) => [k, h.fake.calls[k] ?? 0]));
+// 写原语的调用次数之外还看入口规则集文件（ruleset_resource 的入口写入是文件写入加文件监视，不经适配器写原语）
+const writes = () => ({ ...Object.fromEntries(WRITE_PRIMITIVES.map((k) => [k, h.fake.calls[k] ?? 0])), ...entryWrites(h.fake) });
 const reconcileOps = () => h.repos.operations.listRecent(500).filter((o) => o.kind === 'maintenance.reconcile');
 
 async function until(cond: () => boolean): Promise<void> {
@@ -76,7 +78,8 @@ describe('periodic reconcile is read-only and sticky', () => {
 
   test('Surge restart → surge_restarted, attention, Safari probe expired', async () => {
     const { envId } = await activeHarness();
-    h.clock.advance(1000);
+    // 引擎启动时间由运行时长换算到整秒：重启要让它向后移动超过容差（SURGE_START_JITTER_MS）
+    h.clock.advance(5_000);
     h.fake.restart();
     await h.app.runPeriodicReconcile();
     const route = h.repos.routeState.get();
@@ -90,13 +93,13 @@ describe('periodic reconcile is read-only and sticky', () => {
     h = await createHarness({ entryStrategy: 'temp_rule' });
     const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await bind(h, PROFILE_A, env);
-    // temp_rule 在尾部插入时无法到达 VERIFY_ONLY（B 模块的结论）：激活回滚并停在 BLOCKED
-    const a = await h.app.activate(env, { request_id: rid() }, WEB);
+    // 激活后入口不是 NORMAL、本应用的临时规则在 Surge 中（停在 BLOCKED 或等待实测的 VERIFY_ONLY 都可以：
+    // 这里只关心重启后临时规则消失时的对账，不关心入口策略走到哪一步）
+    await h.app.activate(env, { request_id: rid() }, WEB);
     await h.idle();
-    expect(h.repos.operations.get(a.operation_id)!.phase).toBe('FAILED');
-    expect(h.repos.routeState.get().entryMode).toBe('BLOCKED');
+    expect(['BLOCKED', 'VERIFY_ONLY']).toContain(h.repos.routeState.get().entryMode);
     expect(h.fake.tempRules.length).toBeGreaterThan(0);
-    h.clock.advance(1000);
+    h.clock.advance(5_000);
     h.fake.restart();
     expect(h.fake.tempRules).toEqual([]);
     const before = writes();
@@ -412,5 +415,69 @@ describe('periodic reconcile is read-only and sticky', () => {
     expect(c.ok).toBe(false);
     release();
     await h.idle();
+  });
+});
+
+describe('engine restart detection from the engine uptime (getRuntimeInfo: dump performance uptime)', () => {
+  test('surgeRestartedBetween: uptime falling or startedAt moving forward beyond the jitter; unreadable samples prove nothing', () => {
+    const t = (ms: number) => new Date(Date.UTC(2026, 9, 21) + ms).toISOString();
+    expect(surgeRestartedBetween({ startedAt: t(0), uptimeSeconds: 100 }, { startedAt: t(1_000), uptimeSeconds: 130 })).toBe(false);
+    expect(surgeRestartedBetween({ startedAt: t(0), uptimeSeconds: null }, { startedAt: t(SURGE_START_JITTER_MS), uptimeSeconds: null })).toBe(false);
+    expect(surgeRestartedBetween({ startedAt: t(0), uptimeSeconds: null }, { startedAt: t(SURGE_START_JITTER_MS + 1), uptimeSeconds: null })).toBe(true);
+    expect(surgeRestartedBetween({ startedAt: t(0), uptimeSeconds: 100 }, { startedAt: t(500), uptimeSeconds: 3 })).toBe(true);
+    // 启动时间向前移动（墙钟回拨）不是重启
+    expect(surgeRestartedBetween({ startedAt: t(10_000), uptimeSeconds: null }, { startedAt: t(0), uptimeSeconds: null })).toBe(false);
+    expect(surgeRestartedBetween(null, { startedAt: t(0), uptimeSeconds: 1 })).toBe(false);
+    expect(surgeRestartedBetween({ startedAt: null, uptimeSeconds: null }, { startedAt: t(60_000), uptimeSeconds: 0 })).toBe(false);
+  });
+
+  /**
+   * temp_rule 激活后的受管理状态（入口不是 NORMAL、本应用的临时规则在 Surge 中，对账检查重启）：停在 BLOCKED 或
+   * 等待 Safari 实测的 VERIFY_ONLY 都可以——这里只关心重启检测，不关心入口策略走到哪一步。
+   */
+  async function managedTempRule(): Promise<void> {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    await h.app.activate(env, { request_id: rid() }, WEB);
+    await h.idle();
+    expect(['BLOCKED', 'VERIFY_ONLY']).toContain(h.repos.routeState.get().entryMode);
+    expect(h.fake.tempRules.length).toBeGreaterThan(0);
+  }
+
+  test('startedAt jitter of one second from the whole-second conversion is not a restart', async () => {
+    await managedTempRule();
+    h.clock.advance(10_000);
+    await h.app.runPeriodicReconcile();
+    const startedAt = h.fake.startedAt.getTime();
+    // 同一次引擎运行：运行时长继续增加，换算出的启动时间相差 1 秒
+    h.fake.getRuntimeInfo = async () => ({ startedAt: new Date(startedAt + 1_000), uptimeSeconds: 11 });
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get().warnings).not.toContain('surge_restarted');
+  });
+
+  test('an engine-only restart (uptime falls, process unchanged) → surge_restarted', async () => {
+    await managedTempRule();
+    h.clock.advance(10_000);
+    await h.app.runPeriodicReconcile();
+    expect(h.app.engine.facts.uptimeSeconds).toBe(10);
+    // restart-engine 或 6.9+ 的重载自动升级为完整重启：进程启动时间不变，引擎运行时长回落
+    const startedAt = h.fake.startedAt.getTime();
+    h.fake.getRuntimeInfo = async () => ({ startedAt: new Date(startedAt + 1_500), uptimeSeconds: 2 });
+    const instanceBefore = await h.fake.runningInstance();
+    await h.app.runPeriodicReconcile();
+    expect(await h.fake.runningInstance()).toEqual(instanceBefore);
+    expect(h.repos.routeState.get().warnings).toContain('surge_restarted');
+  });
+
+  test('an unreadable engine uptime never raises surge_restarted', async () => {
+    await managedTempRule();
+    h.fake.getRuntimeInfo = async () => {
+      throw new Error('dump performance unavailable');
+    };
+    h.clock.advance(10_000);
+    await h.app.runPeriodicReconcile();
+    expect(h.app.engine.facts).toMatchObject({ startedAt: null, uptimeSeconds: null });
+    expect(h.repos.routeState.get().warnings).not.toContain('surge_restarted');
   });
 });

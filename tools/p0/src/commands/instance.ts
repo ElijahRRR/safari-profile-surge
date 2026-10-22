@@ -2,7 +2,9 @@
 // 把完整证据（每条规则的结果与耗时、ctime 与启动时间之差、lsof 是否匹配、codesign 退出码、被排除的其他 Surge 进程）
 // 写入运行目录 instance/<时间>.json。从不执行 surge-cli、从不写 Surge 或它的文件，也从不触发更新（P0-RUNBOOK V1–V10）。
 // 能确认时退出 0；无法确认时退出 3（失败原因已打印）。读到了版本、但超过服务读取器的时限（codesign 15 秒、引擎总时限
-// 8 秒）时也退出 3：服务读不到这个版本（P0 的 codesign 超时更长，用来记录真实耗时）。
+// 8 秒）时也退出 3：服务读不到这个版本（P0 的 codesign 超时更长，用来记录真实耗时）。读到的版本低于最低支持版本
+// 6.10.0（构建 12500）时同样退出 3：服务拒绝依赖版本的动作（进入普通模式除外）。与 `surge-cli --raw version` 的交叉
+// 核对（Controller 协议 ≥ 22）在 inventory 与每次能力上下文测量中进行（本命令不执行 surge-cli）。
 // --self-test-bundle <运行目录内的 .app>：V6 自测——用同一组规则核对你在运行目录中做的临时 App（不碰 Surge），
 // 包标识必须是 SELF_TEST_BUNDLE_ID；结果只写证据，从不进入能力上下文。
 
@@ -14,9 +16,11 @@ import {
   RUNNING_INSTANCE_FAILURE_TEXT,
   SERVICE_CODESIGN_TIMEOUT_MS,
   SERVICE_INSTANCE_READ_BUDGET_MS,
+  SURGE_MINIMUM,
   createRunningInstanceReader,
   defaultRunningInstanceDeps,
   isRunningInstanceFailure,
+  meetsSurgeMinimumVersion,
   serviceInstanceResult,
   serviceLimitsExceeded,
   type RunningInstanceReport,
@@ -100,11 +104,15 @@ export function printInstanceReport(out: Output, report: RunningInstanceReport):
   }
 }
 
+/** 最低支持版本的说明（running-instance.ts 的 SURGE_MINIMUM）。 */
+export const MINIMUM_VERSION_TEXT = `最低支持 Surge Mac ${SURGE_MINIMUM.version}（构建 ${SURGE_MINIMUM.build}、Controller 协议 ${SURGE_MINIMUM.controllerProtocol}）`;
+
 export function instanceSummaryText(report: RunningInstanceReport): string {
   const r = report.result;
   if (!r.ok) return `无法确认（${RUNNING_INSTANCE_FAILURE_TEXT[r.reason]}）：依赖 Surge 版本的能力按待验证处理`;
   const text = `${r.instance.version}（${r.instance.build}）· pid ${r.instance.pid} · 启动于 ${r.instance.startedAt}${report.cached ? ' · 包信息与签名沿用缓存' : ''}`;
-  return serviceLimitsExceeded(report).length > 0 ? `${text} · 但超过服务读取的时限，服务读不到这个版本：依赖 Surge 版本的能力按待验证处理，不能提议` : text;
+  if (serviceLimitsExceeded(report).length > 0) return `${text} · 但超过服务读取的时限，服务读不到这个版本：依赖 Surge 版本的能力按待验证处理，不能提议`;
+  return meetsSurgeMinimumVersion(r.instance) ? text : `${text} · 低于${MINIMUM_VERSION_TEXT}：依赖 Surge 版本的动作被拒绝（进入普通模式仍可用，但低于 6.9 时入口撤销无法用 rule match 确认），不能提议`;
 }
 
 /** 超过服务读取器时限的说明（P0 的 codesign 超时更长；服务的时限见 SERVICE_CODESIGN_TIMEOUT_MS、SERVICE_INSTANCE_READ_BUDGET_MS）。 */
@@ -220,7 +228,11 @@ export async function runInstance(ctx: Ctx): Promise<ExitCode> {
   out.line(`磁盘上的 Surge.app（旁证）：${onDisk.version ?? '读不到'}（${onDisk.build ?? '读不到'}）`);
   warnOnDiskDifference(out, report, onDisk);
   warnServiceLimits(out, report);
+  const svc = serviceInstanceResult(report);
+  const supported = svc.ok && meetsSurgeMinimumVersion(svc.instance);
+  if (svc.ok && !supported) out.warn(`运行中的 Surge ${svc.instance.version}（${svc.instance.build}）低于${MINIMUM_VERSION_TEXT}：请升级 Surge 后重新运行 instance`);
+  if (supported) out.line(`下一步：运行 inventory，核对 surge-cli --raw version 与运行实例一致、Controller 协议 ≥ ${SURGE_MINIMUM.controllerProtocol}（V8）`);
   out.line(`证据：${dir.file(file)}`);
-  // 服务按它的时限读不到时同样退出 3：P0 读到的版本不能用来确认依赖版本的能力
-  return serviceInstanceResult(report).ok ? EXIT.OK : EXIT.REFUSED;
+  // 服务按它的时限读不到、或版本低于最低支持版本时同样退出 3：P0 读到的版本不能用来确认依赖版本的能力
+  return supported ? EXIT.OK : EXIT.REFUSED;
 }

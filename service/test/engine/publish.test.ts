@@ -1,8 +1,9 @@
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { CAPABILITY_GATES, NODE_RESOURCE_FILE, type CapabilityKey } from '@sfe/contract';
-import { anyContext, ADMIN, PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, envInput, rid, safariOutcome, type Harness } from './harness.js';
+import { CAPABILITY_GATES, NODE_RESOURCE_FILE, WORKING_PROFILE_NAME, type CapabilityKey } from '@sfe/contract';
+import { profileMatches } from '../../src/engine/context.js';
+import { anyContext, ADMIN, PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, envInput, rid, safariOutcome, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -10,7 +11,8 @@ afterEach(async () => {
 });
 
 const WRITE_PRIMITIVES = ['updateExternalResource', 'selectGroupPolicy', 'addTempRule', 'removeTempRule', 'killRequest', 'reloadProfile'];
-const writes = (hh: Harness) => Object.fromEntries(WRITE_PRIMITIVES.map((k) => [k, hh.fake.calls[k] ?? 0]));
+// 写原语的调用次数之外还看入口规则集文件（ruleset_resource 的入口写入是文件写入加文件监视，不经适配器写原语）
+const writes = (hh: Harness) => ({ ...Object.fromEntries(WRITE_PRIMITIVES.map((k) => [k, hh.fake.calls[k] ?? 0])), ...entryWrites(hh.fake) });
 const resource = (hh: Harness) => readFileSync(join(hh.surgeDir, NODE_RESOURCE_FILE), 'utf8');
 
 describe('publish gate (identical for automatic and manual publish)', () => {
@@ -220,6 +222,35 @@ describe('baseline checks', () => {
     expect(writes(h)).toEqual(before);
   });
 
+  // Surge 当前配置只按完整路径认定（profileMatches）：同名但没有路径（HTTP 的 getCurrentProfile 不给路径；“profiles that do
+  // not originate from a local file report no path”）不是工作配置。之前按名称回退时这里会被当作工作配置。
+  test('the working profile name without a path is not the working profile: refused before writing, and at readback rolled back', async () => {
+    h = await createHarness();
+    const working = { ...h.fake.currentProfile };
+    expect(profileMatches({ name: WORKING_PROFILE_NAME, path: null }, { name: WORKING_PROFILE_NAME, path: working.path! })).toBe(false);
+    expect(profileMatches({ name: WORKING_PROFILE_NAME, path: '' }, { name: WORKING_PROFILE_NAME, path: working.path! })).toBe(false);
+    expect(profileMatches({ name: 'renamed', path: working.path }, { name: WORKING_PROFILE_NAME, path: working.path! })).toBe(true);
+    h.fake.currentProfile = { name: WORKING_PROFILE_NAME, path: null };
+    const st = await h.app.refreshSurge(WEB);
+    expect(st.onWorkingProfile).toBe(false);
+    const before = writes(h);
+    const fileBefore = resource(h);
+    const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10');
+    expect(h.repos.operations.get(a.operation_id)!.error?.code).toBe('EXTERNAL_PROFILE');
+    expect(writes(h)).toEqual(before);
+    expect(resource(h)).toBe(fileBefore);
+    // 写入之后的读回读到同名、无路径的当前配置：EXTERNAL_PROFILE，按同一路径回滚
+    h.fake.currentProfile = working;
+    const orig = h.fake.getCurrentProfile.bind(h.fake);
+    h.fake.getCurrentProfile = async () => (resource(h) === fileBefore ? orig() : { name: WORKING_PROFILE_NAME, path: null });
+    const b = await createEnv(h, 'US-Buyer-02', '203.0.113.11');
+    const op = h.repos.operations.get(b.operation_id)!;
+    expect(op.error?.code).toBe('EXTERNAL_PROFILE');
+    expect((op.error?.details as { checks: string[] }).checks).toContain('profile');
+    expect(h.repos.deployments.latest()!.state).toBe('rolled_back');
+    expect(h.repos.environments.get(b.environment_id!)!.deployedProxyRevision).toBeNull();
+  });
+
   test('front missing in Surge → FRONT_PROXY_MISSING for that environment only', async () => {
     h = await createHarness();
     h.repos.frontProxies.insert({ id: 'front_gone', surgeName: 'Gone-Front', state: 'ok' });
@@ -238,20 +269,21 @@ describe('baseline checks', () => {
 });
 
 describe('readback mismatch → rollback through the same path', () => {
-  test('selection lost during refresh is restored; previous resource restored', async () => {
+  test('selection lost when Surge re-reads the resource is restored; previous resource restored', async () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-01', '203.0.113.10', PROFILE_A);
     const node = h.repos.routeState.get().selectedNode!;
     const prevManifest = h.repos.deployments.latest()!.nodeManifest;
-    const orig = h.fake.updateExternalResource.bind(h.fake);
+    const orig = h.fake.getGroupMembers.bind(h.fake);
     let first = true;
-    h.fake.updateExternalResource = async (key: string) => {
-      await orig(key);
+    h.fake.getGroupMembers = async (group: string) => {
+      const r = await orig(group);
       if (first) {
         first = false;
-        // 模拟刷新后组选择回落到首成员
+        // 模拟 Surge 重新读取节点资源后组选择回落到首成员
         await h.fake.selectGroupPolicy('SFE-ROUTE', 'REJECT');
       }
+      return r;
     };
     const b = await createEnv(h, 'US-Buyer-02', '203.0.113.11');
     const op = h.repos.operations.get(b.operation_id)!;

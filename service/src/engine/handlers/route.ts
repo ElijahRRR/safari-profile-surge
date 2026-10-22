@@ -24,6 +24,7 @@ import { probeView } from '../../domain/views.js';
 import type { EntryController, EntryReadback, EntryTransitionOptions } from '../../ports.js';
 import { findVerificationRequest } from '../../surge/correlate.js';
 import { knownModeOfBits } from '../../surge/entry/plan.js';
+import { hasBlockingIssue } from '../../surge/precedence.js';
 import { killSafariConnections } from '../../surge/safari-connections.js';
 import type { Engine } from '../context.js';
 import { managedSegmentsChanged, reconcile } from '../reconcile.js';
@@ -53,6 +54,9 @@ function undoOptions(engine: Engine, opId: string): EntryTransitionOptions {
     },
   };
 }
+
+/** 撤销入口时 rule match 读不到或不可用（EntryReadback.runtimeConfirmed 为 false）的步骤说明。 */
+const UNCONFIRMED_ENTRY_TEXT = 'rule match 读不到或当前 Surge 不支持，入口按结构读回或写入并等待完成，未经运行时求值确认';
 
 function routePayload(op: OperationRecord): RoutePayload {
   const r = payloadOf(op).route;
@@ -799,9 +803,13 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
   try {
     if (!ctrl) throw new SfeError('UNKNOWN_STATE', '回滚失败：入口控制器不可用');
     let mode = confirmed;
+    // 撤销入口时 rule match 读不到：阻断只按结构读回或写入与等待确认（EntryReadback.runtimeConfirmed），记 entry_unverified
+    let entryUnconfirmed = false;
     if (mode !== 'BLOCKED') {
       // 从 VERIFY_ONLY/未知状态回到阻断（撤销入口：可改写被外部修改的本应用入口文件）；绝不走向 NORMAL
-      await ctrl.transition('BLOCKED', undefined, undoOptions(engine, opId));
+      const rb = await ctrl.transition('BLOCKED', undefined, undoOptions(engine, opId));
+      entryUnconfirmed = rb.runtimeConfirmed === false;
+      if (entryUnconfirmed) engine.step(opId, `回到阻断：${UNCONFIRMED_ENTRY_TEXT}（路由状态带“入口规则未能读回确认”警告）`);
       mode = 'BLOCKED';
     }
     repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
@@ -829,6 +837,7 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
     };
     const keep: RouteWarning[] = before.warnings.filter((w) => w === 'managed_windows_on_original_rules' || w === 'takeover_unknown');
     if (segmentsChanged) keep.push('managed_segments_changed');
+    if (entryUnconfirmed) keep.push('entry_unverified');
     repos.tx(() => {
       repos.routeState.update({
         phase: 'failed',
@@ -896,6 +905,8 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
   }
   const ctrl = engine.entryController(() => op.id);
   let confirmed: EntryMode = route.entryMode;
+  /** 撤销入口时 rule match 读不到，NORMAL 只按写入与等待完成（EntryReadback.runtimeConfirmed）：路由状态带 entry_unverified。 */
+  let normalUnconfirmed = false;
   // 撤销入口会改写被外部修改的本应用入口文件（§5.5），但保留 managed_segments_changed
   const segmentsChanged = await segmentsChangedBefore(engine, route);
   try {
@@ -909,23 +920,35 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
           repos.operations.update(op.id, { result: { ...(cur.result ?? {}), changedEntryFiles: changedFiles } });
           engine.step(op.id, `本应用的入口文件已被外部修改（${changedFiles.join('、')}）：撤销入口时按读到的内容比较后改写`);
         }
-        const precedenceIssues = await blockForNormal(ctrl, undoOptions(engine, op.id));
-        confirmed = 'BLOCKED';
-        repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
-        if (precedenceIssues) {
-          const cur = repos.operations.get(op.id)!;
-          repos.operations.update(op.id, { result: { ...(cur.result ?? {}), precedenceIssues: engine.scrubber.scrubDeep(precedenceIssues) } });
+        const { precedenceIssues, runtimeConfirmed: blockConfirmed, alreadyNormal } = await blockForNormal(ctrl, undoOptions(engine, op.id));
+        if (alreadyNormal) {
+          // 本应用入口已不在 Surge 中：不需要阻断、不写入。但“没有本应用规则”不等于 Surge 重启过：临时规则也可能在 Surge
+          // 运行中被移除（`rule temp remove`、`rule temp flush`——随包技能把后者列为常规操作，别的工具或代理可能执行），
+          // 之前经 SFE-ROUTE 建立的 Safari 长连接仍在买家出口上。照常结束 Safari 连接（门槛不满足时尽力而为）；新连接已按原规则发出。
+          engine.step(op.id, '入口已是普通模式（Surge 中没有本应用的入口规则，例如重启时已丢弃或已被移除）：不需要阻断，未写入；仍结束 Safari 的旧连接');
+          await killForNormal(engine, op.id);
+        } else {
+          confirmed = 'BLOCKED';
+          repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
+          if (precedenceIssues) {
+            const cur = repos.operations.get(op.id)!;
+            repos.operations.update(op.id, { result: { ...(cur.result ?? {}), precedenceIssues: engine.scrubber.scrubDeep(precedenceIssues) } });
+          }
+          engine.updateOp(
+            op.id,
+            { phase: 'SAFARI_BLOCKED' },
+            precedenceIssues
+              ? `入口已切换到阻断，但有 ${precedenceIssues.filter((i) => i.severity === 'blocking').length} 条规则排在本应用入口之前、读回不能确认完全阻断：继续撤销本应用入口`
+              : blockConfirmed
+                ? '已阻断 Safari 新请求（读回确认）'
+                : `已阻断 Safari 新请求：${UNCONFIRMED_ENTRY_TEXT}`,
+            { route: true },
+          );
+          await killForNormal(engine, op.id);
         }
-        engine.updateOp(
-          op.id,
-          { phase: 'SAFARI_BLOCKED' },
-          precedenceIssues
-            ? `入口已切换到阻断，但有 ${precedenceIssues.filter((i) => i.severity === 'blocking').length} 条规则排在本应用入口之前、读回不能确认完全阻断：继续撤销本应用入口`
-            : '已阻断 Safari 新请求（读回确认）',
-          { route: true },
-        );
-        await killForNormal(engine, op.id);
-        await ctrl.transition('NORMAL', undefined, undoOptions(engine, op.id));
+        const normal = await ctrl.transition('NORMAL', undefined, undoOptions(engine, op.id));
+        normalUnconfirmed = normal.runtimeConfirmed === false;
+        if (normalUnconfirmed) engine.step(op.id, `撤销本应用入口：${UNCONFIRMED_ENTRY_TEXT}（路由状态带“入口规则未能读回确认”警告）`);
         confirmed = 'NORMAL';
       }
     } else if (route.entryMode !== 'NORMAL') {
@@ -946,6 +969,7 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
   const warnings: RouteWarning[] = [];
   if (keepOpen || route.warnings.includes('managed_windows_on_original_rules')) warnings.push('managed_windows_on_original_rules');
   if (segmentsChanged) warnings.push('managed_segments_changed');
+  if (normalUnconfirmed) warnings.push('entry_unverified');
   repos.tx(() => {
     repos.routeState.update({
       entryMode: 'NORMAL',
@@ -975,13 +999,20 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
  * 标为 towardNormal：之后进入 NORMAL 本来就把 Safari 流量交给原规则，temp_rule 不因移除本应用规则会暴露其后的其他规则而
  * 在写入前拒绝（回滚不设置，照常拒绝，§5.5）。
  */
-async function blockForNormal(ctrl: EntryController, undo: EntryTransitionOptions): Promise<EntryReadback['precedenceIssues'] | null> {
+async function blockForNormal(
+  ctrl: EntryController,
+  undo: EntryTransitionOptions,
+): Promise<{ precedenceIssues: EntryReadback['precedenceIssues'] | null; runtimeConfirmed: boolean; alreadyNormal: boolean }> {
   try {
-    await ctrl.transition('BLOCKED', undefined, { ...undo, towardNormal: true });
-    return null;
+    const rb = await ctrl.transition('BLOCKED', undefined, { ...undo, towardNormal: true });
+    // 起点已是 NORMAL 时控制器不写入、返回 NORMAL（EntryTransitionOptions.towardNormal）。阻断已经成立而不写入时（ruleset_resource
+    // 上一次普通模式已关闭 udp），有规则排在入口之前随读回返回，与下面的 PRECEDENCE_VIOLATION 一样继续撤销入口。
+    const issues = rb.mode === 'BLOCKED' && hasBlockingIssue(rb.precedenceIssues) ? rb.precedenceIssues : null;
+    return { precedenceIssues: issues, runtimeConfirmed: rb.runtimeConfirmed !== false, alreadyNormal: rb.mode === 'NORMAL' };
   } catch (err) {
     if (err instanceof SfeError && err.code === 'PRECEDENCE_VIOLATION' && confirmedModeFrom(err, 'UNKNOWN') === 'BLOCKED') {
-      return Array.isArray(err.details?.precedenceIssues) ? (err.details.precedenceIssues as EntryReadback['precedenceIssues']) : [];
+      const issues = Array.isArray(err.details?.precedenceIssues) ? (err.details.precedenceIssues as EntryReadback['precedenceIssues']) : [];
+      return { precedenceIssues: issues, runtimeConfirmed: true, alreadyNormal: false };
     }
     throw err;
   }

@@ -2,6 +2,8 @@
 // 不一致返回 PREVIEW_STALE。初始化只写入新文件（目标必须不存在），由用户在 Surge 中手动切换一次；
 // 重新合并受维护写门槛约束、入口必须是 NORMAL，只写受管理段，按 P0 结论生效（自动重载或经确认的同一配置重载），
 // 只有维护处理器能拿到 MaintenanceSurge。恢复本应用节点资源走发布路径（受发布门槛约束）。
+// Surge 6.9+ 的重载只应用差异，但必要时会自动升级为完整的引擎重启（关闭全部连接、清空临时规则）：网页预览与操作步骤都写明，
+// 重载后读引擎运行时长报告是否发生了完整重启。重载只在这里、只经用户确认。
 
 import { readFile, readdir, rm, stat } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -44,7 +46,7 @@ import { classifyDirectoryRisk, createExclusivePrivateFile, ensurePrivateDir, is
 import { hmacHex, keyedRequestDigest } from '../util/keyed-digest.js';
 import { insertOperation, type AcceptDeps } from './accept.js';
 import { checkCandidate } from './candidate.js';
-import type { Engine } from './context.js';
+import { readRuntimeSample, surgeRestartedBetween, type Engine } from './context.js';
 import { acceptedOf, commitOperation, findDuplicateOperation, requestDigest, requireRequestId } from './ledger.js';
 import { registerInitialObjects, segmentDigest, SEGMENT_KIND, type SegmentName } from './ownership.js';
 import { generateResource, type ResourceEntry } from './resource.js';
@@ -52,6 +54,15 @@ import { requireResourceRefresh } from './handlers/publish.js';
 import { unmeasuredFrom } from './capabilities.js';
 
 const MAX_REMERGE_BACKUPS = 5;
+
+/**
+ * 同一配置重载的影响说明（网页预览 RemergeCard 显示同一段文字）。surge-cli 6.10 的 reload 说明：“Reload the main profile
+ * and apply only the changed sections. Unaffected connections, caches and temporary rules are preserved. Automatically
+ * performs a full engine restart if a change requires one.”；restart-engine 说明：“All connections are closed, and all
+ * caches and temporary rules are cleared.”。哪些修改会触发完整重启没有写入文档。
+ */
+export const RELOAD_FULL_RESTART_NOTICE =
+  'Surge 6.9 起重载只应用变化的部分，但在修改需要时会自动执行完整的引擎重启（文档：“Automatically performs a full engine restart if a change requires one.”）：完整重启会关闭全部连接并清空临时规则与缓存，哪些修改会触发它没有写入文档';
 const REMOTE_NOTICE = '源配置的远端更新不再自动应用到工作配置；之后需要通过“重新合并”手动接入';
 
 function requireWebOrAdmin(actor: Actor, action: string): void {
@@ -492,6 +503,14 @@ async function buildRemergePlan(engine: Engine): Promise<RemergePlan> {
   };
 }
 
+/** 重载后的引擎运行时长读回：是否发生了完整引擎重启（运行时长回落或启动时间向后移动）。 */
+export function reloadRestartReport(before: { startedAt: string | null; uptimeSeconds: number | null } | null, after: { startedAt: string | null; uptimeSeconds: number | null } | null): string {
+  if (before === null || after === null) return '无法读取 Surge 引擎运行时长：不能确认重载是否升级为完整引擎重启';
+  return surgeRestartedBetween(before, after)
+    ? '重载后引擎运行时长回落：Surge 执行了完整引擎重启，全部连接已关闭、临时规则已清空'
+    : '重载后引擎运行时长连续：未发生完整引擎重启';
+}
+
 export async function remergePreview(deps: AcceptDeps, actor: Actor): Promise<RemergePreviewResponse> {
   requireWebOrAdmin(actor, '重新合并');
   return (await buildRemergePlan(deps.engine)).response;
@@ -533,14 +552,18 @@ export async function runRemerge(engine: Engine, op: OperationRecord, enqueuePub
     if (plan.candidateText !== plan.currentText) {
       await files.writeAtomic(plan.profileFile, plan.candidateText, files.digestContent(plan.currentText));
       engine.step(op.id, '已写入受管理段');
+      const runtimeBefore = await readRuntimeSample(engine.surge);
       if (engine.facts.autoReload !== true) {
         // 经用户确认的同一配置重载（只有维护处理器能调用）
+        engine.step(op.id, `重载同一工作配置：${RELOAD_FULL_RESTART_NOTICE}`);
         await engine.maintenanceSurge.reloadProfile();
         engine.step(op.id, '已重载同一工作配置');
       } else {
         engine.step(op.id, '自动重载已开启：由 Surge 自动加载同一配置');
       }
       await engine.readBasicFacts();
+      const runtimeAfter = await readRuntimeSample(engine.surge);
+      engine.step(op.id, reloadRestartReport(runtimeBefore, runtimeAfter));
       const after = engine.facts.takeover;
       if (after.enhancedMode !== before.enhancedMode || after.systemProxy !== before.systemProxy || after.outboundMode !== before.outboundMode) {
         throw new SfeError('READBACK_MISMATCH', '重新合并读回不一致：接管、系统代理或出站模式在重载后发生变化，请检查 Surge');
@@ -566,12 +589,12 @@ export async function runRemerge(engine: Engine, op: OperationRecord, enqueuePub
       repos.managedObjects.upsertIntent({ kind: 'entry_ruleset_file', identity: name, contentDigest: d, state: 'pending_add', createdByOperation: op.id });
       repos.managedObjects.setState('entry_ruleset_file', name, 'present', { contentDigest: d });
     }
-    // 节点资源：受发布门槛约束；恢复为上次发布内容后由一次发布定向刷新并读回
+    // 节点资源：受发布门槛约束；恢复为上次发布内容后由一次发布等待 Surge 重新读取并逐节点读回
     if (plan.restoreResource !== null) {
       if (engine.missing(CAPABILITY_GATES.publish).length > 0) {
         engine.step(op.id, '节点资源与上次发布不一致：恢复需要发布能力，已跳过');
       } else {
-        // 先持久记录刷新要求：跟随的发布失败或写入后崩溃，下一次发布仍会定向刷新并读回
+        // 先持久记录读回要求：跟随的发布失败或写入后崩溃，下一次发布仍会写入并逐节点读回
         requireResourceRefresh(engine, op.id);
         const cur = await files.digest(NODE_RESOURCE_FILE);
         if (cur === null) await createExclusivePrivateFile(join(plan.directory, NODE_RESOURCE_FILE), plan.restoreResource);
@@ -580,7 +603,7 @@ export async function runRemerge(engine: Engine, op: OperationRecord, enqueuePub
         repos.managedObjects.upsertIntent({ kind: 'resource_file', identity: NODE_RESOURCE_FILE, contentDigest: d, state: 'pending_add', createdByOperation: op.id });
         repos.managedObjects.setState('resource_file', NODE_RESOURCE_FILE, 'present', { contentDigest: d });
         enqueuePublish();
-        engine.step(op.id, '已恢复节点资源文件，并发起一次发布以定向刷新和读回');
+        engine.step(op.id, '已恢复节点资源文件，并发起一次发布：等待 Surge 重新读取并逐节点读回');
       }
     }
     // 受管理段恢复后，清除“被修改”警告需要用户重新激活；这里只记录结果

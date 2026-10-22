@@ -39,6 +39,11 @@ export interface InventorySummary {
   surgeVersion: { version: string | null; build: string | null };
   /** 运行实例读取的结论；旧运行没有该字段。 */
   surgeInstance?: { ok: boolean; reason: string | null };
+  /**
+   * 运行实例与 `surge-cli --raw version` 的交叉核对（与服务同一规则，最低 6.10.0（12500）、Controller 协议 22）；
+   * 运行实例不可读时为 null；旧运行没有该字段。只有 ok 时能力上下文才记录版本与构建号。
+   */
+  surgeVersionCheck?: { ok: boolean; reason: string | null; controllerProtocol: number | null; coreVersion: number | null } | null;
   cliVerified: { ok: boolean; reason: string };
   httpApi: { configured: boolean; loopbackOnly: boolean | null };
   currentProfileName: string | null;

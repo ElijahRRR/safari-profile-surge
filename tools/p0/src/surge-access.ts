@@ -1,7 +1,7 @@
-// P0 使用的 Surge 访问：复用服务的 CLI/HTTP/组合适配器（同一受限原语集合，没有切换配置、重载全部、
-// flush、接管或出站写入），外加一层写入守卫与调用记录：
+// P0 使用的 Surge 访问：复用服务的 CLI/HTTP/组合适配器（同一受限原语集合与 CLI argv 允许清单，没有切换配置、重载、
+// 重启引擎、flush、接管或出站写入），外加一层写入守卫与调用记录：
 // - 组选择只允许 SFE-ROUTE，且必须确认当前是测试配置；
-// - 资源刷新只允许本工具创建的测试文件对应的 key；
+// - 外部资源更新只允许本工具创建的测试文件对应的 key（Surge 6.10 跳过本地资源，P0 只用它记录这一点，从不当作刷新）；
 // - 临时规则的增删只允许运行状态中先登记过的精确规则；
 // - 结束请求只允许最近一次列出的、进程路径属于已确认 Safari 路径的请求。
 
@@ -9,17 +9,20 @@ import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SfeError } from '@sfe/contract';
 import {
-  CLI_COMMANDS,
-  FORBIDDEN_CLI_WORDS,
   INTERACTIVE_BANNER_RE,
   SURGE_PRIMITIVES,
+  UNSUPPORTED_COMMAND_RE,
+  cliArgvs,
   createCliAdapter,
   createCompositeAdapter,
   createHttpAdapter,
+  isAllowedCliArgv,
+  isUnsupportedCommandError,
   type MechanismMap,
   type SurgeAdapter,
   type SurgeExternalResource,
   type SurgeRequestRecord,
+  type SurgeVersion,
 } from './deps.js';
 
 export const READ_PRIMITIVES = [
@@ -34,6 +37,7 @@ export const READ_PRIMITIVES = [
   'getGroupMembers',
   'getGroupSelection',
   'listRules',
+  'matchRule',
   'listActiveRequests',
   'listRecentRequests',
   'listExternalResources',
@@ -47,14 +51,14 @@ export type ReadPrimitive = (typeof READ_PRIMITIVES)[number];
 export type ActivePrimitive = (typeof ACTIVE_PRIMITIVES)[number];
 export type Primitive = ReadPrimitive | ActivePrimitive;
 
-// 模块 B 的 HTTP 实现对这些原语不发请求、直接 CAPABILITY_UNVERIFIED（6.5 上未核对或标注 6.9+/6.10+）。
+// 模块 B 的 HTTP 实现对这些原语不发请求、直接 CAPABILITY_UNVERIFIED：HTTP API 文档没有对应端点（临时规则、规则求值、
+// 自动重载设置、配置校验），或端点给不出所需字段（版本：没有 Controller 协议号）。外部资源（Mac 6.10.0+）与引擎运行时长
+// （/v1/metrics，Mac 6.9.0+）已实现。
 export const HTTP_NOT_IMPLEMENTED: readonly Primitive[] = [
   'getVersion',
-  'getRuntimeInfo',
   'getAutoReloadSetting',
   'checkProfile',
-  'listExternalResources',
-  'updateExternalResource',
+  'matchRule',
   'listTempRules',
   'addTempRule',
   'removeTempRule',
@@ -62,16 +66,75 @@ export const HTTP_NOT_IMPLEMENTED: readonly Primitive[] = [
 
 const DUMMY_ARGS: Partial<Record<Primitive, unknown[]>> = {
   checkProfile: ['/p0-dummy.conf'],
+  getGroupMembers: ['P0-DUMMY-GROUP'],
+  getGroupSelection: ['P0-DUMMY-GROUP'],
+  selectGroupPolicy: ['SFE-ROUTE', 'P0-DUMMY-POLICY'],
+  matchRule: [{ host: 'p0-dummy.invalid', processPath: '/p0-dummy' }],
+  killRequest: ['1'],
   updateExternalResource: ['p0-dummy-key'],
   addTempRule: ['P0-DUMMY-RULE'],
   removeTempRule: ['P0-DUMMY-RULE'],
 };
 
-/** 帮助文本中出现的命令词与选项（只用于判断原语对应的命令是否存在）。 */
+/** 示例参数中的字符串（对象参数取其字符串字段）：从 argv 中去掉它们，剩下的才是固定命令词。 */
+function dummyStrings(args: readonly unknown[]): string[] {
+  return args.flatMap((a) => (typeof a === 'string' ? [a] : typeof a === 'object' && a !== null ? Object.values(a).filter((v): v is string => typeof v === 'string') : []));
+}
+
+/**
+ * 帮助文本中出现的命令词与选项（只用于判断原语对应的命令是否存在）。词后可以是空白、括号、逗号、竖线、等号、冒号、
+ * 句点或斜杠：6.10 的帮助写作 `--check/-c <path>`（选项与短选项用斜杠连写）、`macOS also supports system-proxy and
+ * enhanced-mode.`（句末句点）。
+ */
 export function helpWords(help: string): Set<string> {
   const words = new Set<string>();
-  for (const m of help.matchAll(/(?:^|[\s[(|,])(--?[A-Za-z][A-Za-z0-9-]*|[a-z][a-z0-9-]*)(?=$|[\s\]),|=:])/gm)) words.add(m[1]!);
+  for (const m of help.matchAll(/(?:^|[\s[(|,<])(--?[A-Za-z][A-Za-z0-9-]*|[a-z][a-z0-9-]*)(?=$|[\s\]),|=:./>])/gm)) words.add(m[1]!);
   return words;
+}
+
+/**
+ * inventory 逐条读取的命令帮助。6.9.0 起顶层帮助只列命令组（“Improved CLI help output with command categories and detailed
+ * help for individual commands.”），子命令与 dump 类型要看 `help <command>`（手册：“`help <command>` for the detailed usage of
+ * one command or command family, for example `help rule match` or `help dump`”；随包技能 §3.2：“`surge-cli -h` shows only a
+ * subset.”）。每条都只是帮助文字，不连接控制器、不改变任何状态。
+ */
+export const CLI_HELP_TOPICS: readonly (readonly string[])[] = [
+  ['dump'],
+  ['rule', 'temp'],
+  ['rule', 'match'],
+  ['external-resource'],
+  ['version'],
+  ['status'],
+  ['policy-group'],
+  ['feature'],
+  ['mode'],
+  ['kill'],
+];
+
+export type HelpTopicStatus = 'ok' | 'interactive' | 'unsupported' | 'failed';
+
+/**
+ * 一条 `help <command>` 的输出是否可以并入帮助词：退出 0、不是交互模式提示、没有回答 Unknown command。
+ * 不可用时这一条的词不并入（失败即关闭：只会让原语显示为 not_in_help，不会让它被探测）。
+ */
+export function classifyTopicHelp(r: { stdout: string; stderr: string; code: number }): HelpTopicStatus {
+  const text = `${r.stdout}\n${r.stderr}`;
+  if (INTERACTIVE_BANNER_RE.test(text)) return 'interactive';
+  if (UNSUPPORTED_COMMAND_RE.test(text)) return 'unsupported';
+  if (r.code !== 0 || r.stdout.trim() === '') return 'failed';
+  return 'ok';
+}
+
+/** 帮助词的并集（顶层帮助加上每条可用的命令帮助）。 */
+export function unionHelpWords(texts: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const t of texts) for (const w of helpWords(t)) out.add(w);
+  return out;
+}
+
+/** 证据文件名：`help rule temp` → `rule-temp.txt`。 */
+export function helpTopicFile(topic: readonly string[]): string {
+  return `${topic.join('-')}.txt`;
 }
 
 /**
@@ -86,17 +149,32 @@ export function parseCliHelp(help: string): { words: Set<string>; interactive: b
   return listsCommands ? { words, interactive: false } : { words: new Set(), interactive: true };
 }
 
-/** CLI 原语表中该原语的固定命令词（去掉参数）；表中没有时为 null。 */
-export function cliLiteralWords(primitive: Primitive): string[] | null {
-  const cmd = (CLI_COMMANDS as Record<string, { argv: (...a: unknown[]) => string[] } | undefined>)[primitive];
-  if (!cmd) return null;
-  const dummies = DUMMY_ARGS[primitive] ?? [];
-  const argv = cmd.argv(...dummies);
-  return argv.filter((w) => !dummies.includes(w));
+/** 原语按示例参数构造的全部 argv；表中没有时为 null。 */
+export function cliSampleArgvs(primitive: Primitive): string[][] | null {
+  return cliArgvs(primitive, DUMMY_ARGS[primitive] ?? []);
 }
 
-export function argvHasForbiddenWord(words: readonly string[]): boolean {
-  return words.some((w) => (FORBIDDEN_CLI_WORDS as readonly string[]).includes(w.toLowerCase()));
+/**
+ * CLI 原语表中该原语的固定命令词（去掉参数；key=value 选项只取 key，例如 rule match 的 process-path）；表中没有时为 null。
+ */
+export function cliLiteralWords(primitive: Primitive): string[] | null {
+  const argvs = cliSampleArgvs(primitive);
+  if (argvs === null) return null;
+  const dummies = dummyStrings(DUMMY_ARGS[primitive] ?? []);
+  const out: string[] = [];
+  for (const w of argvs.flat()) {
+    if (dummies.includes(w)) continue;
+    const eq = w.indexOf('=');
+    const word = eq > 0 && !w.startsWith('-') ? w.slice(0, eq) : w;
+    if (!out.includes(word)) out.push(word);
+  }
+  return out;
+}
+
+/** 该原语的 argv 是否全部在服务的 CLI 允许清单中（不在时 cli-adapter 也不会执行）。 */
+export function cliArgvsAllowed(primitive: Primitive): boolean {
+  const argvs = cliSampleArgvs(primitive);
+  return argvs !== null && argvs.length > 0 && argvs.every((argv) => isAllowedCliArgv(argv));
 }
 
 export type CliAvailability = 'not_in_table' | 'not_in_help' | 'in_help' | 'forbidden';
@@ -104,7 +182,7 @@ export type CliAvailability = 'not_in_table' | 'not_in_help' | 'in_help' | 'forb
 export function cliAvailability(primitive: Primitive, words: ReadonlySet<string>): CliAvailability {
   const lit = cliLiteralWords(primitive);
   if (lit === null) return 'not_in_table';
-  if (argvHasForbiddenWord(lit)) return 'forbidden';
+  if (!cliArgvsAllowed(primitive)) return 'forbidden';
   return lit.every((w) => words.has(w)) ? 'in_help' : 'not_in_help';
 }
 
@@ -167,6 +245,9 @@ export function proposeMechanism(
   // 能读取只证明输出可以解析；临时规则列表的内容还要由 entry 的插入探测正向确认（刚添加的探测规则必须出现在列表中），
   // 之后 temp_rule 入口、临时规则同步与回退才会据它判断规则已不存在。
   if (mechanism.listTempRules !== 'unavailable') notes.listTempRules = `${notes.listTempRules}；内容需 entry 的插入探测正向确认（--probe-insertion）`;
+  // HTTP API 文档（Mac 6.10.0+）：“Local resources are skipped.”——本应用的资源都是本地文件，更新从不作为刷新机制。
+  if (mechanism.updateExternalResource !== 'unavailable') notes.updateExternalResource = `${notes.updateExternalResource}；本地资源被跳过，只用于记录这一点，从不作为发布或入口的刷新机制`;
+  if (mechanism.getVersion !== 'unavailable') notes.getVersion = `${notes.getVersion}；只用于与运行实例交叉核对（版本、构建号一致且 Controller 协议 ≥ 22 才接受）`;
   mechanism.reloadProfile = 'unavailable';
   notes.reloadProfile = '只在维护端口上；P0 从不重载，由用户在 Surge 中手动触发并测量影响';
   return { mechanism, notes, unproven };
@@ -259,8 +340,12 @@ function guardReason(g: WriteGuard, primitive: string, args: unknown[], lastActi
 }
 
 function argSummary(primitive: string, args: unknown[]): string[] {
-  // 规则文本、资源 key、组与策略名、检测地址都不是秘密；配置路径只记文件名。
+  // 规则文本、资源 key、组与策略名、检测地址、进程路径都不是秘密；配置路径只记文件名。
   if (primitive === 'checkProfile') return args.map((a) => String(a).slice(String(a).lastIndexOf('/') + 1));
+  if (primitive === 'matchRule') {
+    const m = (typeof args[0] === 'object' && args[0] !== null ? args[0] : {}) as Record<string, unknown>;
+    return [m.host, m.processPath, m.protocol ?? 'TCP', m.port ?? 443].map((v) => String(v).slice(0, 300));
+  }
   return args.map((a) => String(a).slice(0, 300));
 }
 
@@ -320,4 +405,22 @@ export function allMechanism(value: 'cli' | 'http'): MechanismMap {
 
 export function errorCode(e: unknown): string {
   return e instanceof SfeError ? e.code : 'ERROR';
+}
+
+/**
+ * `surge-cli --raw version` 的结果，供与运行实例交叉核对（与服务 engine/context.ts 的 readCliVersion 同一规则）：
+ * 'unsupported' = 命令不被支持（Unknown command 或交互模式提示；`version` 是 Mac 6.8.0 才有的命令）；读不到或结构不对为
+ * null。只保留版本、构建号、Core 版本与 Controller 协议号（适配器已丢弃系统与设备字段）。
+ */
+export async function readCliVersion(adapter: Pick<SurgeAdapter, 'getVersion'>): Promise<SurgeVersion | 'unsupported' | null> {
+  let v: unknown;
+  try {
+    v = await adapter.getVersion();
+  } catch (e) {
+    return isUnsupportedCommandError(e) ? 'unsupported' : null;
+  }
+  if (typeof v !== 'object' || v === null) return null;
+  const o = v as Record<string, unknown>;
+  if (typeof o.version !== 'string' || typeof o.build !== 'string' || typeof o.controllerProtocol !== 'number' || typeof o.coreVersion !== 'number') return null;
+  return { version: o.version, build: o.build, controllerProtocol: o.controllerProtocol, coreVersion: o.coreVersion };
 }

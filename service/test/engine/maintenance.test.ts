@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync, symlinkSync, writeFileSync } fro
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { NODE_RESOURCE_FILE, SfeError, WORKING_PROFILE_NAME } from '@sfe/contract';
+import { RELOAD_FULL_RESTART_NOTICE } from '../../src/engine/maintenance.js';
 import { ADMIN, AGENT, PROFILE_A, WEB, activeEnv, createEnv, createHarness, rid, type Harness } from './harness.js';
 
 let h: Harness;
@@ -230,6 +231,34 @@ describe('remerge (user-confirmed maintenance)', () => {
     expect(h.fake.calls.reloadProfile).toBe(1);
     expect(h.repos.backups.list({ reason: 'remerge' })).toHaveLength(1);
     expect((await h.app.refreshSurge(WEB)).managedSectionsIntact).toBe(true);
+    // 重载前说明 6.9+ 可能自动完整重启引擎；重载后按引擎运行时长报告是否发生
+    const steps = h.repos.operations.listSteps(acc.operation_id).map((s) => s.message);
+    expect(steps).toContain(`重载同一工作配置：${RELOAD_FULL_RESTART_NOTICE}`);
+    expect(steps).toContain('重载后引擎运行时长连续：未发生完整引擎重启');
+  });
+
+  test('a reload that escalates to a full engine restart is reported from the engine uptime', async () => {
+    h = await createHarness();
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    tamperGroup();
+    h.clock.advance(10_000);
+    const orig = h.fake.reloadProfile.bind(h.fake);
+    h.fake.reloadProfile = async () => {
+      await orig();
+      // 6.9+：“Automatically performs a full engine restart if a change requires one.”
+      h.fake.restart();
+    };
+    const p = await h.app.remergePreview(WEB);
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
+    const steps = h.repos.operations.listSteps(acc.operation_id).map((s) => s.message);
+    expect(steps).toContain('重载后引擎运行时长回落：Surge 执行了完整引擎重启，全部连接已关闭、临时规则已清空');
+  });
+
+  test('the full-restart notice quotes the documentation', () => {
+    expect(RELOAD_FULL_RESTART_NOTICE).toContain('Automatically performs a full engine restart if a change requires one.');
+    expect(RELOAD_FULL_RESTART_NOTICE).toContain('关闭全部连接并清空临时规则');
   });
 
   test('nothing to merge → no profile write and no reload', async () => {
@@ -252,7 +281,7 @@ describe('remerge (user-confirmed maintenance)', () => {
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
   });
 
-  test('tampered node resource is restored to the last publish and refreshed by a targeted publish', async () => {
+  test('tampered node resource is restored to the last publish and read back by a publish (Surge re-reads the file; no external-resource update)', async () => {
     h = await createHarness();
     await createEnv(h, 'US-Buyer-A', '203.0.113.10');
     const resourcePath = join(h.surgeDir, NODE_RESOURCE_FILE);
@@ -267,6 +296,7 @@ describe('remerge (user-confirmed maintenance)', () => {
     expect(readFileSync(resourcePath, 'utf8')).not.toContain('198.51.100.77');
     expect(h.repos.deployments.list().length).toBeGreaterThanOrEqual(deploymentsBefore);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
   });
 
   test('keeps at most 5 remerge backups', async () => {

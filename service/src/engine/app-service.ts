@@ -92,7 +92,7 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
           requestId: `remerge:${engine.ids.token(16)}`,
           digest: 'service',
           actor: { kind: 'admin' },
-          // 恢复的资源名称与上次发布相同：强制写入、定向刷新并读回，不走“没有修改”的捷径
+          // 恢复的资源名称与上次发布相同：强制写入、等待 Surge 重新读取并逐节点读回，不走“没有修改”的捷径
           payload: { environmentIds: null, forceRefresh: true },
           step: '重新合并后发布节点资源',
         }),

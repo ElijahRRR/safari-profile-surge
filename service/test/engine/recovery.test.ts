@@ -11,7 +11,7 @@ afterEach(async () => {
 });
 
 /** 让某个 FakeSurge 原语挂起（模拟进程在调用中途崩溃）。 */
-function hang(name: 'updateExternalResource' | 'selectGroupPolicy', when: (...args: string[]) => boolean = () => true): { entered: () => boolean; restore: () => void } {
+function hang(name: 'updateExternalResource' | 'selectGroupPolicy' | 'getGroupMembers', when: (...args: string[]) => boolean = () => true): { entered: () => boolean; restore: () => void } {
   const fake = h.fake as unknown as Record<string, (...args: string[]) => Promise<unknown>>;
   const orig = fake[name]!.bind(h.fake);
   let entered = false;
@@ -24,6 +24,29 @@ function hang(name: 'updateExternalResource' | 'selectGroupPolicy', when: (...ar
     entered: () => entered,
     restore: () => {
       fake[name] = orig;
+    },
+  };
+}
+
+/**
+ * 让 ruleset_resource 的入口写入挂在“等待 Surge 重新加载”上（模拟进程在写入文件之后、读回确认之前崩溃）：
+ * 只拦截刚写入、尚未被 Surge 加载的那一版见证的 rule match（载入时对已加载见证的读回照常）。bit 为空时任一入口文件。
+ */
+function hangEntryWrite(bit?: string): { entered: () => boolean; restore: () => void } {
+  const fake = h.fake as unknown as { matchRule: (input: { host: string }) => Promise<unknown> };
+  const orig = fake.matchRule.bind(h.fake);
+  let entered = false;
+  fake.matchRule = (input: { host: string }) => {
+    const m = /^sfe-entry-(udp|verify|block|active)-[0-9a-z]+\.invalid$/.exec(input.host);
+    const loaded = m ? (h.fake.loadedContent(`ruleset:sfe-entry-${m[1]}.list`) ?? '').includes(input.host) : true;
+    if (!m || loaded || (bit !== undefined && m[1] !== bit)) return orig(input);
+    entered = true;
+    return new Promise(() => undefined);
+  };
+  return {
+    entered: () => entered,
+    restore: () => {
+      fake.matchRule = orig;
     },
   };
 }
@@ -42,10 +65,13 @@ function nodeNames(): string[] {
 }
 
 describe('crash recovery (same SQLite file, same Surge)', () => {
-  test('crash while refreshing the resource → FAILED UNKNOWN_STATE; next publish converges without duplicate nodes', async () => {
+  test('crash while waiting for Surge to re-read the resource → FAILED UNKNOWN_STATE; next publish converges without duplicate nodes', async () => {
     h = await createHarness({ dbFile: true });
     const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
-    const stuck = hang('updateExternalResource');
+    // 写入节点资源之后第一次读组成员就是等待重新读取（写入之前另读一次组成员作为对照）；发布从不调用外部资源更新
+    // （Surge 6.10 跳过本地资源）
+    const resourceBefore = readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8');
+    const stuck = hang('getGroupMembers', () => readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8') !== resourceBefore);
     const env = h.repos.environments.get(envId)!;
     const upd = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { port: 1081 } } }, WEB);
     await until(stuck.entered);
@@ -65,6 +91,7 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
     const names = nodeNames();
     expect(new Set(names).size).toBe(names.length);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
   });
 
   test('crash mid-switch → rollback from the activation snapshot; selection never left on an unverified exit', async () => {
@@ -91,13 +118,13 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
   });
 
   /** A 使用中，B 已部署并关联；B 的激活挂在某次规则集刷新上时崩溃。 */
-  async function crashMidSwitchToB(when: (key: string) => boolean, opts: { deferPreflight?: boolean } = {}) {
+  async function crashMidSwitchToB(bit: string | undefined, opts: { deferPreflight?: boolean } = {}) {
     const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
     const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
     await bind(h, PROFILE_B, b);
     if (opts.deferPreflight) h.revoke(['independent_node_preflight']);
     const epoch = h.repos.routeState.get().routeEpoch;
-    const stuck = hang('updateExternalResource', when);
+    const stuck = hangEntryWrite(bit);
     const act = await h.app.activate(b, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
     await until(stuck.entered);
     const op = h.repos.operations.get(act.operation_id)!;
@@ -107,7 +134,7 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
 
   test('crash during the BLOCKED write while the op phase is still PREFLIGHT_OK → rolled back, writes not replayed', async () => {
     h = await createHarness({ dbFile: true });
-    const { a, epoch, opId, phaseAtCrash, stageAtCrash } = await crashMidSwitchToB(() => true);
+    const { a, epoch, opId, phaseAtCrash, stageAtCrash } = await crashMidSwitchToB(undefined);
     // 操作阶段还停在写入前的值，但 epoch 已递增、切换已开始
     expect(phaseAtCrash).toBe('PREFLIGHT_OK');
     expect(stageAtCrash).toBe('switching');
@@ -127,7 +154,7 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
 
   test('crash after the deferred preflight (op phase back at PREFLIGHT_OK, target node selected) → rolled back to the previous node', async () => {
     h = await createHarness({ dbFile: true });
-    const { a, b, epoch, opId, phaseAtCrash } = await crashMidSwitchToB((key) => key.includes('verify'), { deferPreflight: true });
+    const { a, b, epoch, opId, phaseAtCrash } = await crashMidSwitchToB('verify', { deferPreflight: true });
     expect(phaseAtCrash).toBe('PREFLIGHT_OK');
     expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe(h.repos.proxyRevisions.get(b, 1)!.nodeName);
     await h.crash();
@@ -156,7 +183,7 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
     const first = await h.app.activate(b, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
     await h.idle();
     expect(h.repos.operations.get(first.operation_id)!.phase).toBe('VERIFY_ONLY');
-    const stuck = hang('updateExternalResource');
+    const stuck = hangEntryWrite();
     h.fake.failNext('getGroupMembers');
     const second = await h.app.activate(c, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
     await until(stuck.entered);

@@ -1,10 +1,19 @@
-// CLI 与 HTTP 输出的解析。字段名以 Surge 6.5 实测为准（TODO(P0)：逐项核对）；
-// 只取识别所需的字段，URL、请求头、节点参数等一律不保留。
+// CLI 与 HTTP 输出的解析（目标 Surge Mac 6.10.0）。字段名以官方文档为准：HTTP API 文档定义的外部资源字段、
+// 随包技能写明的 status 的 profile-path；文档没有定义的 --raw 键名（只能从 6.10 包内 surge-cli 的校验文字推断）
+// 逐项标 TODO(P0)，键名或类型不对时整体报错。只取识别所需的字段，URL、请求头、节点参数等一律不保留。
 // 失败即关闭：只接受已知的外层结构；列表中任何一项无法识别时整体报“输出格式无法识别”，从不静默跳过
 // （漏掉一条规则、一个资源或一条请求会让读回把“存在”误判为“不存在”）。
 
-import { SfeError } from '@sfe/contract';
-import type { SurgeExternalResource, SurgeRequestRecord, SurgeRuleRecord } from '../ports.js';
+import { SURGE_BUILD_RE, SURGE_VERSION_RE, SfeError } from '@sfe/contract';
+import type {
+  SurgeExternalResource,
+  SurgeProfileInfo,
+  SurgeRequestRecord,
+  SurgeResourceUpdateResult,
+  SurgeRuleMatchResult,
+  SurgeRuleRecord,
+  SurgeVersion,
+} from '../ports.js';
 import { redactUrls } from './redact-profile.js';
 
 export function parseJsonLoose(text: string): unknown {
@@ -107,9 +116,20 @@ function nonEmptyString(v: unknown): string | null {
   return typeof v === 'string' && v.trim() !== '' ? v : null;
 }
 
+/** 可选的布尔字段：缺失或 null 为 null；存在但不是布尔值时报错。 */
+function optionalBool(item: Record<string, unknown>, key: string, what: string): boolean | null {
+  const v = item[key];
+  if (v === undefined || v === null) return null;
+  if (typeof v !== 'boolean') throw unrecognized(what);
+  return v;
+}
+
 /**
  * 外部资源：只接受 { defines|resources|…: [ … ] }、顶层数组，或每个值都是带位置字段对象的 { key: { … } }。
  * 缺 key 或位置的项、无法识别的外层结构一律报错。ready 不是 true 且没有错误文本时记为 not_ready（未加载的资源不算健康）。
+ * Mac 6.10.0 的字段（HTTP API 文档，GET /v1/external_resources 返回 defines[]）：local、updating、fromModule、error；
+ * 类型不对时报错。“Local resources have no `updatedAt` field.”：本地资源的更新时间一律为 null，从不据它推断刷新；
+ * “`updatedAt` … 0 if the resource has never been downloaded”：0 也是 null。
  */
 export function parseExternalResources(json: unknown): SurgeExternalResource[] {
   let items = arrayFrom(json, RESOURCE_ENVELOPES);
@@ -127,13 +147,20 @@ export function parseExternalResources(json: unknown): SurgeExternalResource[] {
     const location = nonEmptyString(pick(item, RESOURCE_LOCATION_KEYS));
     if (key === null || key.trim() === '' || location === null) throw unrecognized('外部资源');
     const errorText = nonEmptyString(pick(item, ['error', 'lastError', 'last_error']));
+    const local = optionalBool(item, 'local', '外部资源');
+    const updating = optionalBool(item, 'updating', '外部资源');
+    const fromModuleRaw = item.fromModule;
+    if (fromModuleRaw !== undefined && fromModuleRaw !== null && typeof fromModuleRaw !== 'string') throw unrecognized('外部资源');
     out.push({
       key,
       type: str(pick(item, ['type', 'kind'])) ?? 'unknown',
       location: redactUrls(location),
-      lastUpdatedAt: toDate(pick(item, ['lastUpdatedAt', 'lastUpdated', 'last_updated', 'updatedAt', 'updated'])),
+      lastUpdatedAt: local === true ? null : toDate(pick(item, ['lastUpdatedAt', 'lastUpdated', 'last_updated', 'updatedAt', 'updated'])),
       // ready 存在但不是 true（false 或无法识别的值）都按未就绪处理。
       error: errorText !== null ? redactUrls(errorText) : item.ready !== undefined && item.ready !== true ? 'not_ready' : null,
+      local,
+      updating,
+      fromModule: typeof fromModuleRaw === 'string' ? fromModuleRaw : null,
     });
   }
   return out;
@@ -196,4 +223,183 @@ export function parsePolicyNames(json: unknown): { proxies: string[]; groups: st
       return name;
     });
   return { proxies: names(proxies), groups: Array.isArray(groups) ? names(groups) : [] };
+}
+
+// ---------- Surge Mac 6.10 的读取与结果（--raw JSON；写命令的文字结果） ----------
+
+function nonNegativeInt(v: unknown): number | null {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : null;
+}
+
+/**
+ * `--raw version`（Mac 6.8.0+；手册：“Show Surge, Core, Controller protocol, operating-system, and device versions.”）。
+ * core-version 与 controller-protocol 两个键名与“都是数字”来自 6.10 包内 surge-cli 的校验文字（“core-version or
+ * controller-protocol is not a number”）；App 版本与构建号的键名没有写入文档（渲染为 “Surge %@ (%@)”），这里按
+ * version/build 读取——TODO(P0)：在测试 Mac 上记录 `surge-cli --raw version` 的键名（P0-RUNBOOK 版本核对）。
+ * 键名或格式不对时整体报错（失败即关闭）。只返回四个字段：system-version、device-name、device-identifier 从不读取。
+ */
+export function parseSurgeVersion(json: unknown): SurgeVersion {
+  if (!isObject(json)) throw unrecognized('Surge 版本');
+  const version = json.version;
+  const buildRaw = json.build;
+  const build = typeof buildRaw === 'string' ? buildRaw : nonNegativeInt(buildRaw) !== null ? String(buildRaw) : null;
+  const core = json['core-version'];
+  const protocol = nonNegativeInt(json['controller-protocol']);
+  if (typeof version !== 'string' || !SURGE_VERSION_RE.test(version) || build === null || !SURGE_BUILD_RE.test(build)) throw unrecognized('Surge 版本');
+  if (typeof core !== 'number' || !Number.isFinite(core) || protocol === null) throw unrecognized('Surge 版本');
+  return { version, build, coreVersion: core, controllerProtocol: protocol };
+}
+
+/**
+ * `--raw status`（Mac 6.8.0+）的当前配置。随包技能 §3.14：“`status` displays the active profile's absolute path in
+ * `profile-path`; profiles that do not originate from a local file report no path.”——没有路径时 path 为 null（调用方应
+ * 按“不是工作配置”处理）。配置名的键 profile 来自 6.10 surge-cli 的校验文字；TODO(P0)：核对名称是否带扩展名。
+ */
+export function parseStatusProfile(json: unknown): SurgeProfileInfo {
+  if (!isObject(json)) throw unrecognized('当前配置');
+  const name = nonEmptyString(json.profile);
+  if (name === null) throw unrecognized('当前配置');
+  const rawPath = json['profile-path'];
+  if (rawPath === undefined || rawPath === null) return { name, path: null };
+  if (typeof rawPath !== 'string' || !rawPath.startsWith('/')) throw unrecognized('当前配置');
+  return { name, path: rawPath };
+}
+
+/**
+ * `--raw feature get <name>`（Mac 6.8.0+）。原始 JSON 未写入文档；按与 HTTP API 相同的 {"enabled": bool} 读取
+ * （HTTP 文档：GET /v1/features/… 返回 {"enabled":true}），带 feature 名时必须是请求的那个。TODO(P0)：核对键名。
+ */
+export function parseFeatureEnabled(json: unknown, feature: string): boolean {
+  if (!isObject(json) || typeof json.enabled !== 'boolean') throw unrecognized('功能状态');
+  if (json.feature !== undefined && json.feature !== feature) throw unrecognized('功能状态');
+  return json.enabled;
+}
+
+/**
+ * `--raw mode get`（Mac 6.8.0+，“Usage: mode [get | set <rule|direct|proxy>]”）。按与 HTTP API 相同的 {"mode": …} 读取
+ * （6.10 surge-cli 校验文字：“mode is not a string”）；不是 rule/direct/proxy 之一的字符串为 null（未知模式）。TODO(P0)：核对。
+ */
+export function parseOutboundMode(json: unknown): 'rule' | 'direct' | 'proxy' | null {
+  if (!isObject(json) || typeof json.mode !== 'string') throw unrecognized('出站模式');
+  const m = json.mode.toLowerCase();
+  return m === 'rule' || m === 'direct' || m === 'proxy' ? m : null;
+}
+
+export interface ParsedPolicyGroup {
+  /** 组名；policy-group get 的输出中可能没有。 */
+  name: string | null;
+  /** 当前选择；自动组没有覆盖时为 null。 */
+  selected: string | null;
+  /** 成员名，按 Surge 返回的顺序。 */
+  options: string[];
+}
+
+function parseGroupDict(v: unknown): ParsedPolicyGroup {
+  if (!isObject(v) || !Array.isArray(v.options)) throw unrecognized('策略组');
+  if (v.name !== undefined && v.name !== null && typeof v.name !== 'string') throw unrecognized('策略组');
+  if (v.selected !== undefined && v.selected !== null && typeof v.selected !== 'string') throw unrecognized('策略组');
+  // 无法识别的成员不能静默丢弃：读回会把缺少的成员当作不存在。
+  const options = v.options.map((o) => {
+    const name = typeof o === 'string' ? nonEmptyString(o) : isObject(o) ? nonEmptyString(o.name) : null;
+    if (name === null) throw unrecognized('策略组成员');
+    return name;
+  });
+  return { name: typeof v.name === 'string' ? v.name : null, selected: typeof v.selected === 'string' ? v.selected : null, options };
+}
+
+/**
+ * `--raw policy-group get <group>`（Mac 6.8.0+）。外层 {group: {…}}、组的 selected 与 options[].name 来自 6.10 surge-cli
+ * 的校验文字（“policy group response is missing group or groups”）；未写入文档——TODO(P0)：核对，以及 policy-path 导入的
+ * 外部节点是否出现在 options 中。带组名时必须是请求的那个。
+ */
+export function parsePolicyGroupGet(json: unknown, group: string): ParsedPolicyGroup {
+  if (!isObject(json)) throw unrecognized('策略组');
+  const g = parseGroupDict(json.group);
+  if (g.name !== null && g.name !== group) throw unrecognized('策略组');
+  return g;
+}
+
+/** `--raw policy-group list`（Mac 6.8.0+）：外层 {groups: [ … ]}，每个组必须有名称（同上，TODO(P0)）。 */
+export function parsePolicyGroupList(json: unknown): ParsedPolicyGroup[] {
+  if (!isObject(json) || !Array.isArray(json.groups)) throw unrecognized('策略组');
+  return json.groups.map((g) => {
+    const parsed = parseGroupDict(g);
+    if (parsed.name === null || parsed.name.trim() === '') throw unrecognized('策略组');
+    return parsed;
+  });
+}
+
+/**
+ * `--raw dump performance`（Mac 6.9.0+，协议 ≥22；手册：“Show engine memory usage, uptime, …”）的引擎运行时长。
+ * 键名 uptime 来自 6.10 surge-cli 的校验文字；单位没有写入文档，按秒读取——TODO(P0)：在测试 Mac 上核对单位。
+ */
+export function parsePerformanceUptime(json: unknown): number {
+  if (!isObject(json) || typeof json.uptime !== 'number' || !Number.isFinite(json.uptime) || json.uptime < 0) throw unrecognized('引擎运行时长');
+  return json.uptime;
+}
+
+/** Prometheus 文本中的 surge_uptime_seconds（HTTP API 文档，Mac 6.9.0+：“Engine uptime”）；没有或不是数字时报错。 */
+export function parseMetricsUptime(text: string): number {
+  let found: number | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^surge_uptime_seconds(?:\{[^}]*\})?\s+(\S+)\s*$/.exec(line.trim());
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (found !== null || !Number.isFinite(n) || n < 0) throw unrecognized('引擎运行时长');
+    found = n;
+  }
+  if (found === null) throw unrecognized('引擎运行时长');
+  return found;
+}
+
+/**
+ * `--raw rule match …`（Mac 6.9.0+，协议 ≥20）：随包技能 §3.9 “return the matched rule and final policy”。键名 rule 与
+ * policy 来自 6.10 surge-cli 的校验文字（“rule or policy is not a string”）——TODO(P0)：核对。规则文本经脱敏。
+ */
+export function parseRuleMatch(json: unknown, scrub: (s: string) => string): SurgeRuleMatchResult {
+  if (!isObject(json)) throw unrecognized('规则求值');
+  const rule = nonEmptyString(json.rule);
+  const policy = nonEmptyString(json.policy);
+  if (rule === null || policy === null) throw unrecognized('规则求值');
+  return { rule: scrub(rule), policy };
+}
+
+/** 6.10 surge-cli 在没有更新任何远端资源时打印的文字（本地资源被跳过时也是它）。 */
+export const NO_REMOTE_RESOURCE_UPDATED_TEXT = 'No remote external resource needed updating.';
+
+function resourceUpdateFailed(detail: string, scrub: (s: string) => string): SfeError {
+  const clean = scrub(redactUrls(detail)).replace(/\s+/g, ' ').trim().slice(0, 240);
+  return new SfeError('SURGE_COMMAND_FAILED', `更新外部资源失败：${clean || 'Surge 报告失败'}`);
+}
+
+/**
+ * `external-resource update <key>` 的文字结果（不加 --raw，保留命令行工具的命令校验）。HTTP API 文档对同一操作的说明：
+ * “The response maps each updated key to "success" or an error message.” 与 “Local resources are skipped.”。
+ * 文字形式未写入文档，按 6.10 surge-cli 的渲染（每个 key 一行 “<key>: <结果>”；没有更新任何远端资源时只打印
+ * NO_REMOTE_RESOURCE_UPDATED_TEXT）读取——TODO(P0)：核对。只有恰好一行 “<key>: success” 才算已重新下载；
+ * 跳过从不算刷新；该 key 的其他结果是失败；其余输出无法识别（失败即关闭）。
+ */
+export function parseResourceUpdateText(stdout: string, key: string, scrub: (s: string) => string): SurgeResourceUpdateResult {
+  const lines = stdout
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l !== '');
+  if (lines.length === 1 && lines[0] === NO_REMOTE_RESOURCE_UPDATED_TEXT) return { key, refreshed: false, outcome: 'skipped' };
+  if (lines.length === 1 && lines[0]!.startsWith(`${key}: `)) {
+    const value = lines[0]!.slice(key.length + 2).trim();
+    if (value === 'success') return { key, refreshed: true, outcome: 'downloaded' };
+    throw resourceUpdateFailed(value, scrub);
+  }
+  throw unrecognized('外部资源更新结果');
+}
+
+/** POST /v1/external_resources/update 的结果（HTTP API 文档，Mac 6.10.0+）：键到 "success" 或错误文字的映射；空映射为跳过。 */
+export function parseResourceUpdateMap(json: unknown, key: string, scrub: (s: string) => string): SurgeResourceUpdateResult {
+  if (!isObject(json)) throw unrecognized('外部资源更新结果');
+  const keys = Object.keys(json);
+  if (keys.length === 0) return { key, refreshed: false, outcome: 'skipped' };
+  const value = json[key];
+  if (keys.length !== 1 || typeof value !== 'string') throw unrecognized('外部资源更新结果');
+  if (value === 'success') return { key, refreshed: true, outcome: 'downloaded' };
+  throw resourceUpdateFailed(value, scrub);
 }

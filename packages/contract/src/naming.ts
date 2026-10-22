@@ -14,8 +14,18 @@ export const ENTRY_RULESET_FILES = {
   block: 'sfe-entry-block.list',
   active: 'sfe-entry-active.list',
 } as const;
-/** 永不匹配的占位规则：关闭的位写入它，而不是写空文件。 */
-export const ENTRY_PLACEHOLDER_RULE = 'DOMAIN,sfe-disabled.invalid';
+/**
+ * 入口规则集文件中见证规则与占位规则限定的合成进程路径：不存在、也无法创建的可执行文件（/var/empty 只属于 root 且为空），
+ * 只有 `rule match … process-path=<它>` 的见证探测会命中；Safari、Chrome 与其他应用的真实请求都不会。
+ * 不限定进程不行：规则文档写明“Domain rules match the hostname of a request … never trigger a DNS lookup”
+ * （https://manual.nssurge.com/rules/domain.html），`.invalid` 不解析也照样按主机名匹配，规则集文件又继承 RULE-SET 行的
+ * 策略（verify/active 为 SFE-ROUTE），任何进程请求这一主机都会经买家出口发出。
+ */
+export const ENTRY_WITNESS_PROCESS_PATH = '/var/empty/sfe-entry-witness';
+/** 占位规则：关闭的位写入它，而不是写空文件；限定合成进程，任何真实请求都不会命中（见 ENTRY_WITNESS_PROCESS_PATH）。 */
+export const ENTRY_PLACEHOLDER_RULE = `AND,((PROCESS-NAME,${ENTRY_WITNESS_PROCESS_PATH}),(DOMAIN,sfe-disabled.invalid))`;
+/** 旧格式的占位规则（不限定进程，任何进程请求这一主机都会命中）：只用于识别已有文件，从不写入。 */
+export const LEGACY_ENTRY_PLACEHOLDER_RULE = 'DOMAIN,sfe-disabled.invalid';
 export const MANAGED_BEGIN = '# SFE-BEGIN';
 export const MANAGED_END = '# SFE-END';
 export const WORKING_PROFILE_NAME = '日常-Safari环境';

@@ -1,4 +1,4 @@
-// Surge 规则文本的解析与求值。假 Surge、优先级分类、入口读回与请求核对共用同一套解析，
+// Surge 规则文本的解析与求值（PROCESS-NAME 按文档的三种模式与通配符）。假 Surge、优先级分类、入口读回与请求核对共用同一套解析，
 // 避免各处对 AND/OR/NOT 嵌套的理解不一致。只覆盖本应用需要判断的规则类型：
 // 未知类型在优先级分类中按“可能匹配”处理，在假 Surge 中按“不匹配”处理。
 
@@ -129,9 +129,59 @@ function basename(path: string): string {
   return i >= 0 ? path.slice(i + 1) : path;
 }
 
+/**
+ * PROCESS-NAME 的三种模式（https://manual.nssurge.com/rules/process.html）：
+ * - filename：不以 “/” 开头，“matches only the executable file name, regardless of its path. Wildcards `*` and `?` are supported.”
+ * - full_path：以 “/” 开头且不以 “/” 结尾，匹配完整绝对路径，“Wildcards `*` and `?` are supported in this mode as well.”
+ * - app_bundle（Mac 6.0.0+）：以 “/” 开头并以 “/” 结尾，“the executable path is matched by prefix.”
+ * “Matching is case-sensitive in all modes.”
+ */
+export type ProcessNameMode = 'filename' | 'full_path' | 'app_bundle';
+
+export function processNameMode(value: string): ProcessNameMode {
+  if (!value.startsWith('/')) return 'filename';
+  return value.endsWith('/') ? 'app_bundle' : 'full_path';
+}
+
+export function hasProcessWildcard(value: string): boolean {
+  return value.includes('*') || value.includes('?');
+}
+
+/**
+ * 通配符转正则（大小写敏感）。文档没有说明完整路径模式中的 “*” 能否跨过 “/”：starCrossesSlash 为 true 时按能跨过
+ * （匹配集合最大，用于“可能匹配”），false 时按不能跨过（匹配集合最小，用于“一定匹配”）。
+ */
+function globRegExp(glob: string, starCrossesSlash: boolean, anchoredEnd: boolean): RegExp {
+  let re = '';
+  for (const ch of glob) {
+    if (ch === '*') re += starCrossesSlash ? '.*' : '[^/]*';
+    else if (ch === '?') re += starCrossesSlash ? '.' : '[^/]';
+    else re += ch.replace(/[\\^$.|+()[\]{}]/g, '\\$&');
+  }
+  return new RegExp(`^${re}${anchoredEnd ? '$' : ''}`, 'su');
+}
+
+function processNameTest(value: string, processPath: string | null, permissive: boolean): boolean {
+  if (!processPath || value === '') return false;
+  const mode = processNameMode(value);
+  if (mode === 'filename') {
+    const name = basename(processPath);
+    return hasProcessWildcard(value) ? globRegExp(value, true, true).test(name) : value === name;
+  }
+  if (mode === 'full_path') return hasProcessWildcard(value) ? globRegExp(value, permissive, true).test(processPath) : value === processPath;
+  // App Bundle 前缀模式：文档没有提到通配符。“一定匹配”只认不含通配符的字面前缀；“可能匹配”把通配符按最宽处理。
+  if (!hasProcessWildcard(value)) return processPath.startsWith(value);
+  return permissive && globRegExp(value, true, false).test(processPath);
+}
+
+/** 一定匹配（按文档三种模式；文档没有说明的通配符细节取最窄的解释）。假 Surge 求值与“能证明拦住 Safari”用它。 */
 export function processNameMatches(value: string, processPath: string | null): boolean {
-  if (!processPath) return false;
-  return value.includes('/') ? value === processPath : value === basename(processPath);
+  return processNameTest(value, processPath, false);
+}
+
+/** 可能匹配（文档没有说明的细节取最宽的解释）：优先级分类用它，只有它为 false 时才能证明不相交。 */
+export function processNameMayMatch(value: string, processPath: string | null): boolean {
+  return processNameTest(value, processPath, true);
 }
 
 function hostMatches(type: string, value: string, host: string): boolean {
@@ -181,12 +231,14 @@ export function evaluateCondition(c: RuleCondition, facts: RequestFacts, ctx: Ev
 
 /**
  * 优先级分类用：条件是否“可能”匹配 Safari 发往给定主机的流量。只有能证明不相交时才返回 false
- * （域名规则不覆盖任何关心的主机、进程规则指向其他进程，以及由它们组成的 AND/OR）。
+ * （域名规则不覆盖任何关心的主机、进程规则按文档三种模式与通配符都不可能匹配任何 Safari 进程路径，以及由它们组成的 AND/OR）。
+ * 模块可以把 DIRECT 规则插到规则列表顶部（“Rule lines may only be inserted at the top of the rule list”），
+ * 所以 Safari*、/Applications/Safari.app/ 这类写法必须按可能匹配处理。
  */
 export function mayMatchSafari(c: RuleCondition, ctx: { processPaths: readonly string[]; hosts: readonly string[] }): boolean {
   switch (c.type) {
     case 'PROCESS-NAME':
-      return ctx.processPaths.some((p) => processNameMatches(c.value!, p));
+      return ctx.processPaths.some((p) => processNameMayMatch(c.value!, p));
     case 'DOMAIN':
     case 'DOMAIN-SUFFIX':
     case 'DOMAIN-KEYWORD':

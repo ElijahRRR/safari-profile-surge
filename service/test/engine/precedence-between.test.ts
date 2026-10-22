@@ -11,23 +11,31 @@ afterEach(async () => {
   await h?.close();
 });
 
+/** 激活到 VERIFY_ONLY 等待后取消：回滚停在 BLOCKED（临时规则 {block}，没有切换前的路由）。 */
+async function activateThenCancel(env: string): Promise<void> {
+  const a = await h.app.activate(env, { request_id: rid() }, WEB);
+  await h.idle();
+  expect(h.repos.operations.get(a.operation_id)!.phase).toBe('VERIFY_ONLY');
+  await h.app.cancelOperation(a.operation_id, { request_id: rid() }, WEB);
+  await h.idle();
+}
+
 describe('temp_rule: a user rule between app entry rules', () => {
   test('reconcile reports precedence_violation; normal mode still undoes the entry and keeps the user rule', async () => {
     h = await createHarness({ entryStrategy: 'temp_rule' });
     const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await bind(h, PROFILE_A, env);
-    // temp_rule 尾部插入无法到达 VERIFY_ONLY：激活失败并停在 BLOCKED
-    await h.app.activate(env, { request_id: rid() }, WEB);
-    await h.idle();
+    // 取消等待中的激活：回滚停在 BLOCKED（{block}）
+    await activateThenCancel(env);
     expect(h.repos.routeState.get().entryMode).toBe('BLOCKED');
     const cfg = { processPaths: h.repos.settings.get('safariProcessPaths'), verifyHost: FAKE_VERIFY_HOST };
     const block = tempRuleText('block', cfg);
     const user = 'DOMAIN-SUFFIX,amazon.com,DIRECT';
-    // 尾部插入的交错（用户在本应用两次写入之间加了临时规则）：用户规则落在 udp 与 block 之间
+    // 尾部插入的交错（用户在本应用两次写入之间加了临时规则）：用户规则落在 block 之前
     await h.fake.removeTempRule(block);
     await h.fake.addTempRule(user);
     await h.fake.addTempRule(block);
-    expect(h.fake.tempRules).toEqual([tempRuleText('udp', cfg), user, block]);
+    expect(h.fake.tempRules).toEqual([user, block]);
     expect(safariOutcome(h, 'www.amazon.com').rule).toBe(user);
 
     await h.app.runPeriodicReconcile();
@@ -49,15 +57,14 @@ describe('temp_rule: a user rule between app entry rules', () => {
   });
 
   /**
-   * temp_rule 下先激活一次（尾部插入无法到达 VERIFY_ONLY：停在 BLOCKED [udp, 旧 block]），再模拟进程路径变化（合成路径）：
+   * temp_rule 下先激活一次再取消（回滚停在 BLOCKED [旧 block]），再模拟进程路径变化（合成路径）：
    * 期望的规则文本随之改变，一次超时的写入留下新文本 block 的意图记录（尚未生效）。
    */
   async function blockedWithPendingNewBlock(): Promise<{ env: string; newBlock: string }> {
     h = await createHarness({ entryStrategy: 'temp_rule' });
     const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await bind(h, PROFILE_A, env);
-    await h.app.activate(env, { request_id: rid() }, WEB);
-    await h.idle();
+    await activateThenCancel(env);
     expect(h.repos.routeState.get().entryMode).toBe('BLOCKED');
     const paths = [FAKE_SAFARI_PATH, '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview'];
     h.repos.settings.set('safariProcessPaths', paths);
@@ -77,7 +84,7 @@ describe('temp_rule: a user rule between app entry rules', () => {
     const { env, newBlock } = await blockedWithPendingNewBlock();
     const user = 'DOMAIN-SUFFIX,example.test,DIRECT';
     // 受控检查（第 2 步）通过之后：用户在尾部加了一条临时规则，之前超时的新 block 写入随后才生效
-    // → [udp, 旧 block, 用户规则, 新 block]（duplicate_block）
+    // → [旧 block, 用户规则, 新 block]（duplicate_block）
     const members = h.fake.getGroupMembers.bind(h.fake);
     let landed = false;
     h.fake.getGroupMembers = async (group: string) => {
@@ -92,13 +99,13 @@ describe('temp_rule: a user rule between app entry rules', () => {
     await h.idle();
     expect(landed).toBe(true);
     const op = h.repos.operations.get(a.operation_id!)!;
-    // 第 6 步（未标为撤销）以 UNKNOWN_STATE 拒绝 → 回滚撤销到 BLOCKED：清理会先移除排在用户规则之前的 udp 与旧 block，
+    // 第 6 步（未标为撤销）以 UNKNOWN_STATE 拒绝 → 回滚撤销到 BLOCKED：清理会先移除排在用户规则之前的旧 block，
     // 让 Safari 经用户规则直连 → 写入之前拒绝，回滚停在需要处理
     expect(op.phase).toBe('BLOCKED_NEEDS_ATTENTION');
     expect((op.result as { entryCleanup?: unknown[] } | null)?.entryCleanup ?? []).toEqual([]);
     expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'UNKNOWN' });
-    expect(h.fake.tempRules.slice(2)).toEqual([user, newBlock]);
-    expect(h.fake.tempRules).toHaveLength(4);
+    expect(h.fake.tempRules.slice(1)).toEqual([user, newBlock]);
+    expect(h.fake.tempRules).toHaveLength(3);
     expectSafariBlocked();
 
     // 普通模式（中间阻断标为 towardNormal）照常撤销本应用入口，用户规则不动

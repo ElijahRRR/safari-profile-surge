@@ -18,6 +18,8 @@ const { api, store, toasts, accepted } = useConsole();
 
 const pending = computed(() => store.pendingDeploy.value);
 const gate = computed(() => evaluateGate(store.capabilities.value, 'publish'));
+/** 本地 policy-path 重新读取尚未通过：Surge 6.10 的外部资源更新跳过本地文件，新节点只能靠 Surge 自动重新读取生效。 */
+const policyPathUnproven = computed(() => gate.value.missing.some((m) => m.key === 'policy_path_reread'));
 const selected = ref<string[]>([]);
 /** 已勾选、但之后离开待部署列表而被移出选择的环境（展示名）；非空时必须重新选择才能发布。 */
 const dropped = ref<string[]>([]);
@@ -101,6 +103,9 @@ async function publish() {
     <div class="card-body space-y-4">
       <NoticeBox v-if="!gate.met" tone="warning" title="发布能力尚未通过实测" data-test="publish-gate">
         <MissingCapabilities :missing="gate.missing" intro="新版本已保存为待部署。以下能力在测试 Mac 上通过实测并经你确认后才能发布：" />
+        <p v-if="policyPathUnproven" class="mt-2 text-sm text-gray-700 dark:text-gray-300" data-test="policy-path-note">
+          Surge 的外部资源更新会跳过本地文件（文档：“Local resources are skipped.”），新节点要等 Surge 自动重新读取本地 policy-path 文件后才会生效；Surge 是否会这样做没有写入文档，需要先在测试 Mac 上实测。已部署的节点不受影响，可以照常使用。
+        </p>
       </NoticeBox>
       <NoticeBox v-if="dropped.length" tone="warning" title="所选环境已不再待部署" data-test="selection-dropped">
         <p>{{ dropped.join('、') }} 已部署完成或已在别处处理，已从选择中移除。{{ selectionLost ? '请重新选择要发布的环境，或清除选择后发布全部待部署。' : '请确认剩余的选择后再发布。' }}</p>

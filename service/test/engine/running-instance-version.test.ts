@@ -1,12 +1,12 @@
-// 引擎的 Surge 版本只来自运行中的 Surge 实例（HostInfo.surgeInstance；夹具中是 FakeSurge.runningInstance）：
-// 能力上下文等于实例的版本；实例在托管状态下变得无法证明（例如启动后包被更新）时，依赖版本的能力过期，
+// 引擎的 Surge 版本来自运行中的 Surge 实例（HostInfo.surgeInstance；夹具中是 FakeSurge.runningInstance），并与
+// `surge-cli --raw version` 交叉核对（两者一致且不低于 6.10.0 / 12500 / 协议 22 才接受）：能力上下文等于实例的版本；实例在托管状态下变得无法证明（例如启动后包被更新）时，依赖版本的能力过期，
 // 对账附加 entry_unverified 且不写 Surge；进入普通模式仍然可用。只用合成数据。
 
 import { afterEach, describe, expect, test } from 'vitest';
 import { CAPABILITY_CONTEXT_DEPS, CAPABILITY_KEYS } from '@sfe/contract';
 import { DEFAULT_INSTANCE_READ_BUDGET_MS, versionUnknownMessage } from '../../src/engine/context.js';
 import type { RunningInstanceResult } from '../../src/surge/running-instance.js';
-import { PROFILE_A, WEB, activeEnv, anyContext, createHarness, rid, safariOutcome, type Harness } from './harness.js';
+import { PROFILE_A, WEB, activeEnv, anyContext, createHarness, entryWrites, rid, safariOutcome, type Harness } from './harness.js';
 
 let h: Harness | undefined;
 afterEach(async () => {
@@ -17,21 +17,23 @@ afterEach(async () => {
 const VERSION_KEYS = CAPABILITY_KEYS.filter((k) => CAPABILITY_CONTEXT_DEPS[k].includes('surgeVersion') || CAPABILITY_CONTEXT_DEPS[k].includes('surgeBuild'));
 const WRITES = ['updateExternalResource', 'selectGroupPolicy', 'killRequest', 'addTempRule', 'removeTempRule', 'reloadProfile'] as const;
 
-function writes(hh: Harness): Record<string, number> {
-  return Object.fromEntries(WRITES.map((k) => [k, hh.fake.calls[k] ?? 0]));
+/** 写原语的调用次数与入口规则集文件（ruleset_resource 的入口写入是文件写入加文件监视，不经适配器写原语）。 */
+function writes(hh: Harness): Record<string, unknown> {
+  return { ...Object.fromEntries(WRITES.map((k) => [k, hh.fake.calls[k] ?? 0])), ...entryWrites(hh.fake) };
 }
 
 describe('version from the running Surge instance', () => {
-  test('the capability context equals the running instance version; getVersion is never called', async () => {
+  test('the capability context equals the running instance version, cross-checked with surge-cli version', async () => {
     h = await createHarness();
-    h.fake.version = '6.6.1';
-    h.fake.build = '11234';
+    h.fake.version = '6.11.0';
+    h.fake.build = '12590';
     const reads = h.fake.instanceReads;
+    const versionReads = h.fake.calls.getVersion ?? 0;
     const st = await h.app.refreshSurge(WEB);
-    expect(st).toMatchObject({ reachable: true, version: '6.6.1', build: '11234', message: null });
-    expect(h.app.engine.capabilityContext()).toMatchObject({ surgeVersion: '6.6.1', surgeBuild: '11234' });
+    expect(st).toMatchObject({ reachable: true, version: '6.11.0', build: '12590', message: null });
+    expect(h.app.engine.capabilityContext()).toMatchObject({ surgeVersion: '6.11.0', surgeBuild: '12590' });
     expect(h.fake.instanceReads).toBeGreaterThan(reads);
-    expect(h.fake.calls.getVersion ?? 0).toBe(0);
+    expect((h.fake.calls.getVersion ?? 0) - versionReads).toBe(1);
   });
 
   test('a capability recorded for one version goes stale after the running instance reports another', async () => {
@@ -39,22 +41,23 @@ describe('version from the running Surge instance', () => {
     h.repos.capabilities.upsert({
       key: 'runtime_entry_modes',
       status: 'supported',
-      context: { ...anyContext(), surgeVersion: '6.5.0', surgeBuild: '10960' },
+      context: { ...anyContext(), surgeVersion: '6.10.0', surgeBuild: '12500' },
       verifiedAt: h.clock.now().toISOString(),
       note: '测试记录',
     });
     await h.app.refreshSurge(WEB);
     expect((await h.app.listCapabilities()).find((c) => c.key === 'runtime_entry_modes')!.effectiveStatus).toBe('supported');
-    h.fake.version = '6.6.0';
-    h.fake.build = '11000';
+    h.fake.version = '6.11.0';
+    h.fake.build = '12590';
     await h.app.refreshSurge(WEB);
+    expect(h.app.engine.facts.versionIssue).toBeNull();
     expect((await h.app.listCapabilities()).find((c) => c.key === 'runtime_entry_modes')).toMatchObject({ effectiveStatus: 'unverified', staleReasons: ['surgeVersion', 'surgeBuild'] });
   });
 
   test('a record confirmed with any as version (before the proposal rule) stays unverified once the version is read and after an upgrade', async () => {
     h = await createHarness();
     h.repos.capabilities.upsert({ key: 'runtime_entry_modes', status: 'supported', context: anyContext(), verifiedAt: h.clock.now().toISOString(), note: '旧记录' });
-    for (const [version, build] of [['6.5.0', '10960'], ['6.6.0', '11200']] as const) {
+    for (const [version, build] of [['6.10.0', '12500'], ['6.11.0', '12590']] as const) {
       h.fake.version = version;
       h.fake.build = build;
       expect(await h.app.refreshSurge(WEB)).toMatchObject({ version, build, message: null });
@@ -188,7 +191,7 @@ describe('a running-instance read that never finishes', () => {
     const timers = h.clock.pendingTimers();
     const st = h.app.refreshSurge(WEB);
     await h.clock.advanceAsync(DEFAULT_INSTANCE_READ_BUDGET_MS - 1_000);
-    await expect(st).resolves.toMatchObject({ reachable: true, version: '6.5.0', build: '10960', message: null });
+    await expect(st).resolves.toMatchObject({ reachable: true, version: '6.10.0', build: '12500', message: null });
     // 时限定时器已取消
     expect(h.clock.pendingTimers()).toBe(timers);
   });

@@ -167,10 +167,15 @@ function recoveryAfter(samples: readonly Sample[], firstImpactAt: number | null)
 }
 
 export interface ReloadSignalEvidence {
-  /** canary、临时规则或配置名信号判定发生了重新读取。 */
+  /** 配置 canary、引擎运行时长、临时规则或配置名信号判定发生了重新读取或重启。 */
   reloaded: boolean | null;
-  /** Surge 进程启动时间变化：这是重启，不是同一配置重载。 */
+  /** Surge 进程启动时间变化：这是退出重开，不是同一配置重载。 */
   restarted: boolean;
+  /**
+   * 引擎运行时长回落（进程未变）：6.9.0 起 reload 在需要时“Automatically performs a full engine restart”，这是重载的影响，
+   * 不是另一次重启。读不到运行时长为 null；旧调用方没有该字段。
+   */
+  engineRestarted?: boolean | null;
   reasons: string[];
 }
 
@@ -186,7 +191,10 @@ export interface ReloadAssessment {
   otherEvents: string[];
   /** 对照至少 baselineMinMs 且没有任何中断；否则 null（无法归属）。 */
   baselineOk: boolean | null;
-  /** 确实发生了同一配置重载：信号判定重新读取，或第一次标记前 leadMs 之后出现中断；没有证据或检测到重启为 null。 */
+  /**
+   * 确实发生了同一配置重载：信号判定重新读取（含升级为完整引擎重启），或第一次标记前 leadMs 之后出现中断；没有证据或
+   * 检测到 Surge 进程重启为 null。
+   */
   evidence: boolean | null;
   evidenceNote: string;
   /** 观察期间只有重载；有其他变更为 null。 */
@@ -233,13 +241,16 @@ export function assessReload(
   let evidenceNote: string;
   if (firstMark === null) evidenceNote = '没有重载标记';
   else if (sig?.restarted) evidenceNote = 'Surge 进程启动时间变化：这是重启，不是同一配置重载';
-  else if (sig?.reloaded === true) {
+  else if (sig?.engineRestarted === true) {
+    evidence = true;
+    evidenceNote = `引擎运行时长回落：这次重载升级为完整引擎重启（全部连接关闭、临时规则清空）${sig.reasons.length > 0 ? `；${sig.reasons.join('、')}` : ''}`;
+  } else if (sig?.reloaded === true) {
     evidence = true;
     evidenceNote = `重载信号：${sig.reasons.join('、')}`;
   } else if (impactNearMark) {
     evidence = true;
     evidenceNote = '标记附近出现连接中断';
-  } else evidenceNote = sig === null ? '没有重载信号（未使用 --reload-test 布置 canary），也没有观察到中断：无法确认重载确实发生' : '重载信号未变化且没有观察到中断：无法确认重载确实发生';
+  } else evidenceNote = sig === null ? '没有重载信号（未使用 --reload-test 布置配置 canary），也没有观察到中断：无法确认重载确实发生' : '重载信号未变化且没有观察到中断：无法确认重载确实发生';
   const impacted = impacts.length > 0;
   const onlyReload = otherEvents.length === 0 ? true : null;
   return {

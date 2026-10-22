@@ -1,5 +1,6 @@
 // Surge 原语清单与公共小工具。原语只来自 SurgeAdapter（ports.ts）；这里不出现任何
-// switch-profile、update all、flush、停止 Surge 或接管/出站写入。
+// switch-profile、reload、restart-engine、update all、flush、停止 Surge 或接管/出站写入。
+// 最低支持 Surge Mac 6.10.0（构建 12500、Controller 协议 22），见 running-instance.ts 的 SURGE_MINIMUM。
 
 import { SfeError } from '@sfe/contract';
 import type { SurgeAdapter } from '../ports.js';
@@ -21,6 +22,7 @@ export const SURGE_PRIMITIVES = [
   'selectGroupPolicy',
   'testPolicy',
   'listRules',
+  'matchRule',
   'listActiveRequests',
   'listRecentRequests',
   'killRequest',

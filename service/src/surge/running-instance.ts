@@ -1,6 +1,7 @@
-// 运行中 Surge 实例的版本与构建号（docs/ARCHITECTURE.md §5.2），不经 surge-cli（6.5 没有版本命令，--version
-// 进入交互模式）。定位当前用户唯一的 Surge 主进程 → 它的 .app 包 → Info.plist 的 CFBundleShortVersionString 与
-// CFBundleVersion；只有能证明磁盘上的包就是正在运行的那一份时才接受：
+// 运行中 Surge 实例的版本与构建号（docs/ARCHITECTURE.md §5.2）：证明磁盘上的包就是正在运行的那一份。Surge Mac 6.8.0+
+// 另有 `surge-cli version`（App、Core、Controller 协议），但它只是旁证——只有与这里读到的版本与构建号相同才接受
+// （crossCheckSurgeVersion），Controller 协议号只能从它得到。定位当前用户唯一的 Surge 主进程 → 它的 .app 包 →
+// Info.plist 的 CFBundleShortVersionString 与 CFBundleVersion；只有能证明磁盘上的包就是正在运行的那一份时才接受：
 // 1. ps（C 语言环境、UTC）中当前用户、可执行文件在 <包>/Contents/MacOS/ 下、包的真实路径等于 /Applications/Surge.app
 //    的进程；先按 Info.plist 的 CFBundleExecutable 过滤，再要求恰好一个（其他位置的 Surge.app 同时在运行也不接受）；
 // 2. 启动时间严格按 "%a %b %e %H:%M:%S %Y"（UTC）解析到秒；
@@ -14,9 +15,75 @@
 // 只读：从不写 Surge 或它的任何文件。服务与 P0 用同一个工厂（createDefaultSurgeInstanceReader），得到同一结论。
 
 import { realpath as fsRealpath, stat as fsStat } from 'node:fs/promises';
+import type { SurgeVersion } from '../ports.js';
 import { execFixed } from '../util/exec-fixed.js';
 import { SURGE_BUILD_RE, SURGE_VERSION_RE } from './capability-gate.js';
 import { codesignArgs } from './cli-adapter.js';
+
+// ---------- 最低支持版本 ----------
+
+/**
+ * 最低支持的 Surge Mac：6.10.0，构建 ≥ 12500，Controller 协议 ≥ 22（随包技能的协议门槛：“`rule`/`dns`/`http probe`/
+ * `security ban` ≥20; `geoip`, `dump performance|rule-usage|virtual-ip`, `benchmark rule-matching` ≥22 … An older core answers
+ * `Unknown command`”）。不兼容 6.5。低于最低版本或读不到 → 依赖版本的动作拒绝（失败即关闭）；进入普通模式仍可用（低于 6.9 时 rule match 不可用，
+ * 入口撤销无法经运行时确认，见 docs/ARCHITECTURE.md §0）。
+ */
+export const SURGE_MINIMUM = { version: '6.10.0', build: 12500, controllerProtocol: 22 } as const;
+
+/** 点分数字版本比较（a < b 为负、相等为 0、a > b 为正）；缺少的段按 0。 */
+export function compareSurgeVersions(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/** 版本与构建号（格式正确）都不低于最低支持版本。 */
+export function meetsSurgeMinimumVersion(v: { version: string; build: string }): boolean {
+  return (
+    SURGE_VERSION_RE.test(v.version) &&
+    SURGE_BUILD_RE.test(v.build) &&
+    compareSurgeVersions(v.version, SURGE_MINIMUM.version) >= 0 &&
+    Number(v.build) >= SURGE_MINIMUM.build
+  );
+}
+
+export type SurgeVersionCheckFailure = 'cli_version_unreadable' | 'cli_bundle_mismatch' | 'surge_version_unsupported';
+
+export const SURGE_VERSION_CHECK_FAILURE_TEXT: Readonly<Record<SurgeVersionCheckFailure, string>> = {
+  cli_version_unreadable: '无法通过 surge-cli 读取 Surge 版本与 Controller 协议',
+  cli_bundle_mismatch: 'surge-cli 报告的 Surge 版本与运行中的 Surge.app 不一致',
+  surge_version_unsupported: `Surge 版本低于最低支持版本 ${SURGE_MINIMUM.version}（构建 ${SURGE_MINIMUM.build}、Controller 协议 ${SURGE_MINIMUM.controllerProtocol}），请升级 Surge`,
+};
+
+export type SurgeVersionCheck =
+  | { ok: true; version: string; build: string; controllerProtocol: number; coreVersion: number }
+  | { ok: false; reason: SurgeVersionCheckFailure };
+
+/**
+ * 运行实例读取（证明磁盘上的包就是运行中的那一份）与 `surge-cli --raw version` 的交叉核对：
+ * - 运行实例已低于最低版本 → surge_version_unsupported（不需要 CLI）；
+ * - CLI 不支持 version 命令（6.5 进入交互模式；旧核心回答 Unknown command；version 是 6.8.0 才有的命令）→ surge_version_unsupported；
+ * - CLI 读不到（无法连接、输出无法识别等）→ cli_version_unreadable；
+ * - CLI 的版本或构建号与运行实例不同 → cli_bundle_mismatch（两者至少一个不是正在运行的那一份）；
+ * - Controller 协议低于最低值 → surge_version_unsupported。
+ * 只有全部通过才返回版本、构建号与协议号。
+ */
+export function crossCheckSurgeVersion(instance: { version: string; build: string }, cli: SurgeVersion | 'unsupported' | null): SurgeVersionCheck {
+  if (SURGE_VERSION_RE.test(instance.version) && SURGE_BUILD_RE.test(instance.build) && !meetsSurgeMinimumVersion(instance)) {
+    return { ok: false, reason: 'surge_version_unsupported' };
+  }
+  if (cli === 'unsupported') return { ok: false, reason: 'surge_version_unsupported' };
+  if (cli === null) return { ok: false, reason: 'cli_version_unreadable' };
+  if (cli.version !== instance.version || cli.build !== instance.build) return { ok: false, reason: 'cli_bundle_mismatch' };
+  if (!meetsSurgeMinimumVersion(cli) || !Number.isSafeInteger(cli.controllerProtocol) || cli.controllerProtocol < SURGE_MINIMUM.controllerProtocol) {
+    return { ok: false, reason: 'surge_version_unsupported' };
+  }
+  return { ok: true, version: cli.version, build: cli.build, controllerProtocol: cli.controllerProtocol, coreVersion: cli.coreVersion };
+}
 
 /** 期望的 Surge.app（与 verifyCliPath 要求的包前缀一致）。 */
 export const SURGE_APP_BUNDLE = '/Applications/Surge.app';

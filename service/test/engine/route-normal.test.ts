@@ -22,21 +22,29 @@ async function enterNormal(confirmed: string | null): Promise<string> {
 }
 
 /**
- * temp_rule 下先激活一次（尾部插入无法到达 VERIFY_ONLY：停在 BLOCKED），再模拟进程路径变化（例如 P0 更新后确认了新的
- * 路径，合成路径）：期望的规则文本随之改变，旧文本的记录仍在；一次中断的写入又留下了新文本 block 的意图记录 → 同一位有
- * 两条本应用规则（duplicate_block）。
+ * temp_rule 下先激活一次再取消（条件互不相交的临时规则不论插入位置都能到达 VERIFY_ONLY；取消等待中的激活 → 回滚停在
+ * BLOCKED，即 {block}），再模拟进程路径变化（例如 P0 更新后确认了新的路径，合成路径）：期望的规则文本随之改变，旧文本的
+ * 记录仍在；一次中断的写入又留下了新文本 block 的意图记录 → 同一种有两条本应用规则（duplicate_block）。
  */
+async function activateThenCancel(env: string): Promise<string> {
+  const a = await h.app.activate(env, { request_id: rid() }, WEB);
+  await h.idle();
+  expect(h.repos.operations.get(a.operation_id)!.phase).toBe('VERIFY_ONLY');
+  await h.app.cancelOperation(a.operation_id, { request_id: rid() }, WEB);
+  await h.idle();
+  return a.operation_id;
+}
+
 async function duplicateAfterPathChange(): Promise<{ env: string; paths: string[]; oldRules: string[]; oldUdp: string; oldBlock: string; newBlock: string }> {
   h = await createHarness({ entryStrategy: 'temp_rule' });
   const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
   await bind(h, PROFILE_A, env);
-  await h.app.activate(env, { request_id: rid() }, WEB);
-  await h.idle();
+  await activateThenCancel(env);
   expect(h.repos.routeState.get().entryMode).toBe('BLOCKED');
   const oldCfg = { processPaths: h.repos.settings.get('safariProcessPaths'), verifyHost: FAKE_VERIFY_HOST };
   const paths = [FAKE_SAFARI_PATH, '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview'];
   const oldRules = h.fake.tempRules;
-  expect([...oldRules].sort()).toEqual([tempRuleText('udp', oldCfg), tempRuleText('block', oldCfg)].sort());
+  expect(oldRules).toEqual([tempRuleText('block', oldCfg)]);
   h.repos.settings.set('safariProcessPaths', paths);
   const newBlock = tempRuleText('block', { processPaths: paths, verifyHost: FAKE_VERIFY_HOST });
   h.repos.managedObjects.upsertIntent({ kind: 'temp_rule', identity: newBlock, contentDigest: null, state: 'pending_add', createdByOperation: null });
@@ -85,9 +93,8 @@ describe('normal mode is always available (§5.2)', () => {
     h = await createHarness({ entryStrategy: 'temp_rule' });
     const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await bind(h, PROFILE_A, env);
-    // temp_rule 尾部插入无法到达 VERIFY_ONLY：激活失败并停在 BLOCKED（没有切换前的路由）
-    const a = await h.app.activate(env, { request_id: rid() }, WEB);
-    await h.idle();
+    // 取消等待中的激活：回滚停在 BLOCKED（没有切换前的路由）
+    const a = await activateThenCancel(env);
     expect(h.repos.routeState.get().entryMode).toBe('BLOCKED');
     h.fake.setModuleRules([{ text: 'DOMAIN-SUFFIX,amazon.com,DIRECT', moduleName: 'user-module' }]);
     const opId = await enterNormal(null);
@@ -98,25 +105,24 @@ describe('normal mode is always available (§5.2)', () => {
   });
 
   test('duplicate app-owned temp rules after a process path change do not stop normal mode (temp_rule)', async () => {
-    const { paths, oldRules, oldUdp, oldBlock, newBlock } = await duplicateAfterPathChange();
+    const { oldRules, oldBlock, newBlock } = await duplicateAfterPathChange();
     const opId = await enterNormal(null);
     const op = h.repos.operations.get(opId)!;
     expect(op.error).toBeNull();
     expect(op.phase).toBe('NORMAL_RESTORED');
     expectOriginalRules();
     expect(h.fake.tempRules).toEqual([]);
+    // 第一次激活加入又移除了 udp、verify、blockOther（VERIFY_ONLY 的规则），记录都已是 removed
+    const oldCfg = { processPaths: [FAKE_SAFARI_PATH], verifyHost: FAKE_VERIFY_HOST };
     expect(h.repos.managedObjects.listByKind('temp_rule').map((r) => [r.identity, r.state]).sort()).toEqual(
-      [...oldRules, newBlock, tempRuleText('udp', { processPaths: paths, verifyHost: FAKE_VERIFY_HOST })].map((t) => [t, 'removed']).sort(),
+      [...oldRules, newBlock, ...(['udp', 'verify', 'blockOther'] as const).map((k) => tempRuleText(k, oldCfg))].map((t) => [t, 'removed']).sort(),
     );
     // 移除了哪些本应用规则记入操作（结果与步骤），不只在入口读回的证据里
-    expectCleanupRecorded(opId, [
-      { action: 'remove', kind: 'udp', rule: oldUdp },
-      { action: 'remove', kind: 'block', rule: oldBlock },
-    ]);
+    expectCleanupRecorded(opId, [{ action: 'remove', kind: 'block', rule: oldBlock }]);
   });
 
   test('a rollback that cleans up duplicate app-owned temp rules keeps Safari blocked and records each removal in the operation (temp_rule)', async () => {
-    const { env, paths, oldUdp, oldBlock, newBlock } = await duplicateAfterPathChange();
+    const { env, oldBlock, newBlock } = await duplicateAfterPathChange();
     // 再次激活：第 6 步（未标为撤销）以 UNKNOWN_STATE 拒绝 → 回滚（撤销到 BLOCKED）逐条清理并保持阻断
     const a = await h.app.activate(env, { request_id: rid() }, WEB);
     await h.idle();
@@ -124,15 +130,13 @@ describe('normal mode is always available (§5.2)', () => {
     expect(op.phase).toBe('FAILED');
     expect(op.error!.code).toBe('UNKNOWN_STATE');
     expect(h.repos.routeState.get().entryMode).toBe('BLOCKED');
-    expect([...h.fake.tempRules].sort()).toEqual([newBlock, tempRuleText('udp', { processPaths: paths, verifyHost: FAKE_VERIFY_HOST })].sort());
+    // BLOCKED 只需要匹配 Safari 全部流量的 block（当前进程路径）
+    expect(h.fake.tempRules).toEqual([newBlock]);
     for (const protocol of ['tcp', 'udp'] as const) {
       const r = safariOutcome(h, 'www.example.test', protocol);
       expect(r.failed && r.policyName?.startsWith('REJECT')).toBe(true);
     }
-    const messages = expectCleanupRecorded(a.operation_id!, [
-      { action: 'remove', kind: 'udp', rule: oldUdp },
-      { action: 'remove', kind: 'block', rule: oldBlock },
-    ]);
+    const messages = expectCleanupRecorded(a.operation_id!, [{ action: 'remove', kind: 'block', rule: oldBlock }]);
     // 步骤顺序：开始回滚 → 逐条清理 → 回滚结束（Safari 保持阻断）
     const rollbackAt = messages.findIndex((m) => m.includes('开始回滚'));
     const cleanupAt = messages.findIndex((m) => m.startsWith('撤销入口时逐条清理本应用的临时规则：'));
@@ -185,6 +189,75 @@ describe('normal mode is always available (§5.2)', () => {
     expect(h.fake.calls.updateExternalResource ?? 0).toBe(updates);
     const rec = h.repos.operations.listRecent(50).find((o) => o.kind === 'maintenance.reconcile' && (o.payload as { removed?: string[] }).removed !== undefined)!;
     expect((rec.payload as { removed: string[] }).removed).toEqual(['managed_segments_changed']);
+  });
+
+  test('app temp rules removed while Surge keeps running (not a restart): normal mode writes nothing but still ends the live Safari connection on the buyer exit (temp_rule)', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    expect(h.repos.routeState.get().entryMode).toBe('ACTIVE');
+    const live = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    expect(live.policyName).toBe('SFE-ROUTE');
+    // 别的工具在 Surge 运行中移除了本应用的临时规则（例如 `rule temp remove` 或 `rule temp flush`），没有重启
+    for (const rule of h.fake.tempRules) await h.fake.removeTempRule(rule);
+    expect(h.fake.tempRules).toEqual([]);
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(true);
+    const writes = { add: h.fake.calls.addTempRule ?? 0, remove: h.fake.calls.removeTempRule ?? 0, kill: h.fake.calls.killRequest ?? 0 };
+    const opId = await enterNormal(envId);
+    const op = h.repos.operations.get(opId)!;
+    expect(op.phase).toBe('NORMAL_RESTORED');
+    // 不需要阻断、不写入临时规则；旧连接照常结束，不再留在买家出口上
+    expect({ add: h.fake.calls.addTempRule ?? 0, remove: h.fake.calls.removeTempRule ?? 0 }).toEqual({ add: writes.add, remove: writes.remove });
+    expect(h.fake.calls.killRequest ?? 0).toBe(writes.kill + 1);
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
+    expect((op.result as { killResults: Array<{ surgeRequestId: string; ok: boolean }> }).killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: true })]);
+    const messages = h.repos.operations.listSteps(opId).map((st) => st.message);
+    expect(messages.some((m) => m.includes('不需要阻断，未写入；仍结束 Safari 的旧连接'))).toBe(true);
+    expect(messages.some((m) => m.startsWith('已结束 Safari 连接 1 条'))).toBe(true);
+    expectOriginalRules();
+  });
+
+  test('a watcher slower than the entry wait for the whole normal mode (ruleset_resource): retries keep what was written and normal mode finishes', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    // 假 Surge 的监视延迟（假时钟 60 秒）一直高于入口等待上限（40 毫秒）：每一步都超时；两次尝试之间监视赶上
+    h.fake.localWatchLatencyMs = 60_000;
+    const phases: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const opId = await enterNormal(envId);
+      phases.push(h.repos.operations.get(opId)!.phase);
+      if (phases.at(-1) === 'NORMAL_RESTORED') break;
+      // 失败时 Safari 不会比已确认的状态更宽松，也从不被当作 NORMAL
+      expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', activeEnvironmentId: envId });
+      expect(h.repos.routeState.get().entryMode).not.toBe('NORMAL');
+      h.clock.advance(120_000);
+    }
+    // ACTIVE → BLOCKED（block+、active-，收紧，超时保留）→ NORMAL（udp-、block-，撤销中放宽，超时同样保留）→ 按见证确认
+    expect(phases).toEqual(['FAILED', 'FAILED', 'FAILED', 'FAILED', 'NORMAL_RESTORED']);
+    expectOriginalRules();
+    expect(safariOutcome(h, 'www.example.test', 'udp').rule).toBe('FINAL,DIRECT');
+    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+  });
+
+  test('…with a blocking module rule ahead of the entry: the retry whose intermediate block is already in force (udp off) reports the rule and goes on', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.fake.setModuleRules([{ text: 'DOMAIN-SUFFIX,amazon.com,DIRECT', moduleName: 'user-module' }]);
+    h.fake.localWatchLatencyMs = 60_000;
+    const ops: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      ops.push(await enterNormal(envId));
+      if (h.repos.operations.get(ops.at(-1)!)!.phase === 'NORMAL_RESTORED') break;
+      h.clock.advance(120_000);
+    }
+    expect(ops.map((id) => h.repos.operations.get(id)!.phase)).toEqual(['FAILED', 'FAILED', 'FAILED', 'FAILED', 'NORMAL_RESTORED']);
+    // 第四次：中间阻断已成立（block 开、udp 已关），不写入，排在入口之前的规则照样记入结果，继续撤销入口
+    const fourth = h.repos.operations.get(ops[3]!)!;
+    expect((fourth.result as { precedenceIssues: Array<{ rule: string; severity: string }> }).precedenceIssues).toContainEqual(
+      expect.objectContaining({ rule: 'DOMAIN-SUFFIX,amazon.com,DIRECT', severity: 'blocking' }),
+    );
+    expect(h.repos.operations.listSteps(ops[3]!).some((s) => s.message.includes('排在本应用入口之前'))).toBe(true);
+    expectOriginalRules();
+    expect(safariOutcome(h, 'www.amazon.com').rule).toBe('DOMAIN-SUFFIX,amazon.com,DIRECT');
   });
 
   test('best-effort kill: listing active requests fails → recorded, normal mode still completes', async () => {

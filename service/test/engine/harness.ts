@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import {
   CAPABILITY_CONTEXT_FIELDS,
   CAPABILITY_KEYS,
+  ENTRY_RULESET_FILES,
   NATIVE_PROTOCOL_VERSION,
   WORKING_PROFILE_NAME,
   type Accepted,
@@ -64,6 +65,18 @@ export interface HarnessOptions {
   surge?: (fake: FakeSurge) => SurgeAdapter;
   /** false：不提供 host.surgeInstance（使用引擎的缺省值：非 macOS 为 not_darwin，否则 unavailable）。 */
   surgeInstance?: false;
+  /**
+   * 发布写入本地节点资源后等待 Surge 重新读取的时限与轮询间隔。缺省 { timeoutMs: 0 }：只读一次（FakeClock 不会自动推进，
+   * 非零时限的测试需要自己推进时钟）；FakeSurge 的监视延迟缺省为 0，写入后的下一次调用即重新读取。
+   */
+  resourceReloadWait?: { timeoutMs: number; pollMs: number };
+  rulesetWatch?: { timeoutMs: number; pollMs: number };
+  /**
+   * FakeSurge 是否监视本地 policy-path 文件（文档未说明，需 P0 实测）。缺省跟随 policy_path_reread 能力记录：
+   * 夹具授予该能力时打开、撤销时关闭（h.grant/h.revoke 同样跟随）；显式给出时固定为该值，用于“记录说支持、Surge 却没有
+   * 重新读取”的情形。
+   */
+  watchLocalPolicyPaths?: boolean;
 }
 
 export interface Harness {
@@ -137,6 +150,11 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     tempRuleInsertion: 'tail',
     ...(opts.sourceProfile !== undefined ? { profileFileName: 'Daily.conf' } : {}),
   });
+  // 本地 policy-path 监视只与 policy_path_reread 记录一起打开（演示与测试专用的假设，不代表真实 Surge）
+  const followWatch = (keys: readonly CapabilityKey[], on: boolean) => {
+    if (opts.watchLocalPolicyPaths === undefined && keys.includes('policy_path_reread')) fake.watchLocalPolicyPaths = on;
+  };
+  if (opts.watchLocalPolicyPaths !== undefined) fake.watchLocalPolicyPaths = opts.watchLocalPolicyPaths;
   const scrubber = createScrubber();
   const mem = createMemorySink();
   const logger = createLogger({ sink: mem.sink, scrubber, level: 'debug', now: () => clock.now() });
@@ -170,9 +188,11 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
         note: note ?? (covers ? 'readback-covers: server, port, underlying-proxy' : '测试记录'),
       });
     }
+    followWatch(keys, true);
   };
   const revoke = (keys: readonly CapabilityKey[]) => {
     for (const key of keys) repos.capabilities.upsert({ key, status: 'unverified' });
+    followWatch(keys, false);
   };
   grant(opts.capabilities ?? ALL_CAPS);
   const hostState = { macosBuild: '25A000', safariVersion: '19.0' };
@@ -200,6 +220,9 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     verifyEndpoints: [TEST_ENDPOINT],
     loginUrl: () => ({ url: 'http://127.0.0.1:61847/auth/exchange?code=x', expiresAt: clock.now().toISOString() }),
     serviceVersion: '0.0.0-test',
+    resourceReloadWait: opts.resourceReloadWait ?? { timeoutMs: 0, pollMs: 0 },
+    // 入口规则集的监视等待用真实定时器：假 Surge 的监视延迟为 0，见证在第一次读取时即命中；撤销入口的退路按时限等满
+    rulesetWatch: opts.rulesetWatch ?? { timeoutMs: 40, pollMs: 10 },
     ...(opts.livenessPrimitive === 'auto' ? {} : { livenessPrimitive: opts.livenessPrimitive === undefined ? 'getCurrentProfile' : opts.livenessPrimitive }),
   });
   const events: ServiceEvent[] = [];
@@ -352,6 +375,24 @@ export async function activeEnv(h: Harness, name: string, host: string, profileI
 }
 
 /** 模拟 Safari 与 Chrome 请求在当前已加载规则下的去向。 */
+/**
+ * 入口规则集文件的写入痕迹：四个 sfe-entry-*.list 的内容与文件监视重新加载它们的次数。ruleset_resource 的入口写入是
+ * 原子写入文件、由 Surge 的文件监视生效，从不经 updateExternalResource——只数适配器写原语的“从不写 Surge”断言看不到它们。
+ */
+export function entryWrites(fake: FakeSurge): { entryFiles: Record<string, string | null>; entryReloads: number } {
+  const read = (name: string): string | null => {
+    try {
+      return readFileSync(join(fake.directory, name), 'utf8');
+    } catch {
+      return null;
+    }
+  };
+  return {
+    entryFiles: Object.fromEntries(Object.values(ENTRY_RULESET_FILES).map((name) => [name, read(name)])),
+    entryReloads: fake.watcherReloads.filter((r) => r.key.startsWith('ruleset:sfe-entry-')).length,
+  };
+}
+
 export function safariOutcome(h: Harness, host = 'www.example.test', protocol: 'tcp' | 'udp' = 'tcp') {
   return h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host, protocol });
 }

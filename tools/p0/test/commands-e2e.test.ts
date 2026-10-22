@@ -1,8 +1,10 @@
 // 命令编排的离线端到端测试：真实的本机测试服务（回显、SOCKS5 出口与前置）+ FakeSurge 规则求值 +
 // 迷你代理端口。证明 refresh / chain / preflight / charset / entry --to 的写入守卫、恢复与结论推导；
-// 不证明真实 Surge 的任何行为（那必须在测试 Mac 上实测）。
+// 不证明真实 Surge 的任何行为（那必须在测试 Mac 上实测）。FakeSurge 按 Surge Mac 6.10 的文档建模：update 跳过本地资源，
+// 本地规则集由文件监视重新读取；本地 policy-path 是否被监视没有写入文档——缺省按“被监视”的假设运行，不被监视的
+// 情形另有用例（结论必须失败或不完整，且从不靠 update 或重载补救）。
 
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,7 +21,7 @@ import { createMemoryOutput, createScriptedPrompter } from '../src/io.js';
 import type { CapabilityResult } from '../src/results.js';
 import { RunDir } from '../src/run-dir.js';
 import { loadState, recordTempRuleIntent, saveState } from '../src/state.js';
-import { TEST_NODES, TEST_PROFILE_FILE, TEST_USERS } from '../src/test-profile.js';
+import { CANARY_FILE, TEST_NODES, TEST_PROFILE_FILE, TEST_USERS } from '../src/test-profile.js';
 import { MiniSurge, startMiniSurgeProxy, type MiniProxy } from './support/mini-surge.js';
 
 const SOURCE = [
@@ -90,7 +92,8 @@ beforeEach(async () => {
   const serversDone = runTestServers(ctx, () => stopped);
   for (let i = 0; i < 100 && !loadState(dir, new Date()).servers; i++) await new Promise((r) => setTimeout(r, 10));
   expect(await main(['make-test-profile', '--raw-dir', base, '--profile', sourcePath, '--no-http-api', '--yes'], baseDeps())).toBe(EXIT.OK);
-  const surge = new MiniSurge({ directory: profileDir, profileFileName: TEST_PROFILE_FILE });
+  // 假设本地 policy-path 被 Surge 自动重新读取（TODO(P0)：文档没有写明，refresh 的 policy_path_reread 测量它）。
+  const surge = new MiniSurge({ directory: profileDir, profileFileName: TEST_PROFILE_FILE, watchLocalPolicyPaths: true });
   const proxy = await startMiniSurgeProxy(surge);
   env = {
     base,
@@ -122,33 +125,84 @@ function common(): string[] {
 }
 
 describe('P0 commands end to end (offline harness)', () => {
-  it('refresh measures targeted refresh, re-read and fallback, then restores everything', async () => {
+  it('refresh measures the watcher re-read of the local rule set and node resource without update(key), then restores everything', async () => {
     const d = env!.deps();
+    const surge = env!.surge;
     expect(await main(['refresh', '--auto-reload', 'off', ...common()], d)).toBe(EXIT.OK);
-    expect(result('auto_reload_atomic_replace').verdict).toBe('pass');
+    const auto = result('auto_reload_atomic_replace');
+    expect(auto.verdict).toBe('pass');
+    expect(auto.checks.find((c) => c.name === '原子替换主配置后的行为已测得')?.note).toBe('没有触发配置重载');
+    expect(auto.checks.find((c) => c.name.startsWith('原子替换的规则集由文件监视重新读取'))?.note).toMatch(/ms 后经 rule match 读到新内容.*实际请求同样命中新内容/);
+    // update 只对规则集 canary 调用一次（记录结果）：本地资源被跳过，从不算刷新
+    expect(auto.summary.join('\n')).toContain('报告跳过（与文档“Local resources are skipped.”一致；不算刷新）');
     expect(result('targeted_resource_refresh').verdict).toBe('pass');
-    // 刷新前、刚刷新后与 1 秒后各记录一次资源状态（ready=false 解析为未就绪）。
-    expect(result('targeted_resource_refresh').checks.find((c) => c.name === '资源没有错误')?.note).toBe('刷新前 正常，刷新后立即 正常，1 秒后 正常');
-    expect(result('policy_path_reread').verdict).toBe('pass');
+    // 写入前、读回成员后与 1 秒后各记录一次资源状态（ready=false 解析为未就绪）。
+    expect(result('targeted_resource_refresh').checks.find((c) => c.name === '资源没有错误')?.note).toBe('写入前 正常，读回成员后 正常，1 秒后 正常');
+    expect(result('targeted_resource_refresh').checks.find((c) => c.name.startsWith('恰好一个 key'))?.note).toBe('local=true，来自配置');
+    const reread = result('policy_path_reread');
+    expect(reread.verdict).toBe('pass');
+    expect(reread.checks[0]!.note).toMatch(/ms 后成员与清单相等/);
     const fixed = result('fixed_profile_no_switch');
     expect(fixed.checks.find((c) => c.name.includes('实际经过'))?.ok).toBe(true);
     // Chrome 测试页没有上报 → 不完整，而不是通过
     expect(fixed.verdict).toBe('incomplete');
-    expect(await env!.surge.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', TEST_NODES.a, TEST_NODES.b]);
-    expect(await env!.surge.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
-    expect(env!.surge.reloadCount).toBe(0);
-    expect(env!.surge.calls.reloadProfile ?? 0).toBe(0);
+    expect(await surge.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', TEST_NODES.a, TEST_NODES.b]);
+    expect(await surge.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
+    expect(surge.reloadCount).toBe(0);
+    expect(surge.calls.reloadProfile ?? 0).toBe(0);
+    // 节点资源从不经 update 刷新：唯一一次 update 是对规则集 canary 的记录调用
+    expect(surge.calls.updateExternalResource).toBe(1);
+    const keys = new Set(surge.watcherReloads.map((w) => w.key));
+    expect(keys.size).toBe(2);
   });
 
-  it('refresh fails targeted refresh when an atomic replace reloads the profile', async () => {
+  it('refresh fails closed when Surge does not re-read the local policy-path: update is recorded as skipped and never counted', async () => {
+    const surge = env!.surge;
+    surge.watchLocalPolicyPaths = false;
+    expect(await main(['refresh', '--auto-reload', 'off', ...common()], env!.deps())).toBe(EXIT.OK);
+    const reread = result('policy_path_reread');
+    expect(reread.verdict).toBe('fail');
+    expect(reread.checks[0]).toMatchObject({ ok: false });
+    expect(reread.checks[0]!.note).toContain('随后调用一次 update：报告跳过');
+    expect(reread.checks[0]!.note).toContain('之后成员仍未变化');
+    expect(result('targeted_resource_refresh').verdict).toBe('fail');
+    // 规则集仍由文件监视读取（文档写明），自动重载测量本身通过
+    expect(result('auto_reload_atomic_replace').verdict).toBe('pass');
+    // 从不重载兜底；成员与选择保持原样
+    expect(surge.reloadCount).toBe(0);
+    expect(await surge.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', TEST_NODES.a, TEST_NODES.b]);
+    expect(surge.calls.updateExternalResource).toBe(2);
+  });
+
+  it('with auto-reload on, replacing the main profile reloads it, so the rule-set watcher cannot be told apart from a full reload: never pass', async () => {
     env!.surge.autoReload = true;
     expect(await main(['refresh', '--auto-reload', 'on', ...common()], env!.deps())).toBe(EXIT.OK);
-    // 原子替换触发重新读取：该设置下结论为“不通过”，不能被提议为 supported，也不能作为 any 的证据。
+    // 主配置替换触发重载：配置 canary 不能再用作检测，“没有整份配置重载”无法确认，不能被提议为 supported，也不能作为 any 的证据。
+    const auto = result('auto_reload_atomic_replace');
+    expect(auto.verdict).not.toBe('pass');
+    expect(auto.checks.find((c) => c.name === '原子替换主配置后的行为已测得')).toMatchObject({ ok: true, note: '触发了配置重载' });
+    expect(auto.checks.find((c) => c.name === '规则集重新读取没有触发整份配置重载')?.ok).toBeNull();
+    expect(auto.summary.join('\n')).toContain('重新读取了主配置');
+    expect(result('targeted_resource_refresh').verdict).not.toBe('pass');
+  });
+
+  it('refresh fails when the rule-set watcher reloads the whole profile (detected by the profile canary)', async () => {
+    const surge = env!.surge;
+    const canaryKey = (await surge.listExternalResources()).find((r) => r.location.endsWith(CANARY_FILE))!.key;
+    const original = surge.checkFileChanges.bind(surge);
+    // 模拟“文件监视实为整份配置重载”的 Surge：规则集文件变化时重新加载整个配置。
+    surge.checkFileChanges = () => {
+      if (readFileSync(join(env!.profileDir, CANARY_FILE), 'utf8') !== surge.loadedContent(canaryKey)) {
+        surge.reloadCount++;
+        (surge as unknown as { loadAll(): void }).loadAll();
+        return true;
+      }
+      return original();
+    };
+    expect(await main(['refresh', '--auto-reload', 'off', ...common()], env!.deps())).toBe(EXIT.OK);
     const auto = result('auto_reload_atomic_replace');
     expect(auto.verdict).toBe('fail');
-    expect(auto.checks.find((c) => c.name === '原子替换不触发重新读取')?.ok).toBe(false);
-    expect(auto.summary.join('\n')).toContain('重新读取了该文件');
-    expect(result('targeted_resource_refresh').verdict).not.toBe('pass');
+    expect(auto.checks.find((c) => c.name === '规则集重新读取没有触发整份配置重载')?.ok).toBe(false);
   });
 
   it('auto-reload any cannot be proposed when atomic replace reloads with auto-reload on', async () => {
@@ -205,19 +259,40 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(existsSync(join(env!.run().path, 'proposals'))).toBe(false);
   });
 
-  it('the measured context takes the Surge version from the running instance, never from getVersion', async () => {
-    env!.surge.version = '6.5.2';
-    env!.surge.build = '10970';
-    let versionCalls = 0;
-    env!.surge.getVersion = async () => {
-      versionCalls++;
-      return { version: '9.9.9', build: '99999' };
-    };
-    const before = env!.surge.instanceReads;
+  it('the measured context records the version only when the running instance and surge-cli --raw version agree (≥ 6.10.0 / 12500, protocol ≥ 22)', async () => {
+    const surge = env!.surge;
+    const before = surge.instanceReads;
     expect(await main(['refresh', '--auto-reload', 'off', ...common()], env!.deps())).toBe(EXIT.OK);
-    expect(result('auto_reload_atomic_replace').context).toMatchObject({ surgeVersion: '6.5.2', surgeBuild: '10970' });
-    expect(env!.surge.instanceReads).toBeGreaterThan(before);
-    expect(versionCalls).toBe(0);
+    expect(result('auto_reload_atomic_replace').context).toMatchObject({ surgeVersion: '6.10.0', surgeBuild: '12500' });
+    expect(surge.instanceReads).toBeGreaterThan(before);
+    expect(surge.calls.getVersion ?? 0).toBeGreaterThan(0);
+
+    const propose = async () => {
+      const d = env!.deps();
+      const code = await main(['propose', 'auto_reload_atomic_replace', 'supported', '--working-profile', 'any', '--auto-reload', 'off', '--dry-run', '--raw-dir', env!.base], d);
+      return { code, text: d.out.text() };
+    };
+    const real = surge.getVersion.bind(surge);
+    const cases: Array<{ set: () => void; text: string }> = [
+      // CLI 与运行实例不一致（例如 surge-cli 属于另一份 Surge.app）
+      { set: () => (surge.getVersion = async () => ({ ...(await real()), version: '6.10.1', build: '12510' })), text: 'surge-cli 报告的 Surge 版本与运行中的 Surge.app 不一致' },
+      // Controller 协议低于 22
+      { set: () => (surge.controllerProtocol = 21), text: 'Surge 版本低于最低支持版本 6.10.0' },
+      // 运行实例低于最低支持版本（不再调用 CLI）
+      { set: () => ((surge.version = '6.9.1'), (surge.build = '12290')), text: 'Surge 版本低于最低支持版本 6.10.0' },
+    ];
+    for (const c of cases) {
+      surge.getVersion = real;
+      surge.controllerProtocol = 24;
+      surge.version = '6.10.0';
+      surge.build = '12500';
+      c.set();
+      expect(await main(['refresh', '--auto-reload', 'off', ...common()], { ...env!.deps(), now: () => new Date(Date.now() + 5_000 * (cases.indexOf(c) + 1)) })).toBe(EXIT.OK);
+      expect(result('auto_reload_atomic_replace').context, c.text).toMatchObject({ surgeVersion: null, surgeBuild: null });
+      const p = await propose();
+      expect(p.code, c.text).toBe(EXIT.REFUSED);
+      expect(p.text).toContain(`版本交叉核对未通过：${c.text}`);
+    }
   });
 
   it('continuity --reload-test arms the canary and never reports a reload it did not see', async () => {
@@ -225,12 +300,13 @@ describe('P0 commands end to end (offline harness)', () => {
     const d = env!.deps();
     const ctx: Ctx = { args, deps: { ...d, now: () => new Date() } as Deps };
     expect(await runContinuity(ctx, () => new Promise((r) => setTimeout(r, 300)))).toBe(EXIT.OK);
-    expect(d.out.text()).not.toContain('canary 在没有刷新时已被读取');
+    expect(d.out.text()).not.toContain('配置 canary 在重载之前已被读取');
     const r = result('same_profile_reload_impact');
     expect(r.verdict).toBe('incomplete');
     expect(r.checks.find((c) => c.name === '确实发生了同一配置重载')?.ok).toBeNull();
     expect(r.checks.find((c) => c.name.startsWith('其他应用不受影响'))?.ok).toBeNull();
-    expect(env!.run().readJsonl<{ action: string }>('actions.jsonl').some((a) => a.action === 'canary_armed')).toBe(true);
+    expect(env!.run().readJsonl<{ action: string }>('actions.jsonl').some((a) => a.action === 'profile_canary_armed')).toBe(true);
+    expect(r.summary.join('\n')).toContain('是否升级为完整引擎重启');
     expect(env!.surge.reloadCount).toBe(0);
   });
 
@@ -242,6 +318,22 @@ describe('P0 commands end to end (offline harness)', () => {
     const resource = await env!.run().readText('state.json');
     expect(resource).toBeTruthy();
     expect(await env!.surge.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', TEST_NODES.a, TEST_NODES.b]);
+    // 测试节点资源只由 Surge 的文件监视重新读取：从不调用 update
+    expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
+    expect(r.summary.join('\n')).toContain('测试节点资源由 Surge 自动重新读取');
+  });
+
+  it('chain is incomplete (never forced by update or reload) when Surge does not re-read the local node resource', async () => {
+    env!.surge.watchLocalPolicyPaths = false;
+    const d = env!.deps();
+    expect(await main(['chain', ...common()], d)).toBe(EXIT.OK);
+    const r = result('external_node_underlying_proxy');
+    expect(r.verdict).toBe('incomplete');
+    expect(r.checks.map((c) => c.ok)).toEqual([null, null, null]);
+    expect(d.out.text()).toContain('没有被 Surge 自动重新读取');
+    expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
+    expect(env!.surge.reloadCount).toBe(0);
+    expect(env!.surge.calls.selectGroupPolicy ?? 0).toBe(1);
   });
 
   it('preflight shows testPolicy reached the unselected node without changing the selection', async () => {
@@ -260,6 +352,18 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(d.out.text()).toContain('已证明安全的类别');
     const files = await import('node:fs').then((fs) => fs.readFileSync(join(env!.profileDir, NODE_RESOURCE_FILE), 'utf8'));
     expect(files).not.toContain('p0cs');
+    expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
+  });
+
+  it('charset tests no class when Surge does not re-read the local node resource (not reported as skipped by Surge)', async () => {
+    env!.surge.watchLocalPolicyPaths = false;
+    const d = env!.deps();
+    expect(await main(['charset', '--classes', 'baseline,comma', ...common()], d)).toBe(EXIT.OK);
+    const res = env!.run().readJson<{ reread: boolean; outcome: Array<{ id: string; result: string }> }>('charset/result.json')!;
+    expect(res.reread).toBe(false);
+    expect(res.outcome.map((o) => o.result)).toEqual(['not_tested', 'not_tested']);
+    expect(d.out.text()).toContain('已证明安全的类别：无');
+    expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
   });
 
   it('entry --to switches the ruleset entry with readback and back to NORMAL', async () => {
@@ -305,6 +409,40 @@ describe('P0 commands end to end (offline harness)', () => {
       expect(cov[item]!.result).toBe('limitation');
       expect(cov[item]!.note).toContain('由 safari_process_attribution 覆盖');
     }
+  });
+
+  it('entry checks every mode with a rule match matrix: Safari TCP/UDP/QUIC as expected, Chrome never matched', async () => {
+    const safari = join(env!.profileDir, 'Safari');
+    writeFileSync(safari, '');
+    const args = ['entry', '--strategy', 'ruleset_resource', '--process-path', safari, '--auto-reload-condition', 'off', '--dwell', '0', '--no-kill-test', ...common()];
+    expect(await main(args, env!.deps())).toBe(EXIT.OK);
+    const entry = result('runtime_entry_modes');
+    expect(entry.checks.find((c) => c.name === '四种模式依次精确生效（运行时读回）')?.ok).toBe(true);
+    expect(entry.checks.find((c) => c.name.startsWith('rule match：Safari'))).toMatchObject({ ok: true, note: '核对 24 条' });
+    expect(entry.checks.find((c) => c.name.startsWith('rule match：Chrome'))).toMatchObject({ ok: true, note: '核对 24 条；对照路径 1 个' });
+    expect(entry.checks.find((c) => c.name === '切换不发生配置重载或引擎重启')?.ok).toBe(true);
+    // ruleset_resource 的规则集由文件监视重新读取：从不调用 update，也从不重载
+    expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
+    expect(env!.surge.reloadCount).toBe(0);
+    const [file] = env!.run().listFiles('entry').filter((f) => /ruleset_resource-\d+\.json$/.test(f));
+    const ev = env!.run().readJson<{ controlPaths: string[]; ruleMatch: Array<{ mode: string; protocol: string; safari: boolean }> }>(file!)!;
+    expect(ev.controlPaths).toEqual(['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']);
+    expect(new Set(ev.ruleMatch.map((r) => r.mode))).toEqual(new Set(['BLOCKED', 'VERIFY_ONLY', 'ACTIVE', 'NORMAL']));
+    expect(new Set(ev.ruleMatch.map((r) => r.protocol))).toEqual(new Set(['TCP', 'UDP', 'QUIC']));
+  });
+
+  it('the temp_rule sequence records the measured insertion position and passes the rule match matrix', async () => {
+    const safari = join(env!.profileDir, 'Safari');
+    writeFileSync(safari, '');
+    const args = ['entry', '--strategy', 'temp_rule', '--process-path', safari, '--dwell', '0', '--no-kill-test', ...common()];
+    expect(await main(args, env!.deps())).toBe(EXIT.OK);
+    const entry = result('runtime_entry_modes');
+    expect(entry.checks.find((c) => c.name === '四种模式依次精确生效（运行时读回）')?.ok).toBe(true);
+    expect(entry.checks.find((c) => c.name === '新临时规则的插入位置已实测')).toMatchObject({ ok: true, note: expect.stringContaining('插入位置 head') });
+    expect(entry.checks.find((c) => c.name.startsWith('rule match：Safari'))?.ok).toBe(true);
+    expect(entry.checks.find((c) => c.name.startsWith('rule match：Chrome'))?.ok).toBe(true);
+    // 回到 NORMAL 后没有遗留本工具的临时规则
+    expect(env!.surge.tempRules).toEqual([]);
   });
 
   it('entry counts the first ACTIVE WebSocket open that lands right after the readback confirmation', async () => {
@@ -490,8 +628,9 @@ describe('P0 commands end to end (offline harness)', () => {
 });
 
 describe('resourceHealth', () => {
-  const res = (error: string | null) => ({ key: 'k', type: 'policy-path', location: '/x/sfe-nodes.list', lastUpdatedAt: null, error });
+  const res = (error: string | null, updating = false) => ({ key: 'k', type: 'policy-group', location: '/x/sfe-nodes.list', lastUpdatedAt: null, error, local: true, updating, fromModule: null });
   it('classifies without echoing Surge error text', () => {
+    expect(resourceHealth([res(null, true)])).toBe('正在更新');
     expect(resourceHealth([res(null)])).toBe('正常');
     expect(resourceHealth([res('not_ready')])).toBe('未就绪');
     expect(resourceHealth([res('fetch https://x.example.test/a failed')])).toBe('有错误');

@@ -181,7 +181,7 @@ export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
   runtime_entry_modes: '运行时入口四种模式',
   entry_rules_after_restart: 'Surge 重启后入口规则生命周期',
   safari_udp_quic_handling: 'Safari UDP/QUIC 处理',
-  targeted_resource_refresh: '节点资源定向刷新',
+  targeted_resource_refresh: '节点资源定向重新读取',
   policy_path_reread: '本地 policy-path 重新读取',
   external_node_underlying_proxy: '外部节点前置链路',
   connection_continuity: '其他应用连接连续性',
@@ -262,8 +262,9 @@ export const CAPABILITY_GATES = {
     'fixed_profile_no_switch',
   ],
   /**
-   * ruleset_resource 策略额外要求。规则集文件的定向刷新不同于节点资源刷新，由
-   * runtime_entry_modes（策略为 ruleset_resource 时）本身证明，这里只追加自动重载行为。
+   * ruleset_resource 策略额外要求。入口规则集文件由 Surge 的文件监视重新读取（从不调用 external-resource update：
+   * 本地资源被跳过）、经见证规则的 rule match 确认已加载，由 runtime_entry_modes（策略为 ruleset_resource 时）本身证明；
+   * 这里只追加自动重载设置下的原子替换行为。
    */
   activateRulesetStrategy: ['auto_reload_atomic_replace'],
   /** 结束 Safari 旧连接。普通模式下不满足时按“尽力而为”执行并报告。 */
@@ -287,14 +288,18 @@ export const CAPABILITY_MEASURED_GATES = {
 
 /**
  * 每项能力依赖的 Surge 原语；验证上下文中的 adapterMechanism 记录这些原语当时由哪种实现提供
- * （规范 JSON：{"原语":"cli|http"}），比较时只比较这些原语。
+ * （规范 JSON：{"原语":"cli|http"}），比较时只比较这些原语——映射变化（例如 install.json 中 matchRule 改为 unavailable）
+ * 让相应记录过期、门槛在任何写入之前拒绝。只列产品实际调用的原语：外部资源更新跳过本地资源（HTTP API 文档：“Local
+ * resources are skipped.”），发布与入口从不调用 updateExternalResource，所以它不在任何一项中；入口的每一步与读回都用
+ * rule match（Mac 6.9.0+）确认运行时求值，ruleset_resource 每步写入前读取自动重载设置。
  */
 export const CAPABILITY_PRIMITIVES: Partial<Record<CapabilityKey, readonly string[]>> = {
   fixed_profile_no_switch: ['selectGroupPolicy', 'getGroupSelection', 'getCurrentProfile'],
-  runtime_entry_modes: ['listRules', 'listTempRules', 'addTempRule', 'removeTempRule', 'listExternalResources', 'updateExternalResource'],
-  targeted_resource_refresh: ['listExternalResources', 'updateExternalResource', 'getGroupMembers', 'getGroupSelection'],
-  policy_path_reread: ['listExternalResources', 'updateExternalResource', 'getGroupMembers'],
-  connection_continuity: ['updateExternalResource', 'selectGroupPolicy'],
+  runtime_entry_modes: ['listRules', 'matchRule', 'listTempRules', 'addTempRule', 'removeTempRule', 'listExternalResources'],
+  targeted_resource_refresh: ['listExternalResources', 'getGroupMembers', 'getGroupSelection'],
+  policy_path_reread: ['listExternalResources', 'getGroupMembers'],
+  connection_continuity: ['selectGroupPolicy', 'getGroupMembers'],
+  auto_reload_atomic_replace: ['getAutoReloadSetting', 'matchRule'],
   independent_node_preflight: ['testPolicy'],
   takeover_state_readable: ['getTakeoverState'],
 };
@@ -307,20 +312,20 @@ export const CAPABILITY_CRITERIA: Record<CapabilityKey, string> = {
   native_bridge_ipc: '扩展经原生桥与服务往返成功；Safari 重开、重启、服务重启、服务升级后仍成功；后台脚本休眠后被唤醒仍能完成往返；无 TCC 提示。',
   bridge_keychain_access: '签名的原生桥能读取由指定写入方写入的账号密码钥匙串项，无额外提示；重建/重签后的提示次数已记录。',
   extension_install_persistence: '不开启“允许未签名扩展”，扩展在 Safari 退出重开、重启、8 天以上与重新构建后仍保持启用；证书与描述文件有效期已记录。',
-  fixed_profile_no_switch: '切换 SFE-ROUTE 选择时工作配置身份不变、不发生配置重载、Chrome 长连接与新请求不受影响。',
+  fixed_profile_no_switch: '切换 SFE-ROUTE 选择时工作配置身份不变、不发生配置重载或引擎重启、Chrome 长连接与新请求不受影响。',
   runtime_entry_modes:
-    '所选策略下四种模式精确生效；每次切换位不发生配置重载、其他应用长连接与新请求不受影响；中间状态无放行窗口；本应用入口优先于启用的模块 DIRECT 规则与用户临时规则；AND(进程,域名) 与 AND(进程,UDP) 规则在该机制中可用；ruleset_resource 时 Safari 请求在 updateExternalResource(key) 后改变匹配。',
-  entry_rules_after_restart: 'Surge 重启后入口规则的去留已记录，且控制器在一个对账周期内检测到丢失（入口记为 UNKNOWN 并暂停填充与自动打开）。',
+    '所选策略下四种模式精确生效，运行时读回包括 rule match：Safari 的 TCP、UDP、QUIC 对检测主机与其他主机都得到该模式预期的结果，Chrome 从不命中本应用入口规则或 SFE-ROUTE；每次切换不发生配置重载或引擎重启，其他应用长连接与新请求不受影响；中间状态无放行窗口；本应用入口优先于启用的模块 DIRECT 规则与用户临时规则；AND/NOT 组合（进程、协议、域名）的入口规则在该机制中可用；temp_rule 时新临时规则的插入位置已实测；ruleset_resource 时规则集文件原子替换后不调用 external-resource update，由 Surge 的文件监视在限定时间内重新读取并经见证规则读回。',
+  entry_rules_after_restart: 'Surge 重启（退出重开；只重启引擎时按引擎运行时长回落识别）后入口规则的去留已记录，且控制器在一个对账周期内检测到丢失（入口记为 UNKNOWN 并暂停填充与自动打开）。',
   safari_udp_quic_handling: 'VERIFY_ONLY 与 ACTIVE 下 Safari 的 UDP/QUIC（H3 测试主机）被拒绝且从不直连，页面回落 TCP 经 SFE-ROUTE，出口一致。',
-  targeted_resource_refresh: '按 key 定向刷新本应用节点资源后，经固定原语能读到组成员、资源错误与选择；不影响其他资源；执行器从不写入它无法读回的内容。',
-  policy_path_reread: '本地 policy-path 文件修改后经定向刷新被重新读取，新增成员可选、旧成员与选择保留。',
+  targeted_resource_refresh: '本应用节点资源（本地 policy-path 文件）原子替换后不调用 external-resource update（本地资源被跳过），经固定原语能读回组成员、资源错误与选择；只有该资源变化，其他外部资源不受影响，不发生整份配置重载或引擎重启；执行器从不写入它无法读回的内容。',
+  policy_path_reread: '本地 policy-path 文件原子替换后不调用 external-resource update，Surge 在限定时间内自动重新读取（延迟已记录）：新增成员可选且实际生效，旧成员与选择保留，选中节点被移除时回落到首成员 REJECT。',
   external_node_underlying_proxy: '外部资源中的节点经 underlying-proxy 引用主配置前置时确实经过前置；前置不可达时连接失败而非直连；前置名缺失时节点被跳过或失败而非直连。',
-  connection_continuity: '发布节点资源期间，其他应用的长连接保持、新请求正常、出口不变，并与未执行变更的对照比较。',
-  auto_reload_atomic_replace: '自动重载设置（开/关）下原子替换被引用文件的行为已实测：是否触发整份配置重载；记录验证时的设置值。',
+  connection_continuity: '发布节点资源期间（写入本地 policy-path 文件并等待 Surge 自动重新读取），其他应用的长连接保持、新请求正常、出口不变，并与未执行变更的对照比较。',
+  auto_reload_atomic_replace: '在记录的自动重载设置（开/关）下，原子替换被引用的本地规则集后由 Surge 文件监视重新读取（延迟已记录），不触发整份配置重载或引擎重启，其他应用连接不受影响；主配置被原子替换后是否触发重载也已记录。',
   first_request_and_old_connections: '受控入口下首个业务请求已走新出口；旧环境的长连接、后台请求、恢复的标签页与扩展休眠场景不会继续使用旧出口；限制已写明。',
   independent_node_preflight: '不改变当前选择即可对未选中的候选节点做连通性测试。',
   takeover_state_readable: '能经固定原语只读获取增强模式、系统代理与出站模式。',
-  same_profile_reload_impact: '同一配置维护重载对其他应用的影响（连接重置、恢复时间、接管与模式是否不变）已测量。',
+  same_profile_reload_impact: '同一配置维护重载对其他应用的影响（连接重置、恢复时间、接管与模式是否不变、是否升级为完整引擎重启并清空临时规则）已测量。',
   open_profile_by_id: '存在可用的公开方式按场景 ID 打开 Safari 指定场景。',
   profile_batch_create: '存在可用的公开方式批量创建 Safari 场景。',
 };

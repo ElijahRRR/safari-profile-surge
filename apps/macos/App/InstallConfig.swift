@@ -22,6 +22,7 @@ enum InstallConfig {
         "selectGroupPolicy",
         "testPolicy",
         "listRules",
+        "matchRule",
         "listActiveRequests",
         "listRecentRequests",
         "killRequest",

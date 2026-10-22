@@ -1,8 +1,10 @@
-import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'vitest';
-import { ALL_SURGE_PRIMITIVES, DEFAULT_BRIDGE_PORT, loadConfig, readInstallConfig, type LoadConfigOptions } from '../../src/config.js';
+import { ALL_SURGE_PRIMITIVES, DEFAULT_BRIDGE_PORT, SURGE_ADAPTER_PRIMITIVES, loadConfig, readInstallConfig, type LoadConfigOptions } from '../../src/config.js';
+import { SURGE_PRIMITIVES } from '../../src/surge/primitives.js';
 
 const isRoot = process.getuid?.() === 0;
 
@@ -173,23 +175,25 @@ describe('install.json', () => {
     expect(c.installConfigIssues).toHaveLength(2);
   });
 
-  test.each(['cli', 'http'])('getVersion mapped to %s in install.json is forced to unavailable with a config issue (version comes from the running instance)', (mechanism) => {
+  // Surge Mac 6.8.0+ 有 `surge-cli version`（App、Core、Controller 协议）：getVersion 与其他原语一样由 P0 映射，
+  // 不再强制为不可用（旧行为对应 6.5 没有版本命令）；它只是旁证，必须与运行实例读取一致（crossCheckSurgeVersion）。
+  test.each(['cli', 'http'] as const)('getVersion mapped to %s in install.json is kept like any other primitive', (mechanism) => {
     const o = base();
     const dataDir = dataDirOf(o);
-    writeInstall(dataDir, { adapterMechanism: { getVersion: mechanism, listExternalResources: 'cli' } });
+    writeInstall(dataDir, { adapterMechanism: { getVersion: mechanism, matchRule: 'cli', listExternalResources: 'cli' } });
     const c = loadConfig({ ...o, argv: ['--data-dir', dataDir] });
-    expect(c.adapterMechanism.getVersion).toBe('unavailable');
+    expect(c.adapterMechanism.getVersion).toBe(mechanism);
+    expect(c.adapterMechanism.matchRule).toBe('cli');
     expect(c.adapterMechanism.listExternalResources).toBe('cli');
-    expect(c.installConfigIssues).toEqual(['安装配置中的原语 getVersion 已不再使用（版本改由运行中的 Surge 实例读取），按不可用处理']);
+    expect(c.installConfigIssues).toEqual([]);
   });
 
-  test('getVersion explicitly unavailable in install.json is accepted without an issue', () => {
-    const o = base();
-    const dataDir = dataDirOf(o);
-    writeInstall(dataDir, { adapterMechanism: { getVersion: 'unavailable' } });
-    const c = loadConfig({ ...o, argv: ['--data-dir', dataDir] });
-    expect(c.adapterMechanism.getVersion).toBe('unavailable');
-    expect(c.installConfigIssues).toEqual([]);
+  test('the primitive lists agree: service adapter, config and the macOS host app', () => {
+    expect([...SURGE_ADAPTER_PRIMITIVES]).toEqual([...SURGE_PRIMITIVES]);
+    const swift = readFileSync(fileURLToPath(new URL('../../../apps/macos/App/InstallConfig.swift', import.meta.url)), 'utf8');
+    const block = /static let primitives = \[([\s\S]*?)\]/.exec(swift)![1]!;
+    const names = [...block.matchAll(/"([A-Za-z]+)"/g)].map((m) => m[1]);
+    expect(names).toEqual([...ALL_SURGE_PRIMITIVES]);
   });
 
   test('--http-port and --web-root take precedence over install.json', () => {
