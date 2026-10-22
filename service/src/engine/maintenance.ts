@@ -120,12 +120,14 @@ async function buildInitPlan(engine: Engine, req: InitPreviewRequest): Promise<I
 
   // 名称与文件冲突
   const collisions = new Set<string>();
+  /** 读不到的 Surge 列表：不能确认模块等配置文本之外没有同名对象，按冲突处理（不放行）。 */
+  const unreadable: string[] = [];
   for (const o of findForeignSfeObjects(sourceText, { names: [], files: [] })) collisions.add(`${o.name}（第 ${o.line} 行）`);
   try {
     const policies = await engine.surge.listPolicies();
     for (const n of [...policies.proxies, ...policies.groups]) if (/^SFE-/i.test(n)) collisions.add(n);
   } catch {
-    // 读不到策略列表时只按配置文本判断
+    unreadable.push('策略列表');
   }
   try {
     for (const name of await readdir(directory)) if (/^sfe-/i.test(name)) collisions.add(name);
@@ -138,7 +140,7 @@ async function buildInitPlan(engine: Engine, req: InitPreviewRequest): Promise<I
       if (/(^|\/)sfe-[^/]*$/i.test(r.location)) collisions.add(`外部资源 ${basename(r.location)}`);
     }
   } catch {
-    // 忽略
+    unreadable.push('外部资源列表');
   }
 
   const strategy = engine.repos.settings.get('entryStrategy');
@@ -158,6 +160,8 @@ async function buildInitPlan(engine: Engine, req: InitPreviewRequest): Promise<I
   checks.push({ name: 'git', ok: !inGit, message: inGit ? '配置目录位于 Git 工作树内：请确认不会提交含凭据的文件' : '配置目录不在 Git 工作树内' });
   checks.push({ name: 'access', ok: true, message: '服务以当前运行方式可以读取该目录；LaunchAgent 下是否出现 TCC 提示需在测试 Mac 上确认' });
   checks.push({ name: 'collisions', ok: collisions.size === 0 && insertError === null, message: insertError ?? (collisions.size === 0 ? '没有名称或文件冲突' : '存在非本应用的 SFE- 名称或 sfe-* 文件') });
+  const unreadableMessage = unreadable.length > 0 ? `无法读取 Surge 的${unreadable.join('与')}：不能确认模块或其他配置中没有同名的 SFE- 对象` : null;
+  checks.push({ name: 'surge_names', ok: unreadableMessage === null, message: unreadableMessage ?? '已读取 Surge 的策略与外部资源列表' });
   if (strategy === 'ruleset_resource' && entry === null) checks.push({ name: 'entry', ok: true, message: 'Safari 进程路径尚未确认：入口规则集将在之后的重新合并中写入' });
 
   let checkOk = false;
@@ -195,9 +199,11 @@ async function buildInitPlan(engine: Engine, req: InitPreviewRequest): Promise<I
       ? { code: 'UNSAFE_LOCATION', message: '初始化失败：配置目录位于同步或受保护位置' }
       : insertError !== null || collisions.size > 0
         ? { code: 'NAME_COLLISION', message: insertError ?? '初始化失败：存在非本应用的 SFE- 名称或 sfe-* 文件' }
-        : !checkOk
-          ? { code: 'SURGE_CHECK_FAILED', message: checkMessage }
-          : null;
+        : unreadableMessage !== null
+          ? { code: 'NAME_COLLISION', message: `初始化失败：${unreadableMessage}` }
+          : !checkOk
+            ? { code: 'SURGE_CHECK_FAILED', message: checkMessage }
+            : null;
   const response: InitPreviewResponse = {
     preview_digest: digest,
     sourceProfileName: profile.name,

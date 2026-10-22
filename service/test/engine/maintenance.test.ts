@@ -103,6 +103,27 @@ describe('init (one-time fixed working profile)', () => {
     expect(existsSync(workingPath())).toBe(false);
   });
 
+  test.each([
+    ['policy list', 'listPolicies', '策略列表'],
+    ['external resource list', 'listExternalResources', '外部资源列表'],
+  ] as const)('Surge %s unreadable → collision check fails closed (NAME_COLLISION), nothing written', async (_name, primitive, label) => {
+    h = await createHarness({ sourceProfile: SOURCE });
+    const fake = h.fake as unknown as Record<string, () => Promise<unknown>>;
+    const original = fake[primitive]!;
+    fake[primitive] = async () => {
+      throw new SfeError('SURGE_COMMAND_FAILED', '读取失败：Surge 输出格式无法识别');
+    };
+    const preview = await h.app.initPreview({}, WEB);
+    const check = preview.checks.find((c) => c.name === 'surge_names')!;
+    expect(check.ok).toBe(false);
+    expect(check.message).toContain(label);
+    const err = await expectError(h.app.initCommit({ request_id: rid(), preview_digest: preview.preview_digest }, WEB), 'NAME_COLLISION');
+    expect(err.message).toContain(label);
+    expect(existsSync(workingPath())).toBe(false);
+    fake[primitive] = original;
+    expect((await h.app.initPreview({}, WEB)).checks.find((c) => c.name === 'surge_names')!.ok).toBe(true);
+  });
+
   test('synced profile directory → UNSAFE_LOCATION', async () => {
     h = await createHarness({ sourceProfile: SOURCE, surgeSubdir: 'home/Library/Mobile Documents/iCloud~com~nssurge~inc/Documents' });
     const preview = await h.app.initPreview({}, WEB);

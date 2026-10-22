@@ -186,9 +186,12 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
       const json = await request('GET', '/v1/policy_groups');
       const members = isObject(json) ? json[group] : undefined;
       if (!Array.isArray(members)) throw new SfeError('SURGE_COMMAND_FAILED', '读取策略组失败：组不存在', { details: { group } });
-      return members
-        .map((m) => (typeof m === 'string' ? m : isObject(m) && typeof m.name === 'string' ? m.name : null))
-        .filter((m): m is string => m !== null);
+      // 无法识别的成员不能静默丢弃：读回会把缺少的成员当作不存在。
+      return members.map((m) => {
+        const name = typeof m === 'string' ? m : isObject(m) && typeof m.name === 'string' ? m.name : null;
+        if (!name) throw unrecognized('策略组成员');
+        return name;
+      });
     },
 
     async getGroupSelection(group: string) {
@@ -216,11 +219,13 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
       guard('listRules');
       const json = await request('GET', '/v1/rules');
       const rules = isObject(json) ? json.rules : Array.isArray(json) ? json : null;
-      if (!Array.isArray(rules)) throw unrecognized('规则列表');
+      // 与 CLI 解析一致：空列表（总有 FINAL）或无法识别的条目都是误读，不能静默丢弃（被丢弃的规则可能排在入口之前）。
+      if (!Array.isArray(rules) || rules.length === 0) throw unrecognized('规则列表');
       // TODO(P0)：/v1/rules 是否包含模块与临时规则、能否区分来源。
-      return rules
-        .filter((r): r is string => typeof r === 'string')
-        .map((text) => ({ text: opts.scrub(redactFreeText(text)), source: 'unknown' as const, moduleName: null }));
+      return rules.map((text) => {
+        if (typeof text !== 'string' || text.trim() === '') throw unrecognized('规则列表');
+        return { text: opts.scrub(redactFreeText(text)), source: 'unknown' as const, moduleName: null };
+      });
     },
 
     async listActiveRequests() {

@@ -259,6 +259,22 @@ describe('createHttpAdapter', () => {
     expect(await a.testPolicy('SFE-ROUTE', 'https://verify.example.test/')).toEqual({ ok: true, latencyMs: 80, error: null });
   });
 
+  test.each([
+    ['an unrecognised rule item', { 'GET /v1/rules': { rules: ['FINAL,DIRECT', { ruleString: 'DOMAIN,a.example.test,DIRECT' }] } }, 'listRules'],
+    ['an empty rule list', { 'GET /v1/rules': { rules: [] } }, 'listRules'],
+    ['an unrecognised group member', { 'GET /v1/policy_groups': { 'SFE-ROUTE': [{ name: 'REJECT' }, { policy: 'SFE-N-E0001-US01-v001' }] } }, 'getGroupMembers'],
+  ] as const)('HTTP lists fail closed on %s instead of dropping it', async (_name, routes, primitive) => {
+    const a = createHttpAdapter({
+      baseUrl: 'http://127.0.0.1:6171',
+      getKey: async () => KEY,
+      mechanism: allHttp,
+      fetch: fakeFetch(routes as Record<string, unknown>, []),
+      scrub: (s) => s,
+    });
+    const run = primitive === 'listRules' ? a.listRules() : a.getGroupMembers('SFE-ROUTE');
+    await expect(run).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED' });
+  });
+
   test('external resources and temp rules over HTTP are unverified on 6.5', async () => {
     const fetchSpy = vi.fn();
     const a = createHttpAdapter({ baseUrl: 'http://127.0.0.1:6171', getKey: async () => KEY, mechanism: allHttp, fetch: fetchSpy as unknown as typeof fetch, scrub: (s) => s });
