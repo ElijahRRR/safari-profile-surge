@@ -367,6 +367,11 @@ export interface RouteSummaryView {
   routeEpoch: number;
   entryMode: EntryMode;
   phase: RoutePhase;
+  /**
+   * 路由带 buyer_exit_connections_unconfirmed：上一次普通模式未能确认 Safari 已没有经买家出口的连接。路由可能已是空闲的
+   * 普通模式，任何场景（§6.5）仍要能再次进入普通模式结束这些连接；只给这一项，不给其他警告。
+   */
+  buyerExitConnectionsUnconfirmed: boolean;
 }
 
 export interface CapabilityContext {

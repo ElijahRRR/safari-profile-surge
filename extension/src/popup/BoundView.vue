@@ -2,7 +2,7 @@
 // 已绑定场景：环境状态、出口与警告、受控动作。密码从不显示；登录身份始终为“未核对”。
 import { computed, ref } from 'vue';
 import { Icon } from '@sfe/easyquick';
-import { SITES, type ProbeView, type ProxyRevisionView } from '@sfe/contract';
+import { SITES, type ProbeView, type ProxyRevisionView, type RouteWarning } from '@sfe/contract';
 import BaseDialog from '../ui/BaseDialog.vue';
 import StatusBadge from '../ui/StatusBadge.vue';
 import InfoRow from './InfoRow.vue';
@@ -29,7 +29,9 @@ const confirmWindows = ref(false);
 const cur = computed(() => s.current!);
 const env = computed(() => cur.value.environment!);
 const route = computed(() => cur.value.route);
-const warnings = computed(() => route.value?.warnings ?? []);
+/** 上一次普通模式未能确认 Safari 已没有经买家出口的连接（非活动场景只从路由摘要得到这一项）。 */
+const buyerExitUnconfirmed = computed(() => cur.value.routeSummary.buyerExitConnectionsUnconfirmed === true);
+const warnings = computed<RouteWarning[]>(() => route.value?.warnings ?? (buyerExitUnconfirmed.value ? ['buyer_exit_connections_unconfirmed'] : []));
 const thisActive = computed(() => cur.value.relation === 'this_active');
 const pending = computed(() => cur.value.pendingVerification);
 
@@ -72,7 +74,8 @@ const accountText = computed(() => {
 const showAckWindows = computed(() => warnings.value.includes('old_windows_kept_open') || warnings.value.includes('managed_windows_on_original_rules'));
 const amazonUnverified = computed(() => !thisActive.value && s.profile?.amazon_tabs_open === true);
 const sitePermissionMissing = computed(() => s.profile !== null && !s.profile.site_permission_granted);
-const canEnterNormal = computed(() => cur.value.relation !== 'none_active' || cur.value.routeSummary.entryMode !== 'NORMAL');
+// 路由已是空闲的普通模式时，只有上一次普通模式未能确认结束 Safari 经买家出口的连接才再提供（再次进入会再结束它们）
+const canEnterNormal = computed(() => cur.value.relation !== 'none_active' || cur.value.routeSummary.entryMode !== 'NORMAL' || buyerExitUnconfirmed.value);
 
 const ordersEnabled = computed(() => cur.value.ordersAllowed || cur.value.activationAvailable);
 /** 每个视图最多一个主操作。 */

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 // 已识别、未绑定的场景：关联已有环境（逐个确认，不按名称自动套用）、在此创建环境；
-// 有其他环境使用中时可以结束当前环境、进入普通模式。
+// 有其他环境使用中时可以结束当前环境、进入普通模式；上一次普通模式未能确认 Safari 已没有经买家出口的连接时显示警告，
+// 并可再次进入普通模式（§6.5：任何已识别场景都可发起）。
 import { ref } from 'vue';
 import { Icon } from '@sfe/easyquick';
 import { SITES, type BindableEnvironment } from '@sfe/contract';
@@ -8,6 +9,7 @@ import BaseDialog from '../ui/BaseDialog.vue';
 import StatusBadge from '../ui/StatusBadge.vue';
 import CreateForm from './CreateForm.vue';
 import type { PopupController } from './controller';
+import { WARNING_TEXT } from '../shared/text';
 
 const props = defineProps<{ controller: PopupController }>();
 const c = props.controller;
@@ -63,6 +65,25 @@ async function confirmBind() {
           <button type="button" class="btn btn-primary w-full" :disabled="!!s.busy" data-test="open-create" @click="creating = true">
             <Icon name="plus" size="md" />
             在此创建环境
+          </button>
+        </div>
+      </div>
+
+      <div v-if="s.current?.routeSummary.buyerExitConnectionsUnconfirmed === true" class="card" data-test="buyer-exit-unconfirmed">
+        <div class="card-body space-y-2 p-4">
+          <p class="flex items-start gap-2 text-sm text-warning" data-warning="buyer_exit_connections_unconfirmed">
+            <Icon name="exclamationTriangle" size="sm" class="mt-0.5" />
+            <span>{{ WARNING_TEXT.buyer_exit_connections_unconfirmed }}</span>
+          </p>
+          <button
+            v-if="s.current.relation === 'none_active'"
+            type="button"
+            class="btn btn-secondary btn-sm w-full"
+            :disabled="!!s.busy"
+            data-test="normal"
+            @click="c.enterNormal()"
+          >
+            进入普通模式
           </button>
         </div>
       </div>

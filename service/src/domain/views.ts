@@ -142,9 +142,14 @@ export function buildRouteView(route: RouteStateRecord, lastSafariProbe: ProbeRe
   };
 }
 
-/** 非当前环境的场景只拿到路由摘要（不含实测、选择、操作 id）。 */
+/** 非当前环境的场景只拿到路由摘要（不含实测、选择、操作 id，警告只有是否需要再次进入普通模式结束 Safari 连接）。 */
 export function buildRouteSummary(route: RouteStateRecord): RouteSummaryView {
-  return { routeEpoch: route.routeEpoch, entryMode: route.entryMode, phase: route.phase };
+  return {
+    routeEpoch: route.routeEpoch,
+    entryMode: route.entryMode,
+    phase: route.phase,
+    buyerExitConnectionsUnconfirmed: route.warnings.includes('buyer_exit_connections_unconfirmed'),
+  };
 }
 
 // ---------- Surge 状态 ----------

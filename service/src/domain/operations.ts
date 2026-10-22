@@ -63,6 +63,11 @@ export interface RoutePayload {
   cancelRequested: boolean;
   /** 预检推迟到选择之后（independent_node_preflight 未通过）。 */
   preflightDeferred: boolean;
+  /**
+   * 第 7 步在已确认的阻断下结束并重新列出确认了 Safari 的全部连接，含持久标记中被换掉的进程路径上可能经买家出口的连接
+   * （safari-route-marker.ts）：提交时据此清除 buyer_exit_connections_unconfirmed。缺省（升级前已在进行中的激活）不清除。
+   */
+  safariConnectionsEnded?: boolean;
 }
 
 export interface NormalPayload {

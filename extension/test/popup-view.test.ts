@@ -72,9 +72,20 @@ describe('popup states', () => {
   });
 
   it('unbound without another active environment does not offer normal mode', async () => {
-    const { wrapper } = await mountPopup(currentState({ environment: null, route: null, relation: 'none_active' }));
+    const { wrapper } = await mountPopup(currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false } }));
     expect(wrapper.find('[data-test="end-current"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="normal"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="buyer-exit-unconfirmed"]').exists()).toBe(false);
     expect(wrapper.text()).toContain('没有可关联的环境');
+  });
+
+  it('unbound, idle normal mode that could not confirm Safari left the buyer exit: shows the warning and offers 进入普通模式 again', async () => {
+    const state = currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true } });
+    const { wrapper, calls } = await mountPopup(state, { enterNormalMode: () => accepted('op_n') });
+    expect(wrapper.find('[data-test="buyer-exit-unconfirmed"]').text()).toContain(WARNING_TEXT.buyer_exit_connections_unconfirmed);
+    await wrapper.find('[data-test="normal"]').trigger('click');
+    await flushPromises();
+    expect(calls.find((m) => m.type === 'enterNormalMode')).toEqual({ type: 'enterNormalMode', request_id: 'req_1' });
   });
 });
 
@@ -227,10 +238,20 @@ describe('bound popup', () => {
   });
 
   it('only offers 进入普通模式 when there is something to undo', async () => {
-    const idle = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle' } }));
+    const idle = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false } }));
     expect(idle.wrapper.find('[data-test="normal"]').exists()).toBe(false);
-    const blocked = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 2, entryMode: 'BLOCKED', phase: 'failed' } }));
+    expect(idle.wrapper.find('[data-test="warnings"]').exists()).toBe(false);
+    const blocked = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 2, entryMode: 'BLOCKED', phase: 'failed', buyerExitConnectionsUnconfirmed: false } }));
     expect(blocked.wrapper.find('[data-test="normal"]').exists()).toBe(true);
+  });
+
+  it('idle normal mode that could not confirm Safari left the buyer exit: shows the warning and offers 进入普通模式 again', async () => {
+    const state = currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true } });
+    const { wrapper, calls } = await mountPopup(state, { enterNormalMode: () => accepted('op_n') });
+    expect(wrapper.find('[data-warning="buyer_exit_connections_unconfirmed"]').text()).toBe(WARNING_TEXT.buyer_exit_connections_unconfirmed);
+    await wrapper.find('[data-test="normal"]').trigger('click');
+    await flushPromises();
+    expect(calls.find((m) => m.type === 'enterNormalMode')).toEqual({ type: 'enterNormalMode', request_id: 'req_1' });
   });
 });
 

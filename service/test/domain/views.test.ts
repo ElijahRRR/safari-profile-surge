@@ -284,9 +284,12 @@ describe('publishStateFor', () => {
 describe('route views and control', () => {
   const r = route({ activeEnvironmentId: 'env_1', activeProxyRevision: 1, phase: 'active_verified', entryMode: 'ACTIVE', routeEpoch: 2, selectedNode: 'SFE-N-E0001-US01-v001' });
 
-  test('summary hides probe, selection and operation id', () => {
+  test('summary hides probe, selection, operation id and warnings other than the buyer-exit one', () => {
     const s = buildRouteSummary(r);
-    expect(Object.keys(s).sort()).toEqual(['entryMode', 'phase', 'routeEpoch']);
+    expect(Object.keys(s).sort()).toEqual(['buyerExitConnectionsUnconfirmed', 'entryMode', 'phase', 'routeEpoch']);
+    expect(s.buyerExitConnectionsUnconfirmed).toBe(false);
+    expect(buildRouteSummary({ ...r, warnings: ['probe_failed'] }).buyerExitConnectionsUnconfirmed).toBe(false);
+    expect(buildRouteSummary({ ...r, entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, warnings: ['buyer_exit_connections_unconfirmed'] }).buyerExitConnectionsUnconfirmed).toBe(true);
     const full = buildRouteView(r, probe());
     expect(full.lastSafariProbe!.exitIp).toBe('192.0.2.50');
     expect(full.selectedNode).toBe('SFE-N-E0001-US01-v001');

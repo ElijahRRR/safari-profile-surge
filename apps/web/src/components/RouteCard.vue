@@ -9,7 +9,7 @@ import KeyValueList from './KeyValueList.vue';
 import RouteWarnings from './RouteWarnings.vue';
 import { useConsole } from '../store/context';
 import { ENTRY_MODE_LABELS, PROBE_OUTCOME_LABELS, ROUTE_PHASE_LABELS, ROUTE_WARNING_TEXT, type StatusLabel } from '../lib/labels';
-import { cancelActionLabel, envLabel, isCancellableRouteOperation, probeDisplay } from '../lib/environments';
+import { cancelActionLabel, envLabel, isCancellableRouteOperation, normalModeOffered, probeDisplay } from '../lib/environments';
 import { formatDateTime, formatRevision } from '../lib/format';
 import { newRequestId } from '../lib/request-id';
 
@@ -21,7 +21,7 @@ const probe = computed(() => probeDisplay(route.value?.lastSafariProbe, store.st
 const routeOp = computed(() => store.operationById(route.value?.operationId));
 const cancellable = computed(() => (routeOp.value ? isCancellableRouteOperation(routeOp.value) : false));
 const windowsWarning = computed(() => (route.value?.warnings ?? []).some((w) => w === 'old_windows_kept_open' || w === 'managed_windows_on_original_rules'));
-const showNormal = computed(() => !!route.value && (route.value.entryMode !== 'NORMAL' || route.value.activeEnvironmentId !== null));
+const showNormal = computed(() => normalModeOffered(route.value));
 
 /** 入口是 ACTIVE 时最近 Safari 实测的问题；null 表示实测通过且未过期。 */
 const probeIssue = computed<string | null>(() => {

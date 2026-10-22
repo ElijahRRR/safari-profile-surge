@@ -144,7 +144,7 @@ describe('getCurrentState', () => {
     await bind(h, PROFILE_B, b);
     const other = ((await h.native(PROFILE_B, { type: 'getCurrentState' })) as { data: Record<string, unknown> }).data;
     expect(other.route).toBeNull();
-    expect(other.routeSummary).toEqual({ routeEpoch: 1, entryMode: 'ACTIVE', phase: 'active_verified' });
+    expect(other.routeSummary).toEqual({ routeEpoch: 1, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false });
     expect(other.relation).toBe('other_active');
     expect(other.ordersAllowed).toBe(false);
     expect(other.activationAvailable).toBe(true);
@@ -152,6 +152,30 @@ describe('getCurrentState', () => {
     expect(mine.relation).toBe('this_active');
     expect(mine.route).not.toBeNull();
     expect(mine.ordersAllowed).toBe(true);
+  });
+
+  test('after a normal mode that could not confirm ending Safari connections, every identified profile learns it from the route summary and can enter normal mode again', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const live = h.fake.simulateRequest({ processPath: '/Applications/Safari.app/Contents/MacOS/Safari', host: 'www.example.test', protocol: 'tcp', longLived: true });
+    expect(live.policyName).toBe('SFE-ROUTE');
+    h.fake.failNext('killRequest');
+    const n = await h.native(PROFILE_A, { type: 'enterNormalMode', request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: envId });
+    expect(n.ok).toBe(true);
+    await h.idle();
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, warnings: ['buyer_exit_connections_unconfirmed'] });
+    for (const profile of [PROFILE_A, PROFILE_C]) {
+      const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: Record<string, unknown> }).data;
+      expect(d.relation).toBe('none_active');
+      expect(d.route).toBeNull();
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true });
+    }
+    const again = await h.native(PROFILE_C, { type: 'enterNormalMode', request_id: rid() });
+    expect(again.ok).toBe(true);
+    await h.idle();
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
+    const d = ((await h.native(PROFILE_A, { type: 'getCurrentState' })) as { data: { routeSummary: { buyerExitConnectionsUnconfirmed: boolean } } }).data;
+    expect(d.routeSummary.buyerExitConnectionsUnconfirmed).toBe(false);
   });
 
   test('reportProfileState is only a hint and never changes routing', async () => {

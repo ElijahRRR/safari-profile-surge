@@ -72,6 +72,15 @@ export function isEnvironmentInUse(env: EnvironmentView, route: RouteStateView |
   return env.facets.route === 'active' || env.facets.route === 'activating' || env.facets.route === 'verifying' || env.facets.route === 'waiting_route';
 }
 
+/**
+ * 提供「进入普通模式」：入口不是普通模式、仍有活动环境，或上一次普通模式未能确认 Safari 已没有经买家出口的连接
+ * （buyer_exit_connections_unconfirmed：路由已是空闲的普通模式，再次进入普通模式会再结束 Safari 连接）。
+ */
+export function normalModeOffered(route: RouteStateView | null | undefined): boolean {
+  if (!route) return false;
+  return route.entryMode !== 'NORMAL' || route.activeEnvironmentId !== null || route.warnings.includes('buyer_exit_connections_unconfirmed');
+}
+
 export interface ProbeDisplay {
   exitIp: string | null;
   when: string;

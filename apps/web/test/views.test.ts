@@ -354,6 +354,23 @@ describe('header normal-mode entry', () => {
     m.unmount();
   });
 
+  it('is offered, with the route card button, after a normal mode that could not confirm Safari left the buyer exit (idle NORMAL with buyer_exit_connections_unconfirmed)', async () => {
+    const { ctx, calls } = testContext(
+      (c: Call) => (c.url === '/api/routing/normal' ? { status: 202, body: { operation_id: 'op_n', environment_id: null, revision: null, duplicate: false } } : NOT_FOUND),
+      snapshot({ route: route({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, warnings: ['buyer_exit_connections_unconfirmed'] }) }),
+    );
+    const Page = defineComponent({ render: () => [h(AppLayout), h(RouteCard), h(RouteActionHost)] });
+    const m = await mountWith(Page, ctx);
+    const card = document.body.querySelector('[data-test="route-card"]')!;
+    expect(card.textContent).toContain('未能确认 Safari 已没有经买家出口的连接');
+    expect(card.querySelector('.card-header')?.textContent).toContain('需要处理');
+    expect(byText('[data-test="route-card"] .card-footer button', '进入普通模式')).not.toBeNull();
+    click(document.body.querySelector('[data-test="header-normal-mode"]'));
+    await flush();
+    expect(calls.filter((c) => c.url === '/api/routing/normal').map((c) => c.body)).toEqual([{ request_id: expect.any(String) }]);
+    m.unmount();
+  });
+
   it('is hidden when Safari already follows the original rules', async () => {
     const { ctx } = testContext(() => NOT_FOUND, snapshot());
     const m = await mountWith(AppLayout, ctx);

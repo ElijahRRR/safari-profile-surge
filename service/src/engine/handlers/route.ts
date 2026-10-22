@@ -357,10 +357,17 @@ async function executeSwitch(engine: Engine, opId: string, ctrl: EntryController
     confirmed = 'BLOCKED';
     repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
     engine.updateOp(opId, { phase: 'SAFARI_BLOCKED' }, '已阻断 Safari 新请求（读回确认），暂停自动打开订单与填充', { route: true });
-    // 7. 结束 Safari 连接（只按已确认的进程路径）
+    // 7. 结束 Safari 连接：按已确认的进程路径，另按持久标记中被换掉的进程路径结束其中可能经买家出口的连接（之前一次普通
+    // 模式未能确认结束时它们仍可能在之前买家的出口上；按新的确认它们不再是配置的 Safari 进程，其余连接不碰）
     const cfg = engine.entryConfig();
     try {
-      killResults = await killSafariConnections(engine.surge, { processPaths: cfg.processPaths, verifyHost: cfg.verifyHost, now: () => engine.now(), bestEffort: false });
+      killResults = await killSafariConnections(engine.surge, {
+        processPaths: cfg.processPaths,
+        retiredProcessPaths: retiredSafariPaths(engine, cfg.processPaths),
+        verifyHost: cfg.verifyHost,
+        now: () => engine.now(),
+        bestEffort: false,
+      });
     } catch (err) {
       if (err instanceof SfeError && Array.isArray(err.details?.killResults)) killResults = err.details.killResults as KillResult[];
       throw err;
@@ -368,6 +375,8 @@ async function executeSwitch(engine: Engine, opId: string, ctrl: EntryController
       const cur = repos.operations.get(opId)!;
       repos.operations.update(opId, { result: { ...(cur.result ?? {}), killResults } });
     }
+    const killed = repos.operations.get(opId)!;
+    repos.operations.update(opId, { payload: { ...payloadOf(killed), route: { ...routePayload(killed), safariConnectionsEnded: true } } });
     engine.step(opId, `已结束 Safari 连接 ${killResults.filter((k) => k.ok).length} 条`);
     // 8. 选择目标节点并读回
     const p = routePayload(repos.operations.get(opId)!);
@@ -765,6 +774,9 @@ function commitActive(engine: Engine, opId: string, p: RoutePayload, evidence: R
   if (p.crossEnvironment && !firstRequestOk) warnings.push('old_session_unproven');
   if (p.oldSessionPolicy === 'keep_open_acknowledged') warnings.push('old_windows_kept_open');
   if (takeoverUnknown) warnings.push('takeover_unknown');
+  // 普通模式未能确认 Safari 已离开买家出口的警告：只有本次激活第 7 步在已确认的阻断下结束了全部 Safari 连接（含持久标记中
+  // 被换掉的进程路径上可能经买家出口的连接）时才清除；否则（升级前已在进行中的激活）之前买家出口上的连接仍可能存在
+  if (route.warnings.includes('buyer_exit_connections_unconfirmed') && p.safariConnectionsEnded !== true) warnings.push('buyer_exit_connections_unconfirmed');
   repos.tx(() => {
     repos.routeState.update({
       activeEnvironmentId: p.targetEnvironmentId,
@@ -838,7 +850,8 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
       failureError: failure,
       needsReverify: hasPrevious,
     };
-    // 普通模式未能确认 Safari 已离开买家出口的警告随持久标记保留（激活第 7 步只按当前进程路径结束连接）
+    // 普通模式未能确认 Safari 已离开买家出口的警告随持久标记保留：回滚不结束连接，第 7 步之后 Safari 可能已经经 SFE-ROUTE
+    // 建立连接（检测），第 7 步也可能没有完成；由下一次普通模式结束
     const keep: RouteWarning[] = before.warnings.filter(
       (w) => w === 'managed_windows_on_original_rules' || w === 'takeover_unknown' || w === 'buyer_exit_connections_unconfirmed',
     );

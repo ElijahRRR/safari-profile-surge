@@ -7,6 +7,7 @@ import AppSidebar from './AppSidebar.vue';
 import AppHeader from './AppHeader.vue';
 import DemoBanner from './DemoBanner.vue';
 import { useConsole } from '../store/context';
+import { normalModeOffered } from '../lib/environments';
 import { THEME_KEY } from '../store/theme';
 import type { NavItem } from '../router';
 
@@ -36,10 +37,7 @@ function toggleCollapse() {
 }
 
 const nav = computed(() => (route.meta.nav as NavItem | undefined) ?? null);
-const showNormalMode = computed(() => {
-  const r = store.route.value;
-  return r !== null && (r.entryMode !== 'NORMAL' || r.activeEnvironmentId !== null);
-});
+const showNormalMode = computed(() => normalModeOffered(store.route.value));
 
 async function refresh() {
   refreshing.value = true;

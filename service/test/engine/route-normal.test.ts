@@ -7,9 +7,9 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { ENTRY_RULESET_FILES, type ProtocolCoverage } from '@sfe/contract';
 import { processPathsDigest } from '../../src/engine/capabilities.js';
 import { capabilityUnverified } from '../../src/surge/primitives.js';
-import { FAKE_SAFARI_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
+import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
 import { entryRuleSetFileContent, tempRuleText } from '../../src/surge/generate.js';
-import { AGENT, PROFILE_A, WEB, activeEnv, anyContext, bind, createEnv, createHarness, rid, safariOutcome, type Harness } from './harness.js';
+import { AGENT, ALL_CAPS, PROFILE_A, PROFILE_B, WEB, activeEnv, anyContext, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
 
@@ -63,6 +63,25 @@ async function duplicateAfterPathChange(): Promise<{ env: string; paths: string[
   h.repos.managedObjects.upsertIntent({ kind: 'temp_rule', identity: newBlock, contentDigest: null, state: 'pending_add', createdByOperation: null });
   await h.fake.addTempRule(newBlock);
   return { env, paths, oldRules, oldUdp: tempRuleText('udp', oldCfg), oldBlock: tempRuleText('block', oldCfg), newBlock };
+}
+
+/** 提议并确认新的 Safari 进程路径（合成的进程归属记录）。 */
+async function confirmPaths(paths: string[]): Promise<void> {
+  const { proposal_id } = await h.app.proposeCapability(
+    {
+      request_id: rid('prop'),
+      key: 'safari_process_attribution',
+      proposed_status: 'supported',
+      context: { ...anyContext(), surgeVersion: '6.10.0', surgeBuild: '12500', processPathsDigest: processPathsDigest(paths) },
+      summary: '进程归属（合成）',
+      evidence_digest: 'sha256:0123456789abcdef',
+      protocol_coverage: FULL_COVERAGE,
+      safari_process_paths: paths,
+    },
+    AGENT,
+  );
+  await h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id }, WEB);
+  expect(h.repos.settings.get('safariProcessPaths')).toEqual(paths);
 }
 
 type CleanupRecord = { action: string; kind: string; rule: string };
@@ -378,21 +397,7 @@ describe('normal mode is always available (§5.2)', () => {
     expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(true);
     // 新的进程归属提议（合成路径）只列出 Safari Technology Preview：入口已是普通模式，确认成功
     const stp = '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview';
-    const { proposal_id } = await h.app.proposeCapability(
-      {
-        request_id: rid('prop'),
-        key: 'safari_process_attribution',
-        proposed_status: 'supported',
-        context: { ...anyContext(), surgeVersion: '6.10.0', surgeBuild: '12500', processPathsDigest: processPathsDigest([stp]) },
-        summary: '进程归属（合成）',
-        evidence_digest: 'sha256:0123456789abcdef',
-        protocol_coverage: FULL_COVERAGE,
-        safari_process_paths: [stp],
-      },
-      AGENT,
-    );
-    await h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id }, WEB);
-    expect(h.repos.settings.get('safariProcessPaths')).toEqual([stp]);
+    await confirmPaths([stp]);
     // 之前路径上按原规则发出的连接：不再是配置的 Safari 进程，也不经买家出口——不结束
     const direct = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
     expect(direct.rule).toBe('FINAL,DIRECT');
@@ -409,6 +414,60 @@ describe('normal mode is always available (§5.2)', () => {
     expect(h.repos.operations.get(await enterNormal(null))!.phase).toBe('NORMAL_RESTORED');
     expect(h.fake.calls.killRequest ?? 0).toBe(kills + 1);
     expect((await h.fake.listActiveRequests()).some((r) => r.id === direct.id)).toBe(true);
+  });
+
+  test('activation after a process-path change while the buyer-exit warning is kept: step 7 also ends the replaced path\'s connection on the earlier buyer exit (not its connections on the original rules, not Chrome) before the route counts as in use (ruleset_resource)', async () => {
+    h = await createHarness();
+    const stp = '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview';
+    h.repos.settings.set('safariProcessPaths', [FAKE_SAFARI_PATH, stp]);
+    const { envId: envA } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeA = h.repos.routeState.get().selectedNode;
+    const live = h.fake.simulateRequest({ processPath: stp, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    expect(live.policyName).toBe('SFE-ROUTE');
+    expect(live.leafPolicyName).toBe(nodeA);
+    h.fake.failNext('killRequest');
+    expect(h.repos.operations.get(await enterNormal(envA))!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get().warnings).toContain('buyer_exit_connections_unconfirmed');
+    // 新的进程归属提议（合成路径）只列出 Safari：入口已是普通模式，确认成功；P0 重新确认依赖的能力
+    await confirmPaths([FAKE_SAFARI_PATH]);
+    h.grant(ALL_CAPS);
+    // 被换掉的路径上按原规则发出的连接与 Chrome 的连接：不经买家出口，不结束
+    const direct = h.fake.simulateRequest({ processPath: stp, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    expect(direct.rule).toBe('FINAL,DIRECT');
+    const chrome = h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    const { envId: envB } = await activeEnv(h, 'US-Buyer-B', '203.0.113.20', PROFILE_B);
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: envB });
+    expect(route.selectedNode).not.toBe(nodeA);
+    const active = await h.fake.listActiveRequests();
+    expect(active.some((r) => r.id === live.id)).toBe(false);
+    expect(active.some((r) => r.id === direct.id)).toBe(true);
+    expect(active.some((r) => r.id === chrome.id)).toBe(true);
+    // 第 7 步确认结束了可能经之前买家出口的连接：警告随之清除，不是被提交悄悄丢掉
+    expect(route.warnings).not.toContain('buyer_exit_connections_unconfirmed');
+  });
+
+  test('an activation that did not record ending Safari connections at step 7 (in flight from before the upgrade) keeps the buyer-exit warning at commit (ruleset_resource)', async () => {
+    h = await createHarness();
+    const { envId: envA } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    h.fake.failNext('killRequest');
+    expect(h.repos.operations.get(await enterNormal(envA))!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get().warnings).toContain('buyer_exit_connections_unconfirmed');
+    const envB = (await createEnv(h, 'US-Buyer-B', '203.0.113.20')).environment_id!;
+    await bind(h, PROFILE_B, envB);
+    const act = await h.app.activate(envB, { request_id: rid('act') }, WEB);
+    await h.idle();
+    const op = h.repos.operations.get(act.operation_id)!;
+    expect(op.phase).toBe('VERIFY_ONLY');
+    const payload = op.payload as { route: Record<string, unknown> };
+    expect(payload.route.safariConnectionsEnded).toBe(true);
+    const { safariConnectionsEnded: _ended, ...legacy } = payload.route;
+    h.repos.operations.update(op.id, { payload: { ...payload, route: legacy } });
+    expect((await verify(h, PROFILE_B, act.operation_id)).ok).toBe(true);
+    expect(h.repos.operations.get(act.operation_id)!.phase).toBe('ACTIVE_VERIFIED');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', activeEnvironmentId: envB });
+    expect(h.repos.routeState.get().warnings).toContain('buyer_exit_connections_unconfirmed');
   });
 
   test('entry already NORMAL: Safari reconnecting on the original rules right after the kill is not reported as a kill failure (temp_rule)', async () => {
