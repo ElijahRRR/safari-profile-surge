@@ -294,6 +294,30 @@ describe('re-read proof on a CLI-only install survives a failed pre-write read a
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
   });
 
+  test('a proven re-read whose readback is not yet covered keeps the write baseline: once coverage is recorded the next publish deploys the revision', async () => {
+    h = await createHarness({ readbackCovers: false, surge: cliOnly });
+    const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10');
+    const envId = a.environment_id!;
+    // 组成员从 [REJECT] 变为期望清单（重新读取已证明），但没有读回覆盖记录：部署读回不完整，版本未部署
+    expect(h.repos.operations.get(a.operation_id)!.result).toMatchObject({ targets: [expect.objectContaining({ outcome: 'partial' })] });
+    expect(steps(h, a.operation_id).some((m) => m.includes('无法证明 Surge 已重新读取节点资源'))).toBe(false);
+    expect(h.repos.deployments.latest()!.state).toBe('published');
+    expect(h.repos.environments.get(envId)!.deployedProxyRevision).toBeNull();
+    // 写入对照保留到部署被接受：之后写入前读到的成员都已是期望清单
+    expect(h.app.engine.kv.get('resource:writeBaseline')).toMatchObject({ membersBefore: ['REJECT'] });
+    h.grant(['policy_path_reread', 'targeted_resource_refresh', 'external_node_underlying_proxy'], 'readback-covers: server, port, underlying-proxy');
+    const pub = await h.app.publishPending({ request_id: rid('pub') }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(pub.operation_id)!.phase).toBe('READY_FOR_NEXT_OPEN');
+    expect(steps(h, pub.operation_id).some((m) => m.includes('沿用第一次写入这组节点之前读到的成员'))).toBe(true);
+    expect(steps(h, pub.operation_id).some((m) => m.includes('无法证明 Surge 已重新读取节点资源'))).toBe(false);
+    expect(h.repos.environments.get(envId)!.deployedProxyRevision).toBe(1);
+    expect(h.repos.deployments.latest()!.state).toBe('verified');
+    // 部署已被接受：对照用完
+    expect(h.app.engine.kv.get('resource:writeBaseline')).toBeNull();
+    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+  });
+
   test('remerge drops the write baseline: a restored file with the same node names as tampered content Surge loaded proves nothing', async () => {
     h = await createHarness({ readbackCovers: true, surge: cliOnly });
     const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;

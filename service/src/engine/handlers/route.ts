@@ -920,12 +920,18 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
           repos.operations.update(op.id, { result: { ...(cur.result ?? {}), changedEntryFiles: changedFiles } });
           engine.step(op.id, `本应用的入口文件已被外部修改（${changedFiles.join('、')}）：撤销入口时按读到的内容比较后改写`);
         }
-        const { precedenceIssues, runtimeConfirmed: blockConfirmed, alreadyNormal } = await blockForNormal(ctrl, undoOptions(engine, op.id));
-        if (alreadyNormal) {
+        const { precedenceIssues, runtimeConfirmed: blockConfirmed, alreadyNormal, blockKeptOff } = await blockForNormal(ctrl, undoOptions(engine, op.id));
+        if (blockKeptOff) {
+          // 上一次普通模式在 NORMAL 一段写入、超时后保留的 block 关闭尚未加载（EntryReadback.keptTowardNormal）：verify/active 已由
+          // 见证确认关闭，Safari 新请求不会经 SFE-ROUTE；Surge 已加载的是阻断或已是普通模式，不记录为 BLOCKED，也不重新打开 block
+          // （重新收紧会让比时限慢的监视在每次重试之间来回写入）。照常结束 Safari 的旧连接，再撤销入口。
+          engine.step(op.id, '中间阻断不再写入：verify/active 已确认关闭（Safari 新请求不会经 SFE-ROUTE），上一次保留的 block 关闭尚未确认加载（Surge 已加载的是阻断或已是普通模式），不重新打开 block；仍结束 Safari 的旧连接');
+          await killForNormal(engine, op.id);
+        } else if (alreadyNormal) {
           // 本应用入口已不在 Surge 中：不需要阻断、不写入。但“没有本应用规则”不等于 Surge 重启过：临时规则也可能在 Surge
           // 运行中被移除（`rule temp remove`、`rule temp flush`——随包技能把后者列为常规操作，别的工具或代理可能执行），
           // 之前经 SFE-ROUTE 建立的 Safari 长连接仍在买家出口上。照常结束 Safari 连接（门槛不满足时尽力而为）；新连接已按原规则发出。
-          engine.step(op.id, '入口已是普通模式（Surge 中没有本应用的入口规则，例如重启时已丢弃或已被移除）：不需要阻断，未写入；仍结束 Safari 的旧连接');
+          engine.step(op.id, alreadyNormalStep(ctrl.strategy, blockConfirmed));
           await killForNormal(engine, op.id);
         } else {
           confirmed = 'BLOCKED';
@@ -950,6 +956,13 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
         normalUnconfirmed = normal.runtimeConfirmed === false;
         if (normalUnconfirmed) engine.step(op.id, `撤销本应用入口：${UNCONFIRMED_ENTRY_TEXT}（路由状态带“入口规则未能读回确认”警告）`);
         confirmed = 'NORMAL';
+      } else if (route.entryMode !== 'NORMAL' || route.activeEnvironmentId !== null) {
+        // 入口读回已是普通模式，但路由记录仍是托管状态：之前的一次切换（失败的普通模式、激活或回滚，或其间服务崩溃）已按事实
+        // 确认归属（temp_rule 把消失的本应用规则标为已移除）而没有结束连接，控制器已看不到本应用记录，不能靠它判断。之前经
+        // SFE-ROUTE 建立的 Safari 长连接可能仍在买家出口上：照常结束（门槛不满足时尽力而为）。路由记录已是普通模式、没有使用中
+        // 的环境时不结束——Safari 的连接已按原规则发出。
+        engine.step(op.id, alreadyNormalStep(ctrl.strategy, readback.runtimeConfirmed !== false));
+        await killForNormal(engine, op.id);
       }
     } else if (route.entryMode !== 'NORMAL') {
       throw new SfeError('CAPABILITY_UNVERIFIED', '进入普通模式失败：入口策略或 Safari 进程路径不可用，无法撤销入口');
@@ -1002,20 +1015,37 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
 async function blockForNormal(
   ctrl: EntryController,
   undo: EntryTransitionOptions,
-): Promise<{ precedenceIssues: EntryReadback['precedenceIssues'] | null; runtimeConfirmed: boolean; alreadyNormal: boolean }> {
+): Promise<{ precedenceIssues: EntryReadback['precedenceIssues'] | null; runtimeConfirmed: boolean; alreadyNormal: boolean; blockKeptOff: boolean }> {
   try {
     const rb = await ctrl.transition('BLOCKED', undefined, { ...undo, towardNormal: true });
     // 起点已是 NORMAL 时控制器不写入、返回 NORMAL（EntryTransitionOptions.towardNormal）。阻断已经成立而不写入时（ruleset_resource
-    // 上一次普通模式已关闭 udp），有规则排在入口之前随读回返回，与下面的 PRECEDENCE_VIOLATION 一样继续撤销入口。
-    const issues = rb.mode === 'BLOCKED' && hasBlockingIssue(rb.precedenceIssues) ? rb.precedenceIssues : null;
-    return { precedenceIssues: issues, runtimeConfirmed: rb.runtimeConfirmed !== false, alreadyNormal: rb.mode === 'NORMAL' };
+    // 上一次普通模式已关闭 udp），有规则排在入口之前随读回返回，与下面的 PRECEDENCE_VIOLATION 一样继续撤销入口。上一次 NORMAL
+    // 一段保留的 block 关闭尚未加载时（blockKeptOff）这一段同样已满足，但不能宣称已阻断。
+    const blockKeptOff = rb.mode === 'BLOCKED' && (rb.keptTowardNormal ?? []).includes('block');
+    const issues = rb.mode === 'BLOCKED' && !blockKeptOff && hasBlockingIssue(rb.precedenceIssues) ? rb.precedenceIssues : null;
+    return { precedenceIssues: issues, runtimeConfirmed: rb.runtimeConfirmed !== false, alreadyNormal: rb.mode === 'NORMAL', blockKeptOff };
   } catch (err) {
     if (err instanceof SfeError && err.code === 'PRECEDENCE_VIOLATION' && confirmedModeFrom(err, 'UNKNOWN') === 'BLOCKED') {
       const issues = Array.isArray(err.details?.precedenceIssues) ? (err.details.precedenceIssues as EntryReadback['precedenceIssues']) : [];
-      return { precedenceIssues: issues, runtimeConfirmed: true, alreadyNormal: false };
+      return { precedenceIssues: issues, runtimeConfirmed: true, alreadyNormal: false, blockKeptOff: false };
     }
     throw err;
   }
+}
+
+/**
+ * 入口已是普通模式（不需要阻断、不写入）时的步骤说明，按入口策略与读回证据写明依据：temp_rule 是 Surge 中没有本应用的
+ * 临时规则；ruleset_resource 的四条 RULE-SET 仍在有效规则中，只是入口文件已全部为占位规则——读回确认 Surge 已加载，
+ * 或 rule match 不可用时只按文件内容判断、未经运行时确认（runtimeConfirmed 为 false）。
+ */
+function alreadyNormalStep(strategy: EntryController['strategy'], runtimeConfirmed: boolean): string {
+  const cause =
+    strategy === 'temp_rule'
+      ? 'Surge 中没有本应用的入口规则，例如重启时已丢弃或已被移除'
+      : runtimeConfirmed
+        ? '入口 RULE-SET 仍在有效规则中，本应用入口规则集文件已全部为占位规则，见证与运行时探测读回确认 Surge 已加载'
+        : `入口 RULE-SET 仍在有效规则中，本应用入口规则集文件已全部为占位规则，只按文件内容判断：${UNCONFIRMED_ENTRY_TEXT}`;
+  return `入口已是普通模式（${cause}）：不需要阻断，未写入；仍结束 Safari 的旧连接`;
 }
 
 /**

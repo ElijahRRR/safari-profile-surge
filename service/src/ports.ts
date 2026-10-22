@@ -278,6 +278,13 @@ export interface EntryReadback {
    * 只出现在目标为 BLOCKED/NORMAL 的撤销切换结果中，从不用于 VERIFY_ONLY/ACTIVE。缺省（undefined）为已确认。
    */
   runtimeConfirmed?: boolean;
+  /**
+   * 普通模式的中间阻断（EntryTransitionOptions.towardNormal）不写入而返回 BLOCKED 时：上一次普通模式在 NORMAL 一段写入、
+   * 超时后保留的关闭（ruleset_resource 的 udp/block，走向 NORMAL）尚未由见证确认加载的位。不重新收紧，由 NORMAL 一段再写入。
+   * 含 block 时 Surge 已加载的是写前的阻断或已是这次的关闭：verify/active 已由见证确认关闭，Safari 新请求不会经 SFE-ROUTE，
+   * 但不能宣称已阻断——mode 为 BLOCKED 只表示中间阻断这一段已满足。
+   */
+  keptTowardNormal?: Array<'udp' | 'block'>;
 }
 
 /** 撤销清理的一步：temp_rule 撤销入口时逐条加入或移除的一整条本应用临时规则（不是单个位的变更，§5.5）。 */
@@ -299,7 +306,8 @@ export interface EntryTransitionOptions {
    * rule match 不可用时文件已全部为占位规则）时不写入，直接返回 mode 为 NORMAL 的读回：没有需要阻断的本应用入口，调用方
    * 跳过阻断，但仍结束 Safari 的旧连接（没有本应用规则不能证明 Surge 重启过、旧连接已不在买家出口上）。
    * ruleset_resource 的阻断已经成立而 udp 已关（上一次普通模式失败在 NORMAL 一段）时同样不写入，返回 mode 为 BLOCKED 的读回
-   * （bits 如实报告，有规则排在入口之前时随附 precedenceIssues）。
+   * （bits 如实报告，有规则排在入口之前时随附 precedenceIssues）；NORMAL 一段超时保留的 udp/block 关闭尚未加载时也是如此
+   * （EntryReadback.keptTowardNormal），否则比时限慢的文件监视会让每次重试在两段之间来回写入。
    */
   towardNormal?: boolean;
   /** 撤销清理的每一步运行时读回并确认归属之后调用（写入操作步骤与结果）；只有 undo 时可能调用。 */

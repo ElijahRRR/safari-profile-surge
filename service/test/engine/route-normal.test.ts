@@ -216,15 +216,56 @@ describe('normal mode is always available (§5.2)', () => {
     expectOriginalRules();
   });
 
+  test('…and an earlier attempt already normalized ownership without ending connections: the retry whose first readback is NORMAL still ends the live Safari connection (temp_rule)', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const live = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    expect(live.policyName).toBe('SFE-ROUTE');
+    for (const rule of h.fake.tempRules) await h.fake.removeTempRule(rule);
+    // 第一次尝试：中间阻断按事实确认归属（全部本应用记录标为已移除）之后，下一次读取有效规则失败一次（服务在此崩溃同理）
+    const listRules = h.fake.listRules.bind(h.fake);
+    let armed = true;
+    h.fake.listRules = async () => {
+      if (armed && h.repos.managedObjects.listByKind('temp_rule').every((r) => r.state === 'removed')) {
+        armed = false;
+        throw new Error('模拟失败：读取有效规则');
+      }
+      return listRules();
+    };
+    const kills = h.fake.calls.killRequest ?? 0;
+    const first = await enterNormal(envId);
+    expect(h.repos.operations.get(first)!.phase).toBe('FAILED');
+    expect(h.repos.routeState.get()).toMatchObject({ activeEnvironmentId: envId });
+    expect(h.repos.routeState.get().entryMode).not.toBe('NORMAL');
+    expect(h.fake.calls.killRequest ?? 0).toBe(kills);
+    // 重试：控制器已看不到本应用记录，第一次读回就是 NORMAL；路由记录仍是托管状态，照常结束旧连接
+    const opId = await enterNormal(envId);
+    const op = h.repos.operations.get(opId)!;
+    expect(op.phase).toBe('NORMAL_RESTORED');
+    expect(h.fake.calls.killRequest ?? 0).toBe(kills + 1);
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
+    expect((op.result as { killResults: Array<{ surgeRequestId: string; ok: boolean }> }).killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: true })]);
+    expect(h.repos.operations.listSteps(opId).some((st) => st.message.includes('仍结束 Safari 的旧连接'))).toBe(true);
+    expectOriginalRules();
+    // 已在普通模式（空闲、没有使用中的环境）时再次进入普通模式：不结束按原规则发出的 Safari 连接
+    const direct = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    expect(direct.policyName).not.toBe('SFE-ROUTE');
+    const again = await enterNormal(null);
+    expect(h.repos.operations.get(again)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.fake.calls.killRequest ?? 0).toBe(kills + 1);
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === direct.id)).toBe(true);
+  });
+
   test('a watcher slower than the entry wait for the whole normal mode (ruleset_resource): retries keep what was written and normal mode finishes', async () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
     // 假 Surge 的监视延迟（假时钟 60 秒）一直高于入口等待上限（40 毫秒）：每一步都超时；两次尝试之间监视赶上
     h.fake.localWatchLatencyMs = 60_000;
     const phases: string[] = [];
+    let last = '';
     for (let i = 0; i < 8; i++) {
-      const opId = await enterNormal(envId);
-      phases.push(h.repos.operations.get(opId)!.phase);
+      last = await enterNormal(envId);
+      phases.push(h.repos.operations.get(last)!.phase);
       if (phases.at(-1) === 'NORMAL_RESTORED') break;
       // 失败时 Safari 不会比已确认的状态更宽松，也从不被当作 NORMAL
       expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', activeEnvironmentId: envId });
@@ -233,6 +274,43 @@ describe('normal mode is always available (§5.2)', () => {
     }
     // ACTIVE → BLOCKED（block+、active-，收紧，超时保留）→ NORMAL（udp-、block-，撤销中放宽，超时同样保留）→ 按见证确认
     expect(phases).toEqual(['FAILED', 'FAILED', 'FAILED', 'FAILED', 'NORMAL_RESTORED']);
+    // 完成的那一次：上一次保留的 block- 已由见证确认加载，入口已是普通模式。四条 RULE-SET 仍在有效规则中，步骤按 ruleset_resource
+    // 的事实写明（入口文件已全部为占位规则），不写 temp_rule 的“Surge 中没有本应用的入口规则”
+    expect((await h.fake.listRules()).filter((r) => /^RULE-SET,sfe-entry-/.test(r.text))).toHaveLength(4);
+    const already = h.repos.operations.listSteps(last).map((st) => st.message).filter((m) => m.startsWith('入口已是普通模式'));
+    expect(already).toEqual([expect.stringContaining('入口规则集文件已全部为占位规则，见证与运行时探测读回确认 Surge 已加载')]);
+    expect(already[0]).not.toContain('Surge 中没有本应用的入口规则');
+    expectOriginalRules();
+    expect(safariOutcome(h, 'www.example.test', 'udp').rule).toBe('FINAL,DIRECT');
+    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+  });
+
+  test('…retried every 30 s while the watcher needs 60 s (ruleset_resource): no retry re-tightens a kept udp-/block-, normal mode finishes and each failure says to wait for the watcher', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.fake.localWatchLatencyMs = 60_000;
+    const ops: string[] = [];
+    for (let i = 0; i < 14; i++) {
+      ops.push(await enterNormal(envId));
+      const op = h.repos.operations.get(ops.at(-1)!)!;
+      if (op.phase === 'NORMAL_RESTORED') break;
+      expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', activeEnvironmentId: envId });
+      expect(h.repos.routeState.get().entryMode).not.toBe('NORMAL');
+      expect(op.error?.message).toContain('请等 Surge 的文件监视加载之后再重试');
+      h.clock.advance(30_000);
+    }
+    const failures = ops.map((id) => h.repos.operations.get(id)!).filter((o) => o.phase === 'FAILED');
+    expect(ops.map((id) => h.repos.operations.get(id)!.phase)).toEqual([...failures.map(() => 'FAILED'), 'NORMAL_RESTORED']);
+    // 进入 NORMAL 一段之后（第一次保留 udp-）不再有收紧的一步：不在两段之间来回写入
+    const details = failures.map((o) => o.error!.details as { failedStep: { bit: string; value: boolean }; keptTowardTarget?: boolean; keptStricter?: boolean });
+    const firstToward = details.findIndex((d) => d.keptTowardTarget === true);
+    expect(firstToward).toBeGreaterThan(0);
+    expect(details.slice(firstToward).every((d) => d.keptTowardTarget === true && d.failedStep.value === false)).toBe(true);
+    expect(failures.length).toBeLessThanOrEqual(8);
+    // block- 尚未加载的那次重试不宣称已阻断
+    const heldOff = failures.filter((o) => h.repos.operations.listSteps(o.id).some((st) => st.message.includes('上一次保留的 block 关闭尚未确认加载')));
+    expect(heldOff.length).toBeGreaterThan(0);
+    for (const o of heldOff) expect(h.repos.operations.listSteps(o.id).some((st) => st.message.startsWith('已阻断 Safari 新请求'))).toBe(false);
     expectOriginalRules();
     expect(safariOutcome(h, 'www.example.test', 'udp').rule).toBe('FINAL,DIRECT');
     expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);

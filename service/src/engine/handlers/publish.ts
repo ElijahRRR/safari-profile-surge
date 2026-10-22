@@ -90,7 +90,8 @@ const RESOURCE_REFRESH_KEY = 'resource:needsRefresh';
  * 期望清单；同一组节点行再次发布、文件中已是这一组节点行（基线检查保证文件是本应用写入的）时，沿用最初的对照，而不是
  * 这一次写入前读到的成员——否则那次发布在等待中服务重启（recoverPublish 只确认文件）、或读回不完整之后，Surge 已加载了
  * 新节点，之后每次写入前读到的成员都已是期望清单，再也证明不了重新读取，新版本永远停在 partial。写入其他节点行时更新，
- * 有了证据（refreshProven）时清除；重新合并清除（requireResourceRefresh）。
+ * 部署被接受（有证据且读回覆盖未核对字段，acceptable）时清除——只有证据而读回不完整时保留，补上读回覆盖记录之后的发布
+ * 仍能沿用它；重新合并清除（requireResourceRefresh）。
  */
 const RESOURCE_WRITE_BASELINE_KEY = 'resource:writeBaseline';
 
@@ -1045,11 +1046,11 @@ async function settle(engine: Engine, batch: Batch, s: SettleInput | null): Prom
       retireStaleRevisions(engine, manifestKeys);
     });
     confirmResource(repos, engine.kv, s.plan.newDigest);
-    // 已写入、有 Surge 重新读取的正面证据且读回一致：重新合并留下的读回要求已满足、写入对照用完；否则保留到下一次发布
-    if (s.refreshProven) {
-      engine.kv.delete(RESOURCE_REFRESH_KEY);
-      engine.kv.delete(RESOURCE_WRITE_BASELINE_KEY);
-    }
+    // 已写入、有 Surge 重新读取的正面证据且读回一致：重新合并留下的读回要求已满足；否则保留到下一次发布
+    if (s.refreshProven) engine.kv.delete(RESOURCE_REFRESH_KEY);
+    // 写入对照只在部署被接受时用完：有了证据而读回不完整（例如 CLI 安装还没有读回覆盖记录）时保留——之后 Surge 已加载
+    // 这组节点，写入前读到的成员都已是期望清单，补上记录后的发布只能沿用最初的对照来证明重新读取
+    if (s.acceptable) engine.kv.delete(RESOURCE_WRITE_BASELINE_KEY);
     if (s.plan.removed.length > 0) {
       for (const op of batch.ops) engine.step(op.id, `已移除不再使用的旧节点 ${s.plan.removed.length} 个`, false);
     }

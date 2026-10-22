@@ -127,6 +127,8 @@ interface RulesetState {
   judgement: ProbeJudgement | null;
   /** rule match 在当前 Surge 上不可用（原语未映射、Unknown command）：见证与探测都读不到（isRuleMatchUnavailable）。 */
   ruleMatchUnavailable: boolean;
+  /** 未确认的意图（pending_<位>）中，文件已是写入后内容（摘要等于意图的摘要，不是写前内容）的位。 */
+  intentWritten: EntryBit[];
 }
 
 function sameList(a: readonly string[], b: readonly string[]): boolean {
@@ -269,6 +271,7 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
   async function load(): Promise<RulesetState> {
     const cfg = deps.config();
     const anomalies: string[] = [];
+    const intentWritten: EntryBit[] = [];
     const fileStates = {} as Record<EntryBit, FileState>;
     for (const bit of ENTRY_BITS_IN_ORDER) {
       const name = ENTRY_RULESET_FILES[bit];
@@ -291,7 +294,10 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       else if (rec.state === 'pending_add') {
         // 未确认的意图：文件只能是写前或写后内容之一，否则视为外部修改。
         if (digest !== rec.digest && (rec.previousDigest == null || digest !== rec.previousDigest)) anomalies.push(`file_changed_${bit}`);
-        else anomalies.push(`pending_${bit}`);
+        else {
+          anomalies.push(`pending_${bit}`);
+          if (digest !== null && digest === rec.digest) intentWritten.push(bit);
+        }
       } else if (rec.digest === null || rec.digest !== digest) anomalies.push(`file_changed_${bit}`);
       fileStates[bit] = { bit, name, path: resolve(dir, name), value, digest, witness, bodies };
     }
@@ -340,7 +346,20 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       }),
     ) as Record<EntryBit, boolean | null>;
     for (const bit of ENTRY_BITS_IN_ORDER) if (loaded[bit] === 'stale') anomalies.push(`not_loaded_${bit}`);
-    return { cfg, files: fileStates, resources, rules, issues, bits, anomalies, loaded, known, judgement, ruleMatchUnavailable: judgement?.ruleMatchUnavailable === true };
+    return {
+      cfg,
+      files: fileStates,
+      resources,
+      rules,
+      issues,
+      bits,
+      anomalies,
+      loaded,
+      known,
+      judgement,
+      ruleMatchUnavailable: judgement?.ruleMatchUnavailable === true,
+      intentWritten,
+    };
   }
 
   /** 运行时已确认的模式（不看文件归属与资源异常）：每一位已加载内容已知、探测一致；否则为 null。 */
@@ -411,21 +430,44 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
   }
 
   /**
-   * 普通模式的中间阻断已经成立、而且比 BLOCKED 更接近 NORMAL：见证与探测确认 block 开、verify/active 关、udp 已关，没有异常。
-   * 只在上一次普通模式的 NORMAL 一段写入 udp 关闭（放宽，撤销入口中超时也保留，见 runStep）之后失败时出现。Safari 的全部
-   * 流量（含 UDP）仍被 block 拒绝，与 BLOCKED 效果相同；照常规划会重新打开 udp，比时限慢的监视就会在每次普通模式中来回
-   * 写入 udp，普通模式永远无法完成。退路（rule match 不可用）每步都等满上限后确认、不会超时，不需要这一判断。
+   * 上一次普通模式在 NORMAL 一段写入、超时后保留的关闭（udp/block，撤销入口中放宽的一步，见 runStep 的 keptTowardTarget）：
+   * 文件已是这次写入的关闭内容（意图未确认、摘要等于意图的摘要），Surge 已加载的还不是这一版。
    */
-  function blockedOnWayToNormal(s: RulesetState): boolean {
-    return s.anomalies.length === 0 && s.judgement?.ok === true && s.known.block === true && s.known.verify === false && s.known.active === false && s.known.udp === false;
+  function keptTowardNormal(s: RulesetState, bit: 'udp' | 'block'): boolean {
+    return s.files[bit].value === false && s.intentWritten.includes(bit) && s.loaded[bit] === 'stale';
   }
 
-  /** blockedOnWayToNormal 的读回：效果为 BLOCKED（bits 如实报告）；有规则排在入口之前时随附，普通模式照常继续撤销入口。 */
-  function blockedOnWayToNormalReadback(s: RulesetState): EntryReadback {
+  /**
+   * 普通模式的中间阻断已经满足、而且比 BLOCKED 更接近 NORMAL：探测一致，见证确认 verify/active 关（Safari 新请求不会经
+   * SFE-ROUTE），udp 已关、block 开；或者其中一位是上一次 NORMAL 一段保留的关闭、尚未加载（keptTowardNormal：udp 关闭时
+   * block 已确认开着，Safari 的全部流量仍被拒绝；block 关闭只在 udp 已确认关闭之后写入，已加载的是写前的阻断或已是这次的
+   * 关闭）。异常只能是这些保留写入的 pending_/not_loaded_。照常规划会把未加载的位按更宽松的一侧重新收紧（udp 开、block 开），
+   * 比时限慢的监视就会在每次普通模式中、或在相隔短于监视延迟的重试之间来回写入，普通模式永远无法完成。返回保留写入的位；
+   * 不满足时为 null。退路（rule match 不可用）每步都等满上限后确认、不会超时，不需要这一判断。
+   */
+  function blockedOnWayToNormal(s: RulesetState): Array<'udp' | 'block'> | null {
+    if (s.judgement?.ok !== true || s.known.verify !== false || s.known.active !== false) return null;
+    const kept = (['udp', 'block'] as const).filter((b) => keptTowardNormal(s, b));
+    const udpOff = s.known.udp === false || kept.includes('udp');
+    const blockOk = s.known.block === true || (kept.includes('block') && s.known.udp === false);
+    const allowed = kept.flatMap((b) => [`pending_${b}`, `not_loaded_${b}`]);
+    return udpOff && blockOk && s.anomalies.every((a) => allowed.includes(a)) ? kept : null;
+  }
+
+  /**
+   * blockedOnWayToNormal 的读回：中间阻断这一段已满足（bits 如实报告文件内容，keptTowardNormal 列出尚未加载的保留写入）；
+   * 有规则排在入口之前时随附，普通模式照常继续撤销入口。
+   */
+  function blockedOnWayToNormalReadback(s: RulesetState, kept: Array<'udp' | 'block'>): EntryReadback {
     const base = readbackOf(s);
-    const evidence = [...base.evidence, '普通模式的中间阻断已成立：block 已开、verify/active 已关，udp 已按普通模式关闭（Safari 全部流量仍被 block 拒绝），未写入'];
+    const note = kept.includes('block')
+      ? '普通模式的中间阻断不再写入：verify/active 已关（Safari 新请求不会经 SFE-ROUTE），udp 已关；上一次保留的 block 关闭尚未加载（Surge 已加载的是写前的阻断或已是这次的关闭），不重新打开，由 NORMAL 一段再写入'
+      : kept.includes('udp')
+        ? '普通模式的中间阻断已成立：block 已开、verify/active 已关（Safari 全部流量仍被 block 拒绝）；上一次保留的 udp 关闭尚未加载，不重新打开，由 NORMAL 一段再写入，未写入'
+        : '普通模式的中间阻断已成立：block 已开、verify/active 已关，udp 已按普通模式关闭（Safari 全部流量仍被 block 拒绝），未写入';
+    const evidence = [...base.evidence, note];
     if (hasBlockingIssue(s.issues)) evidence.push('有规则排在入口之前');
-    return { ...base, mode: 'BLOCKED', evidence };
+    return { ...base, mode: 'BLOCKED', evidence, ...(kept.length > 0 ? { keptTowardNormal: kept } : {}) };
   }
 
   async function checkAutoReload(lastConfirmed: EntryBits | null, step: EntryStep): Promise<void> {
@@ -564,7 +606,11 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
             /* 保持 pending，由对账处理 */
           }
         }
-        throw stepFailure('READBACK_MISMATCH', '切换入口失败：规则集文件写入后 Surge 没有在时限内重新加载（结果未知）', restored ? lastConfirmed : null, {
+        // 保留新内容时提示等待：监视赶上之前重试只会再写入同样的内容、再次超时
+        const message = restore
+          ? '切换入口失败：规则集文件写入后 Surge 没有在时限内重新加载（结果未知）'
+          : '切换入口失败：规则集文件写入后 Surge 没有在时限内重新加载（结果未知）；已写入的内容保留，请等 Surge 的文件监视加载之后再重试';
+        throw stepFailure('READBACK_MISMATCH', message, restored ? lastConfirmed : null, {
           failedStep: { bit: step.bit, value: step.value },
           reason: 'watch_timeout',
           waitedMs: waited.waitedMs,
@@ -695,7 +741,8 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       if (to === 'BLOCKED' && opts?.undo === true && opts.towardNormal === true && overwrite.length === 0) {
         if (unwitnessed.active && filesAtMode(s) === 'NORMAL') return unwitnessedReadbackOf(s, 'NORMAL', ['入口文件已全部为占位规则：入口已是普通模式，不需要阻断，未写入']);
         if (!unwitnessed.active && s.anomalies.length === 0 && confirmedMode === 'NORMAL') return readbackOf(s);
-        if (!unwitnessed.active && blockedOnWayToNormal(s)) return blockedOnWayToNormalReadback(s);
+        const kept = unwitnessed.active ? null : blockedOnWayToNormal(s);
+        if (kept) return blockedOnWayToNormalReadback(s, kept);
       }
       // 规划：已加载内容没有见证确认的位（含旧格式文件——NORMAL 时它们的效果已由探测核对，但之后被遮住时无法再核对）
       // 按未知处理，在切换中带见证重写一次。退路中本应用记录已确认、没有异常的文件按文件内容视为已加载。

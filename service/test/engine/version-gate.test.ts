@@ -295,6 +295,14 @@ describe('matchRule not mapped (an install.json written before the primitive exi
     expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle' });
     expect(h.repos.routeState.get().warnings).toContain('entry_unverified');
     expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+    // 再次进入普通模式：入口文件已全部为占位规则，不写入。步骤按 ruleset_resource 的事实写明，且只按文件内容判断、未经运行时确认
+    const again = await h.app.enterNormal({ request_id: rid('normal') }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(again.operation_id)!.phase).toBe('NORMAL_RESTORED');
+    const already = h.repos.operations.listSteps(again.operation_id).map((st) => st.message).filter((m) => m.startsWith('入口已是普通模式'));
+    expect(already).toEqual([expect.stringContaining('入口规则集文件已全部为占位规则，只按文件内容判断')]);
+    expect(already[0]).toContain('未经运行时求值确认');
+    expect(already[0]).not.toContain('Surge 中没有本应用的入口规则');
   });
 
   test('temp_rule: normal mode from VERIFY_ONLY completes (structural readback), the block step is reported unconfirmed', async () => {

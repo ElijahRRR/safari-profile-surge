@@ -360,6 +360,58 @@ describe('ruleset_resource strategy', () => {
     expect(fake.calls.updateExternalResource).toBeUndefined();
   });
 
+  test('…retries spaced below the watcher latency: the intermediate block never re-tightens a kept udp-/block- that is not loaded yet, normal mode finishes', async () => {
+    const { ctrl, fake, files, ownership, clock } = await setupRuleset({ watch: { timeoutMs: 5000, pollMs: 200 } });
+    expect((await ctrl.transition('ACTIVE')).mode).toBe('ACTIVE');
+    // 监视延迟 60 秒，重试相隔 30 秒：每次重试时上一次保留的写入都还没有加载
+    fake.localWatchLatencyMs = 60_000;
+    const writes: string[] = [];
+    const write = files.writeAtomic.bind(files);
+    files.writeAtomic = async (name, content, expected) => {
+      const bit = (['udp', 'verify', 'block', 'active'] as const).find((b) => ENTRY_RULESET_FILES[b] === name)!;
+      const on = parseEntryRuleSetFile(bit, content).bodies[0] !== ENTRY_PLACEHOLDER_RULE;
+      writes.push(`${bit}${on ? '+' : '-'}`);
+      return write(name, content, expected);
+    };
+    const kept: Array<Array<'udp' | 'block'> | undefined> = [];
+    const errors: Array<{ message: string; details: Record<string, unknown> }> = [];
+    let done = false;
+    for (let attempt = 0; attempt < 12 && !done; attempt++) {
+      try {
+        const blocked = await ctrl.transition('BLOCKED', undefined, { undo: true, towardNormal: true });
+        kept.push(blocked.keptTowardNormal);
+        done = (await ctrl.transition('NORMAL', undefined, { undo: true })).mode === 'NORMAL';
+      } catch (e) {
+        expect(e).toBeInstanceOf(SfeError);
+        errors.push({ message: (e as SfeError).message, details: (e as SfeError).details! });
+      }
+      clock.t += 30_000;
+      const o = observe(fake);
+      expect(['BLOCKED', 'NORMAL', 'ACTIVE']).toContain(o.mode);
+      expect(o.chrome).toEqual(['DIRECT', 'DIRECT']);
+    }
+    expect(done).toBe(true);
+    // 收紧的一步在加载之前重写同样的内容；udp-、block- 写入之后从不重新打开（不在两段之间来回写入）
+    expect(writes).toEqual(['block+', 'block+', 'active-', 'active-', 'udp-', 'udp-', 'block-', 'block-']);
+    expect(kept.filter((k) => k !== undefined)).toEqual([['udp'], ['block']]);
+    expect(errors.map((e) => e.details.failedStep)).toEqual([
+      { bit: 'block', value: true },
+      { bit: 'block', value: true },
+      { bit: 'active', value: false },
+      { bit: 'active', value: false },
+      { bit: 'udp', value: false },
+      { bit: 'udp', value: false },
+      { bit: 'block', value: false },
+      { bit: 'block', value: false },
+    ]);
+    // 保留写入的超时提示等待文件监视，而不是立即重试
+    for (const e of errors) expect(e.message).toContain('请等 Surge 的文件监视加载之后再重试');
+    expect(observe(fake).mode).toBe('NORMAL');
+    expect((await ctrl.read()).mode).toBe('NORMAL');
+    expect(ownership.records().every((r) => r.state === 'present')).toBe(true);
+    expect(fake.reloadCount).toBe(0);
+  });
+
   test('normal mode’s intermediate block after udp was already turned off (block on, verify/active off, all witnessed) writes nothing and reports BLOCKED; a rollback still re-opens udp', async () => {
     const { ctrl, fake, files } = await setupRuleset();
     expect((await ctrl.transition('BLOCKED')).mode).toBe('BLOCKED');
