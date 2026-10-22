@@ -602,6 +602,30 @@ function expectAllBlocked(seen: readonly Observation[]): void {
 }
 
 describe('temp_rule strategy: undoing the entry with ambiguous app-owned rules', () => {
+  for (const [target, rejectPolicy] of (['BLOCKED', 'NORMAL'] as const).flatMap((target) =>
+    ['REJECT', 'REJECT-DROP', 'REJECT-NO-DROP', 'REJECT-TINYGIF'].map((policy) => [target, policy] as const),
+  )) {
+    test(`undo ${target} retains an unrecognised ${rejectPolicy} until the routing rule behind it is removed`, async () => {
+      const reject = UNRECOGNIZED.replace(/SFE-ROUTE$/, rejectPolicy);
+      const u = await setupUndo({
+        start: 'NORMAL',
+        config: CFG,
+        extra: [reject, UNRECOGNIZED, tempRuleText('block', CFG)].map((text) => ({ text, recorded: true })),
+        fakeInsertion: 'tail',
+        strategyInsertion: 'tail',
+      });
+      expect(observe(u.fake).semantic).toEqual(ALL_REJECT);
+      const result = await u.ctrl.transition(target, undefined, UNDO).catch((e: unknown) => e);
+      if (target === 'BLOCKED') expectAllBlocked(u.seen);
+      else {
+        expectAllBlocked(u.seen.slice(0, -1));
+        expect(u.seen.at(-1)!.semantic).toEqual(ALL_PASS);
+      }
+      expect(u.removed.indexOf(UNRECOGNIZED)).toBeLessThan(u.removed.indexOf(reject));
+      expect(result).toMatchObject({ mode: target });
+    });
+  }
+
   for (const insertion of ['tail', 'head'] as const) {
     test(`[${insertion}] duplicate block records after a process path change: normal mode (undo BLOCKED → NORMAL) reaches NORMAL`, async () => {
       const blockNew = tempRuleText('block', NEW_CFG);

@@ -9,7 +9,7 @@ import { SfeError, type EntryBits, type KnownEntryMode } from '@sfe/contract';
 import type { EntryCleanupStep, EntryController, EntryReadback, EntryStep, SurgeRuleRecord } from '../../ports.js';
 import { ENTRY_BITS_IN_ORDER, ENTRY_BIT_POLICY, tempRuleText, type EntryBit } from '../generate.js';
 import { classifyPrecedence, hasBlockingIssue } from '../precedence.js';
-import { normalizeRuleText, parseRule, type RuleCondition } from '../rules.js';
+import { REJECT_POLICIES, normalizeRuleText, parseRule, type RuleCondition } from '../rules.js';
 import {
   allowedModes,
   bitsFromOrder,
@@ -248,7 +248,14 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
       const text = s.temps.find((t) => normalizeRuleText(t) === textN) ?? rec.identity;
       groups.set(textN, { kind: bitOfRecord(rec.identity, s.expected) ?? 'unrecognized', text, textN, identities: [rec.identity] });
     }
-    const rank = (i: CleanupItem): number => CLEANUP_ORDER.indexOf(i.kind) * 2 + (i.textN === blockN ? 1 : 0);
+    const rank = (i: CleanupItem): number => {
+      // 结构未知不等于会路由：保留其中的拒绝规则，直到所有可能路由的规则已移除。
+      // 否则先删除同一匹配范围的拒绝规则，会短暂暴露后面的旧 SFE-ROUTE 规则。
+      if (i.kind === 'unrecognized' && REJECT_POLICIES.has((parseRule(i.text)?.policy ?? '').toUpperCase())) {
+        return CLEANUP_ORDER.indexOf('udp') * 2 + 1;
+      }
+      return CLEANUP_ORDER.indexOf(i.kind) * 2 + (i.textN === blockN ? 1 : 0);
+    };
     return [...groups.values()].sort((a, b) => rank(a) - rank(b));
   }
 
@@ -331,7 +338,8 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
         throw stepFailure('READBACK_MISMATCH', '切换入口失败：清理中阻断规则不再生效', null, { anomalies: s.anomalies });
       }
     }
-    return s;
+    // 最后一次 load 发生在 confirm 之前；重新读取归属，避免最后移除的未知规则仍以 pending_remove 造成异常。
+    return load();
   }
 
   /** 从无歧义的状态按单个位逐步切换（planFromBits），每步写入后运行时读回，最后读回目标模式。 */
