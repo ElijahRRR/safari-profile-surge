@@ -24,6 +24,7 @@ import {
 
 const HELP = `Usage: surge-cli [options] <command>
   --check <path>            Check a profile
+  --raw                     Output raw JSON
 Commands:
   reload                    Reload the profile
   switch-profile <name>     Switch profile
@@ -49,6 +50,13 @@ describe('CLI help analysis', () => {
     expect(cliAvailability('selectGroupPolicy', w)).toBe('not_in_table');
     expect(cliAvailability('killRequest', w)).toBe('not_in_table');
     expect(cliAvailability('removeTempRule', w)).toBe('not_in_help');
+  });
+
+  it('requires raw JSON support before proposing JSON read commands', () => {
+    const w = helpWords(HELP);
+    w.delete('--raw');
+    expect(cliAvailability('listExternalResources', w)).toBe('not_in_help');
+    expect(cliAvailability('listTempRules', w)).toBe('not_in_help');
   });
 
   it('literal words never contain global actions', () => {

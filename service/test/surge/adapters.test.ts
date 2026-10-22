@@ -66,11 +66,30 @@ describe('CLI command table', () => {
 describe('createCliAdapter', () => {
   const okExec = (stdout: string): ExecFn => vi.fn(async () => ({ stdout, stderr: '' }));
 
+  test('reads the Surge 6.5 defines envelope through machine-readable CLI output', async () => {
+    // Synthetic resource values; the envelope matches a read-only 6.5 CLI observation.
+    const response = {
+      defines: [
+        { key: 'local-resource', type: 'policy-group', path: '/tmp/sfe-fixture/sfe-nodes.list', local: true, ready: true },
+        { key: 'remote-resource', type: 'ruleset', path: 'https://rules.example.test/list', local: false, ready: true, updatedAt: 1760000000 },
+      ],
+    };
+    const exec: ExecFn = vi.fn(async (_file, args) => ({
+      stdout: args.includes('--raw') ? JSON.stringify(response) : 'External resources (human-readable output)',
+      stderr: '',
+    }));
+    const adapter = createCliAdapter({ cliPath: CLI, mechanism: allCli, exec, scrub: (s) => s });
+    await expect(adapter.listExternalResources()).resolves.toEqual([
+      { key: 'local-resource', type: 'policy-group', location: '/tmp/sfe-fixture/sfe-nodes.list', lastUpdatedAt: null, error: null },
+      { key: 'remote-resource', type: 'ruleset', location: 'https://rules.example.test/list', lastUpdatedAt: new Date(1760000000 * 1000), error: null },
+    ]);
+  });
+
   test('uses execFile with fixed argv and returns parsed output', async () => {
     const exec = okExec('[]');
     const a = createCliAdapter({ cliPath: CLI, mechanism: allCli, exec, scrub: (s) => s });
     expect(await a.listTempRules()).toEqual([]);
-    expect(exec).toHaveBeenCalledWith(CLI, ['dump', 'temp-rule'], expect.objectContaining({ timeout: 15000 }));
+    expect(exec).toHaveBeenCalledWith(CLI, ['--raw', 'dump', 'temp-rule'], expect.objectContaining({ timeout: 15000 }));
   });
 
   test('primitives not mapped to cli are CAPABILITY_UNVERIFIED and never executed', async () => {
