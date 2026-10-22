@@ -21,6 +21,7 @@ import {
 import type { Actor } from '../../src/app.js';
 import { openRepositories, type Repositories } from '../../src/db/index.js';
 import { createAppService, type EngineAppService } from '../../src/engine/app-service.js';
+import type { LivenessPrimitive } from '../../src/engine/context.js';
 import { registerInitialObjects } from '../../src/engine/ownership.js';
 import { MemorySecretStore } from '../../src/secrets/memory-store.js';
 import { loadPepper, pepperKey } from '../../src/secrets/pepper.js';
@@ -30,6 +31,7 @@ import { FakeClock } from '../../src/util/clock.js';
 import { createIdGenerator } from '../../src/util/ids.js';
 import { createLogger, createMemorySink } from '../../src/util/logger.js';
 import { createScrubber } from '../../src/util/scrubber.js';
+import type { SurgeAdapter } from '../../src/ports.js';
 
 export const WEB: Actor = { kind: 'web', sessionId: 'web_test0001' };
 export const AGENT: Actor = { kind: 'agent' };
@@ -53,6 +55,15 @@ export interface HarnessOptions {
   sourceProfile?: string;
   /** Surge 配置目录（相对临时目录），缺省 surge。 */
   surgeSubdir?: string;
+  /**
+   * 可达性检测原语。缺省固定为 getCurrentProfile（读取事实本来就读它，测试没有向它注入故障或谎言），避免检测读取
+   * 消耗测试向 listExternalResources、listPolicies 等注入的故障；'auto' 按 mechanism() 选择（与服务一致）。
+   */
+  livenessPrimitive?: LivenessPrimitive | null | 'auto';
+  /** 引擎使用的 Surge 适配器（缺省就是 FakeSurge）；维护端口始终是 FakeSurge。 */
+  surge?: (fake: FakeSurge) => SurgeAdapter;
+  /** false：不提供 host.surgeInstance（使用引擎的缺省值：非 macOS 为 not_darwin，否则 unavailable）。 */
+  surgeInstance?: false;
 }
 
 export interface Harness {
@@ -165,15 +176,23 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     logger,
     scrubber,
     secretStore: store,
-    surge: fake,
+    surge: opts.surge ? opts.surge(fake) : fake,
     maintenanceSurge: fake,
     paths: { dataDir: dir, tmpDir: join(dir, 'tmp'), backupsDir: join(dir, 'backups'), homedir: join(dir, 'home') },
     surgeCliPath: null,
     demo: false,
-    host: { macosBuild: async () => hostState.macosBuild, safariVersion: async () => hostState.safariVersion, signingIdentity: () => 'TEAMTEST01', processPathExists: () => true },
+    host: {
+      macosBuild: async () => hostState.macosBuild,
+      safariVersion: async () => hostState.safariVersion,
+      signingIdentity: () => 'TEAMTEST01',
+      processPathExists: () => true,
+      // 版本与构建号的来源：FakeSurge 模拟的运行实例（h.fake.version/build/instanceFailure）
+      ...(opts.surgeInstance === false ? {} : { surgeInstance: () => fake.runningInstance() }),
+    },
     verifyEndpoints: [TEST_ENDPOINT],
     loginUrl: () => ({ url: 'http://127.0.0.1:61847/auth/exchange?code=x', expiresAt: clock.now().toISOString() }),
     serviceVersion: '0.0.0-test',
+    ...(opts.livenessPrimitive === 'auto' ? {} : { livenessPrimitive: opts.livenessPrimitive === undefined ? 'getCurrentProfile' : opts.livenessPrimitive }),
   });
   const events: ServiceEvent[] = [];
   const attach = (a: EngineAppService) =>

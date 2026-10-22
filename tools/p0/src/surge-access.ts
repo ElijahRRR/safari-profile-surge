@@ -11,6 +11,7 @@ import { SfeError } from '@sfe/contract';
 import {
   CLI_COMMANDS,
   FORBIDDEN_CLI_WORDS,
+  INTERACTIVE_BANNER_RE,
   SURGE_PRIMITIVES,
   createCliAdapter,
   createCompositeAdapter,
@@ -71,6 +72,15 @@ export function helpWords(help: string): Set<string> {
   const words = new Set<string>();
   for (const m of help.matchAll(/(?:^|[\s[(|,])(--?[A-Za-z][A-Za-z0-9-]*|[a-z][a-z0-9-]*)(?=$|[\s\]),|=:])/gm)) words.add(m[1]!);
   return words;
+}
+
+/**
+ * 解析 --help 的输出。输出是交互模式提示（帮助参数没有被识别）时命令词按空处理：不能从提示文字推断
+ * 任何命令存在，也就不经 CLI 探测任何原语。
+ */
+export function parseCliHelp(help: string): { words: Set<string>; interactive: boolean } {
+  if (INTERACTIVE_BANNER_RE.test(help)) return { words: new Set(), interactive: true };
+  return { words: helpWords(help), interactive: false };
 }
 
 /** CLI 原语表中该原语的固定命令词（去掉参数）；表中没有时为 null。 */

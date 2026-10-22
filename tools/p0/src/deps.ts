@@ -1,10 +1,11 @@
-// P0 工具从服务代码复用的部分（只读引用，不修改 service/）：Surge 适配层、入口策略、生成器、
-// 假 Surge、核对与脱敏，以及 agent.sock 的 NDJSON 客户端。
+// P0 工具从服务代码复用的部分（只读引用，不修改 service/）：Surge 适配层（含运行中 Surge 实例的版本读取器）、入口策略、生成器、
+// 假 Surge、核对与脱敏、子进程执行器（stdin 关闭），以及 agent.sock 的 NDJSON 客户端。
 
 export * from '../../../service/src/surge/index.js';
 export { ndjsonRequest, NdjsonClientError } from '../../../service/src/ipc/ndjson.js';
 export { isSurgeSafeCredential, SURGE_SAFE_CREDENTIAL_RE } from '../../../service/src/domain/validate.js';
 export { classifyDirectoryRisk } from '../../../service/src/util/secure-files.js';
+export { execFixed, type ExecFixedOptions, type ExecFixedResult } from '../../../service/src/util/exec-fixed.js';
 export type {
   EntryController,
   EntryReadback,

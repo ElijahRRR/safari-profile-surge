@@ -29,12 +29,17 @@ const FULL_COVERAGE: ProtocolCoverage = {
   extension_page_fetch: { result: 'pass', note: null },
 };
 
+/** 测量时读到的 Surge 版本与构建（与 FakeSurge 默认值相同）：依赖版本的能力不能记为 null 或 any。其余字段不限。 */
+function measuredContext() {
+  return { ...anyContext(), surgeVersion: '6.5.0', surgeBuild: '10960' };
+}
+
 function proposal(patch: Partial<ProposeCapabilityRequest> = {}): ProposeCapabilityRequest {
   return {
     request_id: rid('prop'),
     key: 'connection_continuity',
     proposed_status: 'supported',
-    context: anyContext(),
+    context: measuredContext(),
     summary: '发布期间 Chrome 长连接保持（脱敏摘要）',
     evidence_digest: 'sha256:0123456789abcdef',
     ...patch,
@@ -59,12 +64,42 @@ describe('capability proposals and confirmation', () => {
 
   test('stale context → effective unverified with reasons', async () => {
     h = await createHarness({ capabilities: [] });
-    const ctx = { ...anyContext(), surgeVersion: '6.4.0', surgeBuild: '1' };
+    const ctx = { ...measuredContext(), surgeVersion: '6.4.0', surgeBuild: '1' };
     const { proposal_id } = await h.app.proposeCapability(proposal({ context: ctx }), ADMIN);
     const view = await h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id }, WEB);
     expect(view.status).toBe('supported');
     expect(view.effectiveStatus).toBe('unverified');
     expect(view.staleReasons).toEqual(expect.arrayContaining(['surgeVersion', 'surgeBuild']));
+  });
+
+  test('version-dependent proposals need a readable, well-formed Surge version and build', async () => {
+    h = await createHarness({ capabilities: [] });
+    const cases: Array<[Record<string, string | null>, string[]]> = [
+      [{ surgeVersion: null, surgeBuild: null }, ['context.surgeVersion', 'context.surgeBuild']],
+      [{ surgeVersion: 'any', surgeBuild: 'any' }, ['context.surgeVersion', 'context.surgeBuild']],
+      // 旧解析器把 surge-cli 交互模式输出中的地址当成版本
+      [{ surgeVersion: '127.0.0.1', surgeBuild: null }, ['context.surgeVersion', 'context.surgeBuild']],
+      [{ surgeVersion: '6.5.0', surgeBuild: 'any' }, ['context.surgeBuild']],
+      [{ surgeVersion: '6.5.0', surgeBuild: '10960 (beta)' }, ['context.surgeBuild']],
+      [{ surgeVersion: 'Surge 6.5', surgeBuild: '10960' }, ['context.surgeVersion']],
+    ];
+    for (const status of ['supported', 'unsupported'] as const) {
+      for (const [patch, fields] of cases) {
+        const err = await expectError(h.app.proposeCapability(proposal({ proposed_status: status, context: { ...measuredContext(), ...patch } }), AGENT), 'EVIDENCE_REQUIRED');
+        expect(err.fieldErrors?.map((e) => e.field), JSON.stringify(patch)).toEqual(fields);
+      }
+    }
+    expect(h.repos.proposals.list()).toEqual([]);
+    // 两段版本号与任意位数的构建号都接受
+    const ok = await h.app.proposeCapability(proposal({ context: { ...measuredContext(), surgeVersion: '6.5', surgeBuild: '1' } }), ADMIN);
+    expect(ok.proposal_id).toMatch(/^prop_/);
+  });
+
+  test('capabilities that do not depend on the Surge version accept a null version', async () => {
+    h = await createHarness({ capabilities: [] });
+    const { proposal_id } = await h.app.proposeCapability(proposal({ key: 'open_profile_by_id', context: { ...anyContext(), surgeVersion: null, surgeBuild: null } }), AGENT);
+    const view = await h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id }, WEB);
+    expect(view).toMatchObject({ key: 'open_profile_by_id', effectiveStatus: 'supported', staleReasons: [] });
   });
 
   test('attribution and UDP proposals need protocol coverage; supported needs every gating item', async () => {
@@ -86,7 +121,7 @@ describe('capability proposals and confirmation', () => {
     );
     const newPath = '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview';
     const { proposal_id } = await h.app.proposeCapability(
-      proposal({ key: 'safari_process_attribution', protocol_coverage: FULL_COVERAGE, safari_process_paths: [newPath], context: { ...anyContext(), processPathsDigest: processPathsDigest([newPath]) } }),
+      proposal({ key: 'safari_process_attribution', protocol_coverage: FULL_COVERAGE, safari_process_paths: [newPath], context: { ...measuredContext(), processPathsDigest: processPathsDigest([newPath]) } }),
       AGENT,
     );
     await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);

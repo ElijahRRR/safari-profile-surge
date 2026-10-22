@@ -70,6 +70,12 @@ describe('startService --demo', () => {
     // 演示能力只在 demo/ 中写入，带明确说明
     const caps = await svc.app.listCapabilities();
     expect(caps.every((c) => c.note === DEMO_CAPABILITY_NOTE)).toBe(true);
+    // 演示模式的版本来自 FakeSurge 模拟的运行实例（不读真实 Surge，也从不调用 getVersion）：依赖版本的演示能力有效
+    expect(snap.surge).toMatchObject({ reachable: true, version: '6.5.0', build: '10960', message: null });
+    expect(caps.every((c) => c.effectiveStatus === 'supported')).toBe(true);
+    const demoFake = svc.app.engine.surge as FakeSurge;
+    expect(demoFake.instanceReads).toBeGreaterThan(0);
+    expect(demoFake.calls.getVersion ?? 0).toBe(0);
 
     // HTTP：未登录的接口请求被拒绝（服务在线）
     const res = await fetch(`${svc.url}/api/snapshot`);
@@ -108,6 +114,7 @@ describe('startService (production wiring, no Surge tools installed)', () => {
     expect(snap.demoMode).toBe(false);
     expect(snap.environments).toEqual([]);
     expect(snap.surge.reachable).toBe(false);
+    expect(snap.surge).toMatchObject({ version: null, build: null });
     const caps = await svc.app.listCapabilities();
     expect(caps.some((c) => c.effectiveStatus === 'supported')).toBe(false);
     expect((statSync(join(dataDir, 'sfe.sqlite')).mode & 0o077) === 0).toBe(true);

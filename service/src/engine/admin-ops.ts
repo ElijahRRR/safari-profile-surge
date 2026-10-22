@@ -31,7 +31,7 @@ import { isSurgeReferenceName } from '../domain/validate.js';
 import { labelOf, revisionNodeName } from '../domain/naming.js';
 import { nodeLineChanged } from '../domain/node-line.js';
 import { BUILTIN_POLICIES } from '../surge/rules.js';
-import { coverageAllowsSupported } from '../surge/capability-gate.js';
+import { coverageAllowsSupported, versionContextErrors } from '../surge/capability-gate.js';
 import { validateSafariProcessPaths } from '../surge/generate.js';
 import { keyedRequestDigest } from '../util/keyed-digest.js';
 import { insertOperation, type AcceptDeps } from './accept.js';
@@ -77,6 +77,9 @@ export async function proposeCapability(deps: AcceptDeps, req: ProposeCapability
   if (typeof req.evidence_digest !== 'string' || !/^[A-Za-z0-9:_-]{8,256}$/.test(req.evidence_digest)) errors.push({ field: 'evidence_digest', message: '原始证据摘要格式不正确' });
   if (errors.length > 0) throw new SfeError('VALIDATION_FAILED', '提交能力证据失败：字段校验未通过', { fieldErrors: errors });
   const evidence: Array<{ field: string; message: string }> = [];
+  // 依赖 Surge 版本/构建的能力必须带读到的具体版本：null 或 any 的记录在门槛中永远不会生效（读不到版本即待验证），
+  // 格式不对的值（例如 CLI 交互模式输出的 127.0.0.1）不是版本。
+  evidence.push(...versionContextErrors(req.key, req.context).map((e) => ({ field: `context.${e.field}`, message: e.message })));
   if (COVERAGE_REQUIRED.includes(req.key) && (typeof req.protocol_coverage !== 'object' || req.protocol_coverage === null)) {
     evidence.push({ field: 'protocol_coverage', message: '该能力的提议必须带逐协议覆盖' });
   }

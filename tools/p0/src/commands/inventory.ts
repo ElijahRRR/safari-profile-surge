@@ -1,4 +1,5 @@
-// inventory（只读）：系统与 Safari/Surge 版本、CLI 签名与帮助、各读原语经 CLI/HTTP 是否可用、外部资源、
+// inventory（只读）：系统与 Safari 版本、运行中 Surge 实例的版本（与服务同一读取器，证据见 inventory/surge-instance.json；
+// 磁盘上 Surge.app 的版本只作旁证）、CLI 签名与帮助、各读原语经 CLI/HTTP 是否可用、外部资源、
 // 当前配置名、临时规则、接管与出站、自动重载、Safari/WebKit 进程候选、配置目录是否在同步位置。
 // 写入 inventory.json，打印表格与建议的 adapterMechanism。盘点从不调用任何写原语（写入守卫全部拒绝）。
 
@@ -29,7 +30,7 @@ import {
   describeLocation,
   emptyGuard,
   errorCode,
-  helpWords,
+  parseCliHelp,
   proposeMechanism,
   type CliAvailability,
   type Primitive,
@@ -38,7 +39,8 @@ import {
 } from '../surge-access.js';
 import { SAFARI_APP, SURGE_APP, appVersion, listProcesses, surgeProcesses, swVers, webkitSafariCandidates } from '../system.js';
 import { TEST_PROFILE_NAME } from '../test-profile.js';
-import { createRun, fmtBool, measureContext, openRun, printResult, profileNameOf, resolveCli, tryRead, type Ctx } from './common.js';
+import { createRun, fmtBool, measureContext, openRun, printResult, profileNameOf, readSurgeInstance, resolveCli, tryRead, type Ctx } from './common.js';
+import { instanceEvidence, instanceSummaryText, printInstanceReport, warnOnDiskDifference } from './instance.js';
 
 const HELP_LINE_RE = /temp|rule|resource|policy|polic|request|dump|version|check|select|kill|profile|group|test/i;
 
@@ -119,18 +121,23 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   const macos = await swVers(exec);
   const safari = await appVersion(exec, SAFARI_APP);
   const surgeApp = await appVersion(exec, SURGE_APP);
+  // Surge 版本只来自运行中的实例（与服务同一读取器）；磁盘上的 Surge.app 版本只作旁证，两者不一致时提示。
+  const instance = await readSurgeInstance(ctx);
+  dir.writeJson('inventory/surge-instance.json', instanceEvidence(now().toISOString(), instance, surgeApp));
   const procs = await listProcesses(exec);
   const webkit = webkitSafariCandidates(procs);
   dir.writeJson('inventory/processes.json', { at: now().toISOString(), webkitSafariCandidates: webkit, surge: surgeProcesses(procs) });
 
-  // CLI：签名校验通过才执行；帮助原文存运行目录。
+  // CLI：签名校验通过才执行；帮助原文存运行目录。帮助参数若进入交互模式，命令词按空处理（不探测任何 CLI 原语）。
   const cli = await resolveCli(ctx, state);
   let words = new Set<string>();
+  let helpInteractive = false;
   if (cli.ok) {
     const r = await exec(cli.path, ['--help'], { timeoutMs: 15_000 });
     const help = `${r.stdout}\n${r.stderr}`;
     dir.writeAtomic('inventory/surge-cli-help.txt', help);
-    words = helpWords(help);
+    ({ words, interactive: helpInteractive } = parseCliHelp(help));
+    if (helpInteractive) out.warn('surge-cli --help 进入了交互模式：帮助中的命令按空处理，本次不经 CLI 探测任何原语（原文见 inventory/surge-cli-help.txt）');
     const relevant = help.split(/\r?\n/).filter((l) => HELP_LINE_RE.test(l)).slice(0, 40);
     dir.writeAtomic('inventory/surge-cli-help-relevant.txt', `${relevant.join('\n')}\n`);
   }
@@ -217,14 +224,14 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   const proposal = proposeMechanism(cliProbes, httpProbes, cliHelp, httpUsable);
 
   const takeover = (values.getTakeoverState as TakeoverState | undefined) ?? null;
-  const version = (values.getVersion as { version: string; build: string | null } | undefined) ?? null;
   const currentProfile = (values.getCurrentProfile as { name: string } | undefined)?.name ?? null;
   const summary: InventorySummary = {
     at: now().toISOString(),
     macos,
     safari,
     surgeApp,
-    surgeVersion: { version: version?.version ?? null, build: version?.build ?? null },
+    surgeVersion: instance.result.ok ? { version: instance.result.instance.version, build: instance.result.instance.build } : { version: null, build: null },
+    surgeInstance: { ok: instance.result.ok, reason: instance.result.ok ? null : instance.result.reason },
     cliVerified: { ok: cli.ok, reason: cli.reason },
     httpApi: httpApiInfo,
     currentProfileName: currentProfile,
@@ -238,6 +245,8 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     summary,
     profile: profileInfo,
     cliHelp,
+    cliHelpInteractive: helpInteractive,
+    surgeInstance: { ok: instance.result.ok, reason: instance.result.ok ? null : instance.result.reason, cached: instance.cached, evidence: 'inventory/surge-instance.json' },
     probes: { cli: cliProbes, http: httpProbes },
     values: Object.fromEntries(Object.entries(values).map(([k, v]) => [k, summarizeValue(k as ReadPrimitive, v)])),
     proposedMechanism: proposal.mechanism,
@@ -253,9 +262,9 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     ['项目', '结果'],
     ['macOS', `${macos.productVersion ?? '读不到'}（${macos.buildVersion ?? '读不到'}）`],
     ['Safari', `${safari.version ?? '读不到'}（${safari.build ?? '读不到'}）`],
-    ['Surge.app', `${surgeApp.version ?? '读不到'}（${surgeApp.build ?? '读不到'}）`],
-    ['Surge getVersion', version ? `${version.version}（${version.build ?? '无构建号'}）` : '不可用（能力上下文中的版本将为空）'],
-    ['Surge CLI', cli.ok ? `签名校验通过（${cli.reason}）` : `不可用（${cli.reason}）`],
+    ['运行中的 Surge', instanceSummaryText(instance)],
+    ['Surge.app（磁盘，旁证）', `${surgeApp.version ?? '读不到'}（${surgeApp.build ?? '读不到'}）`],
+    ['Surge CLI', cli.ok ? `签名校验通过（${cli.reason}）${helpInteractive ? '；--help 进入交互模式，命令按空处理' : ''}` : `不可用（${cli.reason}）`],
     ['http-api', httpApiInfo.configured ? (httpApiInfo.loopbackOnly ? '已配置，只监听回环' : '已配置，绑定非回环地址（不使用）') : profilePath ? '未配置' : '未提供 --profile'],
     ['当前配置', currentProfile ?? '读不到'],
     ['配置目录', profileInfo ? (profileInfo.directoryRisk === null ? '无法确认真实位置' : String(profileInfo.directoryRisk)) : '未提供 --profile'],
@@ -264,6 +273,10 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     ['临时规则', Array.isArray(values.listTempRules) ? `${(values.listTempRules as unknown[]).length} 条` : '读不到'],
     ['外部资源', Array.isArray(values.listExternalResources) ? `${(values.listExternalResources as unknown[]).length} 个` : '读不到'],
   ]);
+  warnOnDiskDifference(out, instance, surgeApp);
+  if (!instance.result.ok) {
+    out.warn('无法确认运行中 Surge 的版本：能力上下文中的版本与构建号为空，依赖 Surge 版本的能力不能提议。逐条检查见下表与 inventory/surge-instance.json');
+  }
   if (profileInfo) {
     const sfe = profileInfo.sfeFilesInDirectory as string[];
     if (sfe.length > 0) out.warn(`配置目录中已有 ${sfe.length} 个 sfe-* 文件（可能已初始化过）：make-test-profile 需要用 --target-dir 指定单独目录`);
@@ -273,6 +286,9 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   } else {
     out.warn('没有提供 --profile：http-api 与配置结构未检查。请在 Surge「配置」中「在访达中显示」找到当前配置文件路径后重新运行');
   }
+
+  out.heading('运行中的 Surge（版本来源）');
+  printInstanceReport(out, instance);
 
   out.heading('Safari / WebKit 进程候选（只是候选，归属以 attribution 实测为准）');
   for (const p of webkit) out.line(`  ${p}`);
@@ -296,7 +312,7 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   // takeover_state_readable：按建议的固定映射只读获取三项（与服务运行时同一来源）。
   const fixedAdapter = createGuardedAdapter(createP0Adapter({ cliPath: cli.ok ? cli.path : null, httpApi, mechanism: proposal.mechanism }), emptyGuard(), log, now);
   const fixedSource = { adapter: fixedAdapter, mechanism: proposal.mechanism };
-  const context = await measureContext(ctx, fixedSource, state);
+  const context = await measureContext(ctx, fixedSource, state, { instance });
   const fixedTakeover = await tryRead(() => fixedAdapter.getTakeoverState());
   const fixed = proposal.mechanism.getTakeoverState !== 'unavailable';
   const takeoverResult = writeResult(dir, {

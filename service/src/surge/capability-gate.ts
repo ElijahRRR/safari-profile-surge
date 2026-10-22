@@ -1,5 +1,7 @@
 // 能力门槛：记录的结论与当前上下文比较后的有效状态。任一依赖字段不匹配 → 待验证。
 // 比较规则：记录为 any 匹配任何当前值；当前值读不到（null）时只匹配记录的 null 或 any；
+// 例外：Surge 版本与构建（NEVER_NULL_FIELDS）任一侧为 null 都不匹配，记录为 any 也不匹配读不到的当前值——
+// 版本读不到时依赖版本的能力一律待验证（失败即关闭）；
 // adapterMechanism 只比较该能力依赖的原语（规范 JSON）。见 docs/ARCHITECTURE.md §5.2。
 
 import {
@@ -47,12 +49,43 @@ function parseMechanism(value: string): Record<string, string> | null {
   }
 }
 
+/**
+ * 读不到（null）就绝不匹配的上下文字段：Surge 版本与构建。null 不表示“与测量时相同”——可能是读取失败，也可能是
+ * 运行中的 Surge 已被替换或升级；记录为 null 或 any 都不能让读不到版本的当前上下文通过。
+ */
+export const NEVER_NULL_FIELDS: readonly CapabilityContextField[] = ['surgeVersion', 'surgeBuild'];
+
+/** Surge 版本号（例如 6.5.0）与构建号（例如 10960）的格式；不接受 CLI 交互模式输出中的地址（例如 127.0.0.1）。 */
+export const SURGE_VERSION_RE = /^\d{1,3}\.\d{1,3}(\.\d{1,3})?$/;
+export const SURGE_BUILD_RE = /^\d{1,10}$/;
+
+/**
+ * 能力提议中版本字段的校验（服务与 P0 共用）：该能力依赖 Surge 版本或构建时，上下文必须带格式正确的具体值——
+ * null（读不到）、any 或格式不对都拒绝，因为这样的记录在门槛中永远不会匹配，或会让升级不再使能力过期。
+ * 不依赖版本的能力不检查。
+ */
+export function versionContextErrors(key: CapabilityKey, context: Pick<CapabilityContext, 'surgeVersion' | 'surgeBuild'>): Array<{ field: 'surgeVersion' | 'surgeBuild'; message: string }> {
+  const deps = CAPABILITY_CONTEXT_DEPS[key] ?? [];
+  const out: Array<{ field: 'surgeVersion' | 'surgeBuild'; message: string }> = [];
+  const check = (field: 'surgeVersion' | 'surgeBuild', label: string, re: RegExp, example: string): void => {
+    if (!deps.includes(field)) return;
+    const v = context[field];
+    if (v === null || v === undefined) out.push({ field, message: `该能力依赖 ${label}，但读不到（这样的记录永远不会生效）` });
+    else if (v === 'any') out.push({ field, message: `该能力依赖 ${label}，不能记为 any` });
+    else if (typeof v !== 'string' || !re.test(v)) out.push({ field, message: `${label}格式不正确（应为 ${example}），读到的可能不是版本信息` });
+  };
+  check('surgeVersion', 'Surge 版本', SURGE_VERSION_RE, '6.5.0 这样的版本号');
+  check('surgeBuild', 'Surge 构建号', SURGE_BUILD_RE, '10960 这样的数字');
+  return out;
+}
+
 export function contextFieldMatches(
   key: CapabilityKey,
   field: CapabilityContextField,
   recorded: string | null,
   current: string | null,
 ): boolean {
+  if (NEVER_NULL_FIELDS.includes(field) && (recorded === null || current === null)) return false;
   if (recorded === 'any') return true;
   if (current === null) return recorded === null;
   if (recorded === null) return false;

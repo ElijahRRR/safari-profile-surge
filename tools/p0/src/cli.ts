@@ -13,6 +13,7 @@ import { runChecklist } from './commands/checklist.js';
 import { sleep, type Ctx, type Deps } from './commands/common.js';
 import { runContinuity } from './commands/continuity.js';
 import { runEntry } from './commands/entry.js';
+import { runInstance } from './commands/instance.js';
 import { runInventory } from './commands/inventory.js';
 import { runMakeTestProfile } from './commands/make-test-profile.js';
 import { runPreflight } from './commands/preflight.js';
@@ -57,11 +58,14 @@ export async function main(argv: readonly string[], deps?: Partial<Deps>): Promi
       prompt: deps?.prompt ?? createConsolePrompter({ interactive, assumeYes: Boolean(args.booleans.yes) }),
       sleep: deps?.sleep ?? sleep,
       ...(deps?.surgeOverride ? { surgeOverride: deps.surgeOverride } : {}),
+      ...(deps?.surgeInstance ? { surgeInstance: deps.surgeInstance } : {}),
     };
     const ctx: Ctx = { args, deps: full };
     switch (args.command) {
       case 'inventory':
         return await runInventory(ctx);
+      case 'instance':
+        return await runInstance(ctx);
       case 'test-servers':
         return await runTestServers(ctx, untilSignal);
       case 'make-test-profile':

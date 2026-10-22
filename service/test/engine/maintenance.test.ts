@@ -124,6 +124,23 @@ describe('init (one-time fixed working profile)', () => {
     expect((await h.app.initPreview({}, WEB)).checks.find((c) => c.name === 'surge_names')!.ok).toBe(true);
   });
 
+  test('Surge liveness read itself unreadable (service order: external resource list) → init fails closed (SURGE_UNREACHABLE), nothing written', async () => {
+    h = await createHarness({ sourceProfile: SOURCE, livenessPrimitive: 'auto' });
+    expect(h.app.engine.livenessPrimitive).toBe('listExternalResources');
+    const fake = h.fake as unknown as Record<string, () => Promise<unknown>>;
+    const original = fake.listExternalResources!;
+    fake.listExternalResources = async () => {
+      throw new SfeError('SURGE_COMMAND_FAILED', '读取失败：Surge 输出格式无法识别');
+    };
+    // 运行实例（版本来源）仍可读：它从不决定可达性
+    const err = await expectError(h.app.initPreview({}, WEB), 'SURGE_UNREACHABLE');
+    expect(err.message).toBe('初始化失败：无法连接 Surge');
+    expect(await h.app.refreshSurge(WEB)).toMatchObject({ reachable: false, message: '无法确认 Surge 连接：只读检测失败或输出无法识别' });
+    expect(existsSync(workingPath())).toBe(false);
+    fake.listExternalResources = original;
+    expect((await h.app.initPreview({}, WEB)).checks.find((c) => c.name === 'surge_names')!.ok).toBe(true);
+  });
+
   test('synced profile directory → UNSAFE_LOCATION', async () => {
     h = await createHarness({ sourceProfile: SOURCE, surgeSubdir: 'home/Library/Mobile Documents/iCloud~com~nssurge~inc/Documents' });
     const preview = await h.app.initPreview({}, WEB);

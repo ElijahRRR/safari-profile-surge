@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { CAPABILITY_GATES, GATING_COVERAGE_ITEMS, type CapabilityProposalView, type ProtocolCoverage } from '@sfe/contract';
 import PendingDeployCard from '../src/components/PendingDeployCard.vue';
 import CapabilitiesView from '../src/views/CapabilitiesView.vue';
-import { coverageBlockReason, evaluateGate } from '../src/lib/gates';
+import { coverageBlockReason, evaluateGate, staleReasonText } from '../src/lib/gates';
 import { allSupported, byText, capabilities, click, environment, flush, mountWith, revision, snapshot, testContext, type Call } from './fixtures';
 
 afterEach(() => {
@@ -199,7 +199,47 @@ describe('coverageBlockReason', () => {
   });
 });
 
+describe('staleReasonText', () => {
+  const ctx = proposal().context;
+  const SURGE = { version: '6.5.0', build: '3000' };
+
+  it('says the current Surge version cannot be read instead of claiming it changed', () => {
+    const text = staleReasonText({ staleReasons: ['surgeVersion', 'surgeBuild'], context: ctx }, { version: null, build: null });
+    expect(text).toBe('读不到当前的 Surge 版本、Surge 构建，依赖版本的能力按待验证处理');
+    expect(text).not.toContain('已变化');
+    expect(staleReasonText({ staleReasons: ['surgeBuild'], context: { ...ctx, surgeBuild: 'any' } }, { version: '6.5.0', build: null })).toBe('读不到当前的 Surge 构建，依赖版本的能力按待验证处理');
+  });
+
+  it('says the record has no version when it was measured without one', () => {
+    expect(staleReasonText({ staleReasons: ['surgeVersion', 'surgeBuild'], context: { ...ctx, surgeVersion: null, surgeBuild: null } }, SURGE)).toBe('验证记录缺少 Surge 版本、Surge 构建，需要重测');
+  });
+
+  it('keeps 已变化 for real changes and other fields, and combines reasons', () => {
+    expect(staleReasonText({ staleReasons: ['surgeVersion', 'surgeBuild'], context: { ...ctx, surgeVersion: '6.4.0', surgeBuild: '2000' } }, SURGE)).toBe('Surge 版本、Surge 构建已变化');
+    expect(staleReasonText({ staleReasons: ['surgeVersion', 'surgeBuild', 'safariVersion'], context: ctx }, { version: null, build: null })).toBe(
+      '读不到当前的 Surge 版本、Surge 构建，依赖版本的能力按待验证处理；Safari 版本已变化',
+    );
+    expect(staleReasonText({ staleReasons: [], context: ctx }, SURGE)).toBe('');
+    expect(staleReasonText({ staleReasons: ['surgeVersion'], context: ctx }, null)).toBe('Surge 版本与当前不一致');
+    expect(staleReasonText({ staleReasons: ['surgeVersion', 'macosBuild'], context: null }, SURGE)).toBe('没有验证上下文，需要重测');
+  });
+});
+
 describe('capabilities page', () => {
+  it('explains a stale reason caused by an unreadable Surge version without saying it changed', async () => {
+    const caps = capabilities(allSupported()).map((c) =>
+      c.key === 'policy_path_reread' ? { ...c, effectiveStatus: 'unverified' as const, staleReasons: ['surgeVersion' as const, 'surgeBuild' as const], context: proposal().context } : c,
+    );
+    const base = snapshot();
+    const { ctx } = testContext(() => ({ status: 404 }), snapshot({ capabilities: caps, surge: { ...base.surge, version: null, build: null } }));
+    const m = await mountWith(CapabilitiesView, ctx, {}, '/capabilities');
+    const reasons = Array.from(document.body.querySelectorAll('[data-test="stale-reason"]')).map((e) => e.textContent?.trim());
+    expect(reasons).toEqual(['读不到当前的 Surge 版本、Surge 构建，依赖版本的能力按待验证处理']);
+    expect(document.body.textContent).toContain('读不到运行中 Surge 的版本时，依赖版本的能力一律按待验证处理');
+    m.unmount();
+  });
+
+
   it('shows pass criteria for every capability and disables 确认 with the reason when coverage is incomplete', async () => {
     const { ctx } = testContext(() => ({ status: 404 }), snapshot({ capabilityProposals: [proposal({ protocolCoverage: { ...coverage('pass'), ipv6: { result: 'not_tested', note: null } } })] }));
     const m = await mountWith(CapabilitiesView, ctx, {}, '/capabilities');

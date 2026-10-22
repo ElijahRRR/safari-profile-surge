@@ -22,3 +22,4 @@ export * from './entry/ownership.js';
 export * from './entry/common.js';
 export * from './entry/temp-rule-strategy.js';
 export * from './entry/ruleset-strategy.js';
+export * from './running-instance.js';

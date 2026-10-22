@@ -1,33 +1,33 @@
 // 只读系统信息：sw_vers、Info.plist（defaults read）、进程列表（ps -axo pid,comm）、codesign。
-// 子进程一律 execFile（不经 shell）、固定可执行文件路径与参数。
+// 子进程一律经服务的 execFixed：execFile（不经 shell）、固定绝对路径与参数、stdin 启动后立即关闭。
 
-import { execFile } from 'node:child_process';
+import { execFixed } from './deps.js';
 
 export interface ExecResult {
   stdout: string;
   stderr: string;
-  /** 退出码；无法启动时为 -1。 */
+  /** 退出码；无法启动（含非绝对路径）、超时被结束时为 -1。 */
   code: number;
 }
 
-export type ExecFn = (file: string, args: readonly string[], opts?: { timeoutMs?: number; maxBuffer?: number }) => Promise<ExecResult>;
+export interface ExecOptions {
+  timeoutMs?: number;
+  maxBuffer?: number;
+  /** 子进程的完整环境（不与本进程合并），例如固定 LC_ALL/TZ；缺省继承本进程。 */
+  env?: NodeJS.ProcessEnv;
+}
 
-export const defaultExec: ExecFn = (file, args, opts = {}) =>
-  new Promise((resolve) => {
-    execFile(
-      file,
-      [...args],
-      { timeout: opts.timeoutMs ?? 15_000, maxBuffer: opts.maxBuffer ?? 8 * 1024 * 1024, encoding: 'utf8', shell: false, windowsHide: true },
-      (err, stdout, stderr) => {
-        if (!err) {
-          resolve({ stdout, stderr, code: 0 });
-          return;
-        }
-        const code = typeof (err as { code?: unknown }).code === 'number' ? ((err as { code: number }).code) : -1;
-        resolve({ stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), code });
-      },
-    );
+export type ExecFn = (file: string, args: readonly string[], opts?: ExecOptions) => Promise<ExecResult>;
+
+export const defaultExec: ExecFn = async (file, args, opts = {}) => {
+  const r = await execFixed(file, args, {
+    timeout: opts.timeoutMs ?? 15_000,
+    maxBuffer: opts.maxBuffer ?? 8 * 1024 * 1024,
+    ...(opts.env !== undefined ? { env: opts.env } : {}),
   });
+  if (!r.error) return { stdout: r.stdout, stderr: r.stderr, code: 0 };
+  return { stdout: r.stdout, stderr: r.stderr, code: typeof r.error.code === 'number' ? r.error.code : -1 };
+};
 
 export const SAFARI_APP = '/Applications/Safari.app';
 export const SURGE_APP = '/Applications/Surge.app';

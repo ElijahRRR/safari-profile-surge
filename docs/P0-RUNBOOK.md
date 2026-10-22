@@ -19,7 +19,7 @@ P0 证明或否定 `CAPABILITY_KEYS` 中的每一项能力，并把结论以“�
 
 ### 0.3 运行方式
 
-2026-10-22 测试 Mac 实测：Surge 6.5.0 (10960) 的 `surge-cli --version` 不返回版本，而是进入交互模式；输入结束时退出 0，输出中包含 `Connected to 127.0.0.1`。旧解析器会把该地址误当版本。CLI 的 `getVersion` 映射已移除，运行实例版本读取仍待实现与验证；不要手动把它设为 `cli`，也不要据此确认依赖版本的能力门槛。本机安装包版本只能作为旁证，不能替代运行实例版本。
+2026-10-22 测试 Mac 实测：Surge 6.5.0 (10960) 的 `surge-cli --version` 不返回版本，而是进入交互模式；输入结束时退出 0，输出中包含 `Connected to 127.0.0.1`。旧解析器会把该地址误当版本。因此 Surge 的版本与构建号不再经 CLI 或 HTTP API 读取：服务与本工具用同一个只读读取器从**运行中的 Surge 实例**取得（当前用户唯一的 `/Applications/Surge.app` 主进程 → 它的 Info.plist，并用启动时间、文件 ctime/birthtime、lsof 与 codesign 证明磁盘上的包就是正在运行的那一份；见 ARCHITECTURE §5.2 与本手册 §1.5）。`getVersion` 不再使用：不要在 `install.json` 或 `--mechanism` 中把它设为 `cli` 或 `http`（服务按不可用处理并提示）。读取器的规则在本机通过 §1.5 的 V1–V8 之前，不要据它读到的版本确认依赖版本的能力门槛。本机安装包版本（`defaults read`）只作旁证，不能替代运行实例版本。读不到运行中 Surge 的版本时，`propose` 拒绝依赖 Surge 版本或构建的能力（supported 与 unsupported 都拒绝，并给出运行实例的失败原因），服务也拒绝这类提议并把已有记录显示为待验证；旧解析器记成 `127.0.0.1` 的记录同样待验证，能读到版本后需要重测。
 
 在测试 Mac 上克隆仓库后：
 
@@ -47,7 +47,7 @@ npx tsx tools/p0/src/cli.ts help
 
 | 顺序 | 阶段 | 命令或操作 | 产出的能力结论 |
 |---|---|---|---|
-| 1 | 盘点（只读） | `inventory --profile <当前配置>` | takeover_state_readable；原语映射建议 |
+| 1 | 盘点（只读） | `inventory --profile <当前配置>`；`instance` 并按 §1.5 完成 V1–V8 | takeover_state_readable；原语映射建议；运行中 Surge 版本的证据 |
 | 2 | 测试服务 | 另开终端 `test-servers`，全程保持运行 | — |
 | 3 | 测试配置 | `make-test-profile`，然后**手动**在 Surge 中切到「SFE-P0-测试」，再 `inventory --run <编号> --profile <测试配置>` | — |
 | 4 | 进程归属 | `attribution` | safari_process_attribution |
@@ -111,6 +111,50 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 4. **当前配置名**变化。
 
 自动重载开启时，原子替换本身可能触发读取，canary 就不能用于后续步骤；工具会提示并改用另外三个信号与连接重置判断。
+
+### 1.5 运行中 Surge 的版本（只读核对 V1–V10）
+
+服务与本工具的 Surge 版本只来自运行中的 Surge 实例（`service/src/surge/running-instance.ts`，双方同一读取器）。下面的核对**全部只读**：不写 Surge 或它的任何文件，不切换配置，不由工具退出或重启 Surge（V7 由你手动退出并重新打开），**从不为了测试而触发或安装更新**。用 `instance` 命令读取并保存证据：
+
+```sh
+npx tsx tools/p0/src/cli.ts instance [--surge-team-id <Team ID>]
+```
+
+它逐条打印规则结果（进程、主程序、启动时间、包信息、启动后未修改、运行映像、签名、读取期间未变化）与已排除的其他 Surge 相关进程，并把完整证据（每条规则的结果与耗时、ctime/birthtime 与启动时间之差、lsof 是否一致、codesign 退出码）写入 `<运行目录>/instance/<时间>.json`；能确认时退出 0，无法确认时退出 3 并打印原因。inventory 同样读取一次并写入 `inventory/surge-instance.json`，「运行中的 Surge」一行显示结论，磁盘上的 Surge.app 版本只作旁证（两者不一致时提示）。`--surge-team-id` 只会让签名校验更严。V1–V8 全部通过之前，不要据读到的版本确认依赖版本的能力；代码中标为 TODO(P0) 的 `SURGE_BUNDLE_IDS` 要在 V2 之后才定稿。以下命令中的 `<pid>` 是 instance 打印的进程号。
+
+| 编号 | 核对 | 做法 | 期望 | 证据 |
+|---|---|---|---|---|
+| V1 | 进程列表 | `LC_ALL=C LANG=C TZ=UTC /bin/ps -ww -axo pid=,uid=,lstart=,comm=`，与 instance 结果对照 | 当前用户恰好一行完整路径 `/Applications/Surge.app/Contents/MacOS/Surge`；其他 Surge 相关进程（root 特权助手、`Contents/Applications/surge-cli`、包内的登录项等）都出现在 instance 的“已排除”列表中；启动时间与「活动监视器」及 `ps -o etime= -p <pid>` 一致 | instance 证据的 process、bundle_executable、start_time |
+| V2 | Info.plist | `/usr/bin/plutil -extract CFBundleShortVersionString raw -o - /Applications/Surge.app/Contents/Info.plist`，再分别读 `CFBundleVersion`、`CFBundleIdentifier`、`CFBundleExecutable` | 版本与构建号等于 Surge「关于」窗口（例如 6.5.0 (10960)）；记录包标识与主程序名，交给开发者填写 `SURGE_BUNDLE_IDS` | 命令输出、关于窗口截图、info_plist |
+| V3 | 文件时间与重启 | `stat -f '%c %B' /Applications/Surge.app/Contents/Info.plist /Applications/Surge.app/Contents/MacOS/Surge`；分别在正常打开、在 Surge 菜单中退出后重新打开、注销再登录之后运行 instance | 每次都早于启动时间（证据中相对启动的毫秒数为负）；连续几天每天运行一次，记录任何让这条检查误判失败的元数据变化 | not_modified |
+| V4 | lsof | `/usr/sbin/lsof -nP -a -p <pid> -d txt -F in` 与 `stat -f %i /Applications/Surge.app/Contents/MacOS/Surge` | 主程序那一项的 inode 与路径都一致；记录是否需要额外权限与耗时 | running_image |
+| V5 | 签名 | `/usr/bin/codesign --verify --strict /Applications/Surge.app`；`/usr/bin/codesign -dv --verbose=2 /Applications/Surge.app` 读取 TeamIdentifier | 退出 0；记录耗时与 Team ID，然后用 `instance --surge-team-id <Team ID>` 复核 | signature（耗时见各规则的 ms） |
+| V6 | 规则自测（不碰 Surge） | 见下方步骤：在运行目录中做一个临时 App，用 `instance --self-test-bundle <该 App>` 核对 | 直接启动：通过；原子改写其 Info.plist：`modified_after_start`；启动前 `cp -p` 一份主程序、启动后用 `mv` 覆盖：`running_image_mismatch`（APFS 改名不更新 ctime 时）或 `modified_after_start`（更新时）——记录是哪一个；给包目录加扩展属性：仍通过 | `instance/selftest-*.json` |
+| V7 | Surge 未运行 | 在 Surge 菜单中手动退出 Surge，运行 instance；再运行 `time /Applications/Surge.app/Contents/Applications/surge-cli --raw external-resource list </dev/null; echo "exit=$?"`；之后手动重新打开 Surge | instance 报告 `not_running`（退出 3）；记录该 CLI 命令的退出码、输出与耗时，交给开发者据此确定“无法连接”的文字模式 | 终端输出 |
+| V8 | 交互模式提示 | `time /Applications/Surge.app/Contents/Applications/surge-cli --version </dev/null; echo "exit=$?"`；检查 `inventory/surge-cli-help.txt` 与运行目录中的调用记录 | `--version` 在 2 秒内结束并打印交互模式提示（服务与 P0 按 `interactive_mode` 处理）；inventory 的帮助原文、每个已映射的读原语与测试配置的 `--check` 都没有出现该提示；记录写命令（external-resource update、temp-rule add/remove）在 refresh/entry 中成功时的原始输出，交给开发者收紧解析 | 终端输出、`inventory/surge-cli-help.txt`、调用记录 |
+| V9 | HTTP API | 测试配置启用回环 HTTP API 时：`curl -sS -D - -o /dev/null http://127.0.0.1:<端口>/v1/outbound`（不带密钥） | 只记录响应头名称与任何像版本的值；**不使用**（即使有，将来也只作交叉核对，与运行实例不一致时版本为空）。需要带密钥的请求时用 `curl -H @<0600 的头文件>`，不要把密钥写在命令行 | 终端输出 |
+| V10 | 真实更新 | 只在 Surge 自己提示有更新、你本来就要更新时进行：安装后如果 Surge 没有立即自动重新打开，先运行 instance；重新打开后再运行一次 | 重新打开前：给出失败原因（例如 `modified_after_start`、`running_image_mismatch`），从不显示新版本；重新打开后：显示新版本。Surge 自动重新打开时只记录这一点。**不要为了测试而触发更新** | 两次 instance 证据 |
+
+V6 的步骤（全部在运行目录中，`RUN` 为 instance 打印的运行目录；每种情况用一个新的临时 App，测完结束进程）：
+
+```sh
+APP="$RUN/selftest/SFE-P0-Selftest.app"; mkdir -p "$APP/Contents/MacOS"
+printf '#include <unistd.h>\nint main(void){for(;;)pause();}\n' > "$RUN/selftest/main.c"
+cc -o "$APP/Contents/MacOS/selftest" "$RUN/selftest/main.c"
+plutil -create xml1 "$APP/Contents/Info.plist"
+plutil -insert CFBundleIdentifier -string test.sfe.p0.instance-selftest "$APP/Contents/Info.plist"
+plutil -insert CFBundleExecutable -string selftest "$APP/Contents/Info.plist"
+plutil -insert CFBundleShortVersionString -string 1.0.0 "$APP/Contents/Info.plist"
+plutil -insert CFBundleVersion -string 1 "$APP/Contents/Info.plist"
+codesign -s - --force "$APP"
+cp -p "$APP/Contents/MacOS/selftest" "$RUN/selftest/selftest.copy"   # 只用于 mv 的情况
+sleep 2; "$APP/Contents/MacOS/selftest" & SELFTEST_PID=$!
+npx tsx tools/p0/src/cli.ts instance --self-test-bundle "$APP"        # 期望通过
+# 原子改写 Info.plist：plutil -convert xml1 -o "$RUN/selftest/Info.new" "$APP/Contents/Info.plist" && mv "$RUN/selftest/Info.new" "$APP/Contents/Info.plist"
+# 覆盖主程序：mv "$RUN/selftest/selftest.copy" "$APP/Contents/MacOS/selftest"
+# 包目录扩展属性：xattr -w com.example.sfe-p0 1 "$APP"
+kill "$SELFTEST_PID"
+```
 
 ## 2. 通用回退
 
@@ -406,7 +450,7 @@ npx tsx tools/p0/src/cli.ts propose <能力> supported              # 发送到 
 - 提议带：上下文（与服务运行时同一来源测得）、脱敏摘要、运行目录的带密钥证据摘要（`hmac-sha256:`，原始证据不离开本机）；safari_process_attribution 与 safari_udp_quic_handling 带全部门槛协议与 DNS/WebRTC/系统服务的覆盖；归属提议带进程完整路径；runtime_entry_modes 提议带入口策略。
 - `supported` 只接受“通过”的结果；测量后上下文（Surge/macOS/Safari 版本、进程路径、原语映射等依赖字段）变化时拒绝，需要重测。
 - 依赖工作配置身份的能力（fixed_profile_no_switch、targeted_resource_refresh、policy_path_reread、connection_continuity、auto_reload_atomic_replace、same_profile_reload_impact）是在测试配置上测得的，必须显式加 `--working-profile any`，摘要会注明“在 P0 测试配置（源配置副本）上测得”。
-- 声明的 `--auto-reload`、`--takeover`、`--signing-identity` 必须有测量证据，对**每个**依赖该字段的能力都适用（不只是 auto_reload_atomic_replace）：具体值必须等于测量时的值（refresh 声明的自动重载设置，或测量时读到的值；测量时没有记录则不能声明）；`--auto-reload any` 需要本能力在自动重载开、关两种设置下的测量都得到与提议相同的结论，`--takeover any` 需要 enhanced、system_proxy、both 三种接管方式下都有，且这些测量的其余依赖上下文与当前一致；任一取值下另有相反结论的测量（不论先后）即拒绝，用作证据的测量次数与时间写入提议摘要。读不到的上下文字段记为 null，服务运行时同样读不到才会匹配；工具会提示。
+- 声明的 `--auto-reload`、`--takeover`、`--signing-identity` 必须有测量证据，对**每个**依赖该字段的能力都适用（不只是 auto_reload_atomic_replace）：具体值必须等于测量时的值（refresh 声明的自动重载设置，或测量时读到的值；测量时没有记录则不能声明）；`--auto-reload any` 需要本能力在自动重载开、关两种设置下的测量都得到与提议相同的结论，`--takeover any` 需要 enhanced、system_proxy、both 三种接管方式下都有，且这些测量的其余依赖上下文与当前一致；任一取值下另有相反结论的测量（不论先后）即拒绝，用作证据的测量次数与时间写入提议摘要。读不到的上下文字段记为 null，服务运行时同样读不到才会匹配；工具会提示。例外：Surge 版本与构建读不到（或不是 `6.5.0`、`10960` 这样的格式）时，依赖它们的能力不能提议，工具直接拒绝——这样的记录在服务中永远不会生效。
 - 提议摘要不超过服务接受的 4000 字（超出部分截断并以“…”结尾）。
 - 原生相关能力需要签名身份：默认读取 `/Applications/SafariProfileSurge.app` 的 Team ID，也可用 `--signing-identity` 提供。
 - 发送后在网页后台「能力门槛」页核对上下文、摘要与覆盖，再确认。工具不能确认。确认新的进程路径或入口策略会让依赖它们的能力回到待验证，且入口必须是 NORMAL。

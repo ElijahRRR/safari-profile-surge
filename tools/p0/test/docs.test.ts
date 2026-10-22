@@ -25,8 +25,17 @@ describe('docs/P0-RUNBOOK.md', () => {
     }
   });
 
+  it('documents the read-only running-instance checks V1–V10 and the instance command', () => {
+    expect(text).toMatch(/^### 1\.5 运行中 Surge 的版本（只读核对 V1–V10）/m);
+    for (let i = 1; i <= 10; i++) expect(text).toMatch(new RegExp(`^\\| V${i} \\|`, 'm'));
+    for (const s of ['instance [--surge-team-id', '--self-test-bundle', 'test.sfe.p0.instance-selftest', '不要为了测试而触发更新', 'SURGE_BUNDLE_IDS', 'TODO(P0)', 'inventory/surge-instance.json']) expect(text).toContain(s);
+    // PR #5 的过渡说明已被替换：版本读取已经实现（仍待测试 Mac 核对）
+    expect(text).not.toContain('运行实例版本读取仍待实现与验证');
+    expect(text).toContain('从**运行中的 Surge 实例**取得');
+  });
+
   it('documents the overall order and the manual profile switch', () => {
-    for (const cmd of ['inventory', 'test-servers', 'make-test-profile', 'attribution', 'entry', 'refresh', 'continuity', 'chain', 'charset', 'preflight', 'checklist', 'propose', 'rollback']) {
+    for (const cmd of ['inventory', 'instance', 'test-servers', 'make-test-profile', 'attribution', 'entry', 'refresh', 'continuity', 'chain', 'charset', 'preflight', 'checklist', 'propose', 'rollback']) {
       expect(text).toContain(cmd);
     }
     expect(text).toContain('手动');

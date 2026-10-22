@@ -8,7 +8,6 @@ import { realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
 import { SfeError } from '@sfe/contract';
 import { loadConfig, type ServiceConfig } from './config.js';
 import { openRepositories, type Repositories } from './db/index.js';
@@ -27,9 +26,11 @@ import { secretStoreError } from './secrets/errors.js';
 import { createCliAdapter, defaultCodesignRunner, verifyCliPath } from './surge/cli-adapter.js';
 import { createCompositeAdapter } from './surge/composite.js';
 import { createHttpAdapter, parseHttpApiLine } from './surge/http-adapter.js';
+import { createDefaultSurgeInstanceReader } from './surge/running-instance.js';
 import { capabilityUnverified, SURGE_PRIMITIVES, type MechanismMap } from './surge/primitives.js';
 import { createDemoSurge, prepareDemoState, seedDemoData } from './demo/index.js';
 import { systemClock } from './util/clock.js';
+import { execFixed } from './util/exec-fixed.js';
 import { createIdGenerator } from './util/ids.js';
 import { createLogger, fileSink, type FileSink } from './util/logger.js';
 import { createScrubber } from './util/scrubber.js';
@@ -94,17 +95,21 @@ const unavailableMaintenance: MaintenanceSurge = {
   },
 };
 
-function execText(file: string, args: string[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile(file, args, { timeout: 10_000, shell: false, encoding: 'utf8' }, (err, stdout) => (err ? reject(err) : resolve(String(stdout).trim())));
-  });
+async function execText(file: string, args: string[]): Promise<string> {
+  const r = await execFixed(file, args, { timeout: 10_000 });
+  if (r.error) throw r.error;
+  return r.stdout.trim();
 }
 
-function macHost(platform: NodeJS.Platform): Partial<HostInfo> {
+/** 非演示模式的本机事实（导出只为测试接线）。 */
+export function macHost(platform: NodeJS.Platform): Partial<HostInfo> {
   if (platform !== 'darwin') {
-    return { macosBuild: async () => 'unknown', safariVersion: async () => 'unknown' };
+    return { macosBuild: async () => 'unknown', safariVersion: async () => 'unknown', surgeInstance: async () => ({ ok: false, reason: 'not_darwin' }) };
   }
+  // 运行中 Surge 的版本：一个常驻的读取器（缓存包信息与签名结果）；Team ID 未知，与 CLI 路径校验一致只做 --verify --strict
+  const instance = createDefaultSurgeInstanceReader({ platform, uid: process.getuid?.() ?? -1, teamId: null });
   return {
+    surgeInstance: () => instance.read(),
     macosBuild: async () => (await execText('/usr/bin/sw_vers', ['-buildVersion'])) || null,
     safariVersion: async () => (await execText('/usr/bin/defaults', ['read', '/Applications/Safari.app/Contents/Info', 'CFBundleShortVersionString'])) || null,
     processPathExists: (p) => {
@@ -208,7 +213,9 @@ export async function startService(opts: StartOptions): Promise<RunningService> 
     paths: { dataDir: config.dataDir, tmpDir: config.tmpDir, backupsDir: config.backupsDir, homedir: config.homedir },
     surgeCliPath: config.surgeCliPath,
     demo: config.demo,
-    host: config.demo ? { macosBuild: async () => 'demo', safariVersion: async () => 'demo', processPathExists: () => true } : macHost(config.platform),
+    host: config.demo
+      ? { macosBuild: async () => 'demo', safariVersion: async () => 'demo', processPathExists: () => true, surgeInstance: () => demoSurge!.fake.runningInstance() }
+      : macHost(config.platform),
     loginUrl: () => {
       if (!http) throw new SfeError('INTERNAL', '签发登录链接失败：网页服务尚未启动');
       return issueLoginUrl(sessions, http);

@@ -1,5 +1,5 @@
 // 各命令共用：运行目录、合成测试凭据、Surge 会话（固定原语映射 + 写入守卫 + 调用记录）、测试服务检查、
-// 上下文测量、写入前快照与确认。
+// 上下文测量（Surge 版本来自运行中的 Surge 实例，与服务同一读取器）、写入前快照与确认。
 
 import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
@@ -9,7 +9,16 @@ import { CAPABILITY_CRITERIA, CAPABILITY_LABELS, ROUTE_GROUP_NAME, VERIFY_ENDPOI
 import { parseMechanismOverrides, type ParsedArgs } from '../args.js';
 import { CALLS_LOG, DEFAULT_SURGE_PROXY, TEST_CREDENTIALS_FILE } from '../constants.js';
 import { buildContext, type ContextOverrides } from '../context.js';
-import { SURGE_PRIMITIVES, parseHttpApiLine, verifyCliPath, type MechanismMap, type SurgeAdapter } from '../deps.js';
+import {
+  SURGE_PRIMITIVES,
+  createDefaultSurgeInstanceReader,
+  parseHttpApiLine,
+  verifyCliPath,
+  type MechanismMap,
+  type RunningInstanceReport,
+  type RunningInstanceResult,
+  type SurgeAdapter,
+} from '../deps.js';
 import { refused } from '../errors.js';
 import { directGet, parseProxyAddress, type ProxyAddress } from '../http-client.js';
 import type { Output, Prompter } from '../io.js';
@@ -31,6 +40,8 @@ export interface Deps {
   sleep: (ms: number) => Promise<void>;
   /** 只用于离线测试：替代真实 CLI/HTTP 适配器（仍套写入守卫与调用记录）。 */
   surgeOverride?: SurgeAdapter;
+  /** 只用于离线测试：替代运行中 Surge 实例的读取（版本来源；例如 FakeSurge.runningInstance）。 */
+  surgeInstance?: () => Promise<RunningInstanceResult | RunningInstanceReport>;
 }
 
 export interface Ctx {
@@ -239,6 +250,8 @@ export interface MeasureExtras {
   processPaths?: readonly string[];
   overrides?: ContextOverrides;
   signingIdentity?: string | null;
+  /** 本次命令已经读过的运行实例（避免同一命令内读两次得到不同结论）。 */
+  instance?: RunningInstanceReport;
 }
 
 export async function tryRead<T>(fn: () => Promise<T>): Promise<T | null> {
@@ -249,6 +262,28 @@ export async function tryRead<T>(fn: () => Promise<T>): Promise<T | null> {
   }
 }
 
+/**
+ * 读取运行中的 Surge 实例（只读）：与服务同一工厂（createDefaultSurgeInstanceReader）、同一常量与执行方式（P0 的
+ * execFixed，stdin 关闭，ps 固定 C/UTC 环境）。--surge-team-id 只会让签名校验更严（失败即关闭，不会与服务结论相反地放宽）。
+ */
+export async function readSurgeInstance(ctx: Ctx): Promise<RunningInstanceReport> {
+  if (ctx.deps.surgeInstance) {
+    try {
+      const r = await ctx.deps.surgeInstance();
+      return 'result' in r ? r : { result: r, steps: [], cached: false };
+    } catch {
+      return { result: { ok: false, reason: 'read_failed' }, steps: [], cached: false };
+    }
+  }
+  const reader = createDefaultSurgeInstanceReader({
+    platform: ctx.deps.platform,
+    uid: process.getuid?.() ?? -1,
+    exec: ctx.deps.exec,
+    teamId: ctx.args.strings['surge-team-id'] ?? null,
+  });
+  return reader.inspect();
+}
+
 /** 按服务运行时的同一来源测量当前上下文（session 只需要固定映射下的适配器与映射）。 */
 export async function measureContext(
   ctx: Ctx,
@@ -256,12 +291,23 @@ export async function measureContext(
   state: RunState,
   extras: MeasureExtras = {},
 ): Promise<CapabilityContext> {
+  return (await measureContextWithInstance(ctx, session, state, extras)).context;
+}
+
+/** 同 measureContext，另返回运行实例的读取结果（拒绝提议时说明原因）。版本从不经 getVersion。 */
+export async function measureContextWithInstance(
+  ctx: Ctx,
+  session: { adapter: SurgeAdapter; mechanism: MechanismMap } | null,
+  state: RunState,
+  extras: MeasureExtras = {},
+): Promise<{ context: CapabilityContext; instance: RunningInstanceReport }> {
   const v = await swVers(ctx.deps.exec);
   const safari = await plistValue(ctx.deps.exec, SAFARI_APP, 'CFBundleShortVersionString');
-  const version = session ? await tryRead(() => session.adapter.getVersion()) : null;
+  const instance = extras.instance ?? (await readSurgeInstance(ctx));
+  const version = instance.result.ok ? { version: instance.result.instance.version, build: instance.result.instance.build } : null;
   const autoReload = session ? await tryRead(() => session.adapter.getAutoReloadSetting()) : null;
   const takeover: TakeoverState | null = session ? await tryRead(() => session.adapter.getTakeoverState()) : null;
-  return buildContext(
+  const context = buildContext(
     {
       surgeVersion: version,
       macosBuild: v.buildVersion,
@@ -275,6 +321,7 @@ export async function measureContext(
     },
     extras.overrides,
   );
+  return { context, instance };
 }
 
 export interface Snapshot {

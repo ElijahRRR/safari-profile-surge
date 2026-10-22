@@ -38,13 +38,57 @@ import { createTempRuleStrategy } from '../surge/entry/temp-rule-strategy.js';
 import type { EntryConfig } from '../surge/entry/common.js';
 import type { EntryOwnership } from '../surge/entry/ownership.js';
 import { parseHttpApiLine } from '../surge/http-adapter.js';
+import { SURGE_BUILD_RE, SURGE_VERSION_RE } from '../surge/capability-gate.js';
+import { RUNNING_INSTANCE_FAILURE_TEXT, isRunningInstanceFailure, type RunningInstanceResult } from '../surge/running-instance.js';
+import type { SurgePrimitive } from '../surge/primitives.js';
 import { classifyDirectoryRisk } from '../util/secure-files.js';
-import { emptySurgeFacts, type SurgeFacts } from '../domain/views.js';
+import { emptySurgeFacts, type SurgeFacts, type SurgeVersionIssue } from '../domain/views.js';
 import { activationGate, buildCapabilityContext, capabilityViews, missingFrom } from './capabilities.js';
 import { createEventBus } from './events.js';
 import { createEngineKv, type EngineKv } from './kv.js';
 import { createDbEntryOwnership } from './ownership.js';
 import { readFile } from 'node:fs/promises';
+
+// ---------- Surge 可达性（docs/ARCHITECTURE.md §5.2、§6.6） ----------
+
+/**
+ * 可达性检测使用的只读原语，按顺序取第一个已映射到 cli、http 或 fake 的。选择在引擎创建时静态完成，从不按成败
+ * 换用另一个，也从不使用 getVersion（Surge 6.5 的命令行工具没有版本命令）。原语只有在 P0 实测读取成功后才会被映射；
+ * 只配置 HTTP API 时落到 getCurrentProfile 或 listPolicies。
+ */
+export const LIVENESS_PRIMITIVES = ['listExternalResources', 'listTempRules', 'getCurrentProfile', 'listPolicies'] as const satisfies readonly SurgePrimitive[];
+export type LivenessPrimitive = (typeof LIVENESS_PRIMITIVES)[number];
+
+export function chooseLivenessPrimitive(mechanism: Readonly<Record<string, string>>): LivenessPrimitive | null {
+  return LIVENESS_PRIMITIVES.find((p) => mechanism[p] === 'cli' || mechanism[p] === 'http' || mechanism[p] === 'fake') ?? null;
+}
+
+/** 检测读取：解析成功且结构正确才算可达（适配器返回意外的值也按无法确认处理）。 */
+const LIVENESS_READ: Record<LivenessPrimitive, (s: SurgeAdapter) => Promise<boolean>> = {
+  listExternalResources: async (s) => Array.isArray(await s.listExternalResources()),
+  listTempRules: async (s) => Array.isArray(await s.listTempRules()),
+  getCurrentProfile: async (s) => {
+    const p: unknown = await s.getCurrentProfile();
+    return typeof p === 'object' && p !== null && typeof (p as { name?: unknown }).name === 'string';
+  },
+  listPolicies: async (s) => {
+    const p: unknown = await s.listPolicies();
+    return typeof p === 'object' && p !== null && Array.isArray((p as { proxies?: unknown }).proxies) && Array.isArray((p as { groups?: unknown }).groups);
+  },
+};
+
+/** 检测失败的分类：not_configured 没有可用实现；unreachable 无法连接；unconfirmed 命令失败或输出无法识别。 */
+export type LivenessFailure = 'not_configured' | 'unreachable' | 'unconfirmed';
+
+export const LIVENESS_FAILURE_TEXT: Record<LivenessFailure, string> = {
+  not_configured: '无法连接 Surge：尚未配置可用的命令行工具或 HTTP API',
+  unreachable: '无法连接 Surge',
+  unconfirmed: '无法确认 Surge 连接：只读检测失败或输出无法识别',
+};
+
+export function versionUnknownMessage(issue: SurgeVersionIssue): string {
+  return `无法确认运行中的 Surge 版本（${RUNNING_INSTANCE_FAILURE_TEXT[issue]}）：依赖 Surge 版本的能力按待验证处理`;
+}
 
 export interface HostInfo {
   /** sw_vers 构建号；非 macOS 为 'unknown'；读不到为 null。 */
@@ -55,6 +99,11 @@ export interface HostInfo {
   signingIdentity(): string | null;
   /** 进程路径是否存在（能力提议与对账检查）。 */
   processPathExists(path: string): boolean;
+  /**
+   * 运行中的 Surge 实例（版本与构建号的唯一来源，surge/running-instance.ts）。缺省：非 macOS 为 not_darwin，
+   * 否则 unavailable——版本为 null，依赖版本的能力按待验证处理。
+   */
+  surgeInstance(): Promise<RunningInstanceResult>;
 }
 
 export interface DemoHooks {
@@ -97,6 +146,11 @@ export interface AppServiceDeps {
   precheckTimeoutMs?: number;
   /** 发布基线检查的最多重试次数。 */
   baselineRetries?: number;
+  /**
+   * 固定可达性检测原语（null 表示没有）；缺省按 surge.mechanism() 选择（chooseLivenessPrimitive）。
+   * 测试夹具用它固定检测读取，避免检测消耗测试注入的故障。
+   */
+  livenessPrimitive?: LivenessPrimitive | null;
 }
 
 export interface EngineKeys {
@@ -140,6 +194,11 @@ export class Engine {
   facts: SurgeFacts = emptySurgeFacts();
   hostFacts: { macosBuild: string | null; safariVersion: string | null } = { macosBuild: null, safariVersion: null };
   views: EventViews | null = null;
+  /** 可达性检测原语：创建时静态选定，之后不变。 */
+  readonly livenessPrimitive: LivenessPrimitive | null;
+  /** 上一次检测与版本读取的结论（只在变化时记日志）；undefined 表示尚未读取。 */
+  private lastLiveness: LivenessFailure | null | undefined = undefined;
+  private lastVersionIssue: SurgeVersionIssue | null | undefined = undefined;
   private keysCache: EngineKeys | null = null;
   private keysLoading: Promise<EngineKeys> | null = null;
 
@@ -168,7 +227,9 @@ export class Engine {
       safariVersion: deps.host?.safariVersion ?? (async () => (off ? 'unknown' : null)),
       signingIdentity: deps.host?.signingIdentity ?? (() => null),
       processPathExists: deps.host?.processPathExists ?? (() => true),
+      surgeInstance: deps.host?.surgeInstance ?? (async () => ({ ok: false, reason: off ? 'not_darwin' : 'unavailable' })),
     };
+    this.livenessPrimitive = deps.livenessPrimitive !== undefined ? deps.livenessPrimitive : chooseLivenessPrimitive(this.surge.mechanism());
   }
 
   now(): Date {
@@ -272,9 +333,14 @@ export class Engine {
   // ---------- Surge 事实与能力上下文 ----------
 
   /**
-   * 只读 Surge 基础事实（版本、启动时间、当前配置、接管、自动重载）；从不写。同时重读本机事实（macOS 构建号、
+   * 只读 Surge 基础事实（可达性、版本、启动时间、当前配置、接管、自动重载）；从不写。同时重读本机事实（macOS 构建号、
    * Safari 版本）：服务常驻运行，Safari 可单独经软件更新升级而不重启，能力门槛（激活前、写入 ACTIVE 前、对账）
    * 必须按当前版本判定，不能沿用启动时的值。
+   *
+   * 可达性只看固定的检测原语（livenessPrimitive）一次读取是否解析成功；其他任何结果都是不可达（失败即关闭），
+   * 不可达时不再读取其他事实。版本与构建号只来自运行中的 Surge 实例（host.surgeInstance），与可达性无关：
+   * 无法证明时为 null，原因记在 versionIssue，依赖版本的能力按待验证处理。从不调用 getVersion。
+   * 提示按优先级取第一条：无法连接 > 不是工作配置 > 版本无法确认 > 目录位置无法确认。
    */
   async readBasicFacts(): Promise<SurgeFacts> {
     await this.refreshHostFacts();
@@ -286,21 +352,17 @@ export class Engine {
       managedSectionsIntact: this.facts.managedSectionsIntact,
     };
     facts.checkedAt = this.nowIso();
-    try {
-      const v = await this.surge.getVersion();
-      facts.reachable = true;
-      facts.version = v.version;
-      facts.build = v.build;
-    } catch (err) {
-      const code = err instanceof SfeError ? err.code : null;
-      // 读版本的原语没有可用实现（安装配置未选定命令行工具或 HTTP API）等同于无法连接
-      facts.reachable = !(code === 'SURGE_UNREACHABLE' || code === 'CAPABILITY_UNVERIFIED');
-      facts.message = facts.reachable ? '读取 Surge 版本失败' : code === 'CAPABILITY_UNVERIFIED' ? '无法连接 Surge：尚未配置可用的命令行工具或 HTTP API' : '无法连接 Surge';
-      if (!facts.reachable) {
-        this.facts = facts;
-        return facts;
-      }
+    const liveness = await this.checkLiveness();
+    this.noteLiveness(liveness);
+    if (liveness !== null) {
+      facts.message = LIVENESS_FAILURE_TEXT[liveness];
+      this.facts = facts;
+      return facts;
     }
+    facts.reachable = true;
+    const versionIssue = await this.readVersion(facts);
+    facts.versionIssue = versionIssue;
+    this.noteVersionIssue(versionIssue);
     const wp = this.workingProfile();
     try {
       const info = await this.surge.getRuntimeInfo();
@@ -345,9 +407,68 @@ export class Engine {
       }
     }
     if (facts.message === null && facts.onWorkingProfile === false) facts.message = 'Surge 当前配置不是固定工作配置';
+    if (facts.message === null && versionIssue !== null) facts.message = versionUnknownMessage(versionIssue);
     if (facts.message === null && directoryUnknown) facts.message = '无法确认固定工作配置所在目录的真实位置：可能位于同步或受保护位置，请检查目录权限与链接';
     this.facts = facts;
     return facts;
+  }
+
+  /** 一次检测读取：null 表示可达。 */
+  private async checkLiveness(): Promise<LivenessFailure | null> {
+    const primitive = this.livenessPrimitive;
+    if (primitive === null) return 'not_configured';
+    try {
+      return (await LIVENESS_READ[primitive](this.surge)) ? null : 'unconfirmed';
+    } catch (err) {
+      const code = err instanceof SfeError ? err.code : null;
+      // CAPABILITY_UNVERIFIED：原语映射到的实现不存在（命令行工具未通过签名校验、HTTP API 不是只监听回环地址等）
+      if (code === 'CAPABILITY_UNVERIFIED') return 'not_configured';
+      if (code === 'SURGE_UNREACHABLE') return 'unreachable';
+      // 命令失败、交互模式提示、输出无法识别、HTTP 401 等：不能证明连接可用
+      return 'unconfirmed';
+    }
+  }
+
+  /**
+   * 运行中 Surge 的版本与构建号（只决定版本，从不决定可达性）：来自运行实例读取，版本与构建号一起接受或一起为 null。
+   * 读取器已经校验过格式；这里再按 A0 的格式核对一次（注入的实现返回其他值时按 version_malformed）。
+   */
+  private async readVersion(facts: SurgeFacts): Promise<SurgeVersionIssue | null> {
+    let r: RunningInstanceResult;
+    try {
+      r = await this.host.surgeInstance();
+    } catch {
+      return 'read_failed';
+    }
+    if (typeof r !== 'object' || r === null) return 'read_failed';
+    if (r.ok !== true) {
+      const reason: unknown = (r as { reason?: unknown }).reason;
+      return isRunningInstanceFailure(reason) ? reason : 'read_failed';
+    }
+    const inst: { version?: unknown; build?: unknown } = typeof r.instance === 'object' && r.instance !== null ? r.instance : {};
+    if (typeof inst.version !== 'string' || !SURGE_VERSION_RE.test(inst.version) || typeof inst.build !== 'string' || !SURGE_BUILD_RE.test(inst.build)) {
+      return 'version_malformed';
+    }
+    facts.version = inst.version;
+    facts.build = inst.build;
+    return null;
+  }
+
+  /** 只在结论变化时记日志；不记录任何输出内容。 */
+  private noteLiveness(failure: LivenessFailure | null): void {
+    const prev = this.lastLiveness;
+    if (failure === prev) return;
+    this.lastLiveness = failure;
+    if (failure !== null) this.logger.log('warn', 'surge.liveness_failed', { primitive: this.livenessPrimitive, reason: failure });
+    else if (prev !== undefined) this.logger.log('info', 'surge.liveness_restored', { primitive: this.livenessPrimitive });
+  }
+
+  private noteVersionIssue(issue: SurgeVersionIssue | null): void {
+    const prev = this.lastVersionIssue;
+    if (issue === prev) return;
+    this.lastVersionIssue = issue;
+    if (issue !== null) this.logger.log('warn', 'surge.version_unknown', { reason: issue });
+    else if (prev !== undefined) this.logger.log('info', 'surge.version_known');
   }
 
   async refreshHostFacts(): Promise<void> {

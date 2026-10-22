@@ -8,13 +8,13 @@ import { join } from 'node:path';
 import { CAPABILITY_CONTEXT_DEPS, type CapabilityKey, type CapabilityStatus } from '@sfe/contract';
 import { parseCapabilityKey } from '../args.js';
 import type { ContextOverrides } from '../context.js';
-import { NdjsonClientError, ndjsonRequest } from '../deps.js';
+import { NdjsonClientError, RUNNING_INSTANCE_FAILURE_TEXT, ndjsonRequest, versionContextErrors } from '../deps.js';
 import { failed, refused, usage, type ExitCode } from '../errors.js';
 import { computeEvidenceManifest } from '../evidence.js';
 import { buildProposal } from '../proposal.js';
 import { readResult, readResultHistory } from '../results.js';
 import { DEFAULT_HOST_APP, codesignTeamId } from '../system.js';
-import { measureContext, openRun, openSession, type Ctx, type Session } from './common.js';
+import { measureContextWithInstance, openRun, openSession, type Ctx, type Session } from './common.js';
 
 function serviceDataDir(ctx: Ctx): string {
   if (ctx.args.strings['data-dir']) return ctx.args.strings['data-dir'];
@@ -36,11 +36,20 @@ export async function runPropose(ctx: Ctx): Promise<ExitCode> {
     session = await openSession(ctx, dir, state, { needTestProfile: false }).catch(() => null);
   }
   const signingIdentity = deps.includes('signingIdentity') ? await codesignTeamId(ctx.deps.exec, ctx.args.strings['app-path'] ?? DEFAULT_HOST_APP) : null;
-  const current = await measureContext(ctx, session, state, {
+  const { context: current, instance } = await measureContextWithInstance(ctx, session, state, {
     entryStrategy: result?.entryStrategy ?? null,
     processPaths: result?.processPaths ?? state.processPaths,
     signingIdentity,
   });
+  // 依赖 Surge 版本/构建的能力：读不到运行中 Surge 的版本（或读到的不是版本）时拒绝，而不是提示后照样提议——
+  // 这样的记录在服务端永远不会生效（版本读不到即待验证，不再匹配记录的 null 或 any），服务端也会拒绝。
+  const versionErrors = versionContextErrors(key, current);
+  if (versionErrors.length > 0) {
+    const why = instance.result.ok ? '' : `运行中的 Surge 无法确认：${RUNNING_INSTANCE_FAILURE_TEXT[instance.result.reason]}。`;
+    throw refused(
+      `生成提议失败：${versionErrors.map((e) => e.message).join('；')}。${why}依赖 Surge 版本的能力要在读到运行中 Surge 的版本与构建号后才能提议（运行 instance 查看逐条检查；版本只来自运行中的 Surge 实例，不要把 getVersion 映射为 cli）`,
+    );
+  }
   const overrides: ContextOverrides = {};
   if (ctx.args.strings['working-profile'] === 'any') overrides.workingProfileId = 'any';
   if (ctx.args.strings['auto-reload']) overrides.autoReload = ctx.args.strings['auto-reload'] as 'on' | 'off' | 'any';
@@ -66,7 +75,6 @@ export async function runPropose(ctx: Ctx): Promise<ExitCode> {
     exists: (p) => existsSync(p),
   });
   if (req.context.autoReload === null && deps.includes('autoReload')) out.warn('自动重载设置读不到：服务运行时同样读不到，只有记录为 any 的能力才会匹配');
-  if (req.context.surgeVersion === null && deps.includes('surgeVersion')) out.warn('Surge 版本读不到（getVersion 不可用）：记录为 null，只有服务运行时也读不到时才匹配');
   dir.writeJson(`proposals/${requestId}.json`, { request: req, manifest });
 
   out.heading(`能力提议：${key} → ${status}`);

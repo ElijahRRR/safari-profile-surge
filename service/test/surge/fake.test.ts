@@ -260,6 +260,28 @@ describe('lifecycle and fault injection', () => {
     expect((await fake.listRecentRequests()).length).toBe(1);
   });
 
+  test('the simulated running instance reports version and build all-or-nothing and is not a Surge primitive call', async () => {
+    createFakeSurgeEnvironment(dir);
+    const fake = new FakeSurge({ directory: dir, version: '6.5.0', build: '10960', now: () => new Date('2026-10-21T09:00:00.700Z') });
+    expect(await fake.runningInstance()).toEqual({
+      ok: true,
+      instance: { pid: 404, startedAt: '2026-10-21T09:00:00.000Z', bundlePath: '/Applications/Surge.app', bundleId: 'com.nssurge.surge-mac', version: '6.5.0', build: '10960' },
+    });
+    fake.build = null;
+    expect(await fake.runningInstance()).toEqual({ ok: false, reason: 'plist_unreadable' });
+    fake.build = '10960';
+    fake.version = '127.0.0.1';
+    expect(await fake.runningInstance()).toEqual({ ok: false, reason: 'version_malformed' });
+    fake.version = '6.5.0';
+    fake.instanceFailure = 'modified_after_start';
+    expect(await fake.runningInstance()).toEqual({ ok: false, reason: 'modified_after_start' });
+    fake.instanceFailure = null;
+    fake.reachable = false;
+    expect(await fake.runningInstance()).toEqual({ ok: false, reason: 'not_running' });
+    expect(fake.instanceReads).toBe(5);
+    expect(fake.calls).toEqual({});
+  });
+
   test('version, profile and takeover state are settable', async () => {
     createFakeSurgeEnvironment(dir);
     const fake = new FakeSurge({ directory: dir, version: '6.5.0', build: '10960' });

@@ -1,13 +1,13 @@
 // sfe 命令行入口（docs/ARCHITECTURE.md §7.3）。构建为 dist/sfe.mjs（带 #!/usr/bin/env node）。
 // 依赖全部经 CliDeps 注入，测试不需要真实套接字或 /usr/bin/open。
 
-import { execFile } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { ndjsonRequest } from '../ipc/ndjson.js';
+import { execFixed } from '../util/exec-fixed.js';
 import { EXIT, SECRET_ARG_MESSAGE, UsageError, containsSecretArg, flag, parseArgv, resolveDataDir, single, type ExitCode } from './args.js';
 import { CliApiError, CliConnectError, MAX_IMPORT_FILE_BYTES, renderError, runCommand, usageText, type CliDeps } from './commands.js';
 import { OpenError } from './open.js';
@@ -91,10 +91,10 @@ export function defaultDeps(argv: string[] = process.argv.slice(2)): CliDeps {
       return readFile(path);
     },
     request: (socketPath, envelope) => ndjsonRequest({ path: socketPath }, envelope, { maxResponseBytes: MAX_RESPONSE_BYTES, timeoutMs: REQUEST_TIMEOUT_MS }),
-    exec: (file, args) =>
-      new Promise((resolve, reject) => {
-        execFile(file, args, { timeout: 10_000, shell: false }, (err) => (err ? reject(err) : resolve()));
-      }),
+    exec: async (file, args) => {
+      const r = await execFixed(file, args, { timeout: 10_000 });
+      if (r.error) throw r.error;
+    },
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     now: () => Date.now(),
     newRequestId: () => `cli-${randomUUID()}`,

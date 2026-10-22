@@ -8,11 +8,13 @@ import {
   type CapabilityKey,
 } from '@sfe/contract';
 import {
+  NEVER_NULL_FIELDS,
   computeCapabilityViews,
   contextFieldMatches,
   coverageAllowsSupported,
   createCapabilityGate,
   mechanismFingerprint,
+  versionContextErrors,
   type CapabilityRecordInput,
 } from '../../src/surge/capability-gate.js';
 
@@ -142,6 +144,111 @@ describe('context comparison rules', () => {
   test('fingerprint is canonical and marks missing primitives unavailable', () => {
     expect(mechanismFingerprint('connection_continuity', { selectGroupPolicy: 'http' })).toBe('{"selectGroupPolicy":"http","updateExternalResource":"unavailable"}');
     expect(mechanismFingerprint('native_profile_id', { selectGroupPolicy: 'http' })).toBe('{}');
+  });
+});
+
+// 读不到 Surge 版本时（例如 Surge 6.5 的 surge-cli --version 进入交互模式），依赖版本的能力一律待验证：
+// 记录的 null 或 any 都不能匹配读不到的当前版本，记录的 null 也不匹配读到的版本。
+describe('Surge version and build never match on null', () => {
+  const VERSION_KEYS = CAPABILITY_KEYS.filter((k) => CAPABILITY_CONTEXT_DEPS[k].some((f) => NEVER_NULL_FIELDS.includes(f)));
+  const NULL_VERSION = { surgeVersion: null, surgeBuild: null };
+
+  test('NEVER_NULL_FIELDS are exactly the Surge version and build', () => {
+    expect([...NEVER_NULL_FIELDS]).toEqual(['surgeVersion', 'surgeBuild']);
+  });
+
+  for (const field of ['surgeVersion', 'surgeBuild'] as const) {
+    test(`${field}: null on either side does not match, recorded any does not match a null current`, () => {
+      const value = field === 'surgeVersion' ? '6.5.0' : '10960';
+      expect(contextFieldMatches('runtime_entry_modes', field, null, null)).toBe(false);
+      expect(contextFieldMatches('runtime_entry_modes', field, 'any', null)).toBe(false);
+      expect(contextFieldMatches('runtime_entry_modes', field, value, null)).toBe(false);
+      expect(contextFieldMatches('runtime_entry_modes', field, null, value)).toBe(false);
+      // 具体值照常比较；记录为 any 仍匹配读到的具体值
+      expect(contextFieldMatches('runtime_entry_modes', field, value, value)).toBe(true);
+      expect(contextFieldMatches('runtime_entry_modes', field, 'any', value)).toBe(true);
+    });
+  }
+
+  test('other fields keep the old rule: null/null and any/null still match', () => {
+    for (const field of ['takeoverMode', 'autoReload', 'macosBuild', 'safariVersion', 'signingIdentity'] as const) {
+      expect(contextFieldMatches('runtime_entry_modes', field, null, null)).toBe(true);
+      expect(contextFieldMatches('runtime_entry_modes', field, 'any', null)).toBe(true);
+    }
+  });
+
+  test('records with a null version are stale on surgeVersion and surgeBuild for every version-dependent capability, also after an upgrade', () => {
+    expect(VERSION_KEYS.length).toBeGreaterThan(0);
+    const recorded = CAPABILITY_KEYS.map((key) => record(key, { context: { ...CTX, ...NULL_VERSION } }));
+    for (const current of [{ ...CTX, ...NULL_VERSION }, CTX, { ...CTX, surgeVersion: '6.10.0', surgeBuild: '11500' }]) {
+      const views = computeCapabilityViews(recorded, current);
+      for (const v of views) {
+        if (VERSION_KEYS.includes(v.key)) {
+          expect(v.effectiveStatus, v.key).toBe('unverified');
+          expect(v.staleReasons, v.key).toEqual(['surgeVersion', 'surgeBuild']);
+        } else {
+          expect(v.effectiveStatus, v.key).toBe('supported');
+        }
+      }
+    }
+  });
+
+  test('records with any as version are stale while the current version cannot be read', () => {
+    const recorded = CAPABILITY_KEYS.map((key) => record(key, { context: { ...CTX, surgeVersion: 'any', surgeBuild: 'any' } }));
+    const unreadable = computeCapabilityViews(recorded, { ...CTX, ...NULL_VERSION });
+    for (const v of unreadable) expect(v.effectiveStatus, v.key).toBe(VERSION_KEYS.includes(v.key) ? 'unverified' : 'supported');
+    expect(unreadable.find((v) => v.key === 'external_node_underlying_proxy')!.staleReasons).toEqual(['surgeVersion', 'surgeBuild']);
+    // 只有构建号读不到时，只列构建号
+    const noBuild = computeCapabilityViews(recorded, { ...CTX, surgeBuild: null });
+    expect(noBuild.find((v) => v.key === 'external_node_underlying_proxy')!.staleReasons).toEqual(['surgeBuild']);
+  });
+
+  test('an old record holding 127.0.0.1 as version (pre-PR #5 parser) is stale while the version cannot be read', () => {
+    const v = computeCapabilityViews([record('takeover_state_readable', { context: { ...CTX, surgeVersion: '127.0.0.1', surgeBuild: null } })], { ...CTX, ...NULL_VERSION }).find(
+      (x) => x.key === 'takeover_state_readable',
+    )!;
+    expect(v.effectiveStatus).toBe('unverified');
+    expect(v.staleReasons).toEqual(['surgeVersion', 'surgeBuild']);
+  });
+
+  test('the gate refuses version-dependent capabilities with an unreadable version and keeps others', async () => {
+    const g = createCapabilityGate({
+      list: () => [record('runtime_entry_modes', { context: { ...CTX, ...NULL_VERSION } }), record('native_profile_id', { context: { ...CTX, ...NULL_VERSION } })],
+      currentContext: async () => ({ ...CTX, ...NULL_VERSION }),
+    });
+    await expect(g.require(['native_profile_id'])).resolves.toBeUndefined();
+    const err = (await g.require(['runtime_entry_modes', 'native_profile_id']).catch((e: unknown) => e)) as SfeError;
+    expect(err.code).toBe('CAPABILITY_UNVERIFIED');
+    expect(err.details).toEqual({ missing: [{ key: 'runtime_entry_modes', staleReasons: ['surgeVersion', 'surgeBuild'] }] });
+  });
+});
+
+describe('versionContextErrors (proposal validation shared by service and P0)', () => {
+  test('accepts well-formed version and build', () => {
+    for (const surgeVersion of ['6.5', '6.5.0', '10.0.12', '999.999.999']) expect(versionContextErrors('runtime_entry_modes', { surgeVersion, surgeBuild: '10960' })).toEqual([]);
+    for (const surgeBuild of ['1', '10960', '1234567890']) expect(versionContextErrors('runtime_entry_modes', { surgeVersion: '6.5.0', surgeBuild })).toEqual([]);
+  });
+
+  test('refuses null, any and malformed values for version-dependent capabilities', () => {
+    const fields = (ctx: { surgeVersion: string | null; surgeBuild: string | null }) => versionContextErrors('external_node_underlying_proxy', ctx).map((e) => e.field);
+    expect(fields({ surgeVersion: null, surgeBuild: null })).toEqual(['surgeVersion', 'surgeBuild']);
+    expect(fields({ surgeVersion: 'any', surgeBuild: 'any' })).toEqual(['surgeVersion', 'surgeBuild']);
+    for (const bad of ['127.0.0.1', '6', '192.0.2.1', '1234.5', '6.5.', 'v6.5.0', ' 6.5.0', '6.5.0 ', '', '6.5.0\n']) {
+      expect(fields({ surgeVersion: bad, surgeBuild: '10960' }), JSON.stringify(bad)).toEqual(['surgeVersion']);
+    }
+    for (const bad of ['12345678901', '10960a', '-1', '1.0', '', ' 10960']) {
+      expect(fields({ surgeVersion: '6.5.0', surgeBuild: bad }), JSON.stringify(bad)).toEqual(['surgeBuild']);
+    }
+    const [v, b] = versionContextErrors('external_node_underlying_proxy', { surgeVersion: null, surgeBuild: '127.0.0.1' });
+    expect(v!.message).toContain('读不到');
+    expect(b!.message).toContain('格式不正确');
+    expect(versionContextErrors('external_node_underlying_proxy', { surgeVersion: 'any', surgeBuild: '1' })[0]!.message).toContain('不能记为 any');
+  });
+
+  test('does not check capabilities that do not depend on the Surge version', () => {
+    const independent = CAPABILITY_KEYS.filter((k) => !CAPABILITY_CONTEXT_DEPS[k].includes('surgeVersion') && !CAPABILITY_CONTEXT_DEPS[k].includes('surgeBuild'));
+    expect(independent).toContain('native_profile_id');
+    for (const key of independent) expect(versionContextErrors(key, { surgeVersion: null, surgeBuild: 'any' })).toEqual([]);
   });
 });
 

@@ -2,7 +2,7 @@
 // 迷你代理端口。证明 refresh / chain / preflight / charset / entry --to 的写入守卫、恢复与结论推导；
 // 不证明真实 Surge 的任何行为（那必须在测试 Mac 上实测）。
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -99,7 +99,8 @@ beforeEach(async () => {
     proxy,
     stopServers: stop,
     serversDone,
-    deps: (answers = []) => ({ ...baseDeps(answers), surgeOverride: surge }),
+    // 版本来源：FakeSurge 模拟的运行实例（与服务同一形状的结果；真实读取需要 macOS）
+    deps: (answers = []) => ({ ...baseDeps(answers), surgeOverride: surge, surgeInstance: () => surge.runningInstance() }),
     run: () => RunDir.open(base, null),
   };
 });
@@ -171,6 +172,36 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(any.code).toBe(EXIT.REFUSED);
     expect(any.text).toContain('缺少：自动重载开');
     expect((await propose('supported', '--auto-reload', 'off')).code).toBe(EXIT.OK);
+  });
+
+  it('propose refuses version-dependent capabilities when the running Surge version cannot be read', async () => {
+    // 运行实例无法证明（例如 Surge 已在磁盘上更新但还没有重新打开）：测量与提议时都读不到版本。
+    env!.surge.instanceFailure = 'modified_after_start';
+    expect(await main(['refresh', '--auto-reload', 'off', ...common()], env!.deps())).toBe(EXIT.OK);
+    expect(result('auto_reload_atomic_replace')).toMatchObject({ verdict: 'pass', context: { surgeVersion: null, surgeBuild: null } });
+    for (const status of ['supported', 'unsupported']) {
+      const d = env!.deps();
+      const code = await main(['propose', 'auto_reload_atomic_replace', status, '--working-profile', 'any', '--auto-reload', 'off', '--dry-run', '--raw-dir', env!.base], d);
+      expect(code, status).toBe(EXIT.REFUSED);
+      expect(d.out.text()).toContain('该能力依赖 Surge 版本，但读不到');
+      expect(d.out.text()).toContain('运行中的 Surge 无法确认：Surge 启动后包被更新或修改，请重新打开 Surge');
+    }
+    expect(existsSync(join(env!.run().path, 'proposals'))).toBe(false);
+  });
+
+  it('the measured context takes the Surge version from the running instance, never from getVersion', async () => {
+    env!.surge.version = '6.5.2';
+    env!.surge.build = '10970';
+    let versionCalls = 0;
+    env!.surge.getVersion = async () => {
+      versionCalls++;
+      return { version: '9.9.9', build: '99999' };
+    };
+    const before = env!.surge.instanceReads;
+    expect(await main(['refresh', '--auto-reload', 'off', ...common()], env!.deps())).toBe(EXIT.OK);
+    expect(result('auto_reload_atomic_replace').context).toMatchObject({ surgeVersion: '6.5.2', surgeBuild: '10970' });
+    expect(env!.surge.instanceReads).toBeGreaterThan(before);
+    expect(versionCalls).toBe(0);
   });
 
   it('continuity --reload-test arms the canary and never reports a reload it did not see', async () => {

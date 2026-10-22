@@ -77,6 +77,37 @@ describe('buildProposal', () => {
     expect(req.proposed_status).toBe('unsupported');
   });
 
+  it('refuses version-dependent capabilities when the Surge version or build is unreadable, any or malformed', () => {
+    const cases: Array<[Partial<CapabilityContext>, string]> = [
+      [{ surgeVersion: null, surgeBuild: null }, '读不到'],
+      [{ surgeVersion: '6.5.0', surgeBuild: null }, 'Surge 构建号'],
+      [{ surgeVersion: '127.0.0.1', surgeBuild: '10960' }, '格式不正确'],
+      [{ surgeVersion: 'any', surgeBuild: '10960' }, '不能记为 any'],
+    ];
+    for (const status of ['supported', 'unsupported'] as const) {
+      for (const [patch, text] of cases) {
+        const ctx = { ...CTX, ...patch };
+        // 测量时与提议时同样读不到：不能因为两边都是 null 就照样提议
+        const r = result('independent_node_preflight', { verdict: status === 'supported' ? 'pass' : 'fail', context: ctx });
+        const msg = refusal(() => buildProposal(input('independent_node_preflight', { status, result: r, current: ctx })));
+        expect(msg, JSON.stringify(patch)).toContain(text);
+        expect(msg).not.toContain('已变化');
+      }
+    }
+  });
+
+  it('refuses when the measurement had no Surge version even if it can be read now', () => {
+    const r = result('independent_node_preflight', { context: { ...CTX, surgeVersion: null, surgeBuild: null } });
+    const msg = refusal(() => buildProposal(input('independent_node_preflight', { result: r })));
+    expect(msg).toContain('测量时（2026-10-21T10:00:00.000Z）该能力依赖 Surge 版本，但读不到');
+  });
+
+  it('does not require a Surge version for capabilities that do not depend on it', () => {
+    const ctx = { ...CTX, surgeVersion: null, surgeBuild: null };
+    const req = buildProposal(input('open_profile_by_id', { result: result('open_profile_by_id', { context: ctx }), current: ctx }));
+    expect(req.context.surgeVersion).toBeNull();
+  });
+
   it('refuses when dependency context drifted since measurement', () => {
     const msg = refusal(() => buildProposal(input('independent_node_preflight', { current: { ...CTX, surgeBuild: '11000' } })));
     expect(msg).toContain('surgeBuild');

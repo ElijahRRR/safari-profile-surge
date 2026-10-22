@@ -4,7 +4,8 @@
 // 归属提议带进程完整路径；入口模式提议带入口策略。声明的自动重载/接管方式/签名身份必须有测量证据：
 // 具体值必须等于测量时的值；any 需要本能力在每个取值下都有同样结论的测量（自动重载开与关；接管 enhanced、
 // system_proxy、both），且这些测量与当前上下文的其余依赖字段一致；任一取值下另有相反结论的测量（不论先后）即拒绝，
-// 用作证据的测量写入摘要。摘要不超过服务的 4000 字上限。
+// 用作证据的测量写入摘要。依赖 Surge 版本/构建的能力在提议时与测量时都必须读到格式正确的版本，读不到即拒绝。
+// 摘要不超过服务的 4000 字上限。
 
 import {
   CAPABILITY_CONTEXT_DEPS,
@@ -18,7 +19,7 @@ import {
 } from '@sfe/contract';
 import { PROPOSAL_SUMMARY_MAX_CHARS } from './constants.js';
 import { contextDrift, type ContextOverrides } from './context.js';
-import { coverageAllowsSupported, validateSafariProcessPaths } from './deps.js';
+import { coverageAllowsSupported, validateSafariProcessPaths, versionContextErrors } from './deps.js';
 import { refused } from './errors.js';
 import { redactSummaryLines } from './redact.js';
 import { verdictLabel, type CapabilityResult } from './results.js';
@@ -108,6 +109,17 @@ export function buildProposal(input: ProposalInput): ProposeCapabilityRequest {
   if (!result) throw refused(`生成提议失败：本次运行没有 ${key} 的测量结果，请先运行对应的测试命令或检查清单`);
   if (status === 'supported' && result.verdict !== 'pass') throw refused(`生成提议失败：测量结论为「${verdictLabel(result.verdict)}」，不能提议支持`);
   if (status === 'unsupported' && result.verdict === 'pass') throw refused('生成提议失败：测量结论为「通过」，不能提议不支持');
+  // 依赖 Surge 版本/构建的能力：提议时与测量时都必须读到格式正确的具体版本（与服务端同一校验）。读不到版本的
+  // 记录在服务端永远不会生效（版本读不到即待验证），服务端也会以 EVIDENCE_REQUIRED 拒绝；先于漂移检查，
+  // 避免把“读不到”说成“已变化”。
+  const currentVersionErrors = versionContextErrors(key, input.current);
+  if (currentVersionErrors.length > 0) {
+    throw refused(`生成提议失败：${currentVersionErrors.map((e) => e.message).join('；')}。请在能读取运行中 Surge 的版本与构建号后重测`);
+  }
+  const measuredVersionErrors = versionContextErrors(key, result.context);
+  if (measuredVersionErrors.length > 0) {
+    throw refused(`生成提议失败：测量时（${result.at}）${measuredVersionErrors.map((e) => e.message).join('；')}。请重测`);
+  }
   const deps = CAPABILITY_CONTEXT_DEPS[key];
   const overrides = input.overrides;
   const declared = new Set(Object.entries(overrides).filter(([, v]) => v !== undefined).map(([k]) => k));

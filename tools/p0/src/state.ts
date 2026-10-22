@@ -35,7 +35,10 @@ export interface InventorySummary {
   macos: { productVersion: string | null; buildVersion: string | null };
   safari: { version: string | null; build: string | null };
   surgeApp: { version: string | null; build: string | null };
+  /** 运行中 Surge 实例的版本（与服务同一读取器）；读不到时为 null。磁盘上的 Surge.app 版本见 surgeApp（只作旁证）。 */
   surgeVersion: { version: string | null; build: string | null };
+  /** 运行实例读取的结论；旧运行没有该字段。 */
+  surgeInstance?: { ok: boolean; reason: string | null };
   cliVerified: { ok: boolean; reason: string };
   httpApi: { configured: boolean; loopbackOnly: boolean | null };
   currentProfileName: string | null;

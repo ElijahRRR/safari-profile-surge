@@ -8,8 +8,8 @@ import CapabilityContextList from '../components/CapabilityContextList.vue';
 import NoticeBox from '../components/NoticeBox.vue';
 import ProtocolCoverageTable from '../components/ProtocolCoverageTable.vue';
 import { useConsole } from '../store/context';
-import { COVERAGE_REQUIRED_KEYS, allCapabilities, capabilityCounts, coverageBlockReason } from '../lib/gates';
-import { CAPABILITY_STATUS_LABELS, CONTEXT_FIELD_LABELS, ENTRY_STRATEGY_LABELS } from '../lib/labels';
+import { COVERAGE_REQUIRED_KEYS, allCapabilities, capabilityCounts, coverageBlockReason, staleReasonText } from '../lib/gates';
+import { CAPABILITY_STATUS_LABELS, ENTRY_STRATEGY_LABELS } from '../lib/labels';
 import { formatCount, formatDateTime } from '../lib/format';
 import { newRequestId } from '../lib/request-id';
 
@@ -44,8 +44,8 @@ function contextSummary(ctx: CapabilityView['context']): string {
   return parts.length ? parts.join(' · ') : '—';
 }
 
-function staleText(fields: readonly string[]): string {
-  return fields.map((f) => CONTEXT_FIELD_LABELS[f as keyof typeof CONTEXT_FIELD_LABELS] ?? f).join('、');
+function staleText(cap: CapabilityView): string {
+  return staleReasonText(cap, store.surge.value);
 }
 
 function confirmBlock(p: CapabilityProposalView): string | null {
@@ -107,7 +107,7 @@ async function doReset() {
   <div>
     <PageHeader title="能力门槛" :description="description" />
     <NoticeBox tone="info" class="mb-6">
-      这些结论来自测试 Mac 上的 P0 工具：工具提交证据摘要作为提议，由你在这里确认后才生效。Surge、macOS、Safari、入口策略、进程路径、工作配置等上下文变化时，相关能力自动回到待验证。离线测试通过不代表能力通过。
+      这些结论来自测试 Mac 上的 P0 工具：工具提交证据摘要作为提议，由你在这里确认后才生效。Surge、macOS、Safari、入口策略、进程路径、工作配置等上下文变化时，相关能力自动回到待验证；读不到运行中 Surge 的版本时，依赖版本的能力一律按待验证处理。离线测试通过不代表能力通过。
     </NoticeBox>
 
     <section v-if="proposals.length" class="mb-6 space-y-4" data-test="proposals">
@@ -156,7 +156,7 @@ async function doReset() {
       <template #cell-status="{ row }"><Badge :variant="CAPABILITY_STATUS_LABELS[row.status].variant">{{ CAPABILITY_STATUS_LABELS[row.status].label }}</Badge></template>
       <template #cell-effective="{ row }"><Badge :variant="CAPABILITY_STATUS_LABELS[row.effectiveStatus].variant">{{ CAPABILITY_STATUS_LABELS[row.effectiveStatus].label }}</Badge></template>
       <template #cell-stale="{ row }">
-        <span v-if="row.staleReasons.length" class="text-xs text-red-600 dark:text-red-400">{{ staleText(row.staleReasons) }}已变化</span>
+        <span v-if="row.staleReasons.length" class="text-xs text-red-600 dark:text-red-400" data-test="stale-reason">{{ staleText(row) }}</span>
         <span v-else class="text-gray-500 dark:text-dark-400">—</span>
       </template>
       <template #cell-context="{ row }"><span class="text-xs text-gray-700 dark:text-gray-300">{{ contextSummary(row.context) }}</span></template>
@@ -194,6 +194,7 @@ async function doReset() {
         <section>
           <h4 class="mb-2 font-semibold text-gray-900 dark:text-white">验证上下文</h4>
           <CapabilityContextList :context="detail.cap.context" :stale="detail.cap.staleReasons" />
+          <p v-if="detail.cap.staleReasons.length" class="mt-2 text-xs text-red-600 dark:text-red-400" data-test="detail-stale-reason">过期原因：{{ staleText(detail.cap) }}</p>
         </section>
         <section v-if="detail.cap.protocolCoverage || COVERAGE_REQUIRED_KEYS.includes(detail.cap.key)">
           <h4 class="mb-2 font-semibold text-gray-900 dark:text-white">逐协议覆盖</h4>

@@ -27,6 +27,8 @@ import type {
 } from '../ports.js';
 import { ENTRY_BITS_IN_ORDER, entryRuleSetFileContent, entryRuleSetBlockLines, groupBlockLines, resourceFile } from './generate.js';
 import { SURGE_PRIMITIVES, type MechanismMap } from './primitives.js';
+import { SURGE_APP_BUNDLE, SURGE_BUNDLE_IDS, type RunningInstanceFailure, type RunningInstanceResult } from './running-instance.js';
+import { SURGE_BUILD_RE, SURGE_VERSION_RE } from './capability-gate.js';
 import { findSections, parseProfile } from './profile.js';
 import { parseProxyLine } from './proxy-line.js';
 import { redactProxyLine } from './redact-profile.js';
@@ -129,8 +131,13 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   frontResolution: 'skip' | 'direct';
   reloadClearsTempRules: boolean;
   reachable = true;
+  /** 运行实例（HostInfo.surgeInstance）报告的版本与构建号；格式不对时运行实例读取失败。 */
   version: string;
   build: string | null;
+  /** 模拟运行实例读取失败（例如 modified_after_start）；null 表示按 version/build 正常报告。 */
+  instanceFailure: RunningInstanceFailure | null = null;
+  /** runningInstance() 的调用次数（不是 Surge 原语，不计入 calls）。 */
+  instanceReads = 0;
   takeover: TakeoverState = { enhancedMode: true, systemProxy: true, outboundMode: 'rule', checkedAt: null };
   currentProfile: SurgeProfileInfo;
   startedAt: Date;
@@ -445,6 +452,20 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
       this.loadAll();
       if (this.reloadClearsTempRules) this.temps = [];
     });
+  }
+
+  /**
+   * 演示与测试用的运行实例（HostInfo.surgeInstance，替代 surge/running-instance.ts 的真实读取）：与真实读取一样
+   * 全有或全无——Surge 没在运行为 not_running，缺构建号为 plist_unreadable，格式不对为 version_malformed。
+   */
+  async runningInstance(): Promise<RunningInstanceResult> {
+    this.instanceReads++;
+    if (this.instanceFailure !== null) return { ok: false, reason: this.instanceFailure };
+    if (!this.reachable) return { ok: false, reason: 'not_running' };
+    if (this.build === null) return { ok: false, reason: 'plist_unreadable' };
+    if (!SURGE_VERSION_RE.test(this.version) || !SURGE_BUILD_RE.test(this.build)) return { ok: false, reason: 'version_malformed' };
+    const startedAt = new Date(Math.floor(this.startedAt.getTime() / 1000) * 1000).toISOString();
+    return { ok: true, instance: { pid: 404, startedAt, bundlePath: SURGE_APP_BUNDLE, bundleId: SURGE_BUNDLE_IDS[0]!, version: this.version, build: this.build } };
   }
 
   getVersion(): Promise<SurgeVersion> {

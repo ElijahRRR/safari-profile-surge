@@ -21,6 +21,7 @@ import {
   type SurgeStatusView,
   type TakeoverState,
 } from '@sfe/contract';
+import type { RunningInstanceFailure } from '../surge/running-instance.js';
 import type {
   AccountRecord,
   EnvironmentRecord,
@@ -148,10 +149,19 @@ export function buildRouteSummary(route: RouteStateRecord): RouteSummaryView {
 
 // ---------- Surge 状态 ----------
 
+/**
+ * Surge 可达、但运行中的版本与构建号无法确认的原因（内部；不进入契约视图，展示文字见 Engine.readBasicFacts）：
+ * 运行实例读取（surge/running-instance.ts）的失败原因，例如 not_running、modified_after_start、running_image_mismatch。
+ */
+export type SurgeVersionIssue = RunningInstanceFailure;
+
 export interface SurgeFacts {
   reachable: boolean;
+  /** 运行中 Surge 的版本与构建号：读不到或格式不对时为 null（依赖版本的能力按待验证处理，§5.2）。 */
   version: string | null;
   build: string | null;
+  /** 只在可达时填写：版本或构建号为 null 的原因；可达且都已确认时为 null。 */
+  versionIssue: SurgeVersionIssue | null;
   startedAt: string | null;
   currentProfileName: string | null;
   currentProfilePath: string | null;
@@ -171,6 +181,7 @@ export function emptySurgeFacts(): SurgeFacts {
     reachable: false,
     version: null,
     build: null,
+    versionIssue: null,
     startedAt: null,
     currentProfileName: null,
     currentProfilePath: null,

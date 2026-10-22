@@ -45,6 +45,13 @@ export const COMMANDS: readonly CommandSpec[] = [
     flags: {},
   },
   {
+    name: 'instance',
+    summary: '只读：读取运行中的 Surge 实例的版本（与服务同一读取器），逐条打印检查结果并把证据写入运行目录',
+    usage: 'instance [--surge-team-id <Team ID>] [--self-test-bundle <运行目录内的临时 .app>]',
+    positionals: { min: 0, max: 0 },
+    flags: { 'self-test-bundle': { kind: 'string' } },
+  },
+  {
     name: 'test-servers',
     summary: '在 127.0.0.1 启动 IP 回显/WebSocket 服务、SOCKS5 出口与前置测试服务',
     usage: 'test-servers [--echo-port 18080] [--exit-port 18081] [--front-port 18082] [--dead-front-port 18083] [--allow-upstream <主机> …]',

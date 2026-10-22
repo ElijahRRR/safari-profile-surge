@@ -173,6 +173,25 @@ describe('install.json', () => {
     expect(c.installConfigIssues).toHaveLength(2);
   });
 
+  test.each(['cli', 'http'])('getVersion mapped to %s in install.json is forced to unavailable with a config issue (version comes from the running instance)', (mechanism) => {
+    const o = base();
+    const dataDir = dataDirOf(o);
+    writeInstall(dataDir, { adapterMechanism: { getVersion: mechanism, listExternalResources: 'cli' } });
+    const c = loadConfig({ ...o, argv: ['--data-dir', dataDir] });
+    expect(c.adapterMechanism.getVersion).toBe('unavailable');
+    expect(c.adapterMechanism.listExternalResources).toBe('cli');
+    expect(c.installConfigIssues).toEqual(['安装配置中的原语 getVersion 已不再使用（版本改由运行中的 Surge 实例读取），按不可用处理']);
+  });
+
+  test('getVersion explicitly unavailable in install.json is accepted without an issue', () => {
+    const o = base();
+    const dataDir = dataDirOf(o);
+    writeInstall(dataDir, { adapterMechanism: { getVersion: 'unavailable' } });
+    const c = loadConfig({ ...o, argv: ['--data-dir', dataDir] });
+    expect(c.adapterMechanism.getVersion).toBe('unavailable');
+    expect(c.installConfigIssues).toEqual([]);
+  });
+
   test('--http-port and --web-root take precedence over install.json', () => {
     const o = base();
     const dataDir = dataDirOf(o);
