@@ -123,7 +123,8 @@ export function buildOperationView(op: OperationRecord, steps: readonly Operatio
   };
 }
 
-export function buildRouteView(route: RouteStateRecord, lastSafariProbe: ProbeRecord | null): RouteStateView {
+/** normalModeOffered：服务端按路由记录与持久标记判定（engine/safari-route-marker.ts normalModeOffered），这里只填入。 */
+export function buildRouteView(route: RouteStateRecord, lastSafariProbe: ProbeRecord | null, normalModeOffered: boolean): RouteStateView {
   return {
     routeEpoch: route.routeEpoch,
     entryMode: route.entryMode,
@@ -137,18 +138,23 @@ export function buildRouteView(route: RouteStateRecord, lastSafariProbe: ProbeRe
     operationId: route.operationId,
     awaitingDeadline: route.awaitingDeadline,
     warnings: [...route.warnings],
+    normalModeOffered,
     lastReconciledAt: route.lastReconciledAt,
     updatedAt: route.updatedAt,
   };
 }
 
-/** 非当前环境的场景只拿到路由摘要（不含实测、选择、操作 id，警告只有是否需要再次进入普通模式结束 Safari 连接）。 */
-export function buildRouteSummary(route: RouteStateRecord): RouteSummaryView {
+/**
+ * 非当前环境的场景只拿到路由摘要（不含实测、选择、操作 id，警告只有是否需要再次进入普通模式结束 Safari 连接；是否提供
+ * 「进入普通模式」由服务端判定后填入）。
+ */
+export function buildRouteSummary(route: RouteStateRecord, normalModeOffered: boolean): RouteSummaryView {
   return {
     routeEpoch: route.routeEpoch,
     entryMode: route.entryMode,
     phase: route.phase,
     buyerExitConnectionsUnconfirmed: route.warnings.includes('buyer_exit_connections_unconfirmed'),
+    normalModeOffered,
   };
 }
 

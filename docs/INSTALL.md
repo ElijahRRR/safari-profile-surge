@@ -81,7 +81,7 @@ npm run check      # 类型检查、离线测试、构建与仓库秘密扫描
    - 选择 ruleset_resource 入口策略时，工作配置中的四条入口 RULE-SET 由初始化写入；之后改用其他策略需要 `remerge`。
 5. **登记默认前置**：在「发布与 Surge」页（或 `sfe admin front add <Surge 中已有的固定节点名> --default`）登记一个你已有的固定代理节点作为默认前置。只接受用户代理节点，不接受组、DIRECT/REJECT 或 SFE- 节点。
 6. **导入环境**：在「导入」页上传 CSV/XLSX/JSON（模板在页面中下载，或 `sfe import <文件>` 预览、`--commit` 提交）。秘密只经页面表单或标准输入传递，从不出现在命令行参数中。导入只保存期望数据；节点发布受发布门槛约束。
-7. **关联场景**：在每个已启用扩展的**已命名** Safari 场景中打开扩展弹窗，按「关联已有环境」选择对应环境（或使用网页的关联向导）。不要按场景名自动猜测。默认场景可能拿不到场景 ID：Apple 的示例代码把没有场景 ID 当作普通浏览（`… else { // Perform normal browsing tasks. }`，https://developer.apple.com/documentation/safariservices/messaging-between-the-app-and-javascript-in-a-safari-web-extension），默认场景是否提供由 P0 `native_profile_id` 记录。拿不到时弹窗显示「未识别当前场景」，只能查看状态，不能关联、切换或修改环境；这时请新建一个场景使用。
+7. **关联场景**：在每个已启用扩展的**已命名** Safari 场景中打开扩展弹窗，按「关联已有环境」选择对应环境（或使用网页的关联向导）。不要按场景名自动猜测。默认场景可能拿不到场景 ID：Apple 的示例代码把没有场景 ID 当作普通浏览（`… else { // Perform normal browsing tasks. }`，https://developer.apple.com/documentation/safariservices/messaging-between-the-app-and-javascript-in-a-safari-web-extension），默认场景是否提供由 P0 `native_profile_id` 记录。拿不到时弹窗显示「未识别当前场景」，只能查看状态，不能关联、切换或修改环境，也不能在这里进入普通模式（用网页后台或已命名场景的弹窗）；它的窗口仍计入激活时的旧窗口确认。这时请新建一个场景使用。
 
 ## 4. 日常使用
 

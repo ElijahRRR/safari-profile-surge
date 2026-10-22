@@ -73,12 +73,19 @@ export function isEnvironmentInUse(env: EnvironmentView, route: RouteStateView |
 }
 
 /**
- * 提供「进入普通模式」：入口不是普通模式、仍有活动环境，或上一次普通模式未能确认 Safari 已没有经买家出口的连接
- * （buyer_exit_connections_unconfirmed：路由已是空闲的普通模式，再次进入普通模式会再结束 Safari 连接）。
+ * 提供「进入普通模式」：按服务端判定的 normalModeOffered（§6.5：入口不是普通模式、阶段不是 idle、仍有活动环境或激活快照、
+ * Safari 可能仍有经买家出口的连接）。本地的几项只是同一判断中看得到的部分，不能代替它：例如回滚失败记为 NORMAL（阶段
+ * attention），或普通模式结束连接失败之后读回也失败、路由已记为空闲的普通模式而持久标记仍在。
  */
 export function normalModeOffered(route: RouteStateView | null | undefined): boolean {
   if (!route) return false;
-  return route.entryMode !== 'NORMAL' || route.activeEnvironmentId !== null || route.warnings.includes('buyer_exit_connections_unconfirmed');
+  return (
+    route.normalModeOffered === true ||
+    route.entryMode !== 'NORMAL' ||
+    route.phase !== 'idle' ||
+    route.activeEnvironmentId !== null ||
+    route.warnings.includes('buyer_exit_connections_unconfirmed')
+  );
 }
 
 export interface ProbeDisplay {

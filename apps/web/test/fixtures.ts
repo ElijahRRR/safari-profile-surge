@@ -85,6 +85,7 @@ export function route(over: Partial<RouteStateView> = {}): RouteStateView {
     operationId: null,
     awaitingDeadline: null,
     warnings: [],
+    normalModeOffered: false,
     lastReconciledAt: T0,
     updatedAt: T0,
     ...over,

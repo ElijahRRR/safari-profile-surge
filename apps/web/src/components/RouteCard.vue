@@ -49,7 +49,8 @@ const overall = computed(() => {
   if (list.some((w) => ROUTE_WARNING_TEXT[w]?.severity === 'danger') || r.entryMode === 'UNKNOWN') return { status: 'danger', label: '需要处理' };
   if (list.length > 0) return { status: 'warning', label: `有 ${list.length} 条警告` };
   if (r.phase === 'active_verified' && r.entryMode === 'ACTIVE') return probeIssue.value ? { status: 'warning', label: probeIssue.value } : { status: 'success', label: '受控' };
-  if (r.entryMode === 'NORMAL' && !r.activeEnvironmentId) return { status: 'unknown', label: '普通模式' };
+  // 入口记为普通模式、但服务端仍提供普通模式（Safari 可能仍有经买家出口的连接，§6.5）：不显示成单纯的「普通模式」
+  if (r.entryMode === 'NORMAL' && !r.activeEnvironmentId) return showNormal.value ? { status: 'warning', label: '普通模式（未确认）' } : { status: 'unknown', label: '普通模式' };
   return { status: 'warning', label: ROUTE_PHASE_LABELS[r.phase].label };
 });
 

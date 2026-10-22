@@ -347,6 +347,13 @@ export interface RouteStateView {
   /** 等待目标场景到达/实测的截止时间。 */
   awaitingDeadline: IsoTime | null;
   warnings: RouteWarning[];
+  /**
+   * 服务端判定的是否提供「进入普通模式」（docs/ARCHITECTURE.md §6.5）：Safari 可能仍经过本应用入口或仍有经买家出口的连接——
+   * 入口不是 NORMAL、阶段不是 idle（例如回滚失败记为 NORMAL、阶段 attention）、仍有使用中的环境或激活快照、持久标记
+   * （route:safariMayUseRoute）仍在，或带 buyer_exit_connections_unconfirmed。与普通模式执行时是否结束 Safari 连接用同一判断；
+   * 都不成立时 Safari 的连接已按原规则发出（服务端仍受理普通模式，只是不需要提供入口）。
+   */
+  normalModeOffered: boolean;
   lastReconciledAt: IsoTime | null;
   updatedAt: IsoTime;
 }
@@ -372,6 +379,8 @@ export interface RouteSummaryView {
    * 普通模式，任何场景（§6.5）仍要能再次进入普通模式结束这些连接；只给这一项，不给其他警告。
    */
   buyerExitConnectionsUnconfirmed: boolean;
+  /** 与 RouteStateView.normalModeOffered 相同：任何场景据此提供「进入普通模式」（§6.5）。 */
+  normalModeOffered: boolean;
 }
 
 export interface CapabilityContext {

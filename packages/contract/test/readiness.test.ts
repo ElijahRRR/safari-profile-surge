@@ -123,9 +123,9 @@ describe('verify endpoints', () => {
 });
 
 describe('permission tables', () => {
-  test('unidentified profiles may only read state', () => {
+  test('unidentified profiles may only read state and report windows (counted for the old-window confirmation)', () => {
     const allowed = Object.entries(NATIVE_PERMISSIONS).filter(([, roles]) => roles.includes('unidentified')).map(([t]) => t);
-    expect(allowed).toEqual(['getCurrentState']);
+    expect(allowed).toEqual(['getCurrentState', 'reportProfileState']);
   });
   test('agent cannot get login codes, account detail or change settings', () => {
     expect(adminOpAllowed('issueLoginCode', 'agent')).toBe(false);

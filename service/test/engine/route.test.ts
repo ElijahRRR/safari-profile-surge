@@ -118,6 +118,36 @@ describe('controlled activation', () => {
     await h.app.activate(a, { request_id: rid() }, WEB);
   });
 
+  test('a profile without a profile ID (e.g. the default profile) reporting open windows also requires confirmation; such reports share one record that a later report without windows does not clear before it expires', async () => {
+    h = await createHarness();
+    const a = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, a);
+    const report = (windows: number) => h.native(null, { type: 'reportProfileState', windows_open: windows, amazon_tabs_open: false, site_permission_granted: true });
+    const activate = () => h.native(PROFILE_A, { type: 'activateCurrentEnvironment', request_id: rid(), environment_id: a, amazon_tabs_open: false });
+    const routeBefore = h.repos.routeState.get();
+    expect((await report(2)).ok).toBe(true);
+    // 只作提示，不改变路由
+    expect({ ...h.repos.routeState.get(), updatedAt: '' }).toEqual({ ...routeBefore, updatedAt: '' });
+    const first = await activate();
+    expect(first.ok).toBe(false);
+    const details = (first as unknown as { error: { code: string; details: { reason: string; otherProfilesOpen: unknown[] } } }).error;
+    expect(details.code).toBe('NEEDS_CONFIRMATION');
+    expect(details.details.reason).toBe('other_profiles_open');
+    expect(details.details.otherProfilesOpen).toEqual([{ profileIdShort: '', environmentLabel: null, unidentified: true }]);
+    // 另一个（或同一个）未识别场景随后上报没有窗口：有效期内不覆盖有窗口的上报
+    h.clock.advance(300_000);
+    expect((await report(0)).ok).toBe(true);
+    expect(await activate()).toMatchObject({ ok: false, error: { code: 'NEEDS_CONFIRMATION' } });
+    // 有窗口的上报刷新有效期；只有较小窗口数的上报也一样计入
+    expect((await report(1)).ok).toBe(true);
+    h.clock.advance(400_000);
+    expect(await activate()).toMatchObject({ ok: false, error: { code: 'NEEDS_CONFIRMATION' } });
+    // 最后一次有窗口的上报过期后不再计入
+    h.clock.advance(201_000);
+    const accepted = await activate();
+    expect(accepted.ok).toBe(true);
+  });
+
   test('preflight failure before any route write leaves route, selection and environment unchanged', async () => {
     h = await createHarness();
     const { a, b } = await twoEnvs();

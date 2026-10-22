@@ -124,7 +124,7 @@ export interface NativeEnvelope {
 }
 
 export interface BridgeInfo {
-  /** 来自 SFExtensionProfileKey；系统不提供时为 null（只允许 getCurrentState）。 */
+  /** 来自 SFExtensionProfileKey；系统不提供时为 null（只允许 getCurrentState 与 reportProfileState）。 */
   profileId: string | null;
   bridgeVersion: string;
 }
@@ -247,7 +247,8 @@ export type NativeNeedsConfirmation = NeedsConfirmationDetails;
 
 /**
  * 按场景状态的权限矩阵（服务端强制）：
- * - 未识别（profileId 为 null）：只允许 getCurrentState（不返回其他环境名称）。
+ * - 未识别（profileId 为 null）：getCurrentState（不返回其他环境名称）、reportProfileState（记入所有未识别场景共用的
+ *   一条记录，只用于旧窗口确认的“其他场景有打开的窗口”：默认场景可能拿不到场景 ID，它的窗口不能因此不计入冲突检测）。
  * - 已识别未绑定：getCurrentState、reportProfileState、bindCurrentProfile（只能绑未绑定环境）、
  *   createAndBindEnvironment、enterNormalMode（需确认）。
  * - 已绑定：以上（除绑定类）+ 针对自己绑定环境的 update/activate/probe/acknowledge、
@@ -256,7 +257,7 @@ export type NativeNeedsConfirmation = NeedsConfirmationDetails;
  */
 export const NATIVE_PERMISSIONS: Record<NativeRequestType, ReadonlyArray<'unidentified' | 'unbound' | 'bound'>> = {
   getCurrentState: ['unidentified', 'unbound', 'bound'],
-  reportProfileState: ['unbound', 'bound'],
+  reportProfileState: ['unidentified', 'unbound', 'bound'],
   bindCurrentProfile: ['unbound'],
   createAndBindEnvironment: ['unbound'],
   updateCurrentEnvironment: ['bound'],

@@ -9,6 +9,7 @@ import type {
   OperationPhase,
   OperationStatus,
   RollbackResult,
+  RouteSummaryView,
   RouteWarning,
 } from '@sfe/contract';
 
@@ -33,7 +34,7 @@ export const WARNING_TEXT: Record<RouteWarning, string> = {
   probe_expired: '实测出口已过期，请重新检测',
   probe_failed: 'Safari 实测失败，已停止自动打开与填充',
   exit_ip_mismatch: '实测出口与预期出口不一致，已停止自动打开与填充',
-  buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，请再次进入普通模式',
+  buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，请再次进入普通模式（只结束可能经买家出口的连接）',
 };
 
 export const PHASE_TEXT: Record<OperationPhase, string> = {
@@ -90,6 +91,37 @@ export const ENTRY_MODE_TEXT: Record<EntryMode, string> = {
   ACTIVE: '托管中',
   UNKNOWN: '入口状态未知',
 };
+
+/**
+ * 路由摘要是否提供「进入普通模式」（§6.5）：服务端判定的 normalModeOffered；其余几项是同一判断中摘要看得到的部分。
+ * 只看入口模式不够：回滚失败可能把入口记为 NORMAL（阶段 attention），普通模式结束连接失败之后读回也可能失败，路由记录
+ * 看起来已是普通模式，而 Safari 仍有经买家出口的连接。
+ */
+export function summaryOffersNormal(summary: RouteSummaryView): boolean {
+  return (
+    summary.normalModeOffered === true ||
+    summary.entryMode !== 'NORMAL' ||
+    summary.phase !== 'idle' ||
+    summary.buyerExitConnectionsUnconfirmed === true
+  );
+}
+
+/** 弹窗顶栏的入口状态：入口记为普通模式、但服务端仍提供「进入普通模式」时不显示成单纯的「普通模式」。 */
+export function entryModeHeaderText(summary: RouteSummaryView): string {
+  if (summary.entryMode === 'NORMAL' && summaryOffersNormal(summary)) return '普通模式（未确认）';
+  return ENTRY_MODE_TEXT[summary.entryMode];
+}
+
+/**
+ * 没有使用中的环境、但路由没有回到已确认的普通模式时的说明（不含 buyer_exit_connections_unconfirmed：那时显示
+ * WARNING_TEXT 中的警告）。
+ */
+export function unsettledRouteText(summary: RouteSummaryView): string {
+  if (summary.entryMode !== 'NORMAL') {
+    return `当前没有使用中的环境，入口为「${ENTRY_MODE_TEXT[summary.entryMode]}」（上一次切换没有完成）：Safari 的请求可能被阻断，或仍有经买家出口的连接。进入普通模式会撤销本应用入口并结束这些连接。`;
+  }
+  return '上一次切换没有回到已确认的状态：Safari 可能仍有经买家出口的连接。进入普通模式会结束这些连接，之后按 Surge 原规则发出请求。';
+}
 
 export const PENDING_KIND_TEXT: Record<'activate' | 'apply_new_revision' | 'reverify' | 'probe_safari', string> = {
   activate: '切换到此环境',

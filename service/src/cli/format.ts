@@ -185,7 +185,7 @@ export const WARNING_TEXT: Record<RouteWarning, string> = {
   probe_expired: 'Safari 实测已过期，显示的是上次结果',
   probe_failed: '最近一次 Safari 实测失败，已停止自动打开订单与填充',
   exit_ip_mismatch: '实测出口与预期出口不一致，已停止自动打开订单与填充',
-  buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，再次进入普通模式会再结束 Safari 连接',
+  buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，再次进入普通模式会再结束其中可能经买家出口的连接（按原规则发出的不受影响）',
 };
 
 export const CAPABILITY_STATUS_TEXT: Record<CapabilityStatus, string> = {
@@ -422,7 +422,11 @@ export function formatNeedsConfirmation(details: Partial<NeedsConfirmationDetail
   else if (reason === 'other_profiles_open') lines.push('需要确认：其他场景有打开的窗口。');
   else lines.push('需要确认旧窗口的处理方式。');
   const others = details?.otherProfilesOpen ?? [];
-  if (others.length) lines.push(`最近上报有打开窗口的场景：${others.map((o) => `${clean(o.profileIdShort)}${o.environmentLabel ? `（${clean(o.environmentLabel)}）` : ''}`).join('、')}`);
+  if (others.length) {
+    const label = (o: (typeof others)[number]): string =>
+      o.unidentified === true ? '未识别场景（可能是默认场景）' : `${clean(o.profileIdShort)}${o.environmentLabel ? `（${clean(o.environmentLabel)}）` : ''}`;
+    lines.push(`最近上报有打开窗口的场景：${others.map(label).join('、')}`);
+  }
   if (details?.limitation) lines.push(`限制：${clean(details.limitation)}`);
   const confirmed = details?.currentEnvironmentId ? clean(details.currentEnvironmentId) : 'none';
   const options = details?.options?.length ? details.options : (['closed_confirmed', 'keep_open_acknowledged'] as const);

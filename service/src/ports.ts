@@ -310,7 +310,7 @@ export interface EntryTransitionOptions {
    * 阻断不设置，照常拒绝（§5.5「优先级检查」）。
    * 起点已经是 NORMAL（例如 Surge 重启或降级时丢弃了本应用的临时规则，或它们在 Surge 运行中被移除；ruleset_resource 在
    * rule match 不可用时文件已全部为占位规则）时不写入，直接返回 mode 为 NORMAL 的读回：没有需要阻断的本应用入口，调用方
-   * 跳过阻断，但仍结束 Safari 的旧连接（没有本应用规则不能证明 Surge 重启过、旧连接已不在买家出口上）。
+   * 跳过阻断，但仍结束 Safari 可能经买家出口的旧连接（没有本应用规则不能证明 Surge 重启过、旧连接已不在买家出口上）。
    * ruleset_resource 的阻断已经成立而 udp 已关（上一次普通模式失败在 NORMAL 一段）时同样不写入，返回 mode 为 BLOCKED 的读回
    * （bits 如实报告，有规则排在入口之前时随附 precedenceIssues）；NORMAL 一段超时保留的 udp/block 关闭尚未加载时也是如此
    * （EntryReadback.keptTowardNormal），否则比时限慢的文件监视会让每次重试在两段之间来回写入。

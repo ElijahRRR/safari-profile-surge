@@ -118,7 +118,7 @@ async function handlePage(message: unknown, deps: RouterDeps): Promise<NativeRes
   if (message.sfe === 'profileState') {
     const report = await deps.collectProfileState();
     if (message.report === true) {
-      // 只作提示：失败（例如未识别场景不允许上报）不影响弹窗。
+      // 只作提示：失败（例如服务不可达）不影响弹窗。未识别场景的上报记入共用记录，只用于旧窗口确认。
       await deps.native.call({ type: 'reportProfileState', ...report });
     }
     return { ok: true, data: report };

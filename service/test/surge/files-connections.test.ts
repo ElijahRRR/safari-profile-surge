@@ -137,10 +137,56 @@ describe('killSafariConnections', () => {
       bestEffort: false,
       entryBlocksSafari: false,
     });
-    // 当前路径的连接照常结束；被换掉的路径只结束经 SFE-ROUTE/出口节点或读不到策略的连接
-    expect(killed.sort()).toEqual(['1', '3', '4']);
+    // 入口不确定阻断 Safari：当前路径与被换掉的路径都只结束经 SFE-ROUTE/出口节点或读不到策略的连接
+    expect(killed.sort()).toEqual(['1', '3']);
     expect(results.every((r) => r.ok)).toBe(true);
-    expect([...active.keys()].sort()).toEqual(['2', '5']);
+    expect([...active.keys()].sort()).toEqual(['2', '4', '5']);
+  });
+
+  test('entry not known to block Safari: current-path connections already on the original rules are left alone (no retired paths); with the entry confirmed blocking every current-path Safari connection is ended', async () => {
+    const rec = (id: string, processPath: string, policyName: string | null, leafPolicyName: string | null = null): SurgeRequestRecord => ({
+      id,
+      processPath,
+      remoteHost: 'www.example.test',
+      policyName,
+      leafPolicyName,
+      rule: null,
+      protocol: 'tcp',
+      startedAt: null,
+      completed: false,
+      failed: false,
+    });
+    const adapterWith = (records: SurgeRequestRecord[]) => {
+      const active = new Map(records.map((r) => [r.id, r] as const));
+      const killed: string[] = [];
+      const adapter = {
+        listActiveRequests: async () => [...active.values()],
+        killRequest: async (id: string) => {
+          killed.push(id);
+          active.delete(id);
+        },
+      } as unknown as SurgeAdapter;
+      return { adapter, killed, active };
+    };
+    const records = () => [
+      rec('1', FAKE_SAFARI_PATH, 'SFE-ROUTE', 'SFE-N-E0001-US01-v001'),
+      rec('2', FAKE_SAFARI_PATH, 'DIRECT'),
+      rec('3', FAKE_SAFARI_PATH, 'Daily', 'Front-A'),
+      rec('4', FAKE_SAFARI_PATH, 'User-Group', 'SFE-N-E0001-US01-v001'),
+      rec('5', FAKE_SAFARI_PATH, null, null),
+      rec('6', FAKE_CHROME_PATH, 'SFE-ROUTE', 'SFE-N-E0001-US01-v001'),
+    ];
+    const opts = { processPaths: [FAKE_SAFARI_PATH], verifyHost: 'verify.example.test', now, bestEffort: false };
+    const loose = adapterWith(records());
+    const results = await killSafariConnections(loose.adapter, { ...opts, entryBlocksSafari: false });
+    expect(loose.killed.sort()).toEqual(['1', '4', '5']);
+    expect(results.map((r) => r.surgeRequestId).sort()).toEqual(['1', '4', '5']);
+    expect(results.every((r) => r.ok)).toBe(true);
+    expect([...loose.active.keys()].sort()).toEqual(['2', '3', '6']);
+    const strict = adapterWith(records());
+    await killSafariConnections(strict.adapter, opts);
+    expect(strict.killed.sort()).toEqual(['1', '2', '3', '4', '5']);
+    expect([...strict.active.keys()]).toEqual(['6']);
   });
 
   test('entry not known to block Safari: a new connection on the original rules is expected; one that may use the buyer exit is not', async () => {

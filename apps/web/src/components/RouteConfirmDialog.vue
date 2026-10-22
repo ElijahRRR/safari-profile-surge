@@ -63,9 +63,14 @@ const confirmText = computed(() => (isActivate.value ? '继续切换' : '进入�
           <dt class="text-gray-500 dark:text-dark-400">有打开窗口的其他场景</dt>
           <dd>
             <ul class="mt-1 space-y-1">
-              <li v-for="p in details.otherProfilesOpen" :key="p.profileIdShort" class="flex items-center gap-2 text-gray-900 dark:text-gray-100">
-                <span class="code">{{ p.profileIdShort }}</span>
-                <span>{{ p.environmentLabel ?? '未绑定场景' }}</span>
+              <li v-for="p in details.otherProfilesOpen" :key="p.unidentified ? '~unidentified' : p.profileIdShort" class="flex items-center gap-2 text-gray-900 dark:text-gray-100">
+                <template v-if="p.unidentified">
+                  <span data-test="unidentified-profile">未识别场景（可能是默认场景）</span>
+                </template>
+                <template v-else>
+                  <span class="code">{{ p.profileIdShort }}</span>
+                  <span>{{ p.environmentLabel ?? '未绑定场景' }}</span>
+                </template>
               </li>
             </ul>
             <p class="mt-1 text-xs text-gray-500 dark:text-dark-400">只包含已启用扩展并上报过的场景。</p>

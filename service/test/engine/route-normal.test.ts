@@ -9,7 +9,7 @@ import { processPathsDigest } from '../../src/engine/capabilities.js';
 import { capabilityUnverified } from '../../src/surge/primitives.js';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
 import { entryRuleSetFileContent, tempRuleText } from '../../src/surge/generate.js';
-import { AGENT, ALL_CAPS, PROFILE_A, PROFILE_B, WEB, activeEnv, anyContext, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
+import { AGENT, ALL_CAPS, PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, anyContext, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
 
@@ -260,7 +260,7 @@ describe('normal mode is always available (§5.2)', () => {
     expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
     expect((op.result as { killResults: Array<{ surgeRequestId: string; ok: boolean }> }).killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: true })]);
     const messages = h.repos.operations.listSteps(opId).map((st) => st.message);
-    expect(messages.some((m) => m.includes('不需要阻断，未写入；仍结束 Safari 的旧连接'))).toBe(true);
+    expect(messages.some((m) => m.includes('不需要阻断，未写入；仍结束 Safari 可能经买家出口的旧连接'))).toBe(true);
     expect(messages.some((m) => m.startsWith('已结束 Safari 连接 1 条'))).toBe(true);
     expectOriginalRules();
   });
@@ -294,7 +294,7 @@ describe('normal mode is always available (§5.2)', () => {
     expect(h.fake.calls.killRequest ?? 0).toBe(kills + 1);
     expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
     expect((op.result as { killResults: Array<{ surgeRequestId: string; ok: boolean }> }).killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: true })]);
-    expect(h.repos.operations.listSteps(opId).some((st) => st.message.includes('仍结束 Safari 的旧连接'))).toBe(true);
+    expect(h.repos.operations.listSteps(opId).some((st) => st.message.includes('仍结束 Safari 可能经买家出口的旧连接'))).toBe(true);
     expectOriginalRules();
     // 已在普通模式（空闲、没有使用中的环境）时再次进入普通模式：不结束按原规则发出的 Safari 连接
     const direct = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
@@ -333,7 +333,7 @@ describe('normal mode is always available (§5.2)', () => {
     expect(h.fake.calls.killRequest ?? 0).toBe(kills + 1);
     expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
     expect((op.result as { killResults: Array<{ surgeRequestId: string; ok: boolean }> }).killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: true })]);
-    expect(h.repos.operations.listSteps(opId).some((st) => st.message.includes('仍结束 Safari 的旧连接'))).toBe(true);
+    expect(h.repos.operations.listSteps(opId).some((st) => st.message.includes('仍结束 Safari 可能经买家出口的旧连接'))).toBe(true);
     expectOriginalRules();
     // 已确认结束之后再次进入普通模式：不结束按原规则发出的连接
     const direct = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
@@ -341,6 +341,86 @@ describe('normal mode is always available (§5.2)', () => {
     expect(h.repos.operations.get(await enterNormal(null))!.phase).toBe('NORMAL_RESTORED');
     expect(h.fake.calls.killRequest ?? 0).toBe(kills + 1);
     expect((await h.fake.listActiveRequests()).some((r) => r.id === direct.id)).toBe(true);
+  });
+
+  test('…and the web and every identified profile (bound or unbound) are offered normal mode in that NORMAL/attention state (temp_rule)', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    const a = await h.app.activate(env, { request_id: rid() }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(a.operation_id)!.phase).toBe('VERIFY_ONLY');
+    const live = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: FAKE_VERIFY_HOST, protocol: 'tcp', longLived: true });
+    expect(live.policyName).toBe('SFE-ROUTE');
+    for (const rule of h.fake.tempRules) await h.fake.removeTempRule(rule);
+    h.fake.failNext('addTempRule');
+    await h.app.cancelOperation(a.operation_id, { request_id: rid() }, WEB);
+    await h.idle();
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ entryMode: 'NORMAL', phase: 'attention', activeEnvironmentId: null, warnings: ['entry_unverified'] });
+    expect(route.warnings).not.toContain('buyer_exit_connections_unconfirmed');
+    // 网页后台：路由视图由服务端判定提供普通模式（入口记为 NORMAL、没有活动环境、没有买家出口警告也一样）
+    expect((await h.app.snapshot(WEB)).route.normalModeOffered).toBe(true);
+    // 扩展：绑定场景与未绑定场景的路由摘要都提供
+    for (const profile of [PROFILE_A, PROFILE_B]) {
+      const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: { relation: string; routeSummary: Record<string, unknown> } }).data;
+      expect(d.relation).toBe('none_active');
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'attention', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true });
+    }
+    const n = await h.native(PROFILE_B, { type: 'enterNormalMode', request_id: rid() });
+    expect(n.ok).toBe(true);
+    await h.idle();
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
+    expect((await h.app.snapshot(WEB)).route.normalModeOffered).toBe(false);
+  });
+
+  test('a normal mode whose kill fails and whose final readback fails after NORMAL was confirmed: the route keeps the buyer-exit warning and the marker, every view still offers normal mode, and the next one ends the connection (temp_rule)', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    // 第一次激活（从 NORMAL）到 VERIFY_ONLY：设置持久标记；Safari 经 SFE-ROUTE 打开检测主机的长连接；取消 → 阻断、失败
+    const a = await h.app.activate(env, { request_id: rid() }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(a.operation_id)!.phase).toBe('VERIFY_ONLY');
+    const live = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: FAKE_VERIFY_HOST, protocol: 'tcp', longLived: true });
+    expect(live.policyName).toBe('SFE-ROUTE');
+    await h.app.cancelOperation(a.operation_id, { request_id: rid() }, WEB);
+    await h.idle();
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'BLOCKED', phase: 'failed', activeEnvironmentId: null, warnings: [] });
+    // 普通模式：结束连接失败；撤销入口的最后一步（移除 block）已读回确认 NORMAL，之后最终读回读取临时规则失败一次
+    h.fake.failNext('killRequest');
+    const listTempRules = h.fake.listTempRules.bind(h.fake);
+    let readsAfterRemoval = 0;
+    h.fake.listTempRules = async () => {
+      if (h.fake.tempRules.length === 0 && ++readsAfterRemoval === 2) throw new Error('模拟失败：读取临时规则');
+      return listTempRules();
+    };
+    const first = await enterNormal(null);
+    h.fake.listTempRules = listTempRules;
+    const op = h.repos.operations.get(first)!;
+    expect(op.phase).toBe('FAILED');
+    expect((op.result as { killResults: Array<{ surgeRequestId: string; ok: boolean }> }).killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: false })]);
+    expect(h.fake.tempRules).toEqual([]);
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, activationSnapshot: null });
+    expect(route.warnings).toContain('buyer_exit_connections_unconfirmed');
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(true);
+    expect(h.repos.operations.listSteps(first).at(-1)!.message).toContain('未能确认 Safari 已没有经买家出口的连接');
+    // 网页后台与任何已识别场景都提供普通模式；对账不处理空闲的普通模式，状态保持
+    await h.app.runPeriodicReconcile();
+    expect((await h.app.snapshot(WEB)).route.normalModeOffered).toBe(true);
+    for (const profile of [PROFILE_A, PROFILE_B]) {
+      const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: { relation: string; routeSummary: Record<string, unknown> } }).data;
+      expect(d.relation).toBe('none_active');
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true });
+    }
+    // 下一次普通模式（未绑定场景发起）结束买家出口上的连接，警告清除、不再提供
+    const n = await h.native(PROFILE_B, { type: 'enterNormalMode', request_id: rid() });
+    expect(n.ok).toBe(true);
+    await h.idle();
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
+    expect(h.repos.routeState.get().warnings).not.toContain('buyer_exit_connections_unconfirmed');
+    expect((await h.app.snapshot(WEB)).route.normalModeOffered).toBe(false);
   });
 
   test('a Safari connection that normal mode could not end is ended by the next normal mode, although the route is already idle/NORMAL (ruleset_resource)', async () => {
@@ -499,41 +579,54 @@ describe('normal mode is always available (§5.2)', () => {
     expectOriginalRules();
   });
 
-  test('ruleset_resource without rule match: every normal mode still ends Safari connections (fail closed); once rule match confirms the entry the record is cleared and later normal modes leave connections on the original rules alone', async () => {
+  test('ruleset_resource without rule match: every normal mode still ends Safari connections that may be on the buyer exit (fail closed) but not those on the original rules; once rule match confirms the entry the record is cleared and later normal modes end nothing', async () => {
     h = await createHarness();
     const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await bind(h, PROFILE_A, envId);
     await h.app.activate(envId, { request_id: rid('act') }, WEB);
     await h.idle();
+    // VERIFY_ONLY：Safari 经 SFE-ROUTE 打开检测主机的长连接（买家出口）
+    const live = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: FAKE_VERIFY_HOST, protocol: 'tcp', longLived: true });
+    expect(live.policyName).toBe('SFE-ROUTE');
     const matchRule = h.fake.matchRule.bind(h.fake);
     const noMatchRule = async (): Promise<never> => {
       throw capabilityUnverified('matchRule');
     };
     h.fake.matchRule = noMatchRule;
+    // 第一次普通模式结束连接失败：买家出口上的连接留到下一次
+    h.fake.failNext('killRequest');
     const first = await enterNormal(h.repos.routeState.get().activeEnvironmentId);
     expect(h.repos.operations.get(first)!.phase).toBe('NORMAL_RESTORED');
     expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
     // 撤销入口未经运行时确认：不能确认 Safari 之后没有经 SFE-ROUTE 的新连接，路由状态带警告
     expect(h.repos.routeState.get().warnings).toEqual(expect.arrayContaining(['entry_unverified', 'buyer_exit_connections_unconfirmed']));
-    // 普通的 Safari 长连接（按原规则）
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(true);
+    // 普通的 Safari 长连接（按原规则）与 Chrome
     const direct = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
     expect(direct.rule).toBe('FINAL,DIRECT');
+    const chrome = h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
     const kills = h.fake.calls.killRequest ?? 0;
-    // 读回为 UNKNOWN（rule match 不可用），中间阻断按文件内容返回 NORMAL：入口从未经运行时确认，记录保留——仍结束 Safari 连接
+    // 读回为 UNKNOWN（rule match 不可用），中间阻断按文件内容返回 NORMAL：入口从未经运行时确认，记录保留——仍结束 Safari
+    // 可能经买家出口的连接；按原规则发出的连接不在买家出口上，不结束
     const again = await enterNormal(null);
-    expect(h.repos.operations.get(again)!.phase).toBe('NORMAL_RESTORED');
+    const op = h.repos.operations.get(again)!;
+    expect(op.phase).toBe('NORMAL_RESTORED');
     expect(h.fake.calls.killRequest ?? 0).toBe(kills + 1);
-    expect((await h.fake.listActiveRequests()).some((r) => r.id === direct.id)).toBe(false);
+    expect((op.result as { killResults: Array<{ surgeRequestId: string; ok: boolean }> }).killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: true })]);
+    const active = (await h.fake.listActiveRequests()).map((r) => r.id);
+    expect(active).not.toContain(live.id);
+    expect(active).toContain(direct.id);
+    expect(active).toContain(chrome.id);
     const already = h.repos.operations.listSteps(again).map((st) => st.message).filter((m) => m.startsWith('入口已是普通模式'));
-    expect(already).toEqual([expect.stringContaining('仍结束 Safari 的旧连接')]);
+    expect(already).toEqual([expect.stringContaining('仍结束 Safari 可能经买家出口的旧连接')]);
     expect(h.repos.routeState.get().warnings).toContain('buyer_exit_connections_unconfirmed');
-    // rule match 恢复：读回经见证与探测确认已是普通模式，结束 Safari 连接并清除记录与警告
+    // rule match 恢复：读回经见证与探测确认已是普通模式；没有可能经买家出口的连接，清除记录与警告，按原规则的连接不碰
     h.fake.matchRule = matchRule;
     const direct2 = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
     const third = await enterNormal(null);
     expect(h.repos.operations.get(third)!.phase).toBe('NORMAL_RESTORED');
-    expect(h.fake.calls.killRequest ?? 0).toBe(kills + 2);
-    expect((await h.fake.listActiveRequests()).some((r) => r.id === direct2.id)).toBe(false);
+    expect(h.fake.calls.killRequest ?? 0).toBe(kills + 1);
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === direct2.id)).toBe(true);
     expect(h.repos.routeState.get().warnings).not.toContain('buyer_exit_connections_unconfirmed');
     expect(h.repos.routeState.get().warnings).not.toContain('entry_unverified');
     // 之后 rule match 再次不可用：没有 Safari 可能经 SFE-ROUTE 的记录，不结束按原规则发出的连接；步骤不声称未确立的事实
@@ -541,13 +634,42 @@ describe('normal mode is always available (§5.2)', () => {
     const direct3 = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
     const fourth = await enterNormal(null);
     expect(h.repos.operations.get(fourth)!.phase).toBe('NORMAL_RESTORED');
-    expect(h.fake.calls.killRequest ?? 0).toBe(kills + 2);
+    expect(h.fake.calls.killRequest ?? 0).toBe(kills + 1);
     expect((await h.fake.listActiveRequests()).some((r) => r.id === direct3.id)).toBe(true);
     const idle = h.repos.operations.listSteps(fourth).map((st) => st.message).filter((m) => m.startsWith('入口已是普通模式'));
     expect(idle).toEqual([expect.stringContaining('不结束 Safari 连接')]);
-    expect(idle[0]).not.toContain('仍结束 Safari 的旧连接');
+    expect(idle[0]).not.toContain('仍结束 Safari 可能经买家出口的旧连接');
     expect(idle[0]).not.toContain('之前的 Safari 连接已确认结束');
   });
+
+  test.each(['temp_rule', 'ruleset_resource'] as const)(
+    'retrying normal mode from idle NORMAL with the buyer-exit warning (offered to any profile) ends only the Safari connection that may be on the buyer exit, not Safari connections on the original rules, not Chrome (%s)',
+    async (entryStrategy) => {
+      h = await createHarness({ entryStrategy });
+      const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+      const live = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+      expect(live.policyName).toBe('SFE-ROUTE');
+      h.fake.failNext('killRequest');
+      expect(h.repos.operations.get(await enterNormal(envId))!.phase).toBe('NORMAL_RESTORED');
+      expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', warnings: ['buyer_exit_connections_unconfirmed'] });
+      const direct = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+      expect(direct.rule).toBe('FINAL,DIRECT');
+      expect(direct.policyName).toBe('DIRECT');
+      const chrome = h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+      const n = await h.native(PROFILE_C, { type: 'enterNormalMode', request_id: rid() });
+      expect(n.ok).toBe(true);
+      await h.idle();
+      const opId = (n as { data: { operation_id: string } }).data.operation_id;
+      const op = h.repos.operations.get(opId)!;
+      expect(op.phase).toBe('NORMAL_RESTORED');
+      expect((op.result as { killResults: Array<{ surgeRequestId: string; ok: boolean }> }).killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: true })]);
+      const active = (await h.fake.listActiveRequests()).map((r) => r.id);
+      expect(active).not.toContain(live.id);
+      expect(active).toContain(direct.id);
+      expect(active).toContain(chrome.id);
+      expect(h.repos.routeState.get().warnings).not.toContain('buyer_exit_connections_unconfirmed');
+    },
+  );
 
   test('ruleset_resource without rule match and a watcher slower than the wait: a Safari connection opened on SFE-ROUTE right after the unconfirmed normal mode is ended by the next normal mode', async () => {
     h = await createHarness();
@@ -575,7 +697,7 @@ describe('normal mode is always available (§5.2)', () => {
     expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
     expect((op.result as { killResults: Array<{ surgeRequestId: string; ok: boolean }> }).killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: true })]);
     const messages = h.repos.operations.listSteps(again).map((st) => st.message);
-    expect(messages.some((m) => m.includes('仍结束 Safari 的旧连接'))).toBe(true);
+    expect(messages.some((m) => m.includes('仍结束 Safari 可能经买家出口的旧连接'))).toBe(true);
     expect(messages.some((m) => m.includes('之前的 Safari 连接已确认结束'))).toBe(false);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
   });
@@ -594,7 +716,7 @@ describe('normal mode is always available (§5.2)', () => {
     const already = h.repos.operations.listSteps(opId).map((st) => st.message).filter((m) => m.startsWith('入口已是普通模式'));
     expect(already).toEqual([expect.stringContaining('文件没有见证规则')]);
     expect(already[0]).not.toContain('见证与运行时探测读回确认');
-    expect(already[0]).toContain('仍结束 Safari 的旧连接');
+    expect(already[0]).toContain('仍结束 Safari 可能经买家出口的旧连接');
     expectOriginalRules();
   });
 

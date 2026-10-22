@@ -1,6 +1,6 @@
 // 原生桥消息（docs/ARCHITECTURE.md §7.2、contract/native.ts）。场景身份只来自原生桥（令牌已由 ipc 层校验），
 // 从不采信消息体中的身份字段。按 NATIVE_PERMISSIONS 矩阵与绑定关系授权：携带 environment_id 的请求先与场景绑定
-// 比对（BINDING_MISMATCH，在版本检查与创建操作之前）；未识别场景只能读取状态且看不到其他环境名称；
+// 比对（BINDING_MISMATCH，在版本检查与创建操作之前）；未识别场景只能读取状态（看不到其他环境名称）与上报窗口（只用于旧窗口确认）；
 // 非活动环境的场景只拿到路由摘要。登录填充按 §6.10 逐项把关，密码只返回钥匙串引用，从不在 Node 中读取。
 
 import {
@@ -36,7 +36,8 @@ import {
 } from './accept.js';
 import type { Engine } from './context.js';
 import type { ControlEvaluation } from '../domain/route-rules.js';
-import { routeOps } from './route-control.js';
+import { recordUnidentifiedProfileReport, routeOps } from './route-control.js';
+import { normalModeOffered } from './safari-route-marker.js';
 import { beginVerification, submitVerification } from './verification.js';
 
 type ProfileState = 'unidentified' | 'unbound' | 'bound';
@@ -89,7 +90,10 @@ async function dispatchNative(deps: NativeDeps, envelope: BridgeEnvelope): Promi
       return currentState(deps, profileId, envId);
     case 'reportProfileState': {
       const windows = Number.isInteger(msg.windows_open) && msg.windows_open >= 0 ? Math.min(msg.windows_open, 10_000) : 0;
-      repos.profileReports.upsert({ profileId: profileId!, windowsOpen: windows, amazonTabsOpen: msg.amazon_tabs_open === true, sitePermissionGranted: msg.site_permission_granted === true });
+      const report = { windowsOpen: windows, amazonTabsOpen: msg.amazon_tabs_open === true, sitePermissionGranted: msg.site_permission_granted === true };
+      // 未识别场景（可能是默认场景）同样计入旧窗口确认的“其他场景有打开的窗口”，记入共用的一条记录
+      if (profileId === null) recordUnidentifiedProfileReport(engine, report);
+      else repos.profileReports.upsert({ profileId, ...report });
       if (envId) engine.emit({ environments: [envId] });
       return { recorded: true };
     }
@@ -217,7 +221,7 @@ async function currentState(deps: NativeDeps, profileId: string | null, envId: s
     profile: { identified: profileId !== null, profileIdShort: shortProfileId(profileId) },
     environment,
     route: relation === 'this_active' ? views.routeView() : null,
-    routeSummary: buildRouteSummary(route),
+    routeSummary: buildRouteSummary(route, normalModeOffered(engine, route)),
     relation,
     // 未识别场景不返回其他环境名称
     otherActiveLabel: relation === 'other_active' && profileId !== null && activeEnv ? labelOf(activeEnv) : null,

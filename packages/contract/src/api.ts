@@ -93,8 +93,11 @@ export interface NeedsConfirmationDetails {
   reason: NeedsConfirmationReason;
   currentEnvironmentId: EnvironmentId | null;
   currentEnvironmentLabel: string | null;
-  /** 最近上报有打开窗口的其他场景（提示性质，只覆盖已启用扩展并上报过的场景）。 */
-  otherProfilesOpen: Array<{ profileIdShort: string; environmentLabel: string | null }>;
+  /**
+   * 最近上报有打开窗口的其他场景（提示性质，只覆盖已启用扩展并上报过的场景）。unidentified 为 true 的一项是没有场景 ID 的
+   * 场景（原生桥拿不到 SFExtensionProfileKey，可能是默认场景；所有这样的场景共用一项），profileIdShort 为空字符串。
+   */
+  otherProfilesOpen: Array<{ profileIdShort: string; environmentLabel: string | null; unidentified?: boolean }>;
   options: OldSessionPolicy[];
   /** 首请求与旧连接能力未通过时的限制说明与建议（保存工作后退出并重开 Safari）。 */
   limitation: string | null;

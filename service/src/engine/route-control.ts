@@ -76,12 +76,43 @@ export function supersedeWaiting(engine: Engine, newOpId: string, state: RouteOp
 export const OLD_SESSION_LIMITATION =
   '首请求与旧连接处理尚未通过实测：旧环境的长连接与后台请求可能继续一段时间，建议保存工作后退出并重开 Safari 再切换';
 
-/** 有效期内上报“有打开的窗口”的场景（不含 exclude 中的场景）。 */
+/**
+ * 未识别场景（原生桥拿不到 SFExtensionProfileKey；默认场景可能就是这样，docs/ARCHITECTURE.md §0.1 第 4 条）的上报记录键。
+ * 不是合法的场景 ID（原生桥只接受 [A-Za-z0-9-]{8,64}），不会与已识别场景的记录冲突，也不会被绑定。
+ */
+export const UNIDENTIFIED_PROFILE_REPORT_KEY = '~unidentified';
+
+/**
+ * 记录未识别场景的上报。所有这样的场景共用一条记录，服务无法区分它们，按失败即关闭合并，使记录等于“有效期内是否有未识别
+ * 场景上报过有打开的窗口”：本次有窗口时取本次与有效期内记录的较大值、上报时间为本次；本次没有窗口而有效期内的记录有窗口时
+ * 原样保留（数值与上报时间：它可能来自另一个未识别场景，不能被覆盖，也不因此延长有效期）；否则以本次为准。代价是同一个场景
+ * 关闭全部窗口之后，最长到它上一次有窗口的上报过期前仍计为有打开的窗口（激活时多一次旧窗口确认）。
+ */
+export function recordUnidentifiedProfileReport(
+  engine: Engine,
+  report: { windowsOpen: number; amazonTabsOpen: boolean; sitePermissionGranted: boolean },
+): void {
+  const { repos } = engine;
+  const since = engine.now().getTime() - PROFILE_REPORT_FRESH_SEC * 1000;
+  const prev = repos.profileReports.get(UNIDENTIFIED_PROFILE_REPORT_KEY);
+  const prevOpen = prev !== null && Date.parse(prev.reportedAt) >= since && prev.windowsOpen > 0 ? prev : null;
+  const rec = { profileId: UNIDENTIFIED_PROFILE_REPORT_KEY, ...report };
+  if (report.windowsOpen > 0) repos.profileReports.upsert({ ...rec, windowsOpen: Math.max(report.windowsOpen, prevOpen?.windowsOpen ?? 0) });
+  else if (prevOpen) repos.profileReports.upsert({ ...rec, windowsOpen: prevOpen.windowsOpen, reportedAt: prevOpen.reportedAt });
+  else repos.profileReports.upsert(rec);
+}
+
+/** 有效期内上报“有打开的窗口”的场景（不含 exclude 中的场景；未识别场景作为一项计入，从不被排除）。 */
 function openProfiles(engine: Engine, excludeProfileIds: readonly string[]): NeedsConfirmationDetails['otherProfilesOpen'] {
   const since = new Date(engine.now().getTime() - PROFILE_REPORT_FRESH_SEC * 1000);
   const out: NeedsConfirmationDetails['otherProfilesOpen'] = [];
   for (const r of engine.repos.profileReports.listSince(since)) {
-    if (r.windowsOpen <= 0 || excludeProfileIds.includes(r.profileId)) continue;
+    if (r.windowsOpen <= 0) continue;
+    if (r.profileId === UNIDENTIFIED_PROFILE_REPORT_KEY) {
+      out.push({ profileIdShort: '', environmentLabel: null, unidentified: true });
+      continue;
+    }
+    if (excludeProfileIds.includes(r.profileId)) continue;
     const b = engine.repos.profileBindings.byProfile(r.profileId);
     const env = b ? engine.repos.environments.get(b.environmentId) : null;
     out.push({ profileIdShort: shortProfileId(r.profileId) ?? '', environmentLabel: env && !env.deletedAt ? labelOf(env) : null });

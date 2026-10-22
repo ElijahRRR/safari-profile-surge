@@ -376,6 +376,24 @@ describe('header normal-mode entry', () => {
     m.unmount();
   });
 
+  it.each([
+    ['NORMAL with phase attention after a failed rollback (entry_unverified only)', { entryMode: 'NORMAL' as const, phase: 'attention' as const, warnings: ['entry_unverified' as const], normalModeOffered: true }],
+    ['idle NORMAL after a failed normal mode, persistent marker only (server flag)', { entryMode: 'NORMAL' as const, phase: 'idle' as const, warnings: [], normalModeOffered: true }],
+  ])('is offered in the header and on the route card: %s', async (_name, over) => {
+    const { ctx, calls } = testContext(
+      (c: Call) => (c.url === '/api/routing/normal' ? { status: 202, body: { operation_id: 'op_n', environment_id: null, revision: null, duplicate: false } } : NOT_FOUND),
+      snapshot({ route: route({ activeEnvironmentId: null, ...over }) }),
+    );
+    const Page = defineComponent({ render: () => [h(AppLayout), h(RouteCard), h(RouteActionHost)] });
+    const m = await mountWith(Page, ctx);
+    expect(byText('[data-test="route-card"] .card-footer button', '进入普通模式')).not.toBeNull();
+    expect(document.body.querySelector('[data-test="route-card"] .card-header')?.textContent).not.toMatch(/普通模式(?!（未确认）)/);
+    click(document.body.querySelector('[data-test="header-normal-mode"]'));
+    await flush();
+    expect(calls.filter((c) => c.url === '/api/routing/normal').map((c) => c.body)).toEqual([{ request_id: expect.any(String) }]);
+    m.unmount();
+  });
+
   it('is hidden when Safari already follows the original rules', async () => {
     const { ctx } = testContext(() => NOT_FOUND, snapshot());
     const m = await mountWith(AppLayout, ctx);

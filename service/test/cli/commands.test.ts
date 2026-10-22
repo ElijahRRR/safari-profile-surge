@@ -10,7 +10,10 @@ const needsConfirmation = apiError('NEEDS_CONFIRMATION', '切换失败：需要�
     reason: 'other_environment_active',
     currentEnvironmentId: 'env_cur',
     currentEnvironmentLabel: 'US-Buyer-01 · E0001',
-    otherProfilesOpen: [{ profileIdShort: 'ABCDEF12', environmentLabel: 'US-Buyer-02 · E0002' }],
+    otherProfilesOpen: [
+      { profileIdShort: 'ABCDEF12', environmentLabel: 'US-Buyer-02 · E0002' },
+      { profileIdShort: '', environmentLabel: null, unidentified: true },
+    ],
     options: ['closed_confirmed', 'keep_open_acknowledged'],
     limitation: '首请求与旧连接能力尚未通过实测：建议保存工作后退出并重开 Safari',
   },
@@ -272,7 +275,7 @@ describe('routing commands', () => {
     expect(await runCli(cli.deps)).toBe(3);
     const out = cli.stdout();
     expect(out).toContain('当前正在使用环境「US-Buyer-01 · E0001」');
-    expect(out).toContain('ABCDEF12（US-Buyer-02 · E0002）');
+    expect(out).toContain('最近上报有打开窗口的场景：ABCDEF12（US-Buyer-02 · E0002）、未识别场景（可能是默认场景）');
     expect(out).toContain('限制：首请求与旧连接能力尚未通过实测');
     expect(out).toContain('  sfe env open env_1 --revision 7 --old-windows closed --confirmed-env env_cur');
     expect(out).toContain('  sfe env open env_1 --revision 7 --old-windows keep --confirmed-env env_cur');

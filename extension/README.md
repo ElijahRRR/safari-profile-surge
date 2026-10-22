@@ -22,7 +22,7 @@ Safari Web Extension（MV3）：后台消息路由、弹窗、准备页、登录
 | 目录 | 职责 |
 |---|---|
 | `src/background/` | 唯一调用 `runtime.sendNativeMessage` 的地方。扩展页面可转发原生请求（`requestLoginFill` 除外）；内容脚本只能发 `requestLoginFill`，后台丢弃它自报的地址、框架与路由序号，改用 `sender` 与一次新的 `getCurrentState` 重建。任何生命周期、窗口、标签页、焦点事件都只会触发 `reportProfileState` 提示上报，从不激活或进入普通模式。后台是非持久的：监听器都在入口顶层同步注册，窗口/标签页事件后的合并上报用 `alarms`（闹钟 `sfe-profile-report`，1.5 秒后到点，再次创建即替换），不用 `setTimeout`（Apple：非持久后台“Use the `Alarms` API instead of `setTimeout`”，计时器在后台卸载后不会触发）；`alarms` 不可用时直接上报，不退回计时器 |
-| `src/popup/` | 弹窗（380px，EasyQuick UI）：当前场景状态、关联与创建、使用此环境、打开或定位订单页、重新检测、编辑、进入普通模式、旧窗口确认、等待中的验证与取消；未识别场景（拿不到 `SFExtensionProfileKey`，默认场景可能就是这样）只显示状态，并说明环境只能关联在已命名的 Safari 场景中 |
+| `src/popup/` | 弹窗（380px，EasyQuick UI）：当前场景状态、关联与创建、使用此环境、打开或定位订单页、重新检测、编辑、进入普通模式、旧窗口确认、等待中的验证与取消；未识别场景（拿不到 `SFExtensionProfileKey`，默认场景可能就是这样）只显示状态（含另一个环境正在使用、普通模式未能确认 Safari 已离开买家出口、路由没有回到已确认的普通模式，并指向网页后台或已命名场景进入普通模式），并说明环境只能关联在已命名的 Safari 场景中；「进入普通模式」按服务端判定的 `routeSummary.normalModeOffered` 提供 |
 | `src/prepare/` | 准备页 `prepare.html?op=<operation_id>`：表示场景到达、请求固定检测服务、提交结果、等待操作结束；成功前从不导航到 Amazon |
 | `src/content/` | 登录页条件填充：只请求页面上实际出现的字段，写入前重读 `form.action`，每页每字段最多一次，从不提交或点击；识别不到时显示「可手动填充」 |
 | `src/harness/` | 演示模式替身，只进入 `--mode harness` 构建（正式构建中被常量折叠移除） |

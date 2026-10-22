@@ -963,13 +963,13 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
           // 上一次普通模式在 NORMAL 一段写入、超时后保留的 block 关闭尚未加载（EntryReadback.keptTowardNormal）：本应用入口的
           // verify/active 已由见证确认关闭；Surge 已加载的是阻断或已是普通模式，不记录为 BLOCKED，也不重新打开 block（重新收紧会让
           // 比时限慢的监视在每次重试之间来回写入）。有规则排在入口之前时与下面的 BLOCKED 一样记入结果，步骤不声称 Safari 新请求
-          // 不会经 SFE-ROUTE。照常结束 Safari 的旧连接（入口不确定阻断 Safari：按原规则重连是预期的），再撤销入口。
+          // 不会经 SFE-ROUTE。照常结束 Safari 可能经买家出口的旧连接（入口不确定阻断 Safari：按原规则发出、重连的连接不碰），再撤销入口。
           recordPrecedence();
           engine.step(
             op.id,
             precedenceIssues
-              ? `中间阻断不再写入：本应用入口的 verify/active 已确认关闭，上一次保留的 block 关闭尚未确认加载（Surge 已加载的是阻断或已是普通模式），不重新打开 block；但有 ${blockingCount(precedenceIssues)} 条规则排在本应用入口之前、读回不能确认 Safari 新请求不经这些规则发出（可能经 SFE-ROUTE）；仍结束 Safari 的旧连接，继续撤销本应用入口`
-              : '中间阻断不再写入：verify/active 已确认关闭（Safari 新请求不会经 SFE-ROUTE），上一次保留的 block 关闭尚未确认加载（Surge 已加载的是阻断或已是普通模式），不重新打开 block；仍结束 Safari 的旧连接',
+              ? `中间阻断不再写入：本应用入口的 verify/active 已确认关闭，上一次保留的 block 关闭尚未确认加载（Surge 已加载的是阻断或已是普通模式），不重新打开 block；但有 ${blockingCount(precedenceIssues)} 条规则排在本应用入口之前、读回不能确认 Safari 新请求不经这些规则发出（可能经 SFE-ROUTE）；仍结束 Safari 可能经买家出口的旧连接（按原规则发出的连接不在买家出口上，不结束），继续撤销本应用入口`
+              : '中间阻断不再写入：verify/active 已确认关闭（Safari 新请求不会经 SFE-ROUTE），上一次保留的 block 关闭尚未确认加载（Surge 已加载的是阻断或已是普通模式），不重新打开 block；仍结束 Safari 可能经买家出口的旧连接（按原规则发出的连接不在买家出口上，不结束）',
           );
           await kill(false, blockConfirmed);
         } else if (alreadyNormal) {
@@ -1014,10 +1014,29 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
   } catch (err) {
     const mode = confirmedModeFrom(err, confirmed);
     const body = engine.errorBody(err, '进入普通模式失败：内部错误');
+    // 与完成路径同一规则：Safari 可能经 SFE-ROUTE，而本次没有在经运行时求值确认的入口下确认结束全部 Safari 连接时，保留（没有时
+    // 补上）持久标记并带 buyer_exit_connections_unconfirmed。否则失败之后路由可能记为空闲的普通模式（撤销已确认 NORMAL、之后的
+    // 读回失败），看起来不需要普通模式，而之前经 SFE-ROUTE 建立的 Safari 连接仍在买家出口上（对账不处理空闲的普通模式）。
+    // 失败路径从不清除标记：撤销入口没有读回完成。
+    const connectionsUnconfirmed = mayUseRoute && !(killAttempted && killsEnded && entryConfirmedAtKill);
     repos.tx(() => {
-      repos.routeState.update({ entryMode: mode, phase: mode === 'NORMAL' ? 'idle' : 'failed', operationId: op.id });
+      if (connectionsUnconfirmed) markSafariMayUseRoute(engine, op.id, engine.entryConfig().processPaths);
+      const fresh = repos.routeState.get();
+      const warnings: RouteWarning[] =
+        connectionsUnconfirmed && !fresh.warnings.includes('buyer_exit_connections_unconfirmed')
+          ? [...fresh.warnings, 'buyer_exit_connections_unconfirmed']
+          : fresh.warnings;
+      repos.routeState.update({ entryMode: mode, phase: mode === 'NORMAL' ? 'idle' : 'failed', operationId: op.id, warnings });
       repos.operations.update(op.id, { phase: 'FAILED', status: 'failed', error: body });
-      repos.operations.appendStep(op.id, 'FAILED', `${body.message}；Safari 停在已确认的状态（${mode}），未回退到其他出口`);
+      repos.operations.appendStep(
+        op.id,
+        'FAILED',
+        `${body.message}；Safari 停在已确认的状态（${mode}），未回退到其他出口${
+          connectionsUnconfirmed
+            ? `；未能确认 Safari 已没有经买家出口的连接（${killAttempted ? '未能确认结束 Safari 连接，或结束时入口未经运行时求值确认' : '未结束 Safari 连接'}）：路由状态带警告，再次进入普通模式会再结束 Safari 可能经买家出口的连接`
+            : ''
+        }`,
+      );
     });
     engine.emit({ operations: [op.id], route: true, environments: route.activeEnvironmentId ? [route.activeEnvironmentId] : [] });
     return;
@@ -1059,7 +1078,7 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
       op.id,
       'NORMAL_RESTORED',
       unconfirmedReason
-        ? `已进入普通模式，但未能确认 Safari 已没有经买家出口的连接（${unconfirmedReason}）：路由状态带警告，再次进入普通模式会再结束 Safari 连接${keepOpen ? '；旧环境窗口未关闭，其后续请求将按 Surge 原规则发出（可能直连）' : ''}`
+        ? `已进入普通模式，但未能确认 Safari 已没有经买家出口的连接（${unconfirmedReason}）：路由状态带警告，再次进入普通模式会再结束 Safari 可能经买家出口的连接${keepOpen ? '；旧环境窗口未关闭，其后续请求将按 Surge 原规则发出（可能直连）' : ''}`
         : keepOpen
           ? '已进入普通模式：旧环境窗口未关闭，其后续请求将按 Surge 原规则发出（可能直连）'
           : '已进入普通模式：Safari 按 Surge 原规则发出请求',
@@ -1139,7 +1158,7 @@ function alreadyNormalStep(
           ? `${files}，有文件没有见证规则（旧格式）：只由 Safari 与对照的运行时探测读回确认，未经见证确认 Surge 已加载的是文件中的这一版`
           : `${files}，见证与运行时探测读回确认 Surge 已加载`;
   const tail = kill
-    ? '仍结束 Safari 的旧连接'
+    ? '仍结束 Safari 可能经买家出口的旧连接（按原规则发出的连接不在买家出口上，不结束）'
     : '路由记录是空闲的普通模式，且没有 Safari 可能经 SFE-ROUTE 的记录（从未激活，或上一次确认结束 Safari 连接、入口经运行时求值确认的普通模式之后本应用没有写入检测或使用中入口）：不结束 Safari 连接';
   return `入口已是普通模式（${cause}）：不需要阻断，未写入；${tail}`;
 }

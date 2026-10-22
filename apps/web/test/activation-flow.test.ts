@@ -12,7 +12,10 @@ const details: NeedsConfirmationDetails = {
   reason: 'other_environment_active',
   currentEnvironmentId: 'env_2',
   currentEnvironmentLabel: 'US-买家02 · E0002',
-  otherProfilesOpen: [{ profileIdShort: 'f00dbabe', environmentLabel: null }],
+  otherProfilesOpen: [
+    { profileIdShort: 'f00dbabe', environmentLabel: null },
+    { profileIdShort: '', environmentLabel: null, unidentified: true },
+  ],
   options: ['closed_confirmed', 'keep_open_acknowledged'],
   limitation: '首请求与旧连接处理尚未通过实测：建议保存工作后退出并重开 Safari。',
 };
@@ -130,6 +133,9 @@ describe('activation from the environments page', () => {
     expect(dialog.querySelector('[data-test="current-env"]')?.textContent).toBe('US-买家02 · E0002');
     expect(dialog.textContent).toContain('f00dbabe');
     expect(dialog.textContent).toContain('未绑定场景');
+    // 没有场景 ID 的场景（可能是默认场景）单独标明，不显示为空的编号加「未绑定场景」
+    expect(dialog.querySelector('[data-test="unidentified-profile"]')?.textContent).toBe('未识别场景（可能是默认场景）');
+    expect(dialog.textContent!.match(/未绑定场景/g)).toHaveLength(1);
     expect(dialog.querySelector('[data-test="limitation"]')?.textContent).toContain('保存工作后退出并重开 Safari');
     expect(dialog.textContent).toContain('我已关闭旧环境窗口');
     expect(dialog.textContent).toContain('不关闭，直接切换');

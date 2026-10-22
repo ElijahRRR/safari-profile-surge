@@ -13,7 +13,7 @@ final class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
         let item = context.inputItems.first as? NSExtensionItem
         let userInfo = item?.userInfo
         let message = userInfo?[SFExtensionMessageKey]
-        // macOS 14 / Safari 17 起提供；没有时 profileId 为 null，服务只允许 getCurrentState
+        // macOS 14 / Safari 17 起提供；没有时 profileId 为 null，服务只允许 getCurrentState 与 reportProfileState（只用于旧窗口确认）
         let profileId = NativeBridge.profileIdentifier(from: userInfo?[SFExtensionProfileKey])
 
         let forwarder = BridgeForwarder(

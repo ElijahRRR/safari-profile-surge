@@ -1,19 +1,24 @@
 <script setup lang="ts">
 // 已识别、未绑定的场景：关联已有环境（逐个确认，不按名称自动套用）、在此创建环境；
-// 有其他环境使用中时可以结束当前环境、进入普通模式；上一次普通模式未能确认 Safari 已没有经买家出口的连接时显示警告，
-// 并可再次进入普通模式（§6.5：任何已识别场景都可发起）。
-import { ref } from 'vue';
+// 有其他环境使用中时可以结束当前环境、进入普通模式；没有使用中的环境、但服务端仍提供「进入普通模式」时（入口不是普通模式，
+// 例如第一次激活被取消后停在阻断；回滚失败记为 NORMAL、阶段 attention；上一次普通模式未能确认 Safari 已没有经买家出口的连接）
+// 显示原因并提供「进入普通模式」（§6.5：任何已识别场景都可发起）。
+import { computed, ref } from 'vue';
 import { Icon } from '@sfe/easyquick';
 import { SITES, type BindableEnvironment } from '@sfe/contract';
 import BaseDialog from '../ui/BaseDialog.vue';
 import StatusBadge from '../ui/StatusBadge.vue';
 import CreateForm from './CreateForm.vue';
 import type { PopupController } from './controller';
-import { WARNING_TEXT } from '../shared/text';
+import { WARNING_TEXT, summaryOffersNormal, unsettledRouteText } from '../shared/text';
 
 const props = defineProps<{ controller: PopupController }>();
 const c = props.controller;
 const s = c.state;
+
+const buyerExit = computed(() => s.current?.routeSummary.buyerExitConnectionsUnconfirmed === true);
+/** 没有使用中的环境时按路由摘要提供「进入普通模式」；有其他环境使用中时由下方「结束当前环境」提供。 */
+const offerNormal = computed(() => !!s.current && s.current.relation === 'none_active' && summaryOffersNormal(s.current.routeSummary));
 
 const creating = ref(false);
 const bindTarget = ref<BindableEnvironment | null>(null);
@@ -69,14 +74,18 @@ async function confirmBind() {
         </div>
       </div>
 
-      <div v-if="s.current?.routeSummary.buyerExitConnectionsUnconfirmed === true" class="card" data-test="buyer-exit-unconfirmed">
+      <div v-if="s.current && (buyerExit || offerNormal)" class="card" data-test="route-attention">
         <div class="card-body space-y-2 p-4">
-          <p class="flex items-start gap-2 text-sm text-warning" data-warning="buyer_exit_connections_unconfirmed">
+          <p v-if="buyerExit" class="flex items-start gap-2 text-sm text-warning" data-test="buyer-exit-unconfirmed" data-warning="buyer_exit_connections_unconfirmed">
             <Icon name="exclamationTriangle" size="sm" class="mt-0.5" />
             <span>{{ WARNING_TEXT.buyer_exit_connections_unconfirmed }}</span>
           </p>
+          <p v-else-if="offerNormal" class="flex items-start gap-2 text-sm text-warning" data-test="route-unsettled">
+            <Icon name="exclamationTriangle" size="sm" class="mt-0.5" />
+            <span>{{ unsettledRouteText(s.current.routeSummary) }}</span>
+          </p>
           <button
-            v-if="s.current.relation === 'none_active'"
+            v-if="offerNormal"
             type="button"
             class="btn btn-secondary btn-sm w-full"
             :disabled="!!s.busy"

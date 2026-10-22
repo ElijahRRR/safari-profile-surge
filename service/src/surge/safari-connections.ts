@@ -11,10 +11,11 @@ export interface KillOptions {
   /** 普通模式下门槛不满足时尽力而为：单条失败不抛错，只记录。 */
   bestEffort: boolean;
   /**
-   * 结束连接时本应用入口是否已确认阻断 Safari（缺省 true）：重新列出时出现的新 Safari 连接都记为失败（入口应已阻断）。
-   * false（普通模式中入口不确定阻断 Safari：入口已是普通模式、上一次保留的 block 关闭尚未加载、有规则排在入口之前）时，
-   * Safari 按原规则立即重连是预期的：只有可能经买家出口的新连接记为失败——策略或叶节点是本应用的对象（`SFE-` 前缀：
-   * SFE-ROUTE、出口节点），或两者都读不到（无法判断，按失败处理）。
+   * 结束连接时本应用入口是否已确认阻断 Safari（缺省 true）：结束配置路径上的全部 Safari 连接，重新列出时出现的新 Safari
+   * 连接都记为失败（入口应已阻断）。false（普通模式中入口不确定阻断 Safari：入口已是普通模式、上一次保留的 block 关闭尚未
+   * 加载、有规则排在入口之前）时只结束、只核对可能经买家出口的连接——策略或叶节点是本应用的对象（`SFE-` 前缀：SFE-ROUTE、
+   * 出口节点），或两者都读不到（无法判断，按可能处理）。已按原规则发出的连接不在买家出口上，结束它们只会打断用户的连接
+   * （例如每次重试普通模式都结束全部 Safari 连接）；Safari 按原规则立即重连同样是预期的，不记为失败。
    */
   entryBlocksSafari?: boolean;
   /**
@@ -38,8 +39,12 @@ function errorText(e: unknown): string {
 export async function killSafariConnections(adapter: SurgeAdapter, opts: KillOptions): Promise<KillResult[]> {
   const paths = new Set(opts.processPaths);
   const retired = new Set((opts.retiredProcessPaths ?? []).filter((p) => !paths.has(p)));
+  const blocks = opts.entryBlocksSafari !== false;
+  // 入口已确认阻断：配置路径上的全部 Safari 连接；否则（以及被换掉的路径）只有可能经买家出口的连接
   const isSafari = (r: SurgeRequestRecord): boolean =>
-    !r.completed && r.processPath !== null && (paths.has(r.processPath) || (retired.has(r.processPath) && mayUseBuyerExit(r)));
+    !r.completed &&
+    r.processPath !== null &&
+    ((paths.has(r.processPath) && (blocks || mayUseBuyerExit(r))) || (retired.has(r.processPath) && mayUseBuyerExit(r)));
   const toVerify = (r: SurgeRequestRecord): boolean => (r.remoteHost ?? '').toLowerCase() === opts.verifyHost.toLowerCase();
   const targets = (await adapter.listActiveRequests()).filter(isSafari);
   const results: KillResult[] = [];
@@ -52,8 +57,7 @@ export async function killSafariConnections(adapter: SurgeAdapter, opts: KillOpt
     }
   }
   // 重新列出确认：已结束的不应再出现；新出现的 Safari 连接也记下来（入口应已阻断）。入口不确定阻断 Safari 时
-  // （entryBlocksSafari: false），按原规则发出的新连接是预期的，只记下可能经买家出口的新连接。
-  const blocks = opts.entryBlocksSafari !== false;
+  // （entryBlocksSafari: false），isSafari 只选出可能经买家出口的连接，按原规则发出的新连接是预期的，不记下。
   const remaining = (await adapter.listActiveRequests()).filter(isSafari);
   for (const r of remaining) {
     const prior = results.find((x) => x.surgeRequestId === r.id);
@@ -62,7 +66,7 @@ export async function killSafariConnections(adapter: SurgeAdapter, opts: KillOpt
         prior.ok = false;
         prior.error = '结束后仍然存在';
       }
-    } else if (blocks || mayUseBuyerExit(r)) {
+    } else {
       results.push({
         surgeRequestId: r.id,
         processPath: r.processPath,

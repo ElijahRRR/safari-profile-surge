@@ -15,6 +15,7 @@ import {
   WARNING_TEXT,
   formatRelative,
   isExpired,
+  summaryOffersNormal,
   type BadgeStatus,
 } from '../shared/text';
 
@@ -74,8 +75,9 @@ const accountText = computed(() => {
 const showAckWindows = computed(() => warnings.value.includes('old_windows_kept_open') || warnings.value.includes('managed_windows_on_original_rules'));
 const amazonUnverified = computed(() => !thisActive.value && s.profile?.amazon_tabs_open === true);
 const sitePermissionMissing = computed(() => s.profile !== null && !s.profile.site_permission_granted);
-// 路由已是空闲的普通模式时，只有上一次普通模式未能确认结束 Safari 经买家出口的连接才再提供（再次进入会再结束它们）
-const canEnterNormal = computed(() => cur.value.relation !== 'none_active' || cur.value.routeSummary.entryMode !== 'NORMAL' || buyerExitUnconfirmed.value);
+// 按服务端判定的 normalModeOffered（§6.5，summaryOffersNormal）：路由记录看起来已是普通模式时（例如回滚失败记为 NORMAL、
+// 阶段 attention，或普通模式结束连接失败之后读回也失败），Safari 仍可能经过本应用入口或仍有经买家出口的连接。
+const canEnterNormal = computed(() => cur.value.relation !== 'none_active' || summaryOffersNormal(cur.value.routeSummary));
 
 const ordersEnabled = computed(() => cur.value.ordersAllowed || cur.value.activationAvailable);
 /** 每个视图最多一个主操作。 */

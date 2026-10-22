@@ -97,7 +97,7 @@ describe('popup states', () => {
   });
 
   it('unbound without another active environment does not offer normal mode', async () => {
-    const { wrapper } = await mountPopup(currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false } }));
+    const { wrapper } = await mountPopup(currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false } }));
     expect(wrapper.find('[data-test="end-current"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="normal"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="buyer-exit-unconfirmed"]').exists()).toBe(false);
@@ -105,12 +105,92 @@ describe('popup states', () => {
   });
 
   it('unbound, idle normal mode that could not confirm Safari left the buyer exit: shows the warning and offers 进入普通模式 again', async () => {
-    const state = currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true } });
+    const state = currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true } });
     const { wrapper, calls } = await mountPopup(state, { enterNormalMode: () => accepted('op_n') });
     expect(wrapper.find('[data-test="buyer-exit-unconfirmed"]').text()).toContain(WARNING_TEXT.buyer_exit_connections_unconfirmed);
     await wrapper.find('[data-test="normal"]').trigger('click');
     await flushPromises();
     expect(calls.find((m) => m.type === 'enterNormalMode')).toEqual({ type: 'enterNormalMode', request_id: 'req_1' });
+  });
+});
+
+describe('normal mode offered by the server-side flag (§6.5)', () => {
+  // 回滚失败记为 NORMAL（阶段 attention、快照保留）：入口看起来是普通模式，Safari 仍可能有经 SFE-ROUTE 的连接
+  const attention = { routeEpoch: 4, entryMode: 'NORMAL' as const, phase: 'attention' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true };
+  // 普通模式结束连接失败之后读回也失败：路由记为空闲的普通模式、没有警告，持久标记仍在
+  const markerOnly = { routeEpoch: 5, entryMode: 'NORMAL' as const, phase: 'idle' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true };
+  // 第一次激活被取消、没有切换前的环境：停在阻断
+  const blocked = { routeEpoch: 2, entryMode: 'BLOCKED' as const, phase: 'failed' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true };
+
+  it('bound, NORMAL with phase attention: offers 进入普通模式 and the header does not read as plain 普通模式', async () => {
+    const { wrapper, calls } = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: attention }), { enterNormalMode: () => accepted('op_n') });
+    expect(wrapper.find('[data-test="entry-mode"]').text()).toBe('普通模式（未确认）');
+    await wrapper.find('[data-test="normal"]').trigger('click');
+    await flushPromises();
+    expect(calls.find((m) => m.type === 'enterNormalMode')).toEqual({ type: 'enterNormalMode', request_id: 'req_1' });
+  });
+
+  it('bound, idle NORMAL without the buyer-exit warning but the server still offers normal mode: offers 进入普通模式', async () => {
+    const { wrapper } = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: markerOnly }));
+    expect(wrapper.find('[data-test="normal"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="entry-mode"]').text()).toBe('普通模式（未确认）');
+  });
+
+  it.each([
+    ['NORMAL with phase attention', attention],
+    ['idle NORMAL with the persistent marker only', markerOnly],
+    ['BLOCKED after the first activation was cancelled', blocked],
+  ])('unbound, no environment in use, %s: explains why and offers 进入普通模式', async (_name, summary) => {
+    const { wrapper, calls } = await mountPopup(currentState({ environment: null, route: null, relation: 'none_active', routeSummary: summary }), { enterNormalMode: () => accepted('op_n') });
+    expect(wrapper.find('[data-test="open-create"]').exists()).toBe(true);
+    const why = wrapper.find('[data-test="route-unsettled"]').text();
+    expect(why).toContain('进入普通模式');
+    if (summary.entryMode === 'BLOCKED') expect(why).toContain('Safari 已阻断');
+    expect(wrapper.find('[data-test="buyer-exit-unconfirmed"]').exists()).toBe(false);
+    await wrapper.find('[data-test="normal"]').trigger('click');
+    await flushPromises();
+    expect(calls.find((m) => m.type === 'enterNormalMode')).toEqual({ type: 'enterNormalMode', request_id: 'req_1' });
+  });
+
+  it('unbound, idle NORMAL and the server does not offer normal mode: no button, header 普通模式', async () => {
+    const { wrapper } = await mountPopup(
+      currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false } }),
+    );
+    expect(wrapper.find('[data-test="normal"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="route-unsettled"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="entry-mode"]').text()).toBe('普通模式');
+  });
+});
+
+describe('unidentified profile (e.g. the default profile) still shows the route state it receives', () => {
+  const unidentified = { profile: { identified: false, profileIdShort: null }, environment: null, route: null, bindable: [], otherActiveLabel: null };
+
+  it('buyer-exit warning: shown, with where normal mode can be entered; no action is sent from here', async () => {
+    const { wrapper, calls } = await mountPopup(
+      currentState({ ...unidentified, relation: 'none_active', routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true } }),
+    );
+    expect(wrapper.find('[data-test="unidentified"] [data-warning="buyer_exit_connections_unconfirmed"]').text()).toBe(WARNING_TEXT.buyer_exit_connections_unconfirmed);
+    expect(wrapper.find('[data-test="unidentified-normal-hint"]').text()).toContain('网页后台');
+    expect(wrapper.find('[data-test="entry-mode"]').text()).toBe('普通模式（未确认）');
+    expect(wrapper.find('[data-test="normal"]').exists()).toBe(false);
+    expect(calls.some((m) => m.type === 'enterNormalMode')).toBe(false);
+  });
+
+  it('another environment in use: says this profile\'s requests use its exit, without naming it', async () => {
+    const { wrapper } = await mountPopup(
+      currentState({ ...unidentified, relation: 'other_active', routeSummary: { routeEpoch: 7, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true } }),
+    );
+    expect(wrapper.find('[data-test="unidentified-other-active"]').text()).toContain('此场景的请求也会经过它的出口');
+    expect(wrapper.find('[data-test="unidentified-normal-hint"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="end-current"]').exists()).toBe(false);
+  });
+
+  it('route in plain idle normal mode: only the named-profile guidance', async () => {
+    const { wrapper } = await mountPopup(
+      currentState({ ...unidentified, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false } }),
+    );
+    expect(wrapper.find('[data-test="named-profile-required"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="unidentified-route"]').exists()).toBe(false);
   });
 });
 
@@ -238,7 +318,10 @@ describe('bound popup', () => {
                 reason: 'other_environment_active',
                 currentEnvironmentId: 'env_9',
                 currentEnvironmentLabel: 'US-买家09 · E0009',
-                otherProfilesOpen: [],
+                otherProfilesOpen: [
+                  { profileIdShort: '9b8a7c6d', environmentLabel: null },
+                  { profileIdShort: '', environmentLabel: null, unidentified: true },
+                ],
                 options: ['closed_confirmed', 'keep_open_acknowledged'],
                 limitation: '建议保存工作后退出并重开 Safari。',
               },
@@ -252,6 +335,10 @@ describe('bound popup', () => {
     await flushPromises();
     expect(wrapper.text()).toContain('确定要切换到此环境吗？');
     expect(wrapper.find('[data-test="confirm-reason"]').text()).toContain('US-买家09 · E0009');
+    // 没有场景 ID 的场景（可能是默认场景）同样列出，不显示为空的场景编号
+    expect(wrapper.text()).toContain('场景 9b8a7c6d');
+    expect(wrapper.find('[data-test="unidentified-profile"]').text()).toBe('未识别场景（可能是默认场景）');
+    expect(wrapper.findAll('li').some((li) => /场景\s*$/.test(li.text()))).toBe(false);
     expect(wrapper.find('[data-test="consequence-closed_confirmed"]').exists()).toBe(true);
     expect(wrapper.find('[data-test="consequence-keep_open_acknowledged"]').text()).toContain('新环境出口');
     expect(wrapper.find('[data-test="confirm-limitation"]').text()).toContain('重开 Safari');
@@ -263,15 +350,15 @@ describe('bound popup', () => {
   });
 
   it('only offers 进入普通模式 when there is something to undo', async () => {
-    const idle = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false } }));
+    const idle = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false } }));
     expect(idle.wrapper.find('[data-test="normal"]').exists()).toBe(false);
     expect(idle.wrapper.find('[data-test="warnings"]').exists()).toBe(false);
-    const blocked = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 2, entryMode: 'BLOCKED', phase: 'failed', buyerExitConnectionsUnconfirmed: false } }));
+    const blocked = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 2, entryMode: 'BLOCKED', phase: 'failed', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true } }));
     expect(blocked.wrapper.find('[data-test="normal"]').exists()).toBe(true);
   });
 
   it('idle normal mode that could not confirm Safari left the buyer exit: shows the warning and offers 进入普通模式 again', async () => {
-    const state = currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true } });
+    const state = currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true } });
     const { wrapper, calls } = await mountPopup(state, { enterNormalMode: () => accepted('op_n') });
     expect(wrapper.find('[data-warning="buyer_exit_connections_unconfirmed"]').text()).toBe(WARNING_TEXT.buyer_exit_connections_unconfirmed);
     await wrapper.find('[data-test="normal"]').trigger('click');

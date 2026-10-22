@@ -144,7 +144,7 @@ describe('getCurrentState', () => {
     await bind(h, PROFILE_B, b);
     const other = ((await h.native(PROFILE_B, { type: 'getCurrentState' })) as { data: Record<string, unknown> }).data;
     expect(other.route).toBeNull();
-    expect(other.routeSummary).toEqual({ routeEpoch: 1, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false });
+    expect(other.routeSummary).toEqual({ routeEpoch: 1, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true });
     expect(other.relation).toBe('other_active');
     expect(other.ordersAllowed).toBe(false);
     expect(other.activationAvailable).toBe(true);
@@ -168,14 +168,16 @@ describe('getCurrentState', () => {
       const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: Record<string, unknown> }).data;
       expect(d.relation).toBe('none_active');
       expect(d.route).toBeNull();
-      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true });
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true });
     }
     const again = await h.native(PROFILE_C, { type: 'enterNormalMode', request_id: rid() });
     expect(again.ok).toBe(true);
     await h.idle();
     expect((await h.fake.listActiveRequests()).some((r) => r.id === live.id)).toBe(false);
-    const d = ((await h.native(PROFILE_A, { type: 'getCurrentState' })) as { data: { routeSummary: { buyerExitConnectionsUnconfirmed: boolean } } }).data;
+    const d = ((await h.native(PROFILE_A, { type: 'getCurrentState' })) as { data: { routeSummary: { buyerExitConnectionsUnconfirmed: boolean; normalModeOffered: boolean } } }).data;
     expect(d.routeSummary.buyerExitConnectionsUnconfirmed).toBe(false);
+    // 已确认结束、入口经运行时确认：持久标记清除，不再提供普通模式
+    expect(d.routeSummary.normalModeOffered).toBe(false);
   });
 
   test('reportProfileState is only a hint and never changes routing', async () => {
@@ -187,6 +189,14 @@ describe('getCurrentState', () => {
     const after = h.repos.routeState.get();
     expect({ ...after, updatedAt: '' }).toEqual({ ...before, updatedAt: '' });
     expect(h.repos.profileReports.get(PROFILE_C)!.windowsOpen).toBe(3);
+    // 未识别场景（可能是默认场景）的上报同样只作提示，记入共用的一条记录（不是任何场景 ID）
+    const r = await h.native(null, { type: 'reportProfileState', windows_open: 2, amazon_tabs_open: false, site_permission_granted: true });
+    expect(r).toEqual({ ok: true, data: { recorded: true } });
+    await h.idle();
+    expect({ ...h.repos.routeState.get(), updatedAt: '' }).toEqual({ ...before, updatedAt: '' });
+    const unidentified = h.repos.profileReports.list().filter((x) => x.profileId !== PROFILE_C);
+    expect(unidentified).toEqual([expect.objectContaining({ profileId: '~unidentified', windowsOpen: 2 })]);
+    expect(h.repos.profileBindings.byProfile('~unidentified')).toBeNull();
   });
 });
 

@@ -62,3 +62,13 @@ export function safariMayUseRoute(engine: Engine, route: RouteStateRecord): bool
     safariMayUseRouteMarked(engine)
   );
 }
+
+/**
+ * 是否提供「进入普通模式」（网页后台、扩展弹窗的任何场景，§6.5）：与普通模式执行时是否结束 Safari 连接（safariMayUseRoute）
+ * 同一判断，另含 buyer_exit_connections_unconfirmed（它总与持久标记一起写入；这里不依赖这一点）。只看入口、活动环境与警告
+ * 不够：回滚失败可能把入口记为 NORMAL（阶段 attention、快照保留），普通模式在结束连接失败之后的读回也可能失败，路由记录
+ * 看起来已是普通模式而 Safari 的连接仍在买家出口上。
+ */
+export function normalModeOffered(engine: Engine, route: RouteStateRecord): boolean {
+  return safariMayUseRoute(engine, route) || route.warnings.includes('buyer_exit_connections_unconfirmed');
+}

@@ -63,7 +63,7 @@ export const ROUTE_WARNING_TEXT: Record<RouteWarning, { text: string; severity: 
   probe_expired: { text: 'Safari 实测已过期，显示的是上次结果', severity: 'warning' },
   probe_failed: { text: '最近一次 Safari 实测失败，已停止自动打开订单与填充', severity: 'danger' },
   exit_ip_mismatch: { text: '实测出口与预期出口不一致，已停止自动打开订单与填充', severity: 'danger' },
-  buyer_exit_connections_unconfirmed: { text: '未能确认 Safari 已没有经买家出口的连接，再次进入普通模式会再结束 Safari 连接', severity: 'danger' },
+  buyer_exit_connections_unconfirmed: { text: '未能确认 Safari 已没有经买家出口的连接，再次进入普通模式会再结束其中可能经买家出口的连接（按原规则发出的不受影响）', severity: 'danger' },
 };
 
 export function warningText(w: RouteWarning): string {

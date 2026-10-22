@@ -66,7 +66,7 @@ export function installBackground(b: WebExtBrowser, transport: NativeTransport):
         do {
           rerun = false;
           const state = await collectProfileState(b);
-          // 只作提示：失败（例如未识别场景不允许上报）不重试，也不影响路由。
+          // 只作提示：失败（例如服务不可达）不重试，也不影响路由。未识别场景（可能是默认场景）同样上报，计入旧窗口确认。
           await native.call({ type: 'reportProfileState', ...state });
         } while (rerun);
       } catch {

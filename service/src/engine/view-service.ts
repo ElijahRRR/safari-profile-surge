@@ -17,6 +17,7 @@ import { OPEN_STATUSES, PUBLISH_KINDS, payloadOf, routeTargetOf } from '../domai
 import { buildEnvironmentView, buildFrontProxyViews, buildOperationView, buildRouteView, buildSurgeStatus } from '../domain/views.js';
 import { missingFrom } from './capabilities.js';
 import type { EmitSpec, Engine } from './context.js';
+import { normalModeOffered } from './safari-route-marker.js';
 
 export interface ViewService {
   environmentView(id: string): EnvironmentView | null;
@@ -117,7 +118,8 @@ export function createViewService(engine: Engine): ViewService {
       return route.activeEnvironmentId ? repos.probes.latest(route.activeEnvironmentId, 'safari') : null;
     },
     routeView() {
-      return buildRouteView(repos.routeState.get(), service.lastSafariProbe());
+      const route = repos.routeState.get();
+      return buildRouteView(route, service.lastSafariProbe(), normalModeOffered(engine, route));
     },
     frontDependents() {
       const map = new Map<string, string[]>();
