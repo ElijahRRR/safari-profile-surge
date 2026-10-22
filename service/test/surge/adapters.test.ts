@@ -60,13 +60,20 @@ describe('CLI command table', () => {
     expect(CLI_COMMANDS.listTempRules!.parse(out(JSON.stringify(['DOMAIN,a.example.test,REJECT'])), ctx)).toEqual(['DOMAIN,a.example.test,REJECT']);
     // --raw 输出只接受 JSON：人类可读的文本不再按行拆成规则。
     expect(() => CLI_COMMANDS.listTempRules!.parse(out('# temp rules\nDOMAIN,a.example.test,REJECT\n'), ctx)).toThrow(/输出格式无法识别/);
-    expect(CLI_COMMANDS.getVersion!.parse(out('Surge Mac 6.5.0 (10960)'), ctx)).toEqual({ version: '6.5.0', build: '10960' });
     expect(() => CLI_COMMANDS.listExternalResources!.parse(out('not json'), ctx)).toThrow(/输出格式无法识别/);
   });
 });
 
 describe('createCliAdapter', () => {
   const okExec = (stdout: string): ExecFn => vi.fn(async () => ({ stdout, stderr: '' }));
+
+  test('does not run the unsupported version flag or treat its connection address as a version', async () => {
+    // Observed on Surge Mac 6.5.0: --version enters interactive mode (exit 0 at EOF).
+    const exec = okExec('No command is provided, enter interactive mode.\nTips: Use surge-cli --help to show available commands.\nConnected to 127.0.0.1\n> ');
+    const adapter = createCliAdapter({ cliPath: CLI, mechanism: { getVersion: 'cli' }, exec, scrub: (s) => s });
+    await expect(adapter.getVersion()).rejects.toMatchObject({ code: 'CAPABILITY_UNVERIFIED' });
+    expect(exec).not.toHaveBeenCalled();
+  });
 
   test('reads the Surge 6.5 defines envelope through machine-readable CLI output', async () => {
     // Synthetic resource values; the envelope matches a read-only 6.5 CLI observation.

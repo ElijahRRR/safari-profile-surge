@@ -97,19 +97,10 @@ export const CLI_COMMANDS: CliCommandTable = {
     argv: (rule) => ['temp-rule', 'remove', safeArg(rule, '规则')],
     parse: () => undefined,
   },
-  // TODO(P0)：以下读取命令与输出格式均未在 6.5 上核对。
-  getVersion: {
-    evidence: 'unverified',
-    argv: () => ['--version'],
-    parse: (out) => {
-      const text = `${out.stdout}\n${out.stderr}`;
-      const full = /(\d+\.\d+(?:\.\d+)*)\s*\(\s*(\d+)\s*\)/.exec(text);
-      if (full) return { version: full[1]!, build: full[2]! };
-      const short = /(\d+\.\d+(?:\.\d+)*)/.exec(text);
-      if (short) return { version: short[1]!, build: null };
-      throw unrecognized('版本信息');
-    },
-  },
+  // 6.5.0 真机：--version 进入交互模式，EOF 时退出 0，且输出 Connected to 127.0.0.1。
+  // 不映射 getVersion：不能把连接地址当版本，也不能用已安装 App 的版本冒充运行实例版本。
+  // TODO(P0)：实现并验证运行实例版本读取后再加入原语表。
+  // TODO(P0)：以下读取命令与输出格式均需在目标版本核对。
   listRules: {
     evidence: 'unverified',
     argv: () => ['--raw', 'dump', 'rule'],
