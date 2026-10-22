@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -23,6 +23,34 @@ describe('base directory', () => {
     expect(classifyLocationRisk('/Users/t/Desktop', '/Users/t')).toBe('protected');
     expect(classifyLocationRisk('/Users/t/Library/Application Support/SafariProfileSurge/p0', '/Users/t')).toBe('none');
     expect(classifyLocationRisk('/Users/t/Documentsx', '/Users/t')).toBe('none');
+  });
+
+  it('uses the canonical location like the service: symlinked and differently-cased aliases of synced folders are synced', () => {
+    const home = tmp();
+    mkdirSync(join(home, 'Library', 'CloudStorage', 'Dropbox'), { recursive: true });
+    mkdirSync(join(home, 'Documents'), { recursive: true });
+    // ~/Dropbox → ~/Library/CloudStorage/Dropbox（Dropbox 的 File Provider 集成通常留下的布局）。
+    symlinkSync(join(home, 'Library', 'CloudStorage', 'Dropbox'), join(home, 'Dropbox'));
+    symlinkSync(join(home, 'Documents'), join(home, 'docs-link'));
+    expect(classifyLocationRisk(join(home, 'Dropbox', 'sfe-p0'), home)).toBe('synced');
+    expect(classifyLocationRisk(join(home, 'Dropbox', 'not', 'yet', 'created'), home)).toBe('synced');
+    expect(classifyLocationRisk(join(home, 'Dropbox'), home)).toBe('synced');
+    expect(classifyLocationRisk(join(home, 'library', 'cloudstorage', 'Dropbox', 'p0'), home)).toBe('synced');
+    expect(classifyLocationRisk(join(home, 'docs-link', 'p0'), home)).toBe('protected');
+    expect(classifyLocationRisk(join(home, 'Library', 'Application Support', 'SafariProfileSurge', 'p0'), home)).toBe('none');
+    const base = join(home, 'Dropbox', 'sfe-p0');
+    expect(() => assertSafeBaseDir(base, home)).toThrow(/iCloud 或云盘同步位置/);
+    expect(existsSync(join(home, 'Library', 'CloudStorage', 'Dropbox', 'sfe-p0'))).toBe(false);
+  });
+
+  it('keeps the iCloud name checks and refuses a location it cannot resolve', () => {
+    expect(classifyLocationRisk('/Volumes/x/com~apple~CloudDocs/p0', '/Users/t')).toBe('synced');
+    expect(classifyLocationRisk('/Volumes/x/iCloud Drive/p0', '/Users/t')).toBe('synced');
+    // 祖先是普通文件：真实位置无法确认（ENOTDIR），按不安全处理。
+    const root = tmp();
+    writeFileSync(join(root, 'file'), '');
+    expect(classifyLocationRisk(join(root, 'file', 'sub'), '/nonexistent-home')).toBe('unknown');
+    expect(() => assertSafeBaseDir(join(root, 'file', 'sub'), '/nonexistent-home')).toThrow(/无法确认目录的真实位置/);
   });
 
   it('finds git work trees from non-existing children', () => {

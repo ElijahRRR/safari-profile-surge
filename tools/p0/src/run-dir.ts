@@ -4,6 +4,7 @@
 import { randomBytes } from 'node:crypto';
 import { appendFileSync, chmodSync, closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { classifyDirectoryRisk } from './deps.js';
 import { P0Error, refused } from './errors.js';
 
 export const RUN_ID_RE = /^\d{8}-\d{6}-[0-9a-f]{6}$/;
@@ -28,19 +29,21 @@ export function findGitWorkTree(path: string): string | null {
   }
 }
 
-export type LocationRisk = 'none' | 'synced' | 'protected';
+/** unknown：无法确认真实位置（例如祖先目录不可读或不是目录），调用方按不安全处理。 */
+export type LocationRisk = 'none' | 'synced' | 'protected' | 'unknown';
 
-/** iCloud/云盘同步位置与文稿/桌面/下载（可能触发 TCC 或同步）。 */
+/**
+ * iCloud/云盘同步位置与文稿/桌面/下载（可能触发 TCC 或同步）。与服务使用同一判断（classifyDirectoryRisk）：
+ * 路径与 home 的字面形式和真实位置（尚未创建的子目录取最近的已存在祖先）都比较、不区分大小写，
+ * 所以 ~/Dropbox 这类指向 ~/Library/CloudStorage 的别名与大小写变体同样识别；另外按名称识别 iCloud Drive。
+ */
 export function classifyLocationRisk(path: string, home: string): LocationRisk {
-  const p = resolve(path);
-  const h = resolve(home);
-  const under = (...parts: string[]): boolean => {
-    const base = join(h, ...parts);
-    return p === base || p.startsWith(base + sep);
-  };
-  if (under('Library', 'Mobile Documents') || under('Library', 'CloudStorage') || /com~apple~CloudDocs|iCloud Drive/i.test(p)) return 'synced';
-  if (under('Desktop') || under('Documents') || under('Downloads')) return 'protected';
-  return 'none';
+  if (/com~apple~CloudDocs|iCloud Drive/i.test(resolve(path))) return 'synced';
+  try {
+    return classifyDirectoryRisk(path, home);
+  } catch {
+    return 'unknown';
+  }
 }
 
 export function assertSafeBaseDir(base: string, home: string): void {
@@ -49,7 +52,8 @@ export function assertSafeBaseDir(base: string, home: string): void {
   if (git !== null) throw new P0Error('unsafe', '准备证据目录失败：目录位于 Git 工作树内，原始证据可能被提交到仓库');
   const risk = classifyLocationRisk(base, home);
   if (risk !== 'none') {
-    throw new P0Error('unsafe', risk === 'synced' ? '准备证据目录失败：目录位于 iCloud 或云盘同步位置' : '准备证据目录失败：目录位于文稿、桌面或下载等受保护位置');
+    const why = { synced: '目录位于 iCloud 或云盘同步位置', protected: '目录位于文稿、桌面或下载等受保护位置', unknown: '无法确认目录的真实位置' }[risk];
+    throw new P0Error('unsafe', `准备证据目录失败：${why}`);
   }
 }
 

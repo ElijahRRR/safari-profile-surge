@@ -174,12 +174,28 @@ function canonicalLocation(path: string): string {
 }
 
 /**
+ * 真实位置（canonicalLocation）；除“尚不存在”之外无法解析时（链接循环、没有权限、路径中有非目录等）抛出
+ * UNSAFE_LOCATION：真实位置未知时无法排除同步或受保护位置，按不安全位置处理。消息与 details 只带错误码，不带路径。
+ */
+function canonicalLocationOrUnsafe(path: string): string {
+  try {
+    return canonicalLocation(path);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    const errno = typeof code === 'string' && /^E[A-Z0-9]+$/.test(code) ? code : 'UNKNOWN';
+    throw unsafe(`无法确认目录的真实位置（${errno}）：按同步或受保护位置处理`, { errno });
+  }
+}
+
+/**
  * 目录风险：iCloud/云盘同步位置为 synced；文稿、桌面、下载（TCC 保护）为 protected。
  * 路径与 home 都检查别名及真实位置，包括尚未创建的子目录。
+ * 路径或 home 的真实位置无法确认时抛出 UNSAFE_LOCATION（失败即拒绝，不按 none 处理）；只做展示的调用方
+ * （readBasicFacts）自行捕获并记为风险未知。
  */
 export function classifyDirectoryRisk(path: string, home: string): 'none' | 'synced' | 'protected' {
-  const candidates = [resolve(path), canonicalLocation(path)];
-  const homes = [resolve(home), canonicalLocation(home)];
+  const candidates = [resolve(path), canonicalLocationOrUnsafe(path)];
+  const homes = [resolve(home), canonicalLocationOrUnsafe(home)];
   const synced = homes.flatMap((h) => [join(h, 'Library', 'Mobile Documents'), join(h, 'Library', 'CloudStorage')]);
   const protectedDirs = homes.flatMap((h) => [join(h, 'Documents'), join(h, 'Desktop'), join(h, 'Downloads')]);
   if (candidates.some((c) => synced.some((s) => isUnder(c, s)))) return 'synced';

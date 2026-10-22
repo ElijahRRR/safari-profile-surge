@@ -227,6 +227,12 @@ export interface EntryCleanupStep {
 export interface EntryTransitionOptions {
   /** 撤销本应用入口（普通模式、回滚；目标 BLOCKED/NORMAL）：允许改写 changedOwnedFiles。激活中的阻断步骤不设置。 */
   undo?: boolean;
+  /**
+   * 本次 BLOCKED 是普通模式的中间阻断（与 undo 一起使用）：之后撤销全部本应用入口，NORMAL 本来就把 Safari 流量交给原规则。
+   * temp_rule 因此不在写入前拒绝“移除本应用规则会让 Safari 流量落到排在其后、可能放行的其他规则”的阻断；回滚与激活中的
+   * 阻断不设置，照常拒绝（§5.5「优先级检查」）。
+   */
+  towardNormal?: boolean;
   /** 撤销清理的每一步运行时读回并确认归属之后调用（写入操作步骤与结果）；只有 undo 时可能调用。 */
   onCleanup?: (step: EntryCleanupStep) => void;
 }

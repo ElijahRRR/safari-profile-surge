@@ -6,7 +6,7 @@
 // 由同一进程路径的归属结果补足（见 analysis/udp-coverage.ts）。
 // 临时规则一律按规范化文本比较（Surge 列出时可能改变逗号与括号周围的空格）；注入测试规则前确认没有相同的用户规则。
 
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { CAPABILITY_CRITERIA, ENTRY_RULESET_FILES, type EntryStrategy, type KillResult, type KnownEntryMode, type ProtocolCoverage } from '@sfe/contract';
 import { analyzeEntryWindow, outcomeOf, type ObservedRequest } from '../analysis/entry-window.js';
 import { compareSignals, type ReloadSignals } from '../analysis/reload.js';
@@ -31,7 +31,7 @@ import { refused, type ExitCode } from '../errors.js';
 import { check, readResult, writeResult, type CheckItem } from '../results.js';
 import { markTempRule, recordTempRuleIntent, saveState } from '../state.js';
 import { surgeStartFingerprint } from '../system.js';
-import { CANARY_FILE, ECHO_HOST, PRECEDENCE_MODULE_FILE, TEST_NODES, TEST_USERS } from '../test-profile.js';
+import { CANARY_FILE, ECHO_HOST, PRECEDENCE_MODULE_FILE, TEST_NODES, TEST_USERS, profileRuleLines } from '../test-profile.js';
 import { describeImpact, startOtherAppTraffic, trafficImpact, trafficUnaffected } from '../traffic.js';
 import { allowRefreshFor, confirmWrites, measureContext, openRun, openSession, printResult, printSnapshot, proxyOf, requireServers, takeSnapshot, tryRead, verifyHostOf, type Ctx } from './common.js';
 import { TestOps, chromeImpact, pageEvents } from './test-ops.js';
@@ -75,6 +75,16 @@ async function restartPhase(
     startChanged: startBefore === null || startAfter === null ? null : startBefore !== startAfter,
     normalAfter,
   };
+}
+
+/** 测试配置 [Rule] 段的规则文本（读不到时为 null，插入探测会如实报告无法确定配置规则的起点）。 */
+function testProfileRules(path: string | null): string[] | null {
+  if (!path) return null;
+  try {
+    return profileRuleLines(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
 }
 
 /** 临时规则列表中是否有与 rule 规范化后相同的规则。 */
@@ -145,11 +155,57 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
     ops.state = markTempRule(ops.state, rule, 'removed', now());
     saveState(dir, ops.state);
   };
+  // listTempRules 的正向确认：本次运行了插入探测时以本次结果为准（undefined = 本次未探测），否则以运行状态中
+  // 之前的确认为准。只有确认为 true 时，列表中“没有”才能当作已删除；未确认（null）与确认不可用（false）都不能。
+  let probedNow: boolean | null | undefined;
+  const tempListTrusted = (): boolean => (probedNow !== undefined ? probedNow === true : ops.state.tempListConfirmed === true);
   const syncTempRules = async (): Promise<void> => {
     const list = await tryRead(() => session.adapter.listTempRules());
     if (list === null) return;
-    for (const r of session.guard.tempRules) ops.state = markTempRule(ops.state, r, hasRule(list, r) ? 'present' : 'removed', now());
+    const trusted = tempListTrusted();
+    for (const r of session.guard.tempRules) {
+      // 列表中出现是正向证据；列表中没有只在列表经过正向确认时才标为已删除。
+      if (hasRule(list, r)) ops.state = markTempRule(ops.state, r, 'present', now());
+      else if (trusted) ops.state = markTempRule(ops.state, r, 'removed', now());
+    }
     saveState(dir, ops.state);
+  };
+  let insertionNote: string | null = null;
+  // 插入探测：添加并删除两条永不命中的临时规则，测量插入位置，并正向确认 listTempRules（结果记入运行状态）。
+  const runInsertionProbe = async (): Promise<void> => {
+    const p = await probeTempInsertion(session.adapter, (r) => register(r, 'insertion-probe'), markRemoved, { profileRules: testProfileRules(ops.state.testProfilePath) });
+    probedNow = p.tempListConfirmed;
+    if (p.insertion || p.tempListConfirmed !== null) {
+      // null（无法确认）不覆盖之前的结论；false 只来自“添加已生效、列表却没有列出”的确定证据，之后的 true 可以覆盖它。
+      ops.state = { ...ops.state, tempRuleInsertion: p.insertion ?? ops.state.tempRuleInsertion, tempListConfirmed: p.tempListConfirmed ?? ops.state.tempListConfirmed };
+      saveState(dir, ops.state);
+    }
+    const listMech = session.mechanism.listTempRules ?? 'unavailable';
+    insertionNote = p.skipped
+      ? `新临时规则插入位置：${p.skipped}；listTempRules（${listMech}）未确认`
+      : [
+          `新临时规则插入位置：${p.insertion ?? '无法判断'}`,
+          p.beforeProfileRules === null
+            ? `与配置规则的先后无法判断（${p.boundaryNote ?? '原因未知'}）`
+            : p.beforeProfileRules
+              ? '临时规则排在测试配置规则之前'
+              : '临时规则没有排在全部测试配置规则之前',
+          p.tempListConfirmed === true ? `listTempRules（${listMech}）列出了刚添加的探测规则` : `listTempRules（${listMech}）${p.tempListConfirmed === false ? '' : '未确认：'}${p.tempListNote ?? '原因未知'}`,
+        ].join('；');
+    ops.action('insertion_probe', {
+      insertion: p.insertion,
+      beforeProfileRules: p.beforeProfileRules,
+      tempListConfirmed: p.tempListConfirmed,
+      tempListReadError: p.tempListReadError,
+      addConfirmed: p.addConfirmed,
+      skipped: p.skipped ?? null,
+    });
+    out.line(insertionNote);
+    if (p.tempListConfirmed === false) {
+      out.warn('listTempRules 读不到刚添加的临时规则：临时规则的读回、同步与回退都不可信，--precedence-test temp 不注入；把 dump temp-rule 的输出格式交给开发者核对');
+    } else if (p.addConfirmed === false) {
+      out.warn('有效规则中也看不到刚添加的探测规则：addTempRule 可能没有生效（不归咎于 listTempRules）；把 temp-rule add 的实际效果交给开发者核对');
+    }
   };
   const syncEntryDigests = async (): Promise<void> => {
     if (strategy === 'ruleset_resource') for (const b of ENTRY_BITS_IN_ORDER) await ops.syncDigest(ENTRY_RULESET_FILES[b]);
@@ -158,14 +214,34 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   // 单次切换（例如回到 NORMAL）。
   const single = ctx.args.strings.to as KnownEntryMode | undefined;
   if (single) {
-    for (const r of entryTempRules) await register(r, 'entry');
-    const ok = await confirmWrites(ctx, `入口切换到 ${single}`, [`按 ${strategy} 策略逐位切换到 ${single}，每步读回`], ['失败时停在已确认的更严格状态；进入普通模式：entry --to NORMAL', 'rollback --execute 删除本工具添加的临时规则']);
+    // temp_rule 进入 NORMAL 之外的模式要靠 listTempRules 读回：运行状态中没有正向确认时先探测（或按 --probe-insertion 探测）。
+    const probe = ctx.args.booleans['probe-insertion'] === true || (strategy === 'temp_rule' && single !== 'NORMAL' && ops.state.tempListConfirmed !== true);
+    // listTempRules 被确认不可用时读回不可信，无法确认任何模式（包括 NORMAL）：改用 rollback 逐条删除本工具登记的规则。
+    const listUnusable = (): boolean => strategy === 'temp_rule' && ops.state.tempListConfirmed === false;
+    const unusable = '前置条件不满足：listTempRules 已被确认不可用（没有列出本工具刚添加的探测规则），temp_rule 入口无法读回。请运行 rollback --execute 逐条删除本工具登记的临时规则，并在 Surge 中手动核对';
+    if (!probe && listUnusable()) throw refused(unusable);
+    const ok = await confirmWrites(
+      ctx,
+      `入口切换到 ${single}`,
+      [...(probe ? ['添加并删除两条永不命中的临时规则，正向确认 listTempRules 并测量插入位置'] : []), `按 ${strategy} 策略逐位切换到 ${single}，每步读回`],
+      ['失败时停在已确认的更严格状态；进入普通模式：entry --to NORMAL', 'rollback --execute 删除本工具添加的临时规则'],
+    );
     if (!ok) throw refused('已取消：没有写入任何东西');
+    if (probe) await runInsertionProbe();
+    if (strategy === 'temp_rule' && single !== 'NORMAL' && !tempListTrusted()) {
+      throw refused(`前置条件不满足：listTempRules 没有经过正向确认（${insertionNote ?? '未探测'}），temp_rule 入口依赖它读回，没有写入入口规则`);
+    }
+    if (listUnusable()) throw refused(unusable);
+    // 入口写入之前登记意图（被拒绝时不登记从未写入的规则）。
+    for (const r of entryTempRules) await register(r, 'entry');
     const run = await runEntrySequence({ controller, now: () => now().getTime(), onStep: (r) => ops.action('entry_step', { bit: r.step.bit, value: r.step.value }) }, [single]);
     await syncTempRules();
     await syncEntryDigests();
     const m = run.modes[0]!;
     out.line(m.ok ? `已切换到 ${single}（读回 ${m.readbackMode}）` : `切换失败：${m.error?.code ?? '读回不符'} ${m.error?.message ?? `读回 ${m.readbackMode}`}`);
+    if (strategy === 'temp_rule' && !tempListTrusted()) {
+      out.warn('listTempRules 没有经过正向确认（entry 的插入探测）：读回不能证明本工具的临时规则已删除；接着运行 rollback --execute，并在 Surge 中核对');
+    }
     return m.ok ? 0 : 1;
   }
 
@@ -174,12 +250,14 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   const snap = await takeSnapshot(ctx, session, dir, 'entry-before');
   printSnapshot(out, snap);
   const precedenceTests = new Set(ctx.args.lists['precedence-test'] ?? []);
+  // temp_rule 入口与 --precedence-test temp 都依赖 listTempRules：必须在本次运行中由插入探测正向确认。
+  const probeMain = ctx.args.booleans['probe-insertion'] === true || strategy === 'temp_rule' || precedenceTests.has('temp');
   const ok = await confirmWrites(
     ctx,
     `入口模式测试（${strategy}）`,
     [
       `SFE-ROUTE 选择 ${TEST_NODES.a}；原子替换 canary 规则集（不刷新）作为重载检测`,
-      ...(ctx.args.booleans['probe-insertion'] ? ['添加并删除两条永不命中的临时规则，测量新临时规则的插入位置'] : []),
+      ...(probeMain ? ['添加并删除两条永不命中的临时规则，正向确认 listTempRules 并测量新临时规则的插入位置'] : []),
       ...(precedenceTests.has('temp') ? [`添加临时规则 DOMAIN,${verifyHost},DIRECT，确认 VERIFY_ONLY 被拒绝后删除`] : []),
       ...(precedenceTests.has('module') ? [`由你在 Surge 中手动启用测试模块 ${PRECEDENCE_MODULE_FILE}，确认 VERIFY_ONLY 被拒绝后手动停用`] : []),
       `按 ${strategy} 策略依次切换 ${SEQUENCE.join(' → ')}，每个模式停留 ${dwellMs / 1000} 秒`,
@@ -187,13 +265,14 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
       ...(ctx.args.booleans['restart-test'] ? ['主序列结束后再次进入 ACTIVE，由你手动退出并重新打开 Surge，读回入口规则去留，再回到 NORMAL'] : []),
     ],
     [
-      `进入普通模式：entry --strategy ${strategy} --to NORMAL（永远可用）`,
+      strategy === 'temp_rule'
+        ? '进入普通模式：entry --strategy temp_rule --to NORMAL（listTempRules 被插入探测确认不可用时会拒绝：改用 rollback --execute 并在 Surge 中核对）'
+        : `进入普通模式：entry --strategy ${strategy} --to NORMAL`,
       'rollback --execute：只删除本工具登记过的临时规则',
       `切回原配置「${ops.state.sourceProfileName ?? '原配置'}」后删除测试文件（本命令不改动测试配置之外的任何文件）`,
     ],
   );
   if (!ok) throw refused('已取消：没有写入任何东西');
-  for (const r of entryTempRules) await register(r, 'entry');
 
   const traffic = startOtherAppTraffic({ proxy, echoPort: servers.echoPort, intervalMs: 1000, label: 'entry' });
   let seqStart = now().getTime();
@@ -203,7 +282,6 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
     for (const r of list ?? []) records.set(r.id, r);
   };
   const checksPrecedence: CheckItem[] = [];
-  let insertionNote: string | null = null;
   let canaryIndex: number | null = null;
   let sigBefore: ReloadSignals | null = null;
   let sigAfter: ReloadSignals | null = null;
@@ -227,23 +305,25 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
       canaryIndex = null;
     }
 
-    if (ctx.args.booleans['probe-insertion']) {
-      const p = await probeTempInsertion(session.adapter, (r) => register(r, 'insertion-probe'), markRemoved);
-      if (p.insertion) {
-        ops.state = { ...ops.state, tempRuleInsertion: p.insertion };
-        saveState(dir, ops.state);
-      }
-      insertionNote = p.skipped
-        ? `新临时规则插入位置：${p.skipped}`
-        : `新临时规则插入位置：${p.insertion ?? '无法判断'}；临时规则${p.beforeProfileRules === null ? '与配置规则的先后无法判断' : p.beforeProfileRules ? '排在配置规则之前' : '没有排在全部配置规则之前'}`;
-      out.line(insertionNote);
+    if (probeMain) await runInsertionProbe();
+    // temp_rule 策略的每一步都靠 listTempRules 读回：本次运行没有正向确认它时，入口写入之前停止。
+    if (strategy === 'temp_rule' && !tempListTrusted()) {
+      throw refused(`前置条件不满足：listTempRules 没有经过正向确认（${insertionNote ?? '未探测'}），temp_rule 策略依赖它读回，未运行入口序列`);
     }
+    // 入口写入（优先级测试与主序列）之前登记意图；上面被拒绝时不登记从未写入的规则。
+    for (const r of entryTempRules) await register(r, 'entry');
 
     const tempPrecedenceName = '入口优先于用户临时规则（注入 DIRECT 规则时拒绝进入 VERIFY_ONLY）';
-    const existingTemps = precedenceTests.has('temp') ? await tryRead(() => session.adapter.listTempRules()) : null;
+    const tempListUnusable = !tempListTrusted();
+    const existingTemps = precedenceTests.has('temp') && !tempListUnusable ? await tryRead(() => session.adapter.listTempRules()) : null;
     if (precedenceTests.has('temp') && (existingTemps === null || hasRule(existingTemps, `DOMAIN,${verifyHost},DIRECT`))) {
-      // 用户已有相同的临时规则（或读不到列表）时不注入：注入与清理都按文本，会删掉或接管用户自己的规则。
-      checksPrecedence.push(check(tempPrecedenceName, null, existingTemps === null ? '读不到当前临时规则，无法确认没有相同的用户规则，未注入' : '已存在相同的用户临时规则，未注入（不会删除用户自己的规则）'));
+      // 用户已有相同的临时规则（或读不到列表、列表未经正向确认）时不注入：注入与清理都按文本，会删掉或接管用户自己的规则。
+      const why = tempListUnusable
+        ? `listTempRules 没有经过正向确认（${insertionNote ?? '未探测'}），无法确认没有相同的用户规则，未注入`
+        : existingTemps === null
+          ? '读不到当前临时规则，无法确认没有相同的用户规则，未注入'
+          : '已存在相同的用户临时规则，未注入（不会删除用户自己的规则）';
+      checksPrecedence.push(check(tempPrecedenceName, null, why));
     } else if (precedenceTests.has('temp')) {
       const rule = `DOMAIN,${verifyHost},DIRECT`;
       const r = await precedenceTest(

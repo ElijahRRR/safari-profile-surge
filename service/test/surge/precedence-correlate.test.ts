@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import type { SurgeRequestRecord, SurgeRuleRecord } from '../../src/ports.js';
-import { classifyPrecedence, hasBlockingIssue } from '../../src/surge/precedence.js';
+import { classifyPrecedence, classifyPrecedenceAt, hasBlockingIssue } from '../../src/surge/precedence.js';
 import { findVerificationRequest } from '../../src/surge/correlate.js';
 import { tempRuleText } from '../../src/surge/generate.js';
 
@@ -59,6 +59,75 @@ describe('classifyPrecedence', () => {
   test('without our rule present, only non-profile rules before the first profile rule count', () => {
     const issues = classifyPrecedence([rule('GEOIP,US,DIRECT', 'module'), rule('DOMAIN-SUFFIX,example.test,DIRECT'), rule('FINAL,DIRECT')], ctx);
     expect(issues).toEqual([{ rule: 'GEOIP,US,DIRECT', source: 'module', severity: 'blocking' }]);
+  });
+
+  test('rules between our rule sets are classified up to the last entry rule set', () => {
+    const rs = (bit: string, policy: string) => rule(`RULE-SET,sfe-entry-${bit}.list,${policy}`);
+    const issues = classifyPrecedence(
+      [
+        rs('udp', 'REJECT'),
+        rs('verify', 'SFE-ROUTE'),
+        rule('DOMAIN-SUFFIX,example.test,DIRECT'),
+        rs('block', 'REJECT'),
+        rule('GEOIP,US,REJECT'),
+        rule('DOMAIN,ads.example.invalid,DIRECT'),
+        rs('active', 'SFE-ROUTE'),
+        rule('FINAL,DIRECT'),
+      ],
+      ctx,
+    );
+    expect(issues).toEqual([
+      { rule: 'DOMAIN-SUFFIX,example.test,DIRECT', source: 'profile', severity: 'blocking' },
+      { rule: 'GEOIP,US,REJECT', source: 'profile', severity: 'warning' },
+    ]);
+  });
+});
+
+describe('classifyPrecedence: temp_rule entries with a user rule between them', () => {
+  const cfg = { processPaths: [SAFARI], verifyHost: 'verify.example.test', siteHosts: ['www.example.test'] };
+  const t = (bit: 'udp' | 'verify' | 'block' | 'active') => rule(tempRuleText(bit, cfg), 'temp_rule');
+  /** 旧版本格式的本应用规则：Safari 访问 example.test 经 SFE-ROUTE（不是覆盖 Safari 全部流量的规则）。 */
+  const LEGACY = rule(`AND,((PROCESS-NAME,${SAFARI}),(DOMAIN-SUFFIX,example.test)),SFE-ROUTE`, 'temp_rule');
+  const ours = (...rs: SurgeRuleRecord[]) => ({ ...ctx, isOurRule: (r: SurgeRuleRecord) => rs.some((o) => o.text === r.text) });
+  const user = (text: string) => rule(text, 'temp_rule');
+
+  test.each([
+    ['udp > user > block (ACTIVE → BLOCKED with tail insertion)', [t('udp'), user('DOMAIN-SUFFIX,example.test,DIRECT'), t('block')]],
+    ['udp > user > active (BLOCKED → ACTIVE with tail insertion)', [t('udp'), user('DOMAIN,www.example.test,DIRECT'), t('active')]],
+    ['udp > legacy route > user > block (before the undo cleanup)', [t('udp'), LEGACY, user('DOMAIN-SUFFIX,example.test,DIRECT'), t('block')]],
+  ])('%s: the user rule is blocking', (_name, rules) => {
+    const user = rules.find((r) => r.text.endsWith(',DIRECT'))!;
+    const issues = classifyPrecedence([...rules, rule('FINAL,DIRECT')], ours(...rules.filter((r) => r !== user)));
+    expect(issues).toEqual([{ rule: user.text, source: 'temp_rule', severity: 'blocking' }]);
+  });
+
+  test('a REJECT-family user rule between our rules only warns', () => {
+    const rules = [t('udp'), user('DOMAIN-SUFFIX,example.test,REJECT-DROP'), t('block')];
+    expect(classifyPrecedence(rules, ours(t('udp'), t('block')))).toEqual([{ rule: 'DOMAIN-SUFFIX,example.test,REJECT-DROP', source: 'temp_rule', severity: 'warning' }]);
+  });
+
+  test('a duplicate block for other process paths keeps the rule before it in scope', () => {
+    const preview = '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview';
+    const blockNew = rule(tempRuleText('block', { ...cfg, processPaths: [SAFARI, preview] }), 'temp_rule');
+    const rules = [t('udp'), t('block'), user('DOMAIN-SUFFIX,example.test,DIRECT'), blockNew];
+    const issues = classifyPrecedence(rules, { ...ours(t('udp'), t('block'), blockNew), processPaths: [SAFARI, preview] });
+    expect(issues).toEqual([{ rule: 'DOMAIN-SUFFIX,example.test,DIRECT', source: 'temp_rule', severity: 'blocking' }]);
+  });
+
+  test('classifyPrecedenceAt gives the same issues with their positions', () => {
+    const rules = [t('udp'), user('DOMAIN-SUFFIX,example.test,REJECT'), user('DOMAIN-SUFFIX,example.test,DIRECT'), t('block'), rule('FINAL,DIRECT')];
+    const c = ours(t('udp'), t('block'));
+    const at = classifyPrecedenceAt(rules, c);
+    expect(at.map((x) => x.index)).toEqual([1, 2]);
+    expect(at.map((x) => x.issue)).toEqual(classifyPrecedence(rules, c));
+  });
+
+  test('rules after the first of our rules that matches all Safari traffic are unreachable and ignored', () => {
+    // block 覆盖 Safari 的全部流量：之后的用户规则与本应用规则都到不了
+    const rules = [t('block'), user('DOMAIN-SUFFIX,example.test,DIRECT'), t('udp'), user('PROCESS-NAME,Safari,DIRECT')];
+    expect(classifyPrecedence(rules, ours(t('block'), t('udp')))).toEqual([]);
+    const active = [t('udp'), t('active'), user('DOMAIN-SUFFIX,example.test,DIRECT'), t('block')];
+    expect(classifyPrecedence(active, ours(t('udp'), t('active'), t('block')))).toEqual([]);
   });
 });
 

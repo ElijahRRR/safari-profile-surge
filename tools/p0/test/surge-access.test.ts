@@ -89,6 +89,14 @@ describe('proposeMechanism', () => {
     expect(p.unproven).toEqual(expect.arrayContaining(['updateExternalResource', 'selectGroupPolicy']));
   });
 
+  it('annotates a readable listTempRules mapping as needing the insertion probe confirmation', () => {
+    // 能读取只证明输出可以解析（空白输出也会读成空列表）：内容要由 entry 的插入探测正向确认。
+    const p = proposeMechanism({ listTempRules: ok }, {}, {}, false);
+    expect(p.mechanism.listTempRules).toBe('cli');
+    expect(p.notes.listTempRules).toContain('插入探测正向确认');
+    expect(proposeMechanism({}, {}, {}, false).notes.listTempRules).not.toContain('插入探测');
+  });
+
   it('never proposes reloadProfile', () => {
     const p = proposeMechanism({}, {}, {}, true);
     expect(p.mechanism.reloadProfile).toBe('unavailable');

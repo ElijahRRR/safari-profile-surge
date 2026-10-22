@@ -155,7 +155,7 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     }
     profileInfo = {
       name: profileNameOf(profilePath),
-      directoryRisk: classifyLocationRisk(profileDir, home),
+      directoryRisk: ((r) => (r === 'unknown' ? null : r))(classifyLocationRisk(profileDir, home)),
       inGitWorkTree: findGitWorkTree(profileDir) !== null,
       managedConfigHeader: detectManagedConfigHeader(text) !== null,
       sfeObjects: findForeignSfeObjects(text, { names: [], files: [] }).length,
@@ -258,7 +258,7 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     ['Surge CLI', cli.ok ? `签名校验通过（${cli.reason}）` : `不可用（${cli.reason}）`],
     ['http-api', httpApiInfo.configured ? (httpApiInfo.loopbackOnly ? '已配置，只监听回环' : '已配置，绑定非回环地址（不使用）') : profilePath ? '未配置' : '未提供 --profile'],
     ['当前配置', currentProfile ?? '读不到'],
-    ['配置目录', profileInfo ? String(profileInfo.directoryRisk) : '未提供 --profile'],
+    ['配置目录', profileInfo ? (profileInfo.directoryRisk === null ? '无法确认真实位置' : String(profileInfo.directoryRisk)) : '未提供 --profile'],
     ['自动重载设置', summary.autoReload === null ? '读不到（需在 Surge 设置中查看并在 refresh 中声明）' : summary.autoReload ? '开' : '关'],
     ['接管', takeover ? `增强模式 ${fmtBool(takeover.enhancedMode)}，系统代理 ${fmtBool(takeover.systemProxy)}，出站 ${takeover.outboundMode ?? '读不到'}` : '读不到'],
     ['临时规则', Array.isArray(values.listTempRules) ? `${(values.listTempRules as unknown[]).length} 条` : '读不到'],
@@ -267,7 +267,8 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   if (profileInfo) {
     const sfe = profileInfo.sfeFilesInDirectory as string[];
     if (sfe.length > 0) out.warn(`配置目录中已有 ${sfe.length} 个 sfe-* 文件（可能已初始化过）：make-test-profile 需要用 --target-dir 指定单独目录`);
-    if (profileInfo.directoryRisk !== 'none') out.warn('配置目录位于同步或受保护位置：正式产品不会在此写入，测试配置也不会写入');
+    if (profileInfo.directoryRisk === null) out.warn('无法确认配置目录的真实位置：按不安全处理，正式产品不会在此写入，测试配置也不会写入');
+    else if (profileInfo.directoryRisk !== 'none') out.warn('配置目录位于同步或受保护位置：正式产品不会在此写入，测试配置也不会写入');
     if (profileInfo.managedConfigHeader) out.warn('源配置带 #!MANAGED-CONFIG 远端托管头');
   } else {
     out.warn('没有提供 --profile：http-api 与配置结构未检查。请在 Surge「配置」中「在访达中显示」找到当前配置文件路径后重新运行');
@@ -290,6 +291,7 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   out.heading('建议的 adapterMechanism（写入 install.json 前先完成各测试命令；未证明的主动原语不能当作已通过）');
   out.json(proposal.mechanism);
   if (proposal.unproven.length > 0) out.line(`待证明的主动原语：${proposal.unproven.join('、')}`);
+  if (proposal.mechanism.listTempRules !== 'unavailable') out.line(`listTempRules：${proposal.notes.listTempRules}`);
 
   // takeover_state_readable：按建议的固定映射只读获取三项（与服务运行时同一来源）。
   const fixedAdapter = createGuardedAdapter(createP0Adapter({ cliPath: cli.ok ? cli.path : null, httpApi, mechanism: proposal.mechanism }), emptyGuard(), log, now);

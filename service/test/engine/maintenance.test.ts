@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { NODE_RESOURCE_FILE, SfeError, WORKING_PROFILE_NAME } from '@sfe/contract';
@@ -110,6 +110,18 @@ describe('init (one-time fixed working profile)', () => {
     await expectError(h.app.initCommit({ request_id: rid(), preview_digest: preview.preview_digest }, WEB), 'UNSAFE_LOCATION');
   });
 
+  test('real location of the profile directory or home cannot be confirmed (e.g. a link loop) → blocked with UNSAFE_LOCATION and a clear reason, not an internal error; no path in the error', async () => {
+    h = await createHarness({ sourceProfile: SOURCE });
+    const home = join(h.dir, 'home');
+    symlinkSync(home, home); // realpath → ELOOP（不是“尚不存在”）
+    const err = await expectError(h.app.initPreview({}, WEB), 'UNSAFE_LOCATION');
+    expect(err.message).toContain('无法确认目录的真实位置');
+    expect(JSON.stringify(err.toBody())).not.toContain(h.dir);
+    expect(existsSync(workingPath())).toBe(false);
+    // 读取事实本身不因此失败
+    expect((await h.app.refreshSurge(WEB)).reachable).toBe(true);
+  });
+
   test('target directory must be the source directory; agent cannot init', async () => {
     h = await createHarness({ sourceProfile: SOURCE });
     await expectError(h.app.initPreview({ targetDirectory: join(h.dir, 'elsewhere') }, WEB), 'VALIDATION_FAILED');
@@ -138,6 +150,19 @@ describe('remerge (user-confirmed maintenance)', () => {
     const p = await h.app.remergePreview(WEB);
     expect(p.checks.find((c) => c.name === 'entry')!.ok).toBe(false);
     await expectError(h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB), 'ENVIRONMENT_ACTIVE');
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+  });
+
+  test('real location of the working-profile directory cannot be confirmed → preview blocked with UNSAFE_LOCATION (clear reason, no path), nothing written', async () => {
+    h = await createHarness();
+    tamperGroup();
+    const home = join(h.dir, 'home');
+    symlinkSync(home, home);
+    const profileBefore = readFileSync(h.profilePath, 'utf8');
+    const err = await expectError(h.app.remergePreview(WEB), 'UNSAFE_LOCATION');
+    expect(err.message).toContain('无法确认目录的真实位置');
+    expect(JSON.stringify(err.toBody())).not.toContain(h.dir);
+    expect(readFileSync(h.profilePath, 'utf8')).toBe(profileBefore);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
   });
 

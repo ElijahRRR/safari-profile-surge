@@ -8,9 +8,10 @@ const R2 = 'PROCESS-NAME,/Applications/Safari.app/Contents/MacOS/Safari,REJECT';
 const R3 = 'DOMAIN,p0-insert-1.invalid,REJECT';
 const USER = 'DOMAIN-SUFFIX,user.example.test,DIRECT';
 
-function state(): RunState {
+/** 默认为 listTempRules 已由插入探测正向确认的运行状态（其他取值见下面的专门测试）。 */
+function state(tempListConfirmed: boolean | null = true): RunState {
   let s = emptyState('20261021-100000-aaaaaa', T);
-  s = { ...s, sourceProfileName: '我的配置' };
+  s = { ...s, sourceProfileName: '我的配置', tempListConfirmed };
   s = recordTempRuleIntent(s, R1, 'entry', T);
   s = markTempRule(s, R1, 'present', T);
   s = recordTempRuleIntent(s, R2, 'entry', T);
@@ -38,6 +39,33 @@ describe('buildRollbackPlan', () => {
     const plan = buildRollbackPlan(state(), null);
     expect(plan.removeTempRules.sort()).toEqual([R1, R2].sort());
     expect(plan.tempListUnknown).toBe(true);
+  });
+
+  it('does not treat rules as gone when listTempRules was confirmed unusable by the insertion probe', () => {
+    // 列表格式可以识别但不含本工具添加的规则：不能据此判定“已不存在”，否则 rollback --execute 会留下规则。
+    const plan = buildRollbackPlan(state(false), [USER]);
+    expect(plan.removeTempRules.sort()).toEqual([R1, R2].sort());
+    expect(plan.alreadyAbsent).toEqual([]);
+    expect(plan.tempListUnknown).toBe(true);
+    expect(plan.tempListUntrusted).toBe(true);
+    expect(formatRollbackPlan(plan).join('\n')).toContain('当前临时规则列表不可信');
+    expect(buildRollbackPlan(state(true), [USER]).alreadyAbsent.sort()).toEqual([R1, R2].sort());
+  });
+
+  it('does not treat rules as gone when listTempRules was never positively confirmed', () => {
+    // 未经插入探测确认的列表（例如 --raw dump temp-rule 输出空白被读成空列表）中“没有”不是已删除的证据：
+    // 否则 rollback --execute 会打印“没有需要删除的临时规则”而把阻断规则留在 Surge 中。
+    const plan = buildRollbackPlan(state(null), []);
+    expect(plan.removeTempRules.sort()).toEqual([R1, R2].sort());
+    expect(plan.alreadyAbsent).toEqual([]);
+    expect(plan.tempListUnknown).toBe(true);
+    expect(plan.tempListUntrusted).toBe(false);
+    expect(plan.tempListUnconfirmed).toBe(true);
+    const text = formatRollbackPlan(plan).join('\n');
+    expect(text).toContain('没有经过正向确认');
+    expect(text).not.toContain('没有需要删除的本工具规则');
+    // 没有需要处理的规则时不提示列表状态。
+    expect(formatRollbackPlan(buildRollbackPlan(emptyState('20261021-100000-dddddd', T), [])).join('\n')).not.toContain('正向确认');
   });
 
   it('uses the latest record for each rule', () => {

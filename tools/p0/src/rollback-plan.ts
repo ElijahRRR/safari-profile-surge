@@ -10,8 +10,12 @@ export interface RollbackPlan {
   removeTempRules: string[];
   /** 本工具登记过、但当前已不存在的规则。 */
   alreadyAbsent: string[];
-  /** 当前临时规则列表读不到。 */
+  /** 当前临时规则列表读不到，或不能作为“已不存在”的证据（未经正向确认或被确认不可用）。 */
   tempListUnknown: boolean;
+  /** listTempRules 曾被确认不可用（有效规则中能看到、列表却没有列出本工具刚添加的探测规则）。 */
+  tempListUntrusted: boolean;
+  /** listTempRules 没有经过插入探测的正向确认（运行状态中为 null）。 */
+  tempListUnconfirmed: boolean;
   /** 本工具创建的文件（切回原配置后手动删除）。 */
   files: string[];
   manual: string[];
@@ -21,7 +25,9 @@ export function buildRollbackPlan(state: RunState, currentTempRules: readonly st
   const latest = new Map<string, RunState['tempRules'][number]>();
   for (const r of state.tempRules) latest.set(r.rule, r);
   const ours = [...latest.values()].filter((r) => r.state !== 'removed').map((r) => r.rule);
-  const current = currentTempRules === null ? null : new Set(currentTempRules.map(normalizeRuleText));
+  // 只有经过插入探测正向确认（列出了刚添加的探测规则）的列表，其中“没有”才能当作已删除；未确认与确认不可用
+  // 都按无法读取处理（例如空白输出被读成空列表时，不能把仍在 Surge 中的规则判为已不存在）。
+  const current = currentTempRules === null || state.tempListConfirmed !== true ? null : new Set(currentTempRules.map(normalizeRuleText));
   const removeTempRules = current === null ? ours : ours.filter((r) => current.has(normalizeRuleText(r)));
   const alreadyAbsent = current === null ? [] : ours.filter((r) => !current.has(normalizeRuleText(r)));
   const original = state.sourceProfileName ?? '（盘点时记录的原配置）';
@@ -31,7 +37,7 @@ export function buildRollbackPlan(state: RunState, currentTempRules: readonly st
     '确认增强模式、系统代理与出站模式与盘点时一致（工具从不修改它们）。',
     '停止 test-servers（在其终端按 Ctrl+C）。',
   ];
-  return { removeTempRules, alreadyAbsent, tempListUnknown: current === null, files: state.createdFiles.map((f) => f.path), manual };
+  return { removeTempRules, alreadyAbsent, tempListUnknown: current === null, tempListUntrusted: state.tempListConfirmed === false, tempListUnconfirmed: state.tempListConfirmed === null, files: state.createdFiles.map((f) => f.path), manual };
 }
 
 export function formatRollbackPlan(plan: RollbackPlan): string[] {
@@ -41,7 +47,10 @@ export function formatRollbackPlan(plan: RollbackPlan): string[] {
     lines.push(`临时规则：删除本工具添加的 ${plan.removeTempRules.length} 条（逐条按原文删除，不影响其他规则）：`);
     for (const r of plan.removeTempRules) lines.push(`  - ${r}`);
   }
-  if (plan.tempListUnknown) lines.push('当前临时规则列表无法读取：执行时逐条尝试删除，并以删除结果为准。');
+  if (plan.tempListUntrusted) lines.push('当前临时规则列表不可信（listTempRules 没有列出本工具添加的探测规则）：执行时逐条尝试删除，删除后无法读回确认，请在 Surge 中手动核对。');
+  else if (plan.tempListUnconfirmed) {
+    if (plan.removeTempRules.length > 0) lines.push('当前临时规则列表没有经过正向确认（entry 的插入探测）：不据它判断“已不存在”，执行时逐条尝试删除，删除后无法读回确认，请在 Surge 中手动核对。');
+  } else if (plan.tempListUnknown) lines.push('当前临时规则列表无法读取：执行时逐条尝试删除，并以删除结果为准。');
   if (plan.alreadyAbsent.length > 0) lines.push(`已不存在（无需处理）：${plan.alreadyAbsent.length} 条。`);
   lines.push('手动步骤：');
   plan.manual.forEach((m, i) => lines.push(`  ${i + 1}. ${m}`));

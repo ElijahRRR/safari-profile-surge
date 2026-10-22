@@ -12,6 +12,7 @@ import { parseArgs } from '../src/args.js';
 import { main } from '../src/cli.js';
 import type { Ctx, Deps } from '../src/commands/common.js';
 import { runContinuity } from '../src/commands/continuity.js';
+import { resourceHealth } from '../src/commands/refresh.js';
 import { runTestServers } from '../src/commands/test-servers.js';
 import { EXIT } from '../src/errors.js';
 import { createMemoryOutput, createScriptedPrompter } from '../src/io.js';
@@ -125,6 +126,8 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(await main(['refresh', '--auto-reload', 'off', ...common()], d)).toBe(EXIT.OK);
     expect(result('auto_reload_atomic_replace').verdict).toBe('pass');
     expect(result('targeted_resource_refresh').verdict).toBe('pass');
+    // 刷新前、刚刷新后与 1 秒后各记录一次资源状态（ready=false 解析为未就绪）。
+    expect(result('targeted_resource_refresh').checks.find((c) => c.name === '资源没有错误')?.note).toBe('刷新前 正常，刷新后立即 正常，1 秒后 正常');
     expect(result('policy_path_reread').verdict).toBe('pass');
     const fixed = result('fixed_profile_no_switch');
     expect(fixed.checks.find((c) => c.name.includes('实际经过'))?.ok).toBe(true);
@@ -283,7 +286,8 @@ describe('P0 commands end to end (offline harness)', () => {
     const rule = 'DOMAIN,p0-rollback.invalid,REJECT';
     const listed = 'DOMAIN, p0-rollback.invalid, REJECT';
     const dir = env!.run();
-    saveState(dir, recordTempRuleIntent(loadState(dir, new Date()), rule, 'entry', new Date()));
+    // listTempRules 已由插入探测正向确认：读回才会被当作删除的证据。
+    saveState(dir, recordTempRuleIntent({ ...loadState(dir, new Date()), tempListConfirmed: true }, rule, 'entry', new Date()));
     await env!.surge.addTempRule(listed);
     const d = env!.deps();
     expect(await main(['rollback', '--execute', '--raw-dir', env!.base, '--yes'], d)).toBe(1);
@@ -309,6 +313,119 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(r.out.text()).toContain(`删除本工具添加的 ${present.length} 条`);
   });
 
+  it('the temp_rule sequence always probes and stops before any entry write when listTempRules does not list the probe rules', async () => {
+    const safari = join(env!.profileDir, 'Safari');
+    writeFileSync(safari, '');
+    const surge = env!.surge;
+    const list = surge.listTempRules.bind(surge);
+    // 输出格式可以识别，内容却不含刚添加的规则（例如映射到了别的列表，或空白输出被读成空列表）。
+    surge.listTempRules = async () => [];
+    const d = env!.deps();
+    // 没有 --probe-insertion：temp_rule 主序列也必须先正向确认 listTempRules。
+    const args = ['entry', '--strategy', 'temp_rule', '--process-path', safari, '--temp-insertion', 'tail', '--dwell', '0', '--no-kill-test', ...common()];
+    expect(await main(args, d)).toBe(EXIT.REFUSED);
+    expect(d.out.text()).toContain('没有列出刚添加的探测规则（有效规则中能看到它们）：该原语映射不可用');
+    expect(d.out.text()).not.toContain('BLOCKED：读回');
+    // 确认提示中不再承诺 --to NORMAL 永远可用。
+    expect(d.out.text()).not.toContain('永远可用');
+    expect(d.out.text()).toContain('改用 rollback --execute');
+    // 探测规则已删除，入口规则从未写入，也不登记从未写入的规则。
+    expect(surge.tempRules).toEqual([]);
+    const st = loadState(env!.run(), new Date());
+    expect(st.tempListConfirmed).toBe(false);
+    expect(st.tempRules.filter((r) => r.purpose === 'entry')).toEqual([]);
+    const r = env!.deps();
+    expect(await main(['rollback', '--raw-dir', env!.base], r)).toBe(EXIT.OK);
+    expect(r.out.text()).toContain('当前临时规则列表不可信');
+    expect(r.out.text()).toContain('没有需要删除的本工具规则');
+    // 读回不可信时 --to 也无法确认 NORMAL：指向 rollback，而不是报告“已切换”。
+    const n = env!.deps();
+    expect(await main(['entry', '--strategy', 'temp_rule', '--process-path', safari, '--to', 'NORMAL', ...common()], n)).toBe(EXIT.REFUSED);
+    expect(n.out.text()).toContain('rollback --execute');
+    expect(n.out.text()).not.toContain('已切换到');
+    // 列表修好后，--to 先重新探测；确认成功覆盖“不可用”的结论后才切换。
+    surge.listTempRules = list;
+    const again = env!.deps();
+    expect(await main(['entry', '--strategy', 'temp_rule', '--process-path', safari, '--temp-insertion', 'tail', '--to', 'BLOCKED', ...common()], again)).toBe(EXIT.OK);
+    expect(again.out.text()).toContain('列出了刚添加的探测规则');
+    expect(again.out.text()).toContain('已切换到 BLOCKED');
+    expect(loadState(env!.run(), new Date()).tempListConfirmed).toBe(true);
+  });
+
+  it('entry --to refuses temp_rule targets other than NORMAL until listTempRules is positively confirmed', async () => {
+    const safari = join(env!.profileDir, 'Safari');
+    writeFileSync(safari, '');
+    const surge = env!.surge;
+    const list = surge.listTempRules.bind(surge);
+    // 添加后读取失败（例如超时）：本次无法确认，但不等于映射不可用，也不写入入口规则。
+    let reads = 0;
+    surge.listTempRules = async () => {
+      if (reads++ === 1) throw Object.assign(new Error('读取临时规则失败：Surge 没有响应'), { code: 'SURGE_UNREACHABLE' });
+      return list();
+    };
+    const d = env!.deps();
+    expect(await main(['entry', '--strategy', 'temp_rule', '--process-path', safari, '--temp-insertion', 'tail', '--to', 'BLOCKED', ...common()], d)).toBe(EXIT.REFUSED);
+    expect(d.out.text()).toContain('listTempRules 没有经过正向确认');
+    expect(d.out.text()).not.toContain('已切换到');
+    expect(surge.tempRules).toEqual([]);
+    // 读取失败不记为“不可用”：之后 --to NORMAL 仍可用，再次探测成功即可切换。
+    const st = loadState(env!.run(), new Date());
+    expect(st.tempListConfirmed).toBeNull();
+    expect(st.tempRules.filter((r) => r.purpose === 'entry')).toEqual([]);
+    const ok = env!.deps();
+    expect(await main(['entry', '--strategy', 'temp_rule', '--process-path', safari, '--temp-insertion', 'tail', '--to', 'BLOCKED', ...common()], ok)).toBe(EXIT.OK);
+    expect(ok.out.text()).toContain('列出了刚添加的探测规则');
+    expect(ok.out.text()).toContain('已切换到 BLOCKED');
+    expect(loadState(env!.run(), new Date()).tempListConfirmed).toBe(true);
+  });
+
+  it('never records a temp rule as gone from an unconfirmed list, so rollback still removes it', async () => {
+    const safari = join(env!.profileDir, 'Safari');
+    writeFileSync(safari, '');
+    const surge = env!.surge;
+    const args = ['entry', '--strategy', 'temp_rule', '--process-path', safari, '--temp-insertion', 'tail'];
+    expect(await main([...args, '--to', 'BLOCKED', ...common()], env!.deps())).toBe(EXIT.OK);
+    const block = surge.tempRules.slice();
+    expect(block.length).toBeGreaterThan(0);
+    // 运行目录来自没有正向确认的旧版本；之后 --raw dump temp-rule 输出空白，被读成空列表。
+    const dir = env!.run();
+    saveState(dir, { ...loadState(dir, new Date()), tempListConfirmed: null });
+    const list = surge.listTempRules.bind(surge);
+    surge.listTempRules = async () => [];
+    const n = env!.deps();
+    expect(await main([...args, '--to', 'NORMAL', ...common()], n)).toBe(EXIT.OK);
+    expect(n.out.text()).toContain('读回不能证明本工具的临时规则已删除');
+    // 规则仍在 Surge 中，运行状态也没有把它记为已删除。
+    expect(await list()).toEqual(block);
+    const latest = new Map(loadState(env!.run(), new Date()).tempRules.map((r) => [r.rule, r.state] as const));
+    for (const rule of block) expect(latest.get(rule)).not.toBe('removed');
+    const plan = env!.deps();
+    expect(await main(['rollback', '--raw-dir', env!.base], plan)).toBe(EXIT.OK);
+    expect(plan.out.text()).not.toContain('没有需要删除的本工具规则');
+    expect(plan.out.text()).toContain('没有经过正向确认');
+    const ex = env!.deps();
+    // 删除后无法用未确认的列表读回确认：如实报告未确认（退出码 1），但规则确实被删除了。
+    expect(await main(['rollback', '--execute', '--raw-dir', env!.base, '--yes'], ex)).toBe(1);
+    expect(ex.out.text()).toContain('无法读回确认');
+    expect(await list()).toEqual([]);
+  });
+
+  it('entry --probe-insertion measures the profile boundary from the test profile rule texts', async () => {
+    const safari = join(env!.profileDir, 'Safari');
+    writeFileSync(safari, '');
+    const surge = env!.surge;
+    // 真实解析不报告规则来源。
+    const listRules = surge.listRules.bind(surge);
+    surge.listRules = async () => (await listRules()).map((x) => ({ ...x, source: x.source === 'module' ? ('module' as const) : ('unknown' as const) }));
+    const d = env!.deps();
+    const args = ['entry', '--strategy', 'ruleset_resource', '--process-path', safari, '--auto-reload-condition', 'off', '--probe-insertion', '--dwell', '0', '--no-kill-test', ...common()];
+    expect(await main(args, d)).toBe(EXIT.OK);
+    expect(d.out.text()).toContain('临时规则排在测试配置规则之前');
+    expect(d.out.text()).toContain('列出了刚添加的探测规则');
+    expect(loadState(env!.run(), new Date()).tempListConfirmed).toBe(true);
+    expect(surge.tempRules).toEqual([]);
+  });
+
   it('entry refuses without a valid Safari process path', async () => {
     const d = env!.deps();
     expect(await main(['entry', '--strategy', 'ruleset_resource', '--to', 'BLOCKED', ...common()], d)).toBe(EXIT.REFUSED);
@@ -322,5 +439,16 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(d.out.text()).toContain('SFE-P0-测试');
     expect(env!.surge.calls.selectGroupPolicy ?? 0).toBe(0);
     expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
+  });
+});
+
+describe('resourceHealth', () => {
+  const res = (error: string | null) => ({ key: 'k', type: 'policy-path', location: '/x/sfe-nodes.list', lastUpdatedAt: null, error });
+  it('classifies without echoing Surge error text', () => {
+    expect(resourceHealth([res(null)])).toBe('正常');
+    expect(resourceHealth([res('not_ready')])).toBe('未就绪');
+    expect(resourceHealth([res('fetch https://x.example.test/a failed')])).toBe('有错误');
+    expect(resourceHealth([])).toBe('读不到');
+    expect(resourceHealth([res(null), res(null)])).toBe('多个 key');
   });
 });

@@ -3,7 +3,7 @@
 // maintenance.reconcile 操作，避免周期任务刷屏。启动恢复在这里整理未完成的意图行与操作。
 
 import { readFile } from 'node:fs/promises';
-import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, type EntryMode, type RoutePhase, type RouteWarning } from '@sfe/contract';
+import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, type EntryMode, type OperationStatus, type RoutePhase, type RouteWarning } from '@sfe/contract';
 import type { RouteStateRecord } from '../db/index.js';
 import { ATTENTION_WARNINGS, evaluateControl, type ControlEvaluation } from '../domain/route-rules.js';
 import { buildSurgeStatus } from '../domain/views.js';
@@ -22,6 +22,19 @@ export interface ReconcileResult {
 }
 
 const IN_PROGRESS: readonly RoutePhase[] = ['switching', 'rolling_back'];
+
+/**
+ * 过渡中的路由阶段，以及仍在负责它的操作可以处于的状态：切换与回滚由执行中（或排队）的操作负责；VERIFY_ONLY 等待
+ * （awaiting_safari_verify）还可以停在 waiting（等待 Safari 实测提交或截止计时器）。负责的操作不在这些状态时（例如核对中
+ * 的意外异常只被执行器标为失败、崩溃恢复失败），路由无人负责，也不会超时。
+ * 注意：awaiting_safari_verify 不属于 IN_PROGRESS——那个列表还会跳过选择与入口不一致检查，而它们正是提交 ACTIVE 之后
+ * 出错时发现不一致的检查。
+ */
+const TRANSITION_OWNER_STATUSES: Partial<Record<RoutePhase, readonly OperationStatus[]>> = {
+  switching: ['running', 'queued'],
+  rolling_back: ['running', 'queued'],
+  awaiting_safari_verify: ['running', 'queued', 'waiting'],
+};
 
 interface ExtraFacts {
   selection: string | null | undefined;
@@ -106,6 +119,9 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   const { repos } = engine;
   const facts = await engine.readBasicFacts();
   const before = repos.routeState.get();
+  // 与路由状态同步读取负责过渡阶段的操作：读取 Surge 期间它可能刚好完成（例如核对通过、提交 ACTIVE），
+  // 之后再读会把已经结束的过渡误判为无人负责。
+  const owner = before.operationId ? repos.operations.get(before.operationId) : null;
   const managed = before.phase !== 'idle' || before.entryMode !== 'NORMAL';
   const extra = facts.reachable ? await readExtraFacts(engine) : null;
   const now = engine.nowIso();
@@ -122,6 +138,7 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   let phase: RoutePhase = before.phase;
   let entryMode: EntryMode = before.entryMode;
   let expireActive = false;
+  let clearDeadline = false;
   const notes: string[] = [];
 
   // 前置状态（数据）：消失 → missing；重新出现 → ok
@@ -134,17 +151,20 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   }
 
   if (managed) {
-    // 切换或回滚中断：没有进行中的操作负责当前的过渡阶段（例如崩溃恢复失败）。入口按读回记录（不一致为 UNKNOWN），
-    // 要求处理；从不写 Surge，恢复需要用户显式激活或进入普通模式。
-    if (IN_PROGRESS.includes(before.phase)) {
-      const owner = before.operationId ? repos.operations.get(before.operationId) : null;
-      if (!owner || (owner.status !== 'running' && owner.status !== 'queued')) {
-        add('entry_unverified');
-        phase = 'attention';
-        if (!extra || extra.entryMode !== before.entryMode) entryMode = 'UNKNOWN';
-        expireActive = true;
-        notes.push('切换或回滚已中断：没有进行中的操作负责当前路由状态');
-      }
+    // 切换、VERIFY_ONLY 等待或回滚中断：没有进行中的操作负责当前的过渡阶段（例如崩溃恢复失败、核对中的意外异常）。
+    // 入口按读回记录（与记录不一致或读不到为 UNKNOWN），要求处理；从不写 Surge，恢复需要用户显式激活或进入普通模式。
+    const ownerStatuses = TRANSITION_OWNER_STATUSES[before.phase];
+    if (ownerStatuses && (!owner || !ownerStatuses.includes(owner.status))) {
+      add('entry_unverified');
+      phase = 'attention';
+      if (!extra || extra.entryMode !== before.entryMode) entryMode = 'UNKNOWN';
+      expireActive = true;
+      clearDeadline = true;
+      notes.push(
+        before.phase === 'awaiting_safari_verify'
+          ? '等待 Safari 实测已中断：没有进行中或等待中的操作负责当前路由状态'
+          : '切换或回滚已中断：没有进行中的操作负责当前路由状态',
+      );
     }
     if (!facts.reachable) {
       add('surge_unreachable');
@@ -244,6 +264,7 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
       warnings: [...new Set<RouteWarning>([...fresh.warnings.filter((w) => !dropped.includes(w)), ...added])],
       phase: nextPhase,
       entryMode: nextEntryMode,
+      ...(sameState && clearDeadline ? { awaitingDeadline: null } : {}),
       lastReconciledAt: now,
       surgeStartedAt: facts.startedAt ?? fresh.surgeStartedAt,
     });

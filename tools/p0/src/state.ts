@@ -72,6 +72,11 @@ export interface RunState {
   selections: SelectionRecord[];
   /** 已测得的新临时规则插入位置（entry --probe-insertion）。 */
   tempRuleInsertion: 'head' | 'tail' | null;
+  /**
+   * entry --probe-insertion 对 listTempRules 的正向确认：添加的探测规则是否出现在列表中。false 时该列表不可信：
+   * 不据此把登记的规则标为已删除，回退按“列表无法读取”逐条删除。null = 未确认。
+   */
+  tempListConfirmed: boolean | null;
   /** 归因确认的 Safari 进程完整路径（attribution）。 */
   processPaths: string[];
   /** 最近一次测量时的上下文（供提议时比较是否已变化）。 */
@@ -95,6 +100,7 @@ export function emptyState(runId: string, now: Date): RunState {
     tempRules: [],
     selections: [],
     tempRuleInsertion: null,
+    tempListConfirmed: null,
     processPaths: [],
     lastContext: null,
   };

@@ -86,9 +86,14 @@ export function isActiveEnvironment(engine: Engine, environmentId: string): bool
   return route.activeEnvironmentId === environmentId && route.entryMode !== 'NORMAL';
 }
 
+/**
+ * 新切换的激活快照（第 5 步）。激活快照只在路由回到已确认状态时清除（提交 ACTIVE、回滚成功恢复切换前节点、进入普通模式），
+ * 所以它仍在就说明上一次切换没有回到已确认状态：切换进行中被取代，或已中断（对账发现无人负责、回滚无法确认 →
+ * attention；之后的普通模式失败）。这时路由记录里的选择可能是半途切换写入的未验证节点，必须沿用最初的切换前状态
+ * （最后一次已确认的路由），否则之后的回滚会把别的买家出口当作原环境的路由恢复。
+ */
 function routeSnapshot(route: RouteStateRecord): ActivationSnapshot {
-  // 切换进行中被取代时，沿用最初的切换前状态（最后一次已确认的路由）
-  if ((route.phase === 'switching' || route.phase === 'awaiting_safari_verify' || route.phase === 'rolling_back') && route.activationSnapshot) {
+  if (route.activationSnapshot) {
     return { ...route.activationSnapshot, previousRouteEpoch: route.routeEpoch };
   }
   return {
@@ -605,16 +610,25 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
     return;
   }
   // 13. 入口 → ACTIVE（读回）→ 提交
-  // 等待期间激活门槛可能已失效（能力被重置、Surge/Safari/macOS 更新使记录过期）：写入 ACTIVE 之前重新检查
-  await engine.readBasicFacts();
-  const missing = engine.activationMissing();
-  if (missing.length > 0) {
-    await rollbackFromWaitingRunning(engine, op.id, capabilityFailure(engine, missing, '切换失败：', '在等待期间已不再满足激活条件'));
-    return;
+  // 等待期间激活门槛可能已失效（能力被重置、Surge/Safari/macOS 更新使记录过期）：写入 ACTIVE 之前重新检查。
+  // 这里的意外异常（读取事实、数据库读取等）同样按第 14 步回滚：否则执行器只把操作标为失败，路由停在
+  // awaiting_safari_verify、无人负责，也不会超时。
+  let ctrl: EntryController | null = null;
+  let precheckFailure: ApiErrorBody | null = null;
+  try {
+    await engine.readBasicFacts();
+    const missing = engine.activationMissing();
+    if (missing.length > 0) {
+      precheckFailure = capabilityFailure(engine, missing, '切换失败：', '在等待期间已不再满足激活条件');
+    } else {
+      ctrl = engine.entryController(() => op.id);
+      if (!ctrl) precheckFailure = { code: 'CAPABILITY_UNVERIFIED', message: '切换失败：入口策略已变化' };
+    }
+  } catch (err) {
+    precheckFailure = engine.errorBody(err, '切换失败：写入使用中模式之前重新检查激活条件出错');
   }
-  const ctrl = engine.entryController(() => op.id);
-  if (!ctrl) {
-    await rollbackFromWaitingRunning(engine, op.id, { code: 'CAPABILITY_UNVERIFIED', message: '切换失败：入口策略已变化' });
+  if (precheckFailure || !ctrl) {
+    await rollbackFromWaitingRunning(engine, op.id, precheckFailure ?? { code: 'CAPABILITY_UNVERIFIED', message: '切换失败：入口策略已变化' });
     return;
   }
   try {
@@ -623,7 +637,15 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
     await rollbackActivation(engine, op.id, engine.errorBody(err, '切换失败：进入使用中模式失败'), ctrl, confirmedModeFrom(err, 'VERIFY_ONLY'));
     return;
   }
-  commitActive(engine, op.id, p, evidence);
+  try {
+    commitActive(engine, op.id, p, evidence);
+  } catch (err) {
+    // 提交事务失败（例如数据库错误）：入口已读回为 ACTIVE 但没有记录。仍负责过渡中的路由时按快照回滚并保持阻断；
+    // 提交已生效（之后的事件发布出错）时不回滚已验证的路由。
+    if (!ownsTransition(engine.repos.routeState.get(), op.id)) throw err;
+    await rollbackActivation(engine, op.id, engine.errorBody(err, '切换失败：提交使用中状态失败'), ctrl, 'ACTIVE');
+    return;
+  }
   // 提交清除了失控类警告（显式激活重新建立控制）：立即对账一次，让仍然成立的事实类警告马上重新出现
   try {
     await reconcile(engine, 'precheck');
@@ -816,6 +838,8 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
         selectedNode: restored,
         awaitingDeadline: null,
         operationId: opId,
+        // 切换前状态已恢复并成为路由记录：快照用完即清除（快照仍在表示上一次切换没有回到已确认状态，见 routeSnapshot）
+        activationSnapshot: null,
         warnings: hasPrevious ? [...keep, 'rollback_needs_reverify'] : keep,
       });
       const cur = repos.operations.get(opId)!;
@@ -948,10 +972,12 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
 /**
  * 普通模式的中间阻断。优先级问题只阻止 VERIFY_ONLY/ACTIVE（§5.2、§5.5）：入口位已全部确认为 BLOCKED、
  * 只因有规则排在入口之前而最终读回不能宣称受控时，返回这些规则并继续撤销入口；其他失败照常抛出。
+ * 标为 towardNormal：之后进入 NORMAL 本来就把 Safari 流量交给原规则，temp_rule 不因移除本应用规则会暴露其后的其他规则而
+ * 在写入前拒绝（回滚不设置，照常拒绝，§5.5）。
  */
 async function blockForNormal(ctrl: EntryController, undo: EntryTransitionOptions): Promise<EntryReadback['precedenceIssues'] | null> {
   try {
-    await ctrl.transition('BLOCKED', undefined, undo);
+    await ctrl.transition('BLOCKED', undefined, { ...undo, towardNormal: true });
     return null;
   } catch (err) {
     if (err instanceof SfeError && err.code === 'PRECEDENCE_VIOLATION' && confirmedModeFrom(err, 'UNKNOWN') === 'BLOCKED') {

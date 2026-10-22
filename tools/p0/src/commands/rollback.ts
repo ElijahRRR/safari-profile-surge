@@ -37,13 +37,15 @@ export async function runRollback(ctx: Ctx): Promise<ExitCode> {
     } catch (e) {
       out.warn(`删除临时规则失败：${(e as { code?: string }).code ?? 'ERROR'}`);
     }
-    const after = await tryRead(() => session.adapter.listTempRules());
+    // 只有经过插入探测正向确认的 listTempRules 才能确认删除（未确认或确认不可用时，列表中“没有”不是证据）。
+    const trusted = state.tempListConfirmed === true;
+    const after = trusted ? await tryRead(() => session.adapter.listTempRules()) : null;
     if (after !== null && !after.some((r) => normalizeRuleText(r) === normalizeRuleText(rule))) {
       state = markTempRule(state, rule, 'removed', now());
       out.line(`已删除：${rule}`);
     } else {
       failures++;
-      out.warn(`读回仍存在或无法读取：${rule}`);
+      out.warn(trusted ? `读回仍存在或无法读取：${rule}` : `已尝试删除，但临时规则列表没有经过正向确认，无法读回确认：${rule}`);
     }
     saveState(dir, state);
   }

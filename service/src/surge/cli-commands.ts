@@ -1,4 +1,4 @@
-// Surge CLI 原语表：每个原语对应固定的 argv 构造与宽松输出解析。
+// Surge CLI 原语表：每个原语对应固定的 argv 构造与输出解析（只接受已知 JSON 结构，无法识别即报错，见 parse-output.ts）。
 // 只有 external-resource list/update、--check、dump temp-rule 在 6.5 帮助中出现过（设计文档 §3）；
 // 其余标为 unverified，需在 P0 用随包技能与本机帮助核对后才能在原语清单中启用（TODO(P0)）。
 // 表中永远不能出现 switch-profile、reload、flush、stop、set-outbound/enhanced/system-proxy 等全局动作；

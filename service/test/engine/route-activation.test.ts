@@ -2,7 +2,7 @@
 // 取代等待中的激活后在写入前失败 → 按快照回滚，不让 VERIFY_ONLY 无人负责；被外部修改的本应用入口文件
 // 从不被激活悄悄改写（§5.5，只有撤销入口会改写）。只用合成数据。
 
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { ENTRY_RULESET_FILES, ROUTE_GROUP_NAME, type ActivateRequest, type RollbackResult } from '@sfe/contract';
@@ -98,6 +98,92 @@ describe('step 13: gates re-checked before ACTIVE', () => {
   });
 });
 
+/** 核对通过之后（读取 Surge 请求记录之后）执行一次 arm：在第 13 步注入一次意外异常。 */
+function afterVerificationRead(arm: () => void): void {
+  const orig = h.fake.listRecentRequests.bind(h.fake);
+  h.fake.listRecentRequests = async () => {
+    const records = await orig();
+    h.fake.listRecentRequests = orig;
+    arm();
+    return records;
+  };
+}
+
+/** 让 obj[key] 下一次调用抛出（一次性）。 */
+function failOnce<T extends object, K extends keyof T>(obj: T, key: K, err: Error): void {
+  const orig = obj[key];
+  obj[key] = (() => {
+    obj[key] = orig;
+    throw err;
+  }) as T[K];
+}
+
+const dbError = (code: string) => Object.assign(new Error(`synthetic ${code}`), { code });
+
+describe('step 13: unexpected errors after a passed verification roll back from the snapshot (never an orphaned VERIFY_ONLY wait)', () => {
+  test('home directory becomes unresolvable (link loop) during the VERIFY_ONLY wait → reading facts does not throw, the activation completes', async () => {
+    h = await createHarness();
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    const opId = await startSwitch(env);
+    expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
+    const home = join(h.dir, 'home');
+    symlinkSync(home, home); // realpath → ELOOP
+    await verify(h, PROFILE_A, opId);
+    expect(h.repos.operations.get(opId)!).toMatchObject({ phase: 'ACTIVE_VERIFIED', status: 'succeeded' });
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: env });
+    const status = await h.app.refreshSurge(WEB);
+    expect(status.profileDirectoryRisk).toBeNull();
+    expect((await h.app.ensureInControl()).ok).toBe(true);
+  });
+
+  test('an unexpected error while re-checking the gates before ACTIVE → rollback to the previous node, Safari stays blocked', async () => {
+    h = await createHarness();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const nodeA = h.repos.proxyRevisions.get(a, 1)!.nodeName;
+    const opId = await startSwitch(b);
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'awaiting_safari_verify', entryMode: 'VERIFY_ONLY', operationId: opId });
+    // 第 13 步读取能力记录时出现意外的数据库错误（不是 SfeError）
+    afterVerificationRead(() => failOnce(h.repos.capabilities, 'list', dbError('SQLITE_IOERR')));
+    await verify(h, PROFILE_B, opId);
+    const op = h.repos.operations.get(opId)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error).toMatchObject({ code: 'INTERNAL' });
+    expect(op.error!.message).not.toContain('SQLITE');
+    expect((op.result as { rollback: RollbackResult }).rollback).toMatchObject({ previousEnvironmentId: a, restoredSelection: nodeA, entryModeAfter: 'BLOCKED' });
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeA, awaitingDeadline: null });
+    expect(route.warnings).toContain('rollback_needs_reverify');
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe(nodeA);
+    expect(h.repos.environments.get(b)!.lastVerifiedProxyRevision).toBeNull();
+    // 检测主机不再经未提交的目标出口；其余 Safari 流量保持拒绝
+    expect(safariOutcome(h, FAKE_VERIFY_HOST).failed).toBe(true);
+    expect(safariOutcome(h).failed).toBe(true);
+  });
+
+  test('the commit fails after the entry reads back ACTIVE → rollback (ACTIVE → BLOCKED), never left ACTIVE without a record', async () => {
+    h = await createHarness();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const nodeA = h.repos.proxyRevisions.get(a, 1)!.nodeName;
+    const opId = await startSwitch(b);
+    afterVerificationRead(() => failOnce(h.repos.environments, 'update', dbError('SQLITE_FULL')));
+    await verify(h, PROFILE_B, opId);
+    const op = h.repos.operations.get(opId)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error).toMatchObject({ code: 'INTERNAL' });
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeA });
+    expect(route.warnings).toContain('rollback_needs_reverify');
+    expect(h.repos.environments.get(b)!.lastVerifiedProxyRevision).toBeNull();
+    expect(safariOutcome(h).failed).toBe(true);
+    expect(safariOutcome(h, FAKE_VERIFY_HOST).failed).toBe(true);
+  });
+});
+
 describe('superseding a waiting activation, then failing before any write', () => {
   test('the new activation rolls back the inherited VERIFY_ONLY state from the snapshot', async () => {
     h = await createHarness();
@@ -137,6 +223,78 @@ describe('superseding a waiting activation, then failing before any write', () =
     expect(h.repos.operations.get(opId)!.phase).toBe('FAILED');
     const route = h.repos.routeState.get();
     expect(route).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: a, routeEpoch: before.routeEpoch, selectedNode: before.selectedNode });
+  });
+});
+
+describe('an interrupted switch never becomes the "previous route" of the next activation (§6.3 step 5/14)', () => {
+  /** A 使用中，切到 B 停在 VERIFY_ONLY 等待（SFE-ROUTE 已选 B 的未验证节点）。 */
+  async function switchedToB() {
+    h = await createHarness();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const c = (await createEnv(h, 'US-Buyer-C', '203.0.113.12')).environment_id!;
+    await bind(h, PROFILE_C, c);
+    const nodeA = h.repos.proxyRevisions.get(a, 1)!.nodeName;
+    const nodeB = h.repos.proxyRevisions.get(b, 1)!.nodeName;
+    const opB = await startSwitch(b);
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'awaiting_safari_verify', entryMode: 'VERIFY_ONLY', activeEnvironmentId: a, selectedNode: nodeB });
+    return { a, b, c, nodeA, nodeB, opB };
+  }
+
+  /** 激活 C 并让它超时回滚：回滚目标必须是 A 的原节点，而不是半途切换写入的 B 节点。 */
+  async function activateCAndTimeOut(a: string, c: string, nodeA: string) {
+    const opC = await startSwitch(c, { confirmed_environment_id: a });
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'awaiting_safari_verify', operationId: opC });
+    await h.clock.advanceAsync((h.repos.settings.get('profileArrivalTimeoutSec') + 1) * 1000);
+    await h.idle();
+    const op = h.repos.operations.get(opC)!;
+    expect(op.error?.code).toBe('SAFARI_VERIFY_TIMEOUT');
+    expect((op.result as { rollback: RollbackResult }).rollback).toMatchObject({ previousEnvironmentId: a, restoredSelection: nodeA, entryModeAfter: 'BLOCKED', needsReverify: true });
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeA });
+    expect(route.warnings).toContain('rollback_needs_reverify');
+    // 切换前状态已恢复：快照用完即清除
+    expect(route.activationSnapshot).toBeNull();
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe(nodeA);
+    expect(safariOutcome(h).failed).toBe(true);
+  }
+
+  test('orphaned VERIFY_ONLY wait → reconcile attention → the next activation fails → rollback restores A\'s original node, not B\'s', async () => {
+    const { a, c, nodeA, opB } = await switchedToB();
+    // 负责的操作意外结束（例如核对中的意外异常只被执行器标为失败）：对账把无人负责的等待标为 attention
+    h.repos.operations.update(opB, { phase: 'FAILED', status: 'failed', error: { code: 'INTERNAL', message: '执行失败：内部错误' } });
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'VERIFY_ONLY', activeEnvironmentId: a });
+    expect(h.repos.routeState.get().activationSnapshot).toMatchObject({ previousEnvironmentId: a, previousSelectedNode: nodeA });
+    await activateCAndTimeOut(a, c, nodeA);
+    // 重新核验 A 照常完成
+    const re = await startSwitch(a, { confirmed_environment_id: a });
+    await verify(h, PROFILE_A, re);
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: a, selectedNode: nodeA });
+  });
+
+  test('a rollback that could not be confirmed (attention) → the next activation fails → rollback restores A\'s original node, not B\'s', async () => {
+    const { a, c, nodeA, nodeB, opB } = await switchedToB();
+    h.fake.failNext('selectGroupPolicy');
+    await h.app.cancelOperation(opB, { request_id: rid() }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(opB)!.phase).toBe('BLOCKED_NEEDS_ATTENTION');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeB });
+    await activateCAndTimeOut(a, c, nodeA);
+  });
+
+  test('normal mode fails after an interrupted switch → the next activation fails → rollback restores A\'s original node, not B\'s', async () => {
+    const { a, c, nodeA, nodeB, opB } = await switchedToB();
+    h.repos.operations.update(opB, { phase: 'FAILED', status: 'failed', error: { code: 'INTERNAL', message: '执行失败：内部错误' } });
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get().phase).toBe('attention');
+    h.fake.failNext('updateExternalResource');
+    const n = await h.app.enterNormal({ request_id: rid('normal'), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(n.operation_id)!.phase).toBe('FAILED');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', activeEnvironmentId: a, selectedNode: nodeB });
+    await activateCAndTimeOut(a, c, nodeA);
   });
 });
 

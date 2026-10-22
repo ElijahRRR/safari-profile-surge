@@ -43,6 +43,7 @@ export async function runMakeTestProfile(ctx: Ctx): Promise<ExitCode> {
   const sourceDir = dirname(sourcePath);
   const targetDir = resolve(ctx.args.strings['target-dir'] ?? sourceDir);
   const risk = classifyLocationRisk(targetDir, home);
+  if (risk === 'unknown') throw refused('前置条件不满足：无法确认目标目录的真实位置（祖先目录不可读或不是目录）；请用 --target-dir 指定本机目录');
   if (risk !== 'none') {
     throw refused('前置条件不满足：目标目录位于 iCloud/同步或受保护位置。正式产品不在此写入；请用 --target-dir 指定本机目录，并在 Surge 设置中手动把配置目录指向它');
   }

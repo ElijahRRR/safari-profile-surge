@@ -20,10 +20,12 @@ import {
   findSections,
   groupBlockLines,
   insertInitialBlocks,
+  isCommentLine,
   nodeLine,
   parseHttpApiLine,
   parseProfile,
   parseProxyLine,
+  parseRule,
   replaceManagedBlock,
   resourceFile,
   serializeProfile,
@@ -138,6 +140,17 @@ function testRuleLines(): string[] {
     `DOMAIN,${CHAIN_HOST},${ROUTE_GROUP_NAME}`,
     `DOMAIN-SUFFIX,${TEST_DOMAIN},${TEST_PROXIES.plain}`,
   ];
+}
+
+/** 配置 [Rule] 段中的规则文本（按文件顺序，跳过空行、注释与无法解析的行）；入口探测用它定位配置规则的起点。 */
+export function profileRuleLines(text: string): string[] {
+  const parsed = parseProfile(text);
+  return findSections(parsed, 'Rule').flatMap((s) =>
+    parsed.lines
+      .slice((s.header ?? s.start) + 1, s.end)
+      .map((l) => l.text.trim())
+      .filter((t) => t !== '' && !isCommentLine(t) && parseRule(t) !== null),
+  );
 }
 
 export function precedenceModuleText(verifyHost: string): string {

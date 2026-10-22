@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, grantForCurrentHost, rid, verify, type Harness } from './harness.js';
+import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, grantForCurrentHost, rid, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -240,6 +241,100 @@ describe('periodic reconcile is read-only and sticky', () => {
     expect(route.phase).toBe('attention');
     expect(route.entryMode).toBe('UNKNOWN');
     expect(writes()).toEqual(before);
+  });
+
+  test('an orphaned awaiting_safari_verify (owner no longer running, queued or waiting) → attention + entry_unverified, never written', async () => {
+    h = await createHarness();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const act = await h.app.activate(b, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await h.idle();
+    const opId = act.operation_id;
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'awaiting_safari_verify', entryMode: 'VERIFY_ONLY', operationId: opId });
+    expect(h.repos.routeState.get().awaitingDeadline).not.toBeNull();
+    // 负责的操作仍在等待 Safari 实测：不是中断
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'awaiting_safari_verify', entryMode: 'VERIFY_ONLY' });
+    expect(h.repos.routeState.get().warnings).not.toContain('entry_unverified');
+    // 例如核对中的意外异常：执行器兜底只把操作标为失败，路由停在 VERIFY_ONLY 等待，计时器也不再处理它
+    h.repos.operations.update(opId, { phase: 'FAILED', status: 'failed', error: { code: 'INTERNAL', message: '执行失败：内部错误' } });
+    const before = writes();
+    await h.app.runPeriodicReconcile();
+    let route = h.repos.routeState.get();
+    expect(route.phase).toBe('attention');
+    expect(route.warnings).toContain('entry_unverified');
+    expect(route.entryMode).toBe('VERIFY_ONLY'); // 读回与记录一致
+    expect(route.awaitingDeadline).toBeNull();
+    expect(writes()).toEqual(before);
+    expect((await h.app.ensureInControl()).ok).toBe(false);
+    const recorded = reconcileOps().find((o) => (o.payload as { added?: string[] }).added?.includes('entry_unverified'));
+    expect(recorded).toBeDefined();
+    // 截止时间过后也不会被计时器“恢复”，警告保持粘性
+    h.clock.advance(3_600_000);
+    await h.idle();
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'VERIFY_ONLY' });
+    // 记录与读回不一致 → UNKNOWN
+    h.repos.routeState.update({ phase: 'awaiting_safari_verify', entryMode: 'BLOCKED', operationId: opId, warnings: [] });
+    await h.app.runPeriodicReconcile();
+    route = h.repos.routeState.get();
+    expect(route.phase).toBe('attention');
+    expect(route.entryMode).toBe('UNKNOWN');
+    expect(route.warnings).toContain('entry_unverified');
+    expect(writes()).toEqual(before);
+  });
+
+  test('a waiting activation superseded while reconcile reads Surge is not mistaken for an orphaned VERIFY_ONLY wait', async () => {
+    h = await createHarness();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const c = (await createEnv(h, 'US-Buyer-C', '203.0.113.12')).environment_id!;
+    await bind(h, PROFILE_C, c);
+    const first = await h.app.activate(b, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await h.idle();
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'awaiting_safari_verify', operationId: first.operation_id });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered = false;
+    const orig = h.fake.listPolicies.bind(h.fake);
+    h.fake.listPolicies = async () => {
+      if (!entered) {
+        entered = true;
+        await gate;
+      }
+      return orig();
+    };
+    const run = h.app.refreshSurge(WEB);
+    await until(() => entered);
+    // 读取事实期间：新的激活取代等待中的激活（受理在执行器之外，同一事务里把路由交给新操作）
+    const second = await h.app.activate(c, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    expect(h.repos.operations.get(first.operation_id)!.status).toBe('superseded');
+    expect(h.repos.routeState.get().operationId).toBe(second.operation_id);
+    release();
+    await run;
+    expect(reconcileOps().some((o) => (o.payload as { added?: string[] }).added?.includes('entry_unverified'))).toBe(false);
+    await h.idle();
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'awaiting_safari_verify', entryMode: 'VERIFY_ONLY', operationId: second.operation_id });
+    expect(h.repos.routeState.get().warnings).not.toContain('entry_unverified');
+  });
+
+  test('an unresolvable home or working-profile directory (e.g. a link loop) never breaks reading facts: risk unknown and warned, reconcile still runs', async () => {
+    await activeHarness();
+    const home = join(h.dir, 'home');
+    symlinkSync(home, home); // realpath → ELOOP（不是“尚不存在”）
+    const status = await h.app.refreshSurge(WEB);
+    expect(status.reachable).toBe(true);
+    expect(status.profileDirectoryRisk).toBeNull();
+    expect(status.message).toContain('无法确认固定工作配置所在目录的真实位置');
+    expect(status.message).not.toContain(h.dir);
+    // 只做展示：不是激活门槛，也不让受控判定失败
+    expect((await h.app.ensureInControl()).ok).toBe(true);
+    // 周期对账照常运行（读取事实不抛出），实测过期照常发现
+    h.clock.advance(901_000);
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get().warnings).toContain('probe_expired');
   });
 
   test('warnings written outside the executor while reconcile reads Surge are not lost', async () => {

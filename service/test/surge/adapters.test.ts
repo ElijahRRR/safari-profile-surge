@@ -50,14 +50,16 @@ describe('CLI command table', () => {
     expect(() => safeResourceKey(k)).toThrow(/单个资源/);
   });
 
-  test('parsers are tolerant of JSON shapes', () => {
+  test('parsers accept the known JSON shapes and refuse other output', () => {
     const ctx = { scrub: (s: string) => s };
     const out = (stdout: string) => ({ stdout, stderr: '', exitCode: 0 });
     expect(CLI_COMMANDS.listExternalResources!.parse(out(JSON.stringify({ resources: [{ key: 'k1', type: 'ruleset', path: '/a/sfe-entry-udp.list', lastUpdated: 1760000000 }] })), ctx)).toEqual([
       { key: 'k1', type: 'ruleset', location: '/a/sfe-entry-udp.list', lastUpdatedAt: new Date(1760000000 * 1000), error: null },
     ]);
     expect(CLI_COMMANDS.listTempRules!.parse(out('[]'), ctx)).toEqual([]);
-    expect(CLI_COMMANDS.listTempRules!.parse(out('# temp rules\nDOMAIN,a.example.test,REJECT\n'), ctx)).toEqual(['DOMAIN,a.example.test,REJECT']);
+    expect(CLI_COMMANDS.listTempRules!.parse(out(JSON.stringify(['DOMAIN,a.example.test,REJECT'])), ctx)).toEqual(['DOMAIN,a.example.test,REJECT']);
+    // --raw 输出只接受 JSON：人类可读的文本不再按行拆成规则。
+    expect(() => CLI_COMMANDS.listTempRules!.parse(out('# temp rules\nDOMAIN,a.example.test,REJECT\n'), ctx)).toThrow(/输出格式无法识别/);
     expect(CLI_COMMANDS.getVersion!.parse(out('Surge Mac 6.5.0 (10960)'), ctx)).toEqual({ version: '6.5.0', build: '10960' });
     expect(() => CLI_COMMANDS.listExternalResources!.parse(out('not json'), ctx)).toThrow(/输出格式无法识别/);
   });

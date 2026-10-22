@@ -326,8 +326,16 @@ export class Engine {
     } catch {
       facts.autoReload = null;
     }
+    let directoryUnknown = false;
     if (wp) {
-      facts.profileDirectoryRisk = classifyDirectoryRisk(wp.directory, this.deps.paths.homedir);
+      try {
+        facts.profileDirectoryRisk = classifyDirectoryRisk(wp.directory, this.deps.paths.homedir);
+      } catch {
+        // 工作配置目录或 home 的真实位置无法确认（链接循环、没有权限等）：风险未知，提示而不让读取事实失败——
+        // 对账、激活与核对都依赖读取事实不抛出（该字段只做展示，不是激活门槛）。
+        facts.profileDirectoryRisk = null;
+        directoryUnknown = true;
+      }
       try {
         const text = await readFile(wp.path, 'utf8');
         const api = parseHttpApiLine(text);
@@ -337,6 +345,7 @@ export class Engine {
       }
     }
     if (facts.message === null && facts.onWorkingProfile === false) facts.message = 'Surge 当前配置不是固定工作配置';
+    if (facts.message === null && directoryUnknown) facts.message = '无法确认固定工作配置所在目录的真实位置：可能位于同步或受保护位置，请检查目录权限与链接';
     this.facts = facts;
     return facts;
   }

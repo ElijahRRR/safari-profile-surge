@@ -4,6 +4,7 @@
 export * from '../../../service/src/surge/index.js';
 export { ndjsonRequest, NdjsonClientError } from '../../../service/src/ipc/ndjson.js';
 export { isSurgeSafeCredential, SURGE_SAFE_CREDENTIAL_RE } from '../../../service/src/domain/validate.js';
+export { classifyDirectoryRisk } from '../../../service/src/util/secure-files.js';
 export type {
   EntryController,
   EntryReadback,

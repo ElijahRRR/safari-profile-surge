@@ -202,6 +202,33 @@ describe('classifyDirectoryRisk', () => {
     expect(classifyDirectoryRisk(destination, homeAlias)).toBe(risk);
     expect(classifyDirectoryRisk(join(shortcut, 'not-created', 'data'), homeAlias)).toBe(risk);
   });
+
+  test('an unresolvable path or home (not just missing, e.g. a link loop) fails closed with UNSAFE_LOCATION, no path in the error', () => {
+    const base = fresh();
+    const loop = join(base, 'loop');
+    symlinkSync(loop, loop);
+    const home = join(base, 'home');
+    mkdirSync(home);
+    for (const [path, h] of [
+      [join(loop, 'surge'), home],
+      [join(base, 'surge'), loop],
+      [join(base, 'surge'), join(loop, 'nested')],
+    ] as const) {
+      let caught: unknown = null;
+      try {
+        classifyDirectoryRisk(path, h);
+      } catch (err) {
+        caught = err;
+      }
+      // 从不按 none 放行，也不抛出原始文件系统错误
+      expect(caught).toBeInstanceOf(SfeError);
+      const e = caught as SfeError;
+      expect(e.code).toBe('UNSAFE_LOCATION');
+      expect(e.message).toContain('无法确认目录的真实位置');
+      expect(e.message).toContain('ELOOP');
+      expect(JSON.stringify(e.toBody())).not.toContain(base);
+    }
+  });
 });
 
 describe('assertUnixSocketPathLength', () => {

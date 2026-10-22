@@ -27,6 +27,7 @@ import {
   buildTestProfile,
   bypassWarnings,
   canaryHost,
+  profileRuleLines,
   testNodeResource,
 } from '../src/test-profile.js';
 
@@ -204,6 +205,16 @@ describe('buildTestProfile', () => {
   it('warns when skip-proxy covers test hosts', () => {
     expect(bypassWarnings('[General]\nskip-proxy = *.example.test, localhost\n', [ECHO_HOST])).toHaveLength(1);
     expect(bypassWarnings('[General]\nskip-proxy = 127.0.0.1\n', [ECHO_HOST])).toHaveLength(0);
+  });
+});
+
+describe('profileRuleLines', () => {
+  it('lists the [Rule] texts in file order (entry block first), without comments, markers or blank lines', () => {
+    const lines = profileRuleLines(buildTestProfile(SOURCE, opts).profileText);
+    expect(lines[0]).toBe(`RULE-SET,${ENTRY_RULESET_FILES.udp},REJECT`);
+    expect(lines).toContain(`DOMAIN,${CHAIN_HOST},SFE-ROUTE`);
+    expect(lines.slice(-2)).toEqual(['DOMAIN-SUFFIX,daily.example.test,Daily', 'FINAL,DIRECT']);
+    expect(lines.some((l) => l.startsWith('#') || l.trim() === '')).toBe(false);
   });
 });
 

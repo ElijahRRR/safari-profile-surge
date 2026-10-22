@@ -151,6 +151,9 @@ export function proposeMechanism(
       notes[p] = `CLI ${cliHelp[p] ?? '未测'}；HTTP ${httpUsable ? '未实现' : '不可用'}`;
     }
   }
+  // 能读取只证明输出可以解析；临时规则列表的内容还要由 entry 的插入探测正向确认（刚添加的探测规则必须出现在列表中），
+  // 之后 temp_rule 入口、临时规则同步与回退才会据它判断规则已不存在。
+  if (mechanism.listTempRules !== 'unavailable') notes.listTempRules = `${notes.listTempRules}；内容需 entry 的插入探测正向确认（--probe-insertion）`;
   mechanism.reloadProfile = 'unavailable';
   notes.reloadProfile = '只在维护端口上；P0 从不重载，由用户在 Surge 中手动触发并测量影响';
   return { mechanism, notes, unproven };

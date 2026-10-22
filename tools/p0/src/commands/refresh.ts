@@ -28,6 +28,13 @@ function lastUpdated(resources: readonly SurgeExternalResource[] | null, key: st
   return r?.lastUpdatedAt ? r.lastUpdatedAt.getTime() : null;
 }
 
+/** 资源健康状态（只写分类，不写 Surge 返回的错误原文）。 */
+export function resourceHealth(found: readonly SurgeExternalResource[]): string {
+  if (found.length !== 1) return found.length === 0 ? '读不到' : '多个 key';
+  const e = found[0]!.error;
+  return e === null ? '正常' : e === 'not_ready' ? '未就绪' : '有错误';
+}
+
 export async function runRefresh(ctx: Ctx): Promise<ExitCode> {
   const { out, now, sleep } = ctx.deps;
   const declared = ctx.args.strings['auto-reload'] as 'on' | 'off' | undefined;
@@ -126,6 +133,8 @@ export async function runRefresh(ctx: Ctx): Promise<ExitCode> {
     const cmpWrite = compareSignals(sigC0, sigC1);
     const membersAfterWrite = await tryRead(() => session.adapter.getGroupMembers(ROUTE_GROUP_NAME));
     const refreshed = await ops.refresh(nodeKey, 'add-node-c');
+    // 刷新刚返回时再读一次：记录资源是否短暂变为未就绪（ready=false 解析为 error 'not_ready'）。
+    const resRightAfter = await tryRead(() => session.adapter.listExternalResources());
     await sleep(1000);
     const resAfter = await tryRead(() => session.adapter.listExternalResources());
     const members = await tryRead(() => session.adapter.getGroupMembers(ROUTE_GROUP_NAME));
@@ -135,6 +144,7 @@ export async function runRefresh(ctx: Ctx): Promise<ExitCode> {
     const cmpRefresh = compareSignals(sigC1, sigC2);
     const ourBefore = resBefore ? resourcesForPath(resBefore, `${ops.state.testDirectory}/${NODE_RESOURCE_FILE}`, ops.state.testDirectory!) : [];
     const ourAfter = resAfter ? resourcesForPath(resAfter, `${ops.state.testDirectory}/${NODE_RESOURCE_FILE}`, ops.state.testDirectory!) : [];
+    const ourRightAfter = resRightAfter ? resourcesForPath(resRightAfter, `${ops.state.testDirectory}/${NODE_RESOURCE_FILE}`, ops.state.testDirectory!) : [];
     const before = lastUpdated(resBefore, nodeKey);
     const after = lastUpdated(resAfter, nodeKey);
     const othersChanged = (resBefore ?? []).filter((r) => r.key !== nodeKey && lastUpdated(resAfter, r.key) !== (r.lastUpdatedAt?.getTime() ?? null));
@@ -142,7 +152,7 @@ export async function runRefresh(ctx: Ctx): Promise<ExitCode> {
     checks.targeted!.push(
       check('恰好一个 key 指向测试节点资源（刷新前后相同）', ourBefore.length === 1 && ourAfter.length === 1 && ourAfter[0]!.key === nodeKey),
       check('按 key 定向刷新成功', refreshed.ok, refreshed.ok ? `${refreshed.ms} ms` : `错误 ${refreshed.code}`),
-      check('资源没有错误', ourAfter.length === 1 ? ourAfter[0]!.error === null : null),
+      check('资源没有错误', ourAfter.length === 1 ? ourAfter[0]!.error === null : null, `刷新前 ${resourceHealth(ourBefore)}，刷新后立即 ${resourceHealth(ourRightAfter)}，1 秒后 ${resourceHealth(ourAfter)}`),
       check('资源更新时间前进', after === null ? null : before === null || after > before, after === null ? '6.5 没有提供更新时间：入口 ruleset 策略将无法确认刷新' : ''),
       check('组成员与清单完全相等', sameList(members, expectedMembers), `读回 ${members?.join('、') ?? '读不到'}`),
       check('选择保持不变', selection === TEST_NODES.a, `读回 ${selection ?? '读不到'}`),

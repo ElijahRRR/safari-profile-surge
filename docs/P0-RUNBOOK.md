@@ -30,7 +30,7 @@ npx tsx tools/p0/src/cli.ts help
 
 | 选项 | 说明 |
 |---|---|
-| `--raw-dir <目录>` | 原始证据根目录（默认见上；位于 Git 工作树、iCloud/云盘、文稿/桌面/下载时拒绝） |
+| `--raw-dir <目录>` | 原始证据根目录（默认见上；位于 Git 工作树、iCloud/云盘、文稿/桌面/下载时拒绝。与服务相同按真实位置判断：指向这些位置的符号链接别名（例如指向 `~/Library/CloudStorage/Dropbox` 的 `~/Dropbox`）、大小写变体与尚未创建的子目录同样拒绝，无法确认真实位置时也拒绝） |
 | `--run <运行编号>` | 使用指定运行；缺省为最近一次 |
 | `--profile <路径>` | Surge 配置文件的绝对路径（Surge →「配置」→ 在访达中显示） |
 | `--surge-cli <路径>` | 默认 `/Applications/Surge.app/Contents/Applications/surge-cli`；必须通过 `codesign --verify` |
@@ -97,7 +97,7 @@ npx tsx tools/p0/src/cli.ts help
 - 源配置带 `#!MANAGED-CONFIG` 时副本移除该行（避免被远端更新覆盖）。
 - 另生成测试模块 `SFE-P0-precedence.sgmodule`（启用时加入 `DOMAIN,<检测主机>,DIRECT`），只在优先级测试中由你手动启用。
 
-源配置已经含 SFE 受管理段（初始化之后复测）时，测试配置整段替换为测试内容、从不引用真实环境节点；但同目录中已有 `sfe-*` 文件，工具会拒绝写入，此时用 `--target-dir` 指定单独的本机目录，并在 Surge 设置中**手动**把配置目录临时指向它，测完再改回。测试配置位于 iCloud/同步目录时拒绝写入（正式产品同样不在此写入）。
+源配置已经含 SFE 受管理段（初始化之后复测）时，测试配置整段替换为测试内容、从不引用真实环境节点；但同目录中已有 `sfe-*` 文件，工具会拒绝写入，此时用 `--target-dir` 指定单独的本机目录，并在 Surge 设置中**手动**把配置目录临时指向它，测完再改回。测试配置位于 iCloud/同步目录时拒绝写入（正式产品同样不在此写入）；目标目录按真实位置判断，别名、大小写变体与无法确认真实位置的目录同样拒绝。
 
 ### 1.4 “未重载”信号（P0 定义）
 
@@ -114,8 +114,8 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 
 任何时候出现意外（页面持续无法访问、Chrome 受影响、读回不一致）：
 
-1. 入口回到普通模式：`npx tsx tools/p0/src/cli.ts entry --strategy <策略> --to NORMAL`（永远允许）。
-2. 删除本工具添加的临时规则：`rollback`（只打印）→ `rollback --execute`（确认后逐条按原文删除，读回确认；回退计划与读回确认都按规范化文本比较，Surge 列出时改了空格的规则仍判定为存在；从不 flush，不删除你自己的临时规则）。
+1. 入口回到普通模式：`npx tsx tools/p0/src/cli.ts entry --strategy <策略> --to NORMAL`（ruleset_resource 总是允许；temp_rule 的例外：插入探测已报告 listTempRules 不可用时无法读回，工具拒绝并提示直接执行第 2 步；listTempRules 还没有经过插入探测正向确认时照常切换，但会提示读回不能证明规则已删除，接着执行第 2 步）。
+2. 删除本工具添加的临时规则：`rollback`（只打印）→ `rollback --execute`（确认后逐条按原文删除，读回确认；回退计划与读回确认都按规范化文本比较，Surge 列出时改了空格的规则仍判定为存在；从不 flush，不删除你自己的临时规则）。只有经过插入探测正向确认的临时规则列表才被当作“已不存在”的证据：未确认或已报告不可用时，回退计划逐条尝试删除本工具登记的全部规则，删除后无法读回确认（退出码 1），请在 Surge 中手动核对。
 3. 在 Surge 菜单「配置」中**手动**切回原配置（inventory 记录的名称）。
 4. 确认增强模式、系统代理与出站模式与盘点时一致。
 5. 在 test-servers 终端按 Ctrl+C。
@@ -208,10 +208,16 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 - **前置条件**：3.2 已得到候选路径（或用 `--process-path` 指定）；测试配置；test-servers；Safari 测试场景打开 `http://echo.p0.example.test:<端口>/app/safari`（轮询页），Chrome 打开 `…/app/chrome`；建议同时在另一个终端运行 `continuity`。
 - **策略选择**：
   - `ruleset_resource`：四个规则集文件 + 按 key 定向刷新。需要 `--auto-reload-condition`：服务规则是“读取当前自动重载设置并与能力记录的条件比较，读不到或不一致即拒绝”。6.5 读不到设置时只有 `any` 能通过，而 `any` 只有在 3.10 中自动重载开、关两种设置都通过时才可以提议。
-  - `temp_rule`：每位一条临时规则逐条增删。先加 `--probe-insertion` 测量新临时规则插在前还是后（添加并删除两条永不命中的 `DOMAIN,p0-insert-N.invalid,REJECT`）。按服务的规划，插入位置不受控时 VERIFY_ONLY 无法到达（插在末尾时验证规则排在阻断之后；插在开头时新规则抢在 udp/block 之前形成放行窗口），工具会在写入前拒绝（CAPABILITY_UNVERIFIED），这本身就是需要记录的结论。
+  - `temp_rule`：每位一条临时规则逐条增删。主序列总会先测量新临时规则插在前还是后（添加并删除两条永不命中的 `DOMAIN,p0-insert-N.invalid,REJECT`；其他情况用 `--probe-insertion` 单独要求测量）。按服务的规划，插入位置不受控时 VERIFY_ONLY 无法到达（插在末尾时验证规则排在阻断之后；插在开头时新规则抢在 udp/block 之前形成放行窗口），工具会在写入前拒绝（CAPABILITY_UNVERIFIED），这本身就是需要记录的结论。
+    - 探测同时正向确认 `listTempRules`：添加后的临时规则列表必须列出两条探测规则才算确认（记入运行状态）。temp_rule 主序列与 `--precedence-test temp` 总会先运行这一探测（不需要 `--probe-insertion`），本次没有确认就在入口写入前停止（前置条件不满足）或不注入；`entry --strategy temp_rule --to <NORMAL 以外>` 在运行状态中没有确认时先探测，仍没有确认就拒绝；临时规则同步与 `rollback` 只在确认后才把列表中没有的规则判为已删除。没有确认的原因分开报告：
+      - “没有列出刚添加的探测规则（有效规则中能看到它们）：该原语映射不可用”：只有这一种记为不可用。此后 `entry --strategy temp_rule --to NORMAL` 也拒绝（无法读回，改用 `rollback --execute`）。把 `dump temp-rule` 的输出交给开发者核对后再重测；之后的探测确认成功会覆盖这一结论。
+      - “添加后读取临时规则失败（错误码）”：本次无法确认，不记为不可用，可以稍后重试。
+      - “临时规则列表与有效规则中都没有刚添加的探测规则：addTempRule 可能没有生效”：问题在 `temp-rule add`，不归咎于 listTempRules；把实际效果交给开发者核对。
+      - 读不到有效规则列表时无法区分以上两种原因，同样只记为无法确认。
+    - 临时规则与配置规则的先后：CLI 不报告规则来源，工具用测试配置自己的 `[Rule]` 文本定位配置规则的起点（第一条规则在有效规则中必须恰好出现一次且顺序与文件一致）；定位不了时输出“与配置规则的先后无法判断（原因）”，不当作结论。
 - **步骤**：
   1. 优先级（必须做两项，才能得到“通过”）：
-     - `--precedence-test temp`：注入临时规则 `DOMAIN,<检测主机>,DIRECT`，尝试进入 VERIFY_ONLY 必须被拒绝（PRECEDENCE_VIOLATION），随后删除注入的规则。注入前工具读取当前临时规则：已有相同（按规范化文本比较）的用户规则或读不到列表时不注入，该项记为“不完整”（工具按文本增删，注入会删掉或接管你自己的规则）；先在 Surge 中确认没有这条规则再重测。`--probe-insertion` 同样在已有相同规则时不探测。
+     - `--precedence-test temp`：注入临时规则 `DOMAIN,<检测主机>,DIRECT`，尝试进入 VERIFY_ONLY 必须被拒绝（PRECEDENCE_VIOLATION），随后删除注入的规则。注入前工具读取当前临时规则：已有相同（按规范化文本比较）的用户规则、读不到列表或列表本次没有经过插入探测正向确认时不注入，该项记为“不完整”（工具按文本增删，注入会删掉或接管你自己的规则）；先在 Surge 中确认没有这条规则再重测。插入探测同样在已有相同规则时不探测。
      - `--precedence-test module`：按提示在 Surge「模块」中安装并启用测试配置目录下的 `SFE-P0-precedence.sgmodule`，同样必须被拒绝；之后按提示停用并移除模块。
   2. 主序列：`entry --strategy ruleset_resource --auto-reload-condition <on|off|any> --precedence-test temp,module`。工具先把 SFE-ROUTE 选为测试节点 A、布置 canary，然后依次切换 BLOCKED → VERIFY_ONLY → ACTIVE → NORMAL，每步写入后运行时读回，每个模式停留 `--dwell` 秒（默认 20）。
   3. BLOCKED 之后工具按候选路径结束 Safari 的连接（逐条记录，不影响其他应用）；VERIFY_ONLY 时 Safari 页面中回显应失败、检测服务应成功；ACTIVE 时回显应经过 p0-a，并按提示在 Safari 打开 `https://cloudflare-quic.com/cdn-cgi/trace` 刷新 3 次、输入 `http=` 的值。入口运行不询问扩展弹窗的「重新检测」：它在 P0 中由服务执行（不经过 Safari 入口），BLOCKED 与 VERIFY_ONLY 下显示相同，不能证明扩展页面请求的处理；扩展页面请求的覆盖见 3.8。
@@ -265,7 +271,7 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 - **前置条件**：同 3.10；建议另一个终端运行 `continuity`。
 - **步骤**：`refresh --auto-reload off`。阶段 C：测试节点资源加入 SFE-N-P0-C → 原子替换 → 按枚举到的唯一 key 定向刷新 → 读回组成员、选择、资源错误、更新时间、节点详情；比较其他外部资源的更新时间。
 - **通过条件**：按 key 定向刷新本应用节点资源后，经固定原语能读到组成员、资源错误与选择；不影响其他资源；执行器从不写入它无法读回的内容。
-- **判定细节**：资源更新时间读不到时该项为“不完整”，并提示 ruleset_resource 入口策略无法确认刷新；节点详情读不到时读回级别为 partial。
+- **判定细节**：资源更新时间读不到时该项为“不完整”，并提示 ruleset_resource 入口策略无法确认刷新；节点详情读不到时读回级别为 partial。“资源没有错误”按刷新后 1 秒的读回判定，备注记录刷新前、刷新刚返回与 1 秒后的资源状态（正常 / 未就绪 / 有错误；Surge 报告 `ready` 不为 true 时记为未就绪，不算健康）。
 - **失败处理**：新节点保持“已保存，待部署”；研究其他发布机制，**不自动重载兜底**。
 - **证据**：`results/targeted_resource_refresh.json`、`snapshots/refresh-before-*.json`、`surge-calls.jsonl`（每次调用的原语与耗时）、`actions.jsonl`。
 - **回退**：命令结束时自动恢复为只含 A、B 的资源并刷新、恢复原选择；失败时按打印的回退处理。
@@ -384,8 +390,9 @@ ARCHITECTURE 要求记录“P0 定义的未重载信号”。工具使用四个�
 
 1. inventory 打印建议的映射：读原语取实测可用的实现（CLI 优先），主动原语（组选择、结束请求、资源刷新、临时规则增删、策略测试）取“CLI 帮助中有对应命令”或“模块 B 已实现且回环 HTTP API 可用”的实现，**未经测试命令证明前不能当作已通过**。`reloadProfile` 不由 P0 设置。
 2. CLI 只执行签名校验通过的 `surge-cli`，并且只执行帮助中出现的命令；argv 中从不出现 switch-profile、reload、flush、stop、kill、outbound/enhanced/system-proxy 等全局动作。
-3. 6.5 帮助中的临时规则增删命令与模块 B 的占位命令（`temp-rule add/remove`）不一致时，inventory 会显示 `not_in_help`；把 `inventory/surge-cli-help-relevant.txt` 中的相关行交给开发者更新服务的 CLI 原语表，**不要**手动改用帮助中的其他动词。
-4. 各测试命令通过后，把映射写入数据目录的 `install.json` 的 `adapterMechanism` 字段（文件保持 0600；宿主 App 从不覆盖该字段）。映射变化会让依赖相应原语的能力回到待验证。
+3. 读原语的 JSON 输出（`--raw`）只接受已知结构：非 JSON、未知外层结构、任何一项缺少可识别字段（规则文本、资源 key 与位置、请求 id、策略名称）时读取直接失败，从不读成空列表或跳过该项；只有空白输出被当作“没有临时规则”。空白输出因此仍可能掩盖仍存在的规则，所以 `listTempRules: cli` 还需要 entry 的插入探测正向确认（见 3.7；inventory 在建议的映射说明中标出）后，才会被当作“规则已不存在”的证据。
+4. 6.5 帮助中的临时规则增删命令与模块 B 的占位命令（`temp-rule add/remove`）不一致时，inventory 会显示 `not_in_help`；把 `inventory/surge-cli-help-relevant.txt` 中的相关行交给开发者更新服务的 CLI 原语表，**不要**手动改用帮助中的其他动词。
+5. 各测试命令通过后，把映射写入数据目录的 `install.json` 的 `adapterMechanism` 字段（文件保持 0600；宿主 App 从不覆盖该字段）。映射变化会让依赖相应原语的能力回到待验证。
 
 ## 5. 提议与确认
 

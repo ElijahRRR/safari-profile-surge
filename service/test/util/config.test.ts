@@ -129,6 +129,13 @@ describe('unsafe locations', () => {
     expect(() => loadConfig({ ...o, argv: ['--data-dir', join(o.homedir, 'Documents', 'x')] })).toThrow(/受保护/);
   });
 
+  test('refuses a data dir whose real location cannot be resolved (UNSAFE_LOCATION, not a raw filesystem error)', () => {
+    const o = base();
+    const loop = join(o.homedir, 'loop');
+    symlinkSync(loop, loop);
+    expect(() => loadConfig({ ...o, argv: ['--data-dir', join(loop, 'data')] })).toThrow(expect.objectContaining({ code: 'UNSAFE_LOCATION', message: expect.stringContaining('无法确认目录的真实位置') }));
+  });
+
   test('refuses data dirs whose socket paths exceed 103 bytes', () => {
     const o = base();
     const long = join('/tmp', 'x'.repeat(90));
