@@ -22,7 +22,8 @@
 //      而还有路由操作排队、执行中或等待中——没有路由操作在进行中之后检测主机仍经未验证的出口发出即为违例（例如回滚按等满上限
 //      视为已阻断，SFE-ROUTE 仍是未验证的出口）。重新选择同一节点不改变出口；换成以前实测过的节点（例如回滚恢复之前的买家
 //      出口）要重新实测。Chrome 从不命中本应用入口或 SFE-ROUTE。
-//      I5b：ACTIVE_VERIFIED（非复用）只在本测试提交过真实通过的实测之后出现。
+//      I5b：ACTIVE_VERIFIED（非复用）只在本测试提交过真实通过的实测之后出现（提交已受理即算：之后服务在核对中崩溃时，崩溃恢复
+//      按提交的结果重新核对）。
 //   I6 路由视图（未带 entry_unverified、外部改动之后已重新读取事实时）声称 NORMAL/BLOCKED（以及 VERIFY_ONLY/ACTIVE 中被拒绝
 //      的部分）与 FakeSurge 求值一致；完成说明「Safari 按 Surge 原规则发出请求」「Safari 保持阻断」（回滚完成）与「Safari 保持已确认
 //      的阻断」（回滚无法确认 → BLOCKED_NEEDS_ATTENTION，路由仍是它留下的状态时）属实；扩展的路由摘要与同一
@@ -1083,7 +1084,19 @@ async function verifyEv(w: World, ev: Extract<Ev, { t: 'verify' }>): Promise<voi
     started_at: started,
     finished_at: finished,
   });
-  if (sub === CRASHED) return;
+  if (sub === CRASHED) {
+    // 提交已受理（检测编号已消费、结果已记入操作）而服务在之后的核对中崩溃：崩溃恢复按提交的结果重新核对（重测，§6.1），它照样是
+    // 本测试提交的实测——按数据库中记下的提交判断（原生桥的应答随崩溃丢失）
+    const stored = payloadOf(h.repos.operations.get(op.id) ?? op).route?.submission?.testId === data.test_id;
+    if (stored) {
+      w.trace.push(`   → 提交实测（${ev.outcome}${good ? '，真实通过' : ''}）：已受理（之后服务崩溃）`);
+      if (good) {
+        w.goodSubmissions.add(op.id);
+        if (w.sel.node === p.nodeName) w.sel.verified = true;
+      }
+    }
+    return;
+  }
   w.trace.push(`   → 提交实测（${ev.outcome}${good ? '，真实通过' : ''}）：${sub.ok ? '已受理' : sub.error.code}`);
   if (sub.ok && good) {
     w.goodSubmissions.add(op.id);
@@ -1632,6 +1645,18 @@ const MINIMAL_TRACES: Array<{ name: string; strategies: ReadonlyArray<Header['st
       { t: 'verify', outcome: 'pass', longLived: false, tabs: false },
       { t: 'normalDuring', nth: 8, via: 'unbound' },
       { t: 'probe', e: 2, kind: 'safari', via: 'profile' },
+    ],
+  },
+  {
+    name: 'I5: 接手等待实测的激活在第一次 Surge 调用时崩溃，重启后启动对账把路由改为 attention/UNKNOWN（模块规则排在入口之前），它在写入之前失败而不回滚：检测主机仍经 SFE-ROUTE 到未验证的出口（种子 600025）',
+    strategies: ['ruleset_resource', 'temp_rule'],
+    events: [
+      { t: 'create' },
+      { t: 'bind', p: 1, e: 1 },
+      { t: 'activate', e: 0, via: 'web', policy: 'none', confirm: 'right', onNeed: 'retry' },
+      { t: 'module', host: 'site' },
+      { t: 'crash', nth: 1, after: false, when: 'early' },
+      { t: 'activate', e: 0, via: 'profile', policy: 'keep', confirm: 'right', onNeed: 'giveup' },
     ],
   },
   {

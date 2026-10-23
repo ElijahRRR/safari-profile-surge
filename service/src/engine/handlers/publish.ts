@@ -92,12 +92,27 @@ const RESOURCE_REFRESH_KEY = 'resource:needsRefresh';
  * 新节点，之后每次写入前读到的成员都已是期望清单，再也证明不了重新读取，新版本永远停在 partial。写入其他节点行时更新，
  * 部署被接受（有证据且读回覆盖未核对字段，acceptable）时清除——只有证据而读回不完整时保留，补上读回覆盖记录之后的发布
  * 仍能沿用它；重新合并清除（requireResourceRefresh）。
+ * bodyDigest 按 pepper 派生的文件密钥对含明文代理凭据的节点行计算（§0「秘密的存放」）：文件已不是这组节点行（回滚恢复了别的
+ * 内容、原子替换失败，dropUnusableWriteBaseline）时它再也用不上，立即删除；其中任一版本退役（之后凭据被清扫）时同样删除
+ * （scrubRetiredDeploymentDigests 按 revisions），否则拿到数据目录副本的人能用它离线核对猜测的旧代理凭据。
  */
 const RESOURCE_WRITE_BASELINE_KEY = 'resource:writeBaseline';
 
 interface ResourceWriteBaseline {
   bodyDigest: string;
   membersBefore: string[];
+  /** 这组节点行中的代理版本（entryKey）；早先记下的对照没有这一项（按其中可能有已退役的版本处理）。 */
+  revisions?: string[];
+}
+
+/**
+ * 文件中已不是写入对照的那组节点行（fileBodyDigest：文件当前内容的节点行摘要，读不到或不是本应用写入的为 null）：对照只在文件
+ * 中仍是它那组节点行时才可能被沿用（runPublish 的 reuseBaseline），之后再写入这组节点行时会重新读取写入前的成员——删除它，
+ * 不留下按 pepper 派生密钥对含明文代理凭据的内容计算的摘要。
+ */
+function dropUnusableWriteBaseline(engine: Engine, fileBodyDigest: string | null): void {
+  const b = engine.kv.get<ResourceWriteBaseline>(RESOURCE_WRITE_BASELINE_KEY);
+  if (b !== null && (fileBodyDigest === null || b.bodyDigest !== fileBodyDigest)) engine.kv.delete(RESOURCE_WRITE_BASELINE_KEY);
 }
 
 /** 节点资源中节点行的摘要：去掉首行（resourceFile 写入的带配置代数的注释），同一组节点与参数在不同代数下摘要相同。 */
@@ -486,7 +501,13 @@ async function publishBatch(engine: Engine, batch: Batch): Promise<void> {
   const reuseBaseline =
     baseline !== null && Array.isArray(baseline.membersBefore) && baseline.bodyDigest === plan.bodyDigest && plan.resourceBodyDigestBefore === plan.bodyDigest;
   const membersBefore = reuseBaseline ? baseline!.membersBefore : await readMembersBeforeWrite(engine);
-  if (!reuseBaseline) engine.kv.set(RESOURCE_WRITE_BASELINE_KEY, { bodyDigest: plan.bodyDigest, membersBefore } satisfies ResourceWriteBaseline);
+  if (!reuseBaseline) {
+    engine.kv.set(RESOURCE_WRITE_BASELINE_KEY, {
+      bodyDigest: plan.bodyDigest,
+      membersBefore,
+      revisions: plan.manifest.map((m) => entryKey(m.environmentId, m.proxyRevision)),
+    } satisfies ResourceWriteBaseline);
+  }
   const runtimeBefore = await readRuntimeSample(engine.surge);
 
   // 记录发布（代数）与各操作，再写入意图、原子替换，等待 Surge 自动重新读取
@@ -515,8 +536,9 @@ async function publishBatch(engine: Engine, batch: Batch): Promise<void> {
   try {
     await files.writeAtomic(NODE_RESOURCE_FILE, plan.content, plan.resourceDigestBefore);
   } catch (err) {
-    // 原子替换失败时文件未变：意图回到写前状态
+    // 原子替换失败时文件未变：意图回到写前状态；文件中不是这组节点行时写入对照用不上，删除
     if (plan.resourceDigestBefore !== null) confirmResource(repos, engine.kv, plan.resourceDigestBefore);
+    dropUnusableWriteBaseline(engine, plan.resourceBodyDigestBefore);
     repos.deployments.update(generation, { state: 'failed' });
     throw fail(engine.errorBody(err, '发布失败：写入节点资源失败'));
   }
@@ -935,6 +957,8 @@ async function rollbackPublish(
       if (currentDigest !== null && (await files.digest(NODE_RESOURCE_FILE)) === currentDigest) confirmResource(repos, engine.kv, currentDigest);
       throw err;
     }
+    // 文件已恢复为上一份内容（不论之后的读回能否确认）：本次写入的那组节点行的写入对照再也用不上，删除
+    dropUnusableWriteBaseline(engine, resourceBodyDigest(files.digestContent, content));
     // 与发布相同：等待 Surge 自动重新读取恢复的文件，从不调用外部资源更新
     const expected = (prev?.nodeManifest ?? []).map((m) => m.nodeName);
     const membersBefore = await engine.surge.getGroupMembers(ROUTE_GROUP_NAME).catch(() => null);
@@ -1043,6 +1067,7 @@ async function settle(engine: Engine, batch: Batch, s: SettleInput | null): Prom
         repos.proxyRevisions.updateState(rev.environmentId, rev.revision, 'retired');
         for (const ref of [rev.usernameRef, rev.passwordRef]) if (ref) engine.secrets.orphanIfUnreferenced(ref);
       }
+      scrubRetiredDeploymentDigests(engine, new Set(s.plan.removed.map((rev) => entryKey(rev.environmentId, rev.revision))));
       retireStaleRevisions(engine, manifestKeys);
     });
     confirmResource(repos, engine.kv, s.plan.newDigest);
@@ -1117,6 +1142,28 @@ async function settle(engine: Engine, batch: Batch, s: SettleInput | null): Prom
  * 不在新资源中、也不再被任何地方需要的旧版本（从未部署就被取代的期望版本等）：retired 并回收秘密。
  * 只在执行器中（发布结算时）进行，避免与进行中的发布竞争。
  */
+/** 发布记录中清除后的资源摘要（不是任何内容的摘要，regenerate 从不与之相等）。 */
+export const SCRUBBED_DIGEST = 'scrubbed';
+
+/**
+ * 含刚退役版本的旧发布记录：资源摘要（与工作配置摘要）按当时的节点资源内容计算，其中有这些版本的明文代理凭据；pepper 在同一个
+ * 数据库中，留着就能从数据目录的副本离线核对猜测的旧凭据（§0「秘密的存放」）。这些发布已无法也不会再重建（回滚目标是最近一次
+ * 可接受的发布，它不含退役的版本；退役版本的凭据随后被回收），清除它们的摘要。在调用方的结算事务中执行。
+ */
+export function scrubRetiredDeploymentDigests(engine: Engine, retired: ReadonlySet<string>): void {
+  if (retired.size === 0) return;
+  // 写入对照（RESOURCE_WRITE_BASELINE_KEY）的节点行含退役版本（或早先记下、不知道含哪些版本）：同样删除——含退役版本的节点行
+  // 不会再被写入，对照用不上；留下它，凭据被清扫之后它仍能离线核对
+  const baseline = engine.kv.get<ResourceWriteBaseline>(RESOURCE_WRITE_BASELINE_KEY);
+  if (baseline !== null && (!Array.isArray(baseline.revisions) || baseline.revisions.some((k) => retired.has(k)))) engine.kv.delete(RESOURCE_WRITE_BASELINE_KEY);
+  // LIMIT -1：全部发布记录（SQLite 的负数上限表示不限）
+  for (const d of engine.repos.deployments.list(-1)) {
+    if (d.resourceDigest === SCRUBBED_DIGEST && d.workingProfileDigest === null) continue;
+    if (!d.nodeManifest.some((m) => retired.has(entryKey(m.environmentId, m.proxyRevision)))) continue;
+    engine.repos.deployments.update(d.generation, { resourceDigest: SCRUBBED_DIGEST, workingProfileDigest: null });
+  }
+}
+
 function retireStaleRevisions(engine: Engine, manifestKeys: ReadonlySet<string>): void {
   const { repos } = engine;
   const route = repos.routeState.get();
@@ -1130,11 +1177,14 @@ function retireStaleRevisions(engine: Engine, manifestKeys: ReadonlySet<string>)
     if (p.route) keep.add(entryKey(p.route.targetEnvironmentId, p.route.proxyRevision));
     for (const t of p.targets ?? []) keep.add(entryKey(t.environmentId, t.proxyRevision));
   }
+  const retired = new Set<string>();
   for (const rev of repos.proxyRevisions.list({ state: ['desired', 'superseded'] })) {
     if (keep.has(entryKey(rev.environmentId, rev.revision))) continue;
     repos.proxyRevisions.updateState(rev.environmentId, rev.revision, 'retired');
+    retired.add(entryKey(rev.environmentId, rev.revision));
     for (const ref of [rev.usernameRef, rev.passwordRef]) if (ref) engine.secrets.orphanIfUnreferenced(ref);
   }
+  scrubRetiredDeploymentDigests(engine, retired);
 }
 
 function finalPhase(engine: Engine, units: readonly Unit[]): { phase: OperationPhase; status: OperationStatus; error: ApiErrorBody | null; message: string } {

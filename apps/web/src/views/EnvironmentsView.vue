@@ -129,6 +129,13 @@ async function onSubmit(payload: EnvironmentSubmit) {
     if (e.code === 'REVISION_CONFLICT') {
       const current = typeof e.details?.currentRevision === 'number' ? `（当前版本 ${e.details.currentRevision}）` : '';
       editor.formError = `保存失败：环境已在其他界面被修改${current}。请关闭后重新打开再修改，你的输入不会自动覆盖对方的修改。`;
+    } else if (e.code === 'DUPLICATE_REQUEST_MISMATCH') {
+      // 同一请求编号已有一次提交生效（例如连接中断、服务重新启动之前已保存），而这一次的内容不同或带密码（服务重新启动之后无法
+      // 核对密码是否相同）：这一次没有保存。不换新编号重试——之前那次可能已创建环境或改了版本，重新打开才能看到实际内容
+      editor.formError =
+        payload.kind === 'create'
+          ? '保存失败：之前一次提交（例如连接中断或服务重新启动之前）已经生效，这次的内容没有保存。请关闭后在列表中查看已创建的环境，再在其中修改。'
+          : '保存失败：之前一次提交（例如连接中断或服务重新启动之前）已经生效，这次的修改没有保存。请关闭后重新打开，确认当前内容再修改。';
     } else if (!e.fieldErrors?.length) {
       editor.formError = e.message;
     }

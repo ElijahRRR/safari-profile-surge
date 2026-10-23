@@ -3,8 +3,9 @@
 // 并读回，结束 Safari 连接只按已确认的进程路径。失败、超时、取消一律回滚到切换前的已验证节点并保持阻断，
 // 从不回退到 NORMAL、DIRECT 或其他买家出口；回滚无法确认 → BLOCKED_NEEDS_ATTENTION（回到阻断未经运行时求值确认时不恢复
 // 切换前节点，SFE-ROUTE 改选 REJECT，见 holdUnconfirmedRollback）。路由操作结束时 Surge 仍可能加载着检测或使用中入口、
-// 而 SFE-ROUTE 的选择不是使用中环境已验证的出口（回滚、普通模式失败或撤销未经运行时确认、处理器意外异常）：一律尽力改选
-// REJECT 并读回，如实写明是否确认（selectRejectBestEffort）。
+// 而 SFE-ROUTE 的选择不是使用中环境已验证的出口（回滚、普通模式失败或撤销未经运行时确认、处理器意外异常，以及其余每条结束
+// 路径——例如对账已把路由改为 attention 之后在写入之前失败的激活，见 holdAtRouteEnd）：一律尽力改选 REJECT 并读回，如实写明
+// 是否确认（selectRejectBestEffort）。
 
 import {
   CAPABILITY_GATES,
@@ -21,7 +22,7 @@ import {
 } from '@sfe/contract';
 import { isIP } from 'node:net';
 import type { OperationRecord, RouteStateRecord } from '../../db/index.js';
-import { PUBLISH_KINDS, newRoutePayload, payloadOf, type RoutePayload } from '../../domain/operations.js';
+import { PUBLISH_KINDS, newRoutePayload, payloadOf, type EndHoldIntent, type ProbeVerdict, type RouteEnding, type RoutePayload, type SafariProbeEvidence } from '../../domain/operations.js';
 import { LOSS_OF_CONTROL_WARNINGS, REUSE_BLOCKING_WARNINGS, hasAny, safariProbeCurrent } from '../../domain/route-rules.js';
 import { labelOf } from '../../domain/naming.js';
 import { probeView } from '../../domain/views.js';
@@ -30,7 +31,7 @@ import { findVerificationRequest } from '../../surge/correlate.js';
 import { knownModeOfBits } from '../../surge/entry/plan.js';
 import { hasBlockingIssue } from '../../surge/precedence.js';
 import { killSafariConnections } from '../../surge/safari-connections.js';
-import type { Engine } from '../context.js';
+import type { EmitSpec, Engine } from '../context.js';
 import { managedSegmentsChanged, reconcile } from '../reconcile.js';
 import { confirmationNeeded, entrySettingsKey, needsConfirmationError, routeOps, supersedeWaiting, waitingEnvironments } from '../route-control.js';
 import { clearSafariMayUseRoute, markSafariMayUseRoute, retiredSafariPaths, safariMayUseRoute } from '../safari-route-marker.js';
@@ -127,6 +128,11 @@ interface RejectHold {
   readback: string | null;
   /** 改选或读回失败的原因（脱敏）；确认时为 null。 */
   error: string | null;
+  /**
+   * 崩溃恢复中重新结束的结束点读回 REJECT，而本操作在服务崩溃之前已记下改选的意图（OperationPayload.endHold）：改选是本操作做的，
+   * 按改选（读回确认）记下（recordEndHold、heldEnd），不当作之前已是 REJECT。
+   */
+  recovered?: EndHoldIntent;
 }
 
 /**
@@ -179,6 +185,26 @@ function holdExistingConnections(engine: Engine, opId: string, warnings: Set<Rou
 }
 
 /**
+ * 本次切换已开始把入口写入使用中模式（RoutePayload.activeWriteStarted）之后回滚或中断（写入或读回失败、提交失败、写入期间服务
+ * 崩溃、处理器意外异常）：Safari 的全部请求（含目标环境场景中已打开的窗口）可能已经过目标环境的出口——与让给排队普通模式的
+ * 切换相同（yieldToQueuedNormal），而任何旧窗口确认都没有覆盖它的窗口：之后的普通模式只按那时路由记录的使用中环境确认。
+ * 目标不是结束后路由记录的使用中环境（activeAfter）时返回它（label 是带引号的环境名，环境不存在时为空），调用方在结束事务中带
+ * managed_windows_on_original_rules（之后的普通模式完成时保留并写明，用户确认旧窗口已关闭或之后的激活提交时清除）并按
+ * activeWrittenNote 写明；否则为 null。
+ */
+function activeWrittenUncovered(engine: Engine, opId: string, activeAfter: string | null): { environmentId: string; label: string } | null {
+  const op = engine.repos.operations.get(opId);
+  const p = op ? payloadOf(op).route : undefined;
+  if (!p?.activeWriteStarted || p.targetEnvironmentId === activeAfter) return null;
+  const env = engine.repos.environments.get(p.targetEnvironmentId);
+  return { environmentId: p.targetEnvironmentId, label: env ? `「${labelOf(env)}」` : '' };
+}
+
+function activeWrittenNote(t: { label: string }): string {
+  return `切换目标环境${t.label}的入口已开始写入使用中模式，其窗口可能已经过它的出口、未经确认：路由带旧窗口警告，之后进入普通模式时其后续请求按 Surge 原规则发出（可能直连）`;
+}
+
+/**
  * 普通模式完成时改选 REJECT 的说明（收紧未经运行时求值确认；改选只影响新连接）。按入口策略写明还剩什么不确定
  * （unconfirmedLoadText）：ruleset_resource 是 Surge 加载撤销之前仍可能加载着检测或使用中入口；temp_rule 没有加载阶段，临时规则
  * 已按列表与有效规则顺序读回，只是 Surge 实际如何匹配 Safari 请求没有经 rule match 确认。
@@ -202,15 +228,311 @@ function normalHoldText(hold: RejectHold, strategy: EntryController['strategy'] 
  * 只看记录会把别的买家出口当作已验证的路由留给 Safari。读不到按不是。从不抛出。
  */
 async function selectionIsVerifiedExit(engine: Engine, route: RouteStateRecord): Promise<boolean> {
-  if (route.activationSnapshot !== null || route.activeEnvironmentId === null || route.activeProxyRevision === null) return false;
-  if (route.warnings.includes('external_selection_change')) return false;
-  const rev = engine.repos.proxyRevisions.get(route.activeEnvironmentId, route.activeProxyRevision);
-  if (!rev || route.selectedNode !== rev.nodeName) return false;
+  const node = verifiedExitNode(engine, route);
+  if (node === null) return false;
   try {
-    return (await engine.surge.getGroupSelection(ROUTE_GROUP_NAME)) === rev.nodeName;
+    return (await engine.surge.getGroupSelection(ROUTE_GROUP_NAME)) === node;
   } catch {
     return false;
   }
+}
+
+/** 按路由记录，使用中环境已验证的出口节点（selectionIsVerifiedExit 的记录部分）；记录不能证明时为 null。 */
+function verifiedExitNode(engine: Engine, route: RouteStateRecord): string | null {
+  if (route.activationSnapshot !== null || route.activeEnvironmentId === null || route.activeProxyRevision === null) return null;
+  if (route.warnings.includes('external_selection_change')) return null;
+  const rev = engine.repos.proxyRevisions.get(route.activeEnvironmentId, route.activeProxyRevision);
+  return rev && route.selectedNode === rev.nodeName ? rev.nodeName : null;
+}
+
+/**
+ * 按路由记录，Surge 加载的本应用入口是否可能仍让 Safari 经 SFE-ROUTE：入口不是经运行时求值确认的阻断或普通模式（VERIFY_ONLY、
+ * ACTIVE、UNKNOWN），或带 entry_unverified（读回未经运行时求值确认、退路写入、对账发现与记录不一致或能力过期），或阻断带
+ * precedence_violation（排在入口之前的规则可能把 Safari 请求交给 SFE-ROUTE）。普通模式只看 entry_unverified：本应用入口已撤下时，
+ * 排在它之前的规则与本应用入口无关。
+ */
+function entryMayUseRoute(route: RouteStateRecord): boolean {
+  if (route.warnings.includes('entry_unverified')) return true;
+  if (route.entryMode === 'NORMAL') return false;
+  if (route.entryMode === 'BLOCKED') return route.warnings.includes('precedence_violation');
+  return true;
+}
+
+/** holdAtRouteEnd 的输入：结束的操作自己在本次结束之前读到的情况。 */
+interface EndHoldOptions {
+  /**
+   * 结束的操作刚刚自己读到的 SFE-ROUTE 选择（重测核对读到的选择、开始等待时读到的与记录不一致的选择；没有读到时不传）。结束点
+   * 重读失败而它不是使用中环境已验证的出口时，它是选择已变的正面证据：照样改选 REJECT，不按「读取失败不说明选择变了」放过。
+   */
+  observedSelection?: string | null;
+}
+
+/**
+ * 路由操作的结束点（失败即关闭，所有结束路径共用；在把操作记为结束之前调用）。路由操作结束之后不再有操作负责撤下当前入口，
+ * 对账只读、从不写 Surge（§6.6）：结束时 Surge 加载的入口可能仍让 Safari 经 SFE-ROUTE（entryMayUseRoute），而 SFE-ROUTE 的选择
+ * 不是使用中环境已验证的出口（例如半途切换写入的未验证节点、之前一次改选 REJECT 失败、选择在记录之外被改过）时，Safari（至少
+ * 检测主机）会在没有任何实测进行中的情况下经它发出。与回滚无法确认同一规则：尽力改选 REJECT 并读回（selectRejectBestEffort），
+ * 调用方用 recordEndHold 记下、用 endHoldNote/withEndHold 如实写明。
+ * 典型来源是不由结束的操作写入、而由对账发现的状态：启动对账或周期对账把等待实测的路由改为 attention（例如有规则排在入口之前，
+ * 入口改记为 UNKNOWN）之后，接手它的激活在第一次写入之前失败——它不负责非过渡中的路由（ownsTransition），不回滚。
+ * 不改选（返回 null）：入口记录为经运行时求值确认的阻断或普通模式；选择读回已是 REJECT，或就是使用中环境已验证的出口（记录
+ * 表明选着已验证的出口而选择读不到时同样不改选：结束的操作没有改选过 SFE-ROUTE，读取失败不说明选择变了——结束的操作自己
+ * 刚读到选择已不是这个出口（EndHoldOptions.observedSelection：重测核对或开始等待时读到的不一致的选择）时除外，这是选择已变的
+ * 正面证据，照样改选）；有排队或执行中的普通模式（执行器优先领取它，它接着从当前状态撤销入口，激活让给它时从不写入 Surge）；
+ * 路由记在另一个未结束的操作名下（不论路由阶段——对账把等待实测的路由改为 attention 时不改负责的操作；由它结算）。读路由或
+ * 操作出错时照样改选（失败即关闭）。从不抛出。
+ * 回滚（rollbackActivation、holdUnconfirmedRollback）、普通模式（runNormal）与执行器兜底中负责过渡中路由的一支
+ * （settleAbandonedTransition）按各自读回的入口另行改选，不经这里（它们在崩溃恢复中重新读回入口、重新改选，不看之前的选择）。
+ * 改选之前在操作中记下意图（OperationPayload.endHold，markEndHoldIntent）：改选之后、记下改选之前服务崩溃时，崩溃恢复重新结束的
+ * 结束点（recoverRoute：按 ending 重新结束、重测按已判定的失败重新结束、被取代的切换、执行器兜底）读回 REJECT——有这一记录就是
+ * 本操作改选的，按改选（读回确认，RejectHold.recovered）记下并结束为需要处理，不按「之前已是 REJECT、路由未改变」结束。这一判断
+ * 排在排队普通模式与另一负责者两项之前：本操作改选期间受理的普通模式（受理从不拒绝，排在本操作之后）在崩溃之后仍排着，
+ * 否则恢复的结束会把本操作自己的改选当作「路由未改变」。
+ */
+async function holdAtRouteEnd(engine: Engine, opId: string, opts: EndHoldOptions = {}): Promise<RejectHold | null> {
+  const { repos } = engine;
+  let externalSelectionBefore = false;
+  const readSelection = async (): Promise<string | null | undefined> => {
+    try {
+      return await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
+    } catch {
+      return undefined;
+    }
+  };
+  try {
+    const route = repos.routeState.get();
+    if (!entryMayUseRoute(route)) return null;
+    // 本操作在服务崩溃之前已记下改选的意图：先读回——读回的 REJECT 就是它的改选（崩溃发生在改选之后、记下之前），按改选记下，
+    // 不论之后是否有排队的普通模式或另一个负责者（它们在本操作改选期间受理，交给它们就会把本操作的结束记为「路由未改变」）
+    const self = repos.operations.get(opId);
+    const intent = self ? payloadOf(self).endHold : undefined;
+    let sel: string | null | undefined;
+    let selRead = false;
+    if (intent) {
+      sel = await readSelection();
+      selRead = true;
+      if (sel === 'REJECT') return { confirmed: true, readback: 'REJECT', error: null, recovered: intent };
+    }
+    const others = repos.operations.listByStatus(['queued', 'running', 'waiting']).filter((o) => o.id !== opId);
+    if (others.some((o) => o.kind === 'route.normal' && (o.status === 'queued' || o.status === 'running'))) return null;
+    // 路由记在另一个未结束的操作名下（不论阶段）：它会自己结算路由——等待中的激活经它的计时器、取消或核对（对账把等待实测的
+    // 路由改为 attention 之后它照样负责，例如 Surge 短暂不可达之后它仍可能核对通过），排队或执行中的接手者经 failBeforeSwitch
+    // 或切换。在这里改选会让一个无关操作的结束抢走仍在进行中的激活的路由（两个负责者），之后它的核对因选择已不是目标节点失败
+    if (route.operationId !== null && others.some((o) => o.id === route.operationId)) return null;
+    if (!selRead) sel = await readSelection();
+    if (sel === 'REJECT') return null;
+    const verified = verifiedExitNode(engine, route);
+    if (verified !== null && sel === verified) return null;
+    // 读不到选择、而记录表明选着使用中环境已验证的出口：结束的操作没有改选过 SFE-ROUTE，读取失败不能说明选择变了——不改选
+    // （否则一次短暂的读取失败就会让已验证的路由降为需要处理）；Surge 不可达由对账记下。结束的操作自己刚读到选择已不是这个
+    // 出口时除外（observedSelection）：那是选择已变的正面证据，一次读取失败不能把它变成「路由未改变」，照样改选
+    if (verified !== null && sel === undefined && (opts.observedSelection === undefined || opts.observedSelection === verified)) return null;
+    externalSelectionBefore = route.warnings.includes('external_selection_change');
+  } catch (err) {
+    engine.log('warn', 'route.end_hold_check_failed', { operationId: opId, error: err instanceof Error ? err.name : 'unknown' });
+  }
+  markEndHoldIntent(engine, opId, { externalSelectionBefore });
+  return selectRejectBestEffort(engine);
+}
+
+/** holdAtRouteEnd 改选 REJECT 之前在操作中记下意图（OperationPayload.endHold）。写入失败只记日志：照样改选（失败即关闭）。 */
+function markEndHoldIntent(engine: Engine, opId: string, intent: EndHoldIntent): void {
+  const { repos } = engine;
+  try {
+    repos.tx(() => {
+      const cur = repos.operations.get(opId);
+      if (!cur) return;
+      const prev = payloadOf(cur).endHold;
+      // 已记下（例如崩溃恢复中再次改选）：保留最早的一次——它记下的是本操作第一次改选之前的路由警告
+      if (prev) return;
+      repos.operations.update(opId, { payload: { ...payloadOf(cur), endHold: intent } });
+    });
+  } catch (err) {
+    engine.log('warn', 'route.end_hold_intent_failed', { operationId: opId, error: err instanceof Error ? err.name : 'unknown' });
+  }
+}
+
+/**
+ * 在调用方的事务中记下结束点的改选（holdAtRouteEnd 返回 null 时什么也不做）：与回滚无法确认相同——带 entry_unverified，已建立的
+ * 连接不受改选影响（holdExistingConnections：持久标记与 buyer_exit_connections_unconfirmed），之前一次成功回滚留下的
+ * rollback_needs_reverify 不再成立；只有读回确认才记为 REJECT。路由需要处理（attention）；空闲的普通模式（普通模式完成而撤销未经
+ * 运行时求值确认）保持 idle，由警告与持久标记提供普通模式。
+ * 崩溃恢复中记下的改选（RejectHold.recovered）：启动对账在恢复之前读到本操作的 REJECT、把它当作外部修改记下
+ * external_selection_change——改选之前路由没有这一警告时去掉它（改选是本应用做的，路由仍因改选需要处理）。
+ */
+function recordEndHold(engine: Engine, opId: string, hold: RejectHold | null): void {
+  if (!hold) return;
+  const { repos } = engine;
+  const fresh = repos.routeState.get();
+  const warnings = new Set<RouteWarning>(
+    fresh.warnings.filter((w) => w !== 'rollback_needs_reverify' && !(w === 'external_selection_change' && hold.recovered && !hold.recovered.externalSelectionBefore)),
+  );
+  warnings.add('entry_unverified');
+  holdExistingConnections(engine, opId, warnings);
+  repos.routeState.update({
+    ...(fresh.phase === 'idle' ? {} : { phase: 'attention' as const, awaitingDeadline: null }),
+    operationId: opId,
+    ...(hold.confirmed ? { selectedNode: 'REJECT' } : {}),
+    warnings: [...warnings],
+  });
+}
+
+/**
+ * 结束点改选的说明，附在结束说明之后（没有改选时为空）。路由因此需要处理：路由记录带 entry_unverified，自动打开订单与填充停止，
+ * 需要进入普通模式或重新使用环境。
+ */
+function endHoldNote(hold: RejectHold | null): string {
+  if (!hold) return '';
+  return `；结束时路由仍未回到已确认的状态（入口可能仍让 Safari 经 SFE-ROUTE，而 SFE-ROUTE 选着的不是使用中环境已验证的出口），失败即关闭：${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}；路由需要处理（自动打开订单与填充已停止）：进入普通模式，或重新使用环境`;
+}
+
+/**
+ * 结束点改选了 SFE-ROUTE（holdAtRouteEnd 返回非 null）时，结束说明不能再说「路由未改变」：去掉这一说法（结束说明的其余部分
+ * 照旧，改选的说明由 endHoldNote 附上）。
+ */
+function withoutUnchangedClaim(text: string): string {
+  return text.replace(/[，：；]路由未改变/g, '');
+}
+
+/** 错误说明附上结束点的改选（details.rejectSelected），并去掉「路由未改变」的说法。 */
+function withEndHold(body: ApiErrorBody, hold: RejectHold | null): ApiErrorBody {
+  if (!hold) return body;
+  return { ...body, message: `${withoutUnchangedClaim(body.message)}${endHoldNote(hold)}`, details: { ...(body.details ?? {}), rejectSelected: hold.confirmed } };
+}
+
+type EndPatch = Parameters<Engine['updateOp']>[1];
+
+/**
+ * 重新检测要求路由是使用中且已验证的（§6.4：入口读回为 ACTIVE、路由阶段 active_verified）。等待期间对账发现失控（Surge 重启、
+ * 出站模式改变、选择被外部修改等）时路由改为 attention 或 external_change——只有之后的激活提交 ACTIVE 才会设回已验证，而新的
+ * 激活会取代这次重测：这次重测再也无法签发检测编号。
+ */
+export function retestRouteLost(route: Pick<RouteStateRecord, 'entryMode' | 'phase'>): boolean {
+  return route.entryMode !== 'ACTIVE' || route.phase !== 'active_verified';
+}
+
+/** 重测等待期间使路由不再已验证的警告（写入说明用；按路由记录）。 */
+const RETEST_LOST_TEXT: Partial<Record<RouteWarning, string>> = {
+  surge_unreachable: '无法连接 Surge',
+  surge_restarted: 'Surge 已重启',
+  entry_unverified: '入口规则未能读回确认',
+  takeover_lost: 'Surge 接管已关闭',
+  outbound_mode_changed: 'Surge 出站模式不是规则模式',
+  external_selection_change: 'SFE-ROUTE 的选择在 Surge 中被外部修改',
+  external_profile_change: 'Surge 当前配置不是固定工作配置',
+  precedence_violation: '有规则排在本应用入口之前',
+  managed_segments_changed: '受管理段或本应用文件被外部修改',
+};
+
+/**
+ * 已开始等待检测（stage probe_waiting：开始等待时路由是使用中且已验证的）的重新检测结束时，路由已不在已验证的使用中状态：
+ * 返回路由记录的警告（结果 routeLeftVerified；准备页据此不说「路由与之前的检测结果都未改变」），否则为 null。结束点改选了
+ * SFE-ROUTE（hold）时由改选的说明负责，这里为 null。
+ */
+function retestRouteLeftVerified(engine: Engine, rp: RoutePayload | undefined, hold: RejectHold | null): RouteWarning[] | null {
+  if (hold || rp?.flow !== 'probe' || rp.stage !== 'probe_waiting') return null;
+  const route = engine.repos.routeState.get();
+  return retestRouteLost(route) ? [...route.warnings] : null;
+}
+
+/** 重测等待期间路由已不在已验证的使用中状态的说明（附在结束说明之后，并去掉「路由未改变」：路由确实变了，只是不是这次重测改的）。 */
+function retestLostNote(warnings: readonly RouteWarning[]): string {
+  const causes = warnings.map((w) => RETEST_LOST_TEXT[w]).filter((t): t is string => t !== undefined);
+  return `；这次重新检测等待期间路由已不在已验证的使用中状态${causes.length > 0 ? `（${causes.join('、')}）` : ''}，不是这次重新检测改变的：自动打开订单与填充已停止，需要重新使用此环境或进入普通模式`;
+}
+
+/**
+ * 结束点改选了 SFE-ROUTE 时的结束状态：不论原本要结束成什么（失败、取消，或 WAITING_ROUTE 的 READY_FOR_NEXT_OPEN 成功），一律
+ * BLOCKED_NEEDS_ATTENTION / needs_attention——路由已改变（改选 REJECT 或改选失败），Safari 经本应用出口的新连接被拒绝、订单与
+ * 填充停止，不能显示为成功或「路由未改变」。错误保留原来的代码（没有错误时 UNKNOWN_STATE），说明写明原本的结束与改选。
+ */
+function heldEnd(patch: EndPatch, step: string, hold: RejectHold): { patch: EndPatch; step: string } {
+  const text = `${withoutUnchangedClaim(step)}${endHoldNote(hold)}`;
+  const error: ApiErrorBody = patch.error ? withEndHold(patch.error, hold) : { code: 'UNKNOWN_STATE', message: text, details: { rejectSelected: hold.confirmed } };
+  return { patch: { ...patch, phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', error }, step: text };
+}
+
+/**
+ * 不负责过渡中路由的路由操作结束（engine.updateOp 的结束版本）：结束之前按 holdAtRouteEnd 失败即关闭，记下改选，再记下结束状态
+ * （改选了就按 heldEnd 改为需要处理，结果带 rejectSelected）。cancelOutbox：同时取消本操作的计时器；observedSelection：本操作
+ * 结束之前自己读到的 SFE-ROUTE 选择（见 EndHoldOptions）。
+ * 等待中的操作（超时、取消、目标版本已被替换）在第一次读写 Surge 之前同步改为 running，并在 payload 中记下要结束成什么
+ * （RoutePayload.ending）：结束点的 Surge 调用期间它不再是等待中——原生桥不再签发检测编号或记到达（beginVerification 按正在结束
+ * 回答）、提交被拒绝、取消返回 ROUTE_BUSY、新的普通模式排在它之后、新的激活返回 ROUTE_BUSY、保存新版本不再结束它；否则它们会
+ * 对一个马上就要结束的操作签发检测编号、提示「正在切换到新版本」，或把它记为 SUPERSEDED 之后又被这里覆盖。服务在这期间崩溃时
+ * 崩溃恢复按 ending 重新结束（recoverRoute）。重测的检测截止时间在结束事务中按重读的 payload 清除（probeDeadlineCleared）。
+ */
+async function endRouteOp(
+  engine: Engine,
+  opId: string,
+  patch: EndPatch,
+  step: string,
+  emit: EmitSpec = {},
+  opts: { cancelOutbox?: boolean } & EndHoldOptions = {},
+): Promise<void> {
+  const { repos } = engine;
+  markEnding(engine, opId, patch, step, opts.cancelOutbox === true);
+  const hold = await holdAtRouteEnd(engine, opId, { observedSelection: opts.observedSelection });
+  // 以下到 updateOp 都是同步的：重读之后没有其他处理器能在其间改动本操作
+  const cur = repos.operations.get(opId);
+  if (!cur || (cur.status !== 'running' && cur.status !== 'queued' && cur.status !== 'waiting')) {
+    engine.log('warn', 'route.end_skipped', { operationId: opId, status: cur?.status ?? 'missing' });
+    return;
+  }
+  const activeBefore = repos.routeState.get().activeEnvironmentId;
+  let routeChanged = hold !== null;
+  repos.tx(() => {
+    recordEndHold(engine, opId, hold);
+    const rp = payloadOf(cur).route;
+    if (rp?.flow === 'probe') {
+      const cleared = probeDeadlineCleared(repos.routeState.get(), rp);
+      if ('awaitingDeadline' in cleared) {
+        repos.routeState.update(cleared);
+        routeChanged = true;
+      }
+    }
+  });
+  const left = retestRouteLeftVerified(engine, payloadOf(cur).route, hold);
+  const final = hold
+    ? heldEnd(patch, step, hold)
+    : left
+      ? {
+          patch: { ...patch, ...(patch.error ? { error: { ...patch.error, message: `${withoutUnchangedClaim(patch.error.message)}${retestLostNote(left)}` } } : {}) },
+          step: `${withoutUnchangedClaim(step)}${retestLostNote(left)}`,
+        }
+      : { patch, step };
+  // 结束之后不再保留 ending（只在结束点进行中有意义）
+  const endedRoute = payloadOf(cur).route;
+  let payloadPatch: Pick<EndPatch, 'payload'> = {};
+  if (endedRoute?.ending) {
+    const next: RoutePayload = { ...endedRoute };
+    delete next.ending;
+    payloadPatch = { payload: { ...payloadOf(cur), route: next } };
+  }
+  engine.updateOp(
+    opId,
+    {
+      ...final.patch,
+      ...payloadPatch,
+      ...(hold ? { result: { ...(patch.result ?? cur.result ?? {}), rejectSelected: hold.confirmed } } : {}),
+      ...(left ? { result: { ...(patch.result ?? cur.result ?? {}), routeLeftVerified: left } } : {}),
+    },
+    final.step,
+    { ...emit, ...(routeChanged ? { route: true } : {}), ...(hold ? { environments: [...(emit.environments ?? []), ...(activeBefore ? [activeBefore] : [])] } : {}) },
+  );
+  if (opts.cancelOutbox) repos.outbox.cancelForOperation(opId);
+}
+
+/** endRouteOp 的第一步：等待中的操作同步改为 running 并记下要结束成什么（RoutePayload.ending）；其他状态什么也不做。 */
+function markEnding(engine: Engine, opId: string, patch: EndPatch, step: string, cancelOutbox: boolean): void {
+  const { repos } = engine;
+  repos.tx(() => {
+    const cur = repos.operations.get(opId);
+    const rp = cur ? payloadOf(cur).route : undefined;
+    if (!cur || cur.status !== 'waiting' || !rp) return;
+    const ending: RouteEnding = { phase: patch.phase ?? cur.phase, status: patch.status ?? cur.status, error: patch.error ?? null, step, cancelOutbox };
+    repos.operations.update(opId, { status: 'running', payload: { ...payloadOf(cur), route: { ...rp, ending } } });
+  });
 }
 
 export function isActiveEnvironment(engine: Engine, environmentId: string): boolean {
@@ -240,9 +562,21 @@ function routeSnapshot(route: RouteStateRecord): ActivationSnapshot {
 }
 
 class RouteFailure extends Error {
-  constructor(readonly body: ApiErrorBody) {
+  /**
+   * @param observedSelection 失败的检查自己读到的 SFE-ROUTE 选择（例如开始重测时读到与记录不一致的选择）：结束点重读失败时
+   *   据此失败即关闭（EndHoldOptions.observedSelection）；没有读到时不传。
+   */
+  constructor(
+    readonly body: ApiErrorBody,
+    readonly observedSelection?: string | null,
+  ) {
     super(body.message);
   }
+}
+
+/** 失败的检查自己读到的 SFE-ROUTE 选择（RouteFailure.observedSelection）；其他错误为 undefined。 */
+function observedSelectionOf(err: unknown): string | null | undefined {
+  return err instanceof RouteFailure ? err.observedSelection : undefined;
 }
 
 function failBody(engine: Engine, err: unknown, fallback: string): ApiErrorBody {
@@ -272,9 +606,12 @@ async function segmentsChangedBefore(engine: Engine, route: RouteStateRecord): P
 
 /**
  * 写入之前失败（第 1–3 步）：本操作经 supersedeWaiting 接手了过渡中的路由（被取代的激活停在 VERIFY_ONLY 等待，
- * 切换中或回滚中）时，没有其他操作负责它——按激活快照回滚（阻断并恢复切换前节点）；否则只标为失败，不碰路由。
+ * 切换中或回滚中）时，没有其他操作负责它——按激活快照回滚（阻断并恢复切换前节点）；否则标为失败，不改写入口。
+ * 后者同样是路由操作的结束点（endRouteOp → holdAtRouteEnd）：接手的路由已不在过渡中（例如启动对账或周期对账发现有规则排在
+ * 入口之前，把等待实测的路由改为 attention、入口 UNKNOWN），Surge 仍加载着检测入口、SFE-ROUTE 选着未验证的节点时，失败即
+ * 关闭改选 REJECT，从不把检测主机留在未验证的出口上。
  */
-async function failBeforeSwitch(engine: Engine, opId: string, body: ApiErrorBody): Promise<void> {
+async function failBeforeSwitch(engine: Engine, opId: string, body: ApiErrorBody, observedSelection?: string | null): Promise<void> {
   const cur = engine.repos.operations.get(opId)!;
   if (cur.status !== 'running' && cur.status !== 'queued') return;
   const route = engine.repos.routeState.get();
@@ -282,7 +619,7 @@ async function failBeforeSwitch(engine: Engine, opId: string, body: ApiErrorBody
     await rollbackActivation(engine, opId, body, engine.entryController(() => opId), route.entryMode);
     return;
   }
-  engine.updateOp(opId, { phase: 'FAILED', status: 'failed', error: body }, body.message, { route: true });
+  await endRouteOp(engine, opId, { phase: 'FAILED', status: 'failed', error: body }, body.message, { route: true }, { observedSelection });
 }
 
 const TRANSITION_PHASES: readonly RouteStateRecord['phase'][] = ['switching', 'awaiting_safari_verify', 'rolling_back'];
@@ -293,18 +630,23 @@ const TRANSITION_PHASES: readonly RouteStateRecord['phase'][] = ['switching', 'a
  * Surge 可能仍加载着检测或使用中入口，SFE-ROUTE 选着未验证的节点，对账只标 attention、从不写 Surge（§6.6）。这里按回滚无法
  * 确认的同一规则失败即关闭：选择不是使用中环境已验证的出口时 SFE-ROUTE 尽力改选 REJECT 并读回（处理器中断在哪一步未知，记录的
  * 入口模式不能作为依据）；路由 attention、入口 UNKNOWN 并带 entry_unverified，操作 BLOCKED_NEEDS_ATTENTION，说明如实写明。
- * 本操作不负责过渡中的路由时什么也不做。从不抛出。
+ * 本操作是不负责过渡中路由的路由操作时，这同样是它的结束点：按 holdAtRouteEnd 失败即关闭（需要时改选 REJECT 并记下），操作记为
+ * 需要处理（BLOCKED_NEEDS_ATTENTION）、说明写明改选；不需要改选时什么也不做，交给执行器记录。其他操作什么也不做。从不抛出。
  */
 export async function settleAbandonedTransition(engine: Engine, opId: string, err: unknown): Promise<void> {
   const { repos } = engine;
   try {
     const route = repos.routeState.get();
-    if (route.operationId !== opId || !TRANSITION_PHASES.includes(route.phase)) return;
+    if (route.operationId !== opId || !TRANSITION_PHASES.includes(route.phase)) {
+      await settleAbandonedRouteOp(engine, opId, err);
+      return;
+    }
     const hold = (await selectionIsVerifiedExit(engine, route)) ? null : await selectRejectBestEffort(engine);
     const cause = holdErrorText(engine, err, '内部错误');
+    const written = activeWrittenUncovered(engine, opId, repos.routeState.get().activeEnvironmentId);
     const body: ApiErrorBody = {
       code: 'UNKNOWN_STATE',
-      message: `切换中断：处理中出现意外错误（${cause}），入口状态未知，需要处理${hold ? `；${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}` : ''}`,
+      message: `切换中断：处理中出现意外错误（${cause}），入口状态未知，需要处理${hold ? `；${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}` : ''}${written ? `；${activeWrittenNote(written)}` : ''}`,
       details: hold ? { rejectSelected: hold.confirmed } : {},
     };
     // 视图随之改变的环境：本操作的目标（切换中、检测中 → 未使用）、路由记录的使用中环境（→ 路由状态需要处理），以及普通模式
@@ -324,6 +666,7 @@ export async function settleAbandonedTransition(engine: Engine, opId: string, er
       const warnings = new Set<RouteWarning>(fresh.warnings.filter((w) => w !== 'rollback_needs_reverify'));
       warnings.add('entry_unverified');
       if (hold) holdExistingConnections(engine, opId, warnings);
+      if (written) warnings.add('managed_windows_on_original_rules');
       repos.routeState.update({
         phase: 'attention',
         entryMode: 'UNKNOWN',
@@ -342,6 +685,34 @@ export async function settleAbandonedTransition(engine: Engine, opId: string, er
   } catch (e) {
     engine.log('error', 'route.settle_failed', { operationId: opId, error: e instanceof Error ? e.name : 'unknown' });
   }
+}
+
+/**
+ * settleAbandonedTransition 中不负责过渡中路由的路由操作（激活、普通模式、重测，或带路由参数的发布）：处理器的意外异常越过了它
+ * 自己的结束点，按 holdAtRouteEnd 失败即关闭；改选了就在这里结束为需要处理（heldEnd；执行器看到已结束，不再覆盖），否则交给
+ * 执行器记录。
+ */
+async function settleAbandonedRouteOp(engine: Engine, opId: string, err: unknown): Promise<void> {
+  const { repos } = engine;
+  const op = repos.operations.get(opId);
+  if (!op || (op.status !== 'running' && op.status !== 'queued' && op.status !== 'waiting')) return;
+  const isRoute = op.kind === 'route.activate' || op.kind === 'route.normal' || op.kind === 'probe.safari' || payloadOf(op).route !== undefined;
+  if (!isRoute) return;
+  const hold = await holdAtRouteEnd(engine, opId);
+  if (!hold) return;
+  const failure = engine.errorBody(err, '执行失败：内部错误');
+  const end = heldEnd({ phase: 'FAILED', status: 'failed', error: failure }, failure.message, hold);
+  const activeBefore = repos.routeState.get().activeEnvironmentId;
+  repos.tx(() => {
+    // 在事务中重读：改选的 Surge 调用期间本操作可能已由其他路径结束（不覆盖）
+    const cur = repos.operations.get(opId);
+    if (!cur || (cur.status !== 'running' && cur.status !== 'queued' && cur.status !== 'waiting')) return;
+    recordEndHold(engine, opId, hold);
+    repos.operations.update(opId, { ...end.patch, result: { ...(cur.result ?? {}), rejectSelected: hold.confirmed } });
+    repos.operations.appendStep(opId, 'BLOCKED_NEEDS_ATTENTION', end.step);
+    repos.outbox.cancelForOperation(opId);
+  });
+  engine.emit({ operations: [opId], route: true, environments: [...(op.environmentId ? [op.environmentId] : []), ...(activeBefore ? [activeBefore] : [])] });
 }
 
 /** 本操作负责一个过渡中的路由（切换中、VERIFY_ONLY 等待、回滚中，且有激活快照）：失败或中断都只能按快照回滚。 */
@@ -463,13 +834,13 @@ function replacedTarget(engine: Engine, p: RoutePayload): string | null {
  * 已被替换时不碰 Surge：活动环境发布结束为 READY_FOR_NEXT_OPEN（返回 true），激活失败（RouteFailure），路由未改变；经取代接手了
  * 过渡中的路由时由 failBeforeSwitch 按快照回滚。
  */
-function stopIfReplaced(engine: Engine, opId: string): boolean {
+async function stopIfReplaced(engine: Engine, opId: string): Promise<boolean> {
   const { repos } = engine;
   const op = repos.operations.get(opId)!;
   const replaced = replacedTarget(engine, routePayload(op));
   if (!replaced) return false;
   if (PUBLISH_KINDS.includes(op.kind) && !ownsTransition(repos.routeState.get(), opId)) {
-    endReplacedPublish(engine, opId, replaced);
+    await endReplacedPublish(engine, opId, replaced);
     return true;
   }
   throw new RouteFailure({ code: 'NODE_NOT_DEPLOYED', message: `激活失败：${replaced}，路由未改变，请重新使用此环境` });
@@ -477,25 +848,27 @@ function stopIfReplaced(engine: Engine, opId: string): boolean {
 
 /**
  * 活动环境发布的目标版本已被替换（replacedTarget），而本操作还没有写入 Surge、也不负责过渡中的路由：不切换，结束为
- * READY_FOR_NEXT_OPEN（succeeded，没有错误；更新的版本由它自己的发布在下次打开时切换），路由未改变。
+ * READY_FOR_NEXT_OPEN（succeeded，没有错误；更新的版本由它自己的发布在下次打开时切换），路由未改变（结束点照常按 holdAtRouteEnd
+ * 失败即关闭）。
  */
-function endReplacedPublish(engine: Engine, opId: string, why: string): void {
-  const { repos } = engine;
-  const op = repos.operations.get(opId)!;
-  repos.tx(() => {
-    repos.operations.update(opId, { phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded' });
-    repos.operations.appendStep(opId, 'READY_FOR_NEXT_OPEN', `${why}：不切换到这一版本，路由未改变`);
-    repos.outbox.cancelForOperation(opId);
-  });
+async function endReplacedPublish(engine: Engine, opId: string, why: string): Promise<void> {
+  const op = engine.repos.operations.get(opId)!;
   const target = payloadOf(op).route?.targetEnvironmentId ?? op.environmentId;
-  engine.emit({ operations: [opId], environments: target ? [target] : [] });
+  await endRouteOp(
+    engine,
+    opId,
+    { phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded' },
+    `${why}：不切换到这一版本，路由未改变`,
+    { environments: target ? [target] : [] },
+    { cancelOutbox: true },
+  );
 }
 
 /** 停在 WAITING_ROUTE 的发布的目标版本已被替换：结束为 READY_FOR_NEXT_OPEN，返回是否已结束。 */
-function endReplacedWaitingRoute(engine: Engine, op: OperationRecord): boolean {
+async function endReplacedWaitingRoute(engine: Engine, op: OperationRecord): Promise<boolean> {
   const why = replacedTarget(engine, routePayload(op));
   if (!why) return false;
-  endReplacedPublish(engine, op.id, why);
+  await endReplacedPublish(engine, op.id, why);
   return true;
 }
 
@@ -567,7 +940,8 @@ export async function runActivation(engine: Engine, op: OperationRecord): Promis
   try {
     await prepareAndSwitch(engine, op.id, { allowReuse: p.flow === 'activate' });
   } catch (err) {
-    await failBeforeSwitch(engine, op.id, failBody(engine, err, '激活失败：内部错误'));
+    // 复用改为重测时开始等待读到的不一致选择（observedSelectionOf）随结束点传入
+    await failBeforeSwitch(engine, op.id, failBody(engine, err, '激活失败：内部错误'), observedSelectionOf(err));
   }
 }
 
@@ -584,7 +958,7 @@ async function prepareAndSwitch(engine: Engine, opId: string, opts: { allowReuse
   // 受理之后目标版本已被之后的修改替换（排队期间、停在 WAITING_ROUTE 期间、崩溃恢复时又改了代理）：不读也不写 Surge。活动环境
   // 发布结束为 READY_FOR_NEXT_OPEN（更新的版本由它自己的发布切换）；激活失败，路由未改变。经取代接手了过渡中的路由时由
   // failBeforeSwitch 按快照回滚
-  if (stopIfReplaced(engine, opId)) return;
+  if (await stopIfReplaced(engine, opId)) return;
   await engine.readBasicFacts();
   const missing = engine.activationMissing();
   if (missing.length > 0) throw new RouteFailure(capabilityFailure(engine, missing, '激活失败：', '尚未通过实测'));
@@ -697,6 +1071,18 @@ async function checkSwitchPreconditions(engine: Engine, p: RoutePayload, ctrl: E
     throw new RouteFailure({ code: 'TAKEOVER_LOST', message: '激活失败：Surge 出站模式不是规则模式，路由未改变' });
   }
   const readback = await ctrl.read();
+  // 本应用入口尚未写入工作配置（例如更改入口策略之后尚未重新合并，EntryReadback.notInstalled）：没有可切换的入口，写入之前停止
+  if (readback.notInstalled) {
+    throw new RouteFailure({ code: 'RESOURCE_MISSING', message: '激活失败：本应用入口尚未写入工作配置（更改入口策略之后需要先在维护中重新合并），路由未改变' });
+  }
+  // 入口段不完整、重复或顺序不对（ruleset_resource 的四条 RULE-SET，EntryReadback.segmentDamaged；例如用户在 Surge 中编辑或恢复了
+  // 工作配置）：按位先后的切换无法规划、读回无法确认，写入之前停止。普通模式会把入口文件改写为占位规则，之后重新合并恢复受管理段
+  if (readback.segmentDamaged) {
+    throw new RouteFailure({
+      code: 'RESOURCE_MISSING',
+      message: '激活失败：本应用入口的 RULE-SET 不在有效规则中、重复或顺序不对（工作配置被外部修改），路由未改变；请先进入普通模式，再在维护中重新合并',
+    });
+  }
   if (readback.precedenceIssues.some((i) => i.severity === 'blocking')) {
     throw new RouteFailure({
       code: 'PRECEDENCE_VIOLATION',
@@ -739,7 +1125,7 @@ async function executeSwitch(engine: Engine, opId: string, ctrl: EntryController
   const missingNow = engine.activationMissing();
   if (missingNow.length > 0) throw new RouteFailure(capabilityFailure(engine, missingNow, '激活失败：', '在检查期间已不再满足，路由未改变'));
   // 第 1–3 步的读取与独立预检期间又改了代理（保存了更新的版本）：第一次写入之前停下，不阻断、不断连、不改选到被替换的节点
-  if (stopIfReplaced(engine, opId)) return;
+  if (await stopIfReplaced(engine, opId)) return;
   const before = repos.routeState.get();
   const snapshot = routeSnapshot(before);
   snapshot.previousSafariProbeId =
@@ -838,7 +1224,8 @@ export async function runProbeSafari(engine: Engine, op: OperationRecord): Promi
     await startProbeWaiting(engine, op.id, ctrl);
   } catch (err) {
     const body = failBody(engine, err, '重新检测失败：内部错误');
-    engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message);
+    // 开始等待时读到 SFE-ROUTE 选择与记录不一致：结束点重读失败时据此改选（observedSelectionOf）
+    await endRouteOp(engine, op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message, {}, { observedSelection: observedSelectionOf(err) });
   }
 }
 
@@ -855,7 +1242,7 @@ async function startProbeWaiting(engine: Engine, opId: string, ctrl: EntryContro
   const readback = await ctrl.read();
   if (readback.mode !== 'ACTIVE') throw new RouteFailure({ code: 'UNKNOWN_STATE', message: '重新检测失败：Safari 入口读回不是使用中模式' });
   const sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-  if (sel !== route.selectedNode || sel === null) throw new RouteFailure({ code: 'READBACK_MISMATCH', message: '重新检测失败：SFE-ROUTE 选择与记录不一致' });
+  if (sel !== route.selectedNode || sel === null) throw new RouteFailure({ code: 'READBACK_MISMATCH', message: '重新检测失败：SFE-ROUTE 选择与记录不一致' }, sel);
   const deadline = addSeconds(engine, repos.settings.get('profileArrivalTimeoutSec'));
   repos.tx(() => {
     const op = repos.operations.get(opId)!;
@@ -888,6 +1275,9 @@ export async function resumeRoute(engine: Engine, op: OperationRecord, reason: s
     case 'verify_submitted':
       await completeVerification(engine, op);
       return;
+    case 'route_lost':
+      await endLostRetest(engine, op);
+      return;
     case 'arrival_timeout':
     case 'verify_timeout':
       await handleTimeout(engine, op, reason);
@@ -913,7 +1303,7 @@ async function continueWaitingRoute(engine: Engine, op: OperationRecord): Promis
     return;
   }
   // 目标版本已被之后的修改替换：不切换到用户已替换的出口
-  if (endReplacedWaitingRoute(engine, latest)) return;
+  if (await endReplacedWaitingRoute(engine, latest)) return;
   // 路由忙（其他切换进行中或等待中）：继续等待，从不取代已开始的切换
   const others = repos.operations
     .listByStatus(['queued', 'running', 'waiting'])
@@ -946,7 +1336,7 @@ async function handleTimeout(engine: Engine, op: OperationRecord, reason: string
     if (p.verifyDeadline === null || Date.parse(p.verifyDeadline) > now) return;
   }
   if (op.phase === 'WAITING_ROUTE') {
-    engine.updateOp(op.id, { phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded' }, '场景未在截止时间内到达：新版本已部署，路由未改变，下次打开时切换');
+    await endRouteOp(engine, op.id, { phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded' }, '场景未在截止时间内到达：新版本已部署，路由未改变，下次打开时切换');
     return;
   }
   const body: ApiErrorBody = {
@@ -954,8 +1344,8 @@ async function handleTimeout(engine: Engine, op: OperationRecord, reason: string
     message: reason === 'arrival_timeout' ? 'Safari 实测超时：绑定场景未在截止时间内到达' : 'Safari 实测超时：未在截止时间内完成出口检测',
   };
   if (p.flow === 'probe') {
-    const cleared = clearProbeDeadline(engine, p);
-    engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message, { route: cleared });
+    // 检测截止时间由结束事务按重读的 payload 清除（endRouteOp）
+    await endRouteOp(engine, op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message);
     return;
   }
   await rollbackFromWaiting(engine, op.id, body);
@@ -964,19 +1354,41 @@ async function handleTimeout(engine: Engine, op: OperationRecord, reason: string
 async function handleCancel(engine: Engine, op: OperationRecord): Promise<void> {
   const p = routePayload(op);
   if (op.phase === 'WAITING_ROUTE') {
-    engine.updateOp(op.id, { phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded' }, '已取消切换：新版本已部署，路由未改变');
-    engine.repos.outbox.cancelForOperation(op.id);
+    await endRouteOp(engine, op.id, { phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded' }, '已取消切换：新版本已部署，路由未改变', {}, { cancelOutbox: true });
     return;
   }
   const body: ApiErrorBody = { code: 'SUPERSEDED', message: '已取消：切换未完成' };
   if (p.flow === 'probe') {
-    const cleared = clearProbeDeadline(engine, p);
-    engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: { ...body, message: '已取消重新检测：路由未改变' } }, '已取消重新检测，路由未改变', { route: cleared });
-    engine.repos.outbox.cancelForOperation(op.id);
+    await endRouteOp(
+      engine,
+      op.id,
+      { phase: 'FAILED', status: 'failed', error: { ...body, message: '已取消重新检测：路由未改变' } },
+      '已取消重新检测，路由未改变',
+      {},
+      { cancelOutbox: true },
+    );
     return;
   }
   // 只写明请求本身：回滚能否恢复原节点并保持阻断要到回滚读回之后才知道（无法确认时改选 REJECT 并要求处理，第 14 步）
   await rollbackFromWaiting(engine, op.id, { ...body, message: '已取消切换' });
+}
+
+/**
+ * 绑定场景已到达，而等待中的重新检测的路由已不在已验证的使用中状态（verification.ts 排入 route_lost）：这次重测再也无法签发检测
+ * 编号（retestRouteLost），立即结束（FAILED），不等到达截止时间、不说「场景未到达」；结束说明与结果按 endRouteOp 写明路由在
+ * 等待期间已不在已验证的状态（routeLeftVerified）。已受理的取消优先；路由又已是已验证的（不会发生）时继续等待。
+ */
+async function endLostRetest(engine: Engine, op: OperationRecord): Promise<void> {
+  const latest = engine.repos.operations.get(op.id) ?? op;
+  const p = routePayload(latest);
+  if (latest.status !== 'waiting' || p.flow !== 'probe' || p.stage !== 'probe_waiting') return;
+  if (p.cancelRequested) {
+    await handleCancel(engine, latest);
+    return;
+  }
+  if (!retestRouteLost(engine.repos.routeState.get())) return;
+  const body: ApiErrorBody = { code: 'UNKNOWN_STATE', message: '重新检测已结束：绑定场景已到达，但无法开始检测' };
+  await endRouteOp(engine, op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message, {}, { cancelOutbox: true });
 }
 
 async function rollbackFromWaiting(engine: Engine, opId: string, failure: ApiErrorBody): Promise<void> {
@@ -1020,8 +1432,11 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
   const cfg = engine.entryConfig();
   let failure: ApiErrorBody | null = null;
   let evidence: ReturnType<typeof findVerificationRequest>['match'] = null;
+  // 核对读到的 SFE-ROUTE 选择（读不到为 undefined）：重测失败时随结束点传入（EndHoldOptions.observedSelection）
+  let observedSelection: string | null | undefined;
   try {
     const sel = await currentSelection(engine);
+    observedSelection = sel;
     if (sel !== p.nodeName) failure = { code: 'SAFARI_VERIFY_FAILED', message: 'Safari 实测失败：提交后 SFE-ROUTE 选择已不是目标节点' };
     if (!failure) {
       const bf = browserFailure(p);
@@ -1050,7 +1465,17 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
   }
 
   if (p.flow === 'probe') {
-    finishProbe(engine, op.id, p, failure, evidence);
+    if (!failure) {
+      // 通过时出口刚经实测，不改选；记下是同步的
+      finishProbe(engine, op.id, p, null, probeEvidence(evidence), null);
+      return;
+    }
+    // 重测失败同样是路由操作的结束点（holdAtRouteEnd），结束点还要读写 Surge：先记下判定（RoutePayload.verdict），期间服务崩溃时
+    // 崩溃恢复按它重新结束（recoverRoute），不重新开始检测——否则不符或失败的结果丢失，订单与填充继续
+    const verdict: ProbeVerdict = { failure, evidence: probeEvidence(evidence), ...(observedSelection !== undefined ? { observedSelection } : {}) };
+    savePayload(engine, op.id, { verdict });
+    const hold = await holdAtRouteEnd(engine, op.id, { observedSelection });
+    finishProbe(engine, op.id, p, failure, verdict.evidence, hold);
     return;
   }
   if (failure) {
@@ -1088,7 +1513,12 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
   // 核对期间受理的普通模式排在本操作之后：不写入 ACTIVE、不提交（否则普通模式受理时针对的使用中环境已被换掉），路由交给它
   if (yieldToQueuedNormal(engine, op.id, '实测已通过核对，但在进入使用中模式（ACTIVE）之前停下，未提交')) return;
   try {
-    markSafariMayUseRoute(engine, op.id, engine.entryConfig().processPaths);
+    // 写入之前记下（同一事务）：从此 Safari 可能经 SFE-ROUTE 发出（持久标记），目标环境的窗口可能经过它的出口——之后回滚时据此
+    // 带旧窗口警告（activeWrittenUncovered）
+    repos.tx(() => {
+      markSafariMayUseRoute(engine, op.id, engine.entryConfig().processPaths);
+      savePayload(engine, op.id, { activeWriteStarted: true });
+    });
     await ctrl.transition('ACTIVE');
   } catch (err) {
     await rollbackActivation(engine, op.id, engine.errorBody(err, '切换失败：进入使用中模式失败'), ctrl, runtimeConfirmedModeFrom(err, 'VERIFY_ONLY'));
@@ -1130,7 +1560,7 @@ async function rollbackFromWaitingRunning(engine: Engine, opId: string, failure:
   await rollbackActivation(engine, opId, failure, ctrl, engine.repos.routeState.get().entryMode);
 }
 
-function probeEvidence(evidence: ReturnType<typeof findVerificationRequest>['match']) {
+function probeEvidence(evidence: ReturnType<typeof findVerificationRequest>['match']): SafariProbeEvidence {
   if (!evidence) return {};
   return {
     surgeRequestId: evidence.id,
@@ -1150,7 +1580,7 @@ function insertSafariProbe(
   outcome: 'ok' | 'failed' | 'mismatch',
   entryMode: EntryMode,
   routeEpoch: number,
-  evidence: ReturnType<typeof findVerificationRequest>['match'],
+  evidence: SafariProbeEvidence,
   message: string | null,
 ) {
   const now = engine.now();
@@ -1168,7 +1598,7 @@ function insertSafariProbe(
     entryMode,
     testId: sub.testId,
     operationId: opId,
-    ...probeEvidence(evidence),
+    ...evidence,
     chainEvidence: '出口由 Safari 场景实测；前置链路依赖 external_node_underlying_proxy 实测，不以出口 IP 作为链路证明',
     browserHttpStatus: sub.httpStatus,
     browserStartedAt: sub.startedAt,
@@ -1188,20 +1618,13 @@ function probeDeadlineCleared(route: RouteStateRecord, p: RoutePayload): { await
   return p.verifyDeadline !== null && route.awaitingDeadline === p.verifyDeadline ? { awaitingDeadline: null } : {};
 }
 
-/** probeDeadlineCleared 的单独写入版本；返回是否改变了路由记录。 */
-function clearProbeDeadline(engine: Engine, p: RoutePayload): boolean {
-  const patch = probeDeadlineCleared(engine.repos.routeState.get(), p);
-  if (!('awaitingDeadline' in patch)) return false;
-  engine.repos.routeState.update(patch);
-  return true;
-}
-
 function finishProbe(
   engine: Engine,
   opId: string,
   p: RoutePayload,
   failure: ApiErrorBody | null,
-  evidence: ReturnType<typeof findVerificationRequest>['match'],
+  evidence: SafariProbeEvidence,
+  hold: RejectHold | null = null,
 ): void {
   const { repos } = engine;
   const route = repos.routeState.get();
@@ -1225,12 +1648,25 @@ function finishProbe(
     repos.routeState.update({ warnings: [...route.warnings, w], ...probeDeadlineCleared(route, p) });
     // 记下加到路由上的警告：准备页只在有它时说「已停止自动打开订单与填充」（取消、超时与开始等待之前的失败不加警告，路由与
     // 之前的检测结果都不变）
+    // 结束点改选了 SFE-ROUTE（holdAtRouteEnd）：路由已改变，按 heldEnd 结束为需要处理
+    recordEndHold(engine, opId, hold);
     const cur = repos.operations.get(opId)!;
-    repos.operations.update(opId, { phase: 'FAILED', status: 'failed', error: failure, result: { ...(cur.result ?? {}), probeWarning: w } });
-    repos.operations.appendStep(opId, 'FAILED', `${failure.message}；已停止自动打开订单与填充，路由未改变`);
+    // 核对期间对账已把路由改为不再已验证（Surge 重启、出站模式改变等）：不说「路由未改变」，写明路由的状态（routeLeftVerified）
+    const left = retestRouteLeftVerified(engine, p, hold);
+    const end = hold
+      ? heldEnd({ phase: 'FAILED', status: 'failed', error: failure }, `${failure.message}；已停止自动打开订单与填充，路由未改变`, hold)
+      : {
+          patch: { phase: 'FAILED' as const, status: 'failed' as const, error: failure },
+          step: left ? `${failure.message}${retestLostNote(left)}` : `${failure.message}；已停止自动打开订单与填充，路由未改变`,
+        };
+    repos.operations.update(opId, {
+      ...end.patch,
+      result: { ...(cur.result ?? {}), probeWarning: w, ...(hold ? { rejectSelected: hold.confirmed } : {}), ...(left ? { routeLeftVerified: left } : {}) },
+    });
+    repos.operations.appendStep(opId, end.patch.phase!, end.step);
     repos.outbox.cancelForOperation(opId);
   });
-  engine.emit({ operations: [opId], environments: [p.targetEnvironmentId], route: true });
+  engine.emit({ operations: [opId], environments: [...new Set([p.targetEnvironmentId, ...(route.activeEnvironmentId ? [route.activeEnvironmentId] : [])])], route: true });
 }
 
 function commitActive(engine: Engine, opId: string, p: RoutePayload, evidence: ReturnType<typeof findVerificationRequest>['match']): void {
@@ -1266,7 +1702,7 @@ function commitActive(engine: Engine, opId: string, p: RoutePayload, evidence: R
       warnings,
     });
     const after = repos.routeState.get();
-    insertSafariProbe(engine, opId, p, 'ok', 'VERIFY_ONLY', after.routeEpoch, evidence, 'Safari 实测通过');
+    insertSafariProbe(engine, opId, p, 'ok', 'VERIFY_ONLY', after.routeEpoch, probeEvidence(evidence), 'Safari 实测通过');
     repos.environments.update(p.targetEnvironmentId, { lastVerifiedProxyRevision: p.proxyRevision });
     repos.operations.update(opId, { phase: 'ACTIVE_VERIFIED', status: 'succeeded', resultRevision: p.proxyRevision, payload: { ...payloadOf(repos.operations.get(opId)!), route: { ...p, stage: 'done' } } });
     repos.operations.appendStep(opId, 'ACTIVE_VERIFIED', `已切换并通过 Safari 实测${warnings.length ? `（警告：${warnings.join('、')}）` : ''}`);
@@ -1347,6 +1783,7 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
       failureError: failure,
       needsReverify: hasPrevious,
     };
+    const written = activeWrittenUncovered(engine, opId, hasPrevious ? snapshot!.previousEnvironmentId : null);
     repos.tx(() => {
       // 普通模式未能确认 Safari 已离开买家出口的警告随持久标记保留：回滚不结束连接，第 7 步之后 Safari 可能已经经 SFE-ROUTE
       // 建立连接（检测），第 7 步也可能没有完成；由下一次普通模式结束。在事务中重读：回滚的 Surge 调用期间受理处理器可能已改过
@@ -1355,6 +1792,7 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
         .get()
         .warnings.filter((w) => w === 'managed_windows_on_original_rules' || w === 'takeover_unknown' || w === 'buyer_exit_connections_unconfirmed');
       if (segmentsChanged) keep.push('managed_segments_changed');
+      if (written && !keep.includes('managed_windows_on_original_rules')) keep.push('managed_windows_on_original_rules');
       repos.routeState.update({
         phase: 'failed',
         entryMode: 'BLOCKED',
@@ -1372,7 +1810,7 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
       repos.operations.appendStep(
         opId,
         'FAILED',
-        hasPrevious ? '已回滚：恢复切换前的节点，Safari 保持阻断，需要重新核验' : '切换失败：切换前没有已验证的路由，Safari 保持阻断',
+        `${hasPrevious ? '已回滚：恢复切换前的节点，Safari 保持阻断，需要重新核验' : '切换失败：切换前没有已验证的路由，Safari 保持阻断'}${written ? `；${activeWrittenNote(written)}` : ''}`,
       );
       repos.outbox.cancelForOperation(opId);
     });
@@ -1400,9 +1838,10 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
     // 不恢复切换前的节点，激活快照保留（之后的激活与回滚仍从最初的切换前状态出发）。有规则排在入口之前时同样改选：入口位即使
     // 已是阻断，排在它之前的规则也可能把 Safari 请求交给 SFE-ROUTE，而它选着本次切换写入的未验证节点。
     const hold = (mode === 'BLOCKED' || mode === 'NORMAL') && !precedence ? null : await selectRejectBestEffort(engine);
+    const written = activeWrittenUncovered(engine, opId, repos.routeState.get().activeEnvironmentId);
     const body: ApiErrorBody = {
       code: 'UNKNOWN_STATE',
-      message: `回滚无法确认：${where}，需要处理${hold ? `；${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}` : ''}`,
+      message: `回滚无法确认：${where}，需要处理${hold ? `；${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}` : ''}${written ? `；${activeWrittenNote(written)}` : ''}`,
       details: { cause: failure.code, ...(hold ? { rejectSelected: hold.confirmed } : {}) },
     };
     repos.tx(() => {
@@ -1414,6 +1853,7 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
       if (precedence) warnings.add('precedence_violation');
       if (segmentsChanged) warnings.add('managed_segments_changed');
       if (hold) holdExistingConnections(engine, opId, warnings);
+      if (written) warnings.add('managed_windows_on_original_rules');
       repos.routeState.update({
         phase: 'attention',
         entryMode: mode,
@@ -1460,6 +1900,7 @@ async function holdUnconfirmedRollback(
   engine.step(opId, `回到阻断：入口已按计划写入阻断，但${UNCONFIRMED_ENTRY_TEXT}，${load}`);
   const hold = await selectRejectBestEffort(engine);
   const p = routePayload(repos.operations.get(opId)!);
+  const written = activeWrittenUncovered(engine, opId, repos.routeState.get().activeEnvironmentId);
   const body: ApiErrorBody = {
     code: 'UNKNOWN_STATE',
     message:
@@ -1467,7 +1908,7 @@ async function holdUnconfirmedRollback(
       (hold.confirmed
         ? '未恢复切换前的节点，SFE-ROUTE 已改选 REJECT（读回确认），经 SFE-ROUTE 的 Safari 新连接都被拒绝、不会经任何买家出口建立'
         : `未恢复切换前的节点，但 SFE-ROUTE 未能改选 REJECT（${hold.error ?? '原因未知'}），Safari 请求（至少检测主机）可能仍经 SFE-ROUTE 当前选择的买家出口发出`) +
-      `；${EXISTING_CONNECTIONS_TEXT}。需要处理：进入普通模式，或等 rule match 可用后重新使用环境`,
+      `；${EXISTING_CONNECTIONS_TEXT}${written ? `；${activeWrittenNote(written)}` : ''}。需要处理：进入普通模式，或等 rule match 可用后重新使用环境`,
     details: { cause: failure.code, rejectSelected: hold.confirmed },
   };
   repos.tx(() => {
@@ -1476,6 +1917,7 @@ async function holdUnconfirmedRollback(
     if (segmentsChanged) warnings.add('managed_segments_changed');
     warnings.add('entry_unverified');
     holdExistingConnections(engine, opId, warnings);
+    if (written) warnings.add('managed_windows_on_original_rules');
     repos.routeState.update({
       phase: 'attention',
       entryMode: 'UNKNOWN',
@@ -1509,7 +1951,8 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
     const body = details
       ? needsConfirmationError('进入普通模式', details).toBody()
       : { code: 'NEEDS_CONFIRMATION' as const, message: '进入普通模式需要重新确认：使用中的环境已变化' };
-    engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message);
+    // 不碰入口；这同样是路由操作的结束点（holdAtRouteEnd）
+    await endRouteOp(engine, op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message);
     return;
   }
   // 受理时排在正在执行的路由操作之后（§6.3 并发矩阵）：其间停在等待中的激活与重测（VERIFY_ONLY 等待、重测等待）、WAITING_ROUTE
@@ -1521,6 +1964,7 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
     engine.step(op.id, '结束受理之后停在等待中的切换或检测（检测编号作废），由本次普通模式撤销本应用入口');
     engine.emit({ operations: touched, route: true, environments: waitingEnvironments(waiting) });
   }
+  endQueuedBefore(engine, op);
   const route = repos.routeState.get();
   const ctrl = engine.entryController(() => op.id);
   let confirmed: EntryMode = route.entryMode;
@@ -1625,6 +2069,9 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
         engine.step(op.id, alreadyNormalStep(ctrl.strategy, readback, true));
         tighteningUnconfirmed = readback.runtimeConfirmed === false;
         await kill(false, readback.runtimeConfirmed !== false);
+      } else if (readback.notInstalled) {
+        // 本应用入口尚未写入工作配置（例如更改入口策略之后尚未重新合并）：没有可撤销的入口，不写入、不结束连接，写明依据
+        engine.step(op.id, alreadyNormalStep(ctrl.strategy, readback, false));
       }
     } else if (route.entryMode !== 'NORMAL') {
       throw new SfeError('CAPABILITY_UNVERIFIED', '进入普通模式失败：入口策略或 Safari 进程路径不可用，无法撤销入口');
@@ -1798,6 +2245,39 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
 }
 
 /**
+ * 受理时排在本次普通模式之前、到它开始执行时仍在排队（尚未开始，从未写入 Surge）的激活、重测与带路由参数的发布
+ * （normal.queuedBehind）：按受理顺序它们应先执行，并在第一次写入之前让给排队的普通模式（yieldBeforeFirstWrite）——普通模式
+ * 先开始执行只可能是领取顺序被打乱（同组内按可用时间排序，墙上时钟在两次受理之间回拨时受理在后的普通模式反而更早；可用时间
+ * 未到的条目也不能领取）。旧请求的结果不能覆盖新请求（方案 1 设计「多环境争抢」）：在这里按它们本来的结局结束——激活与重测
+ * SUPERSEDED（superseded_by 为本次普通模式），活动环境发布 READY_FOR_NEXT_OPEN（新版本已部署、未切换）——否则它们会在普通模式
+ * 完成之后执行，重新阻断 Safari、写入检测入口。排队的普通模式不在其中（之后再执行一次只是重复撤销）。
+ */
+function endQueuedBefore(engine: Engine, op: OperationRecord): void {
+  const { repos } = engine;
+  const behind = payloadOf(repos.operations.get(op.id) ?? op).normal?.queuedBehind ?? [];
+  const ended: OperationRecord[] = [];
+  repos.tx(() => {
+    for (const id of behind) {
+      const o = repos.operations.get(id);
+      if (!o || o.id === op.id || o.status !== 'queued' || o.kind === 'route.normal') continue;
+      if (PUBLISH_KINDS.includes(o.kind)) {
+        repos.operations.update(o.id, { phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', supersededBy: op.id });
+        repos.operations.appendStep(o.id, 'READY_FOR_NEXT_OPEN', '新版本已部署，未切换：受理在后的进入普通模式已先开始执行（本操作尚未开始、没有写入 Surge），路由未改变');
+      } else {
+        repos.operations.update(o.id, { phase: 'SUPERSEDED', status: 'superseded', supersededBy: op.id, error: { code: 'SUPERSEDED', message: '已被进入普通模式取代' } });
+        repos.operations.appendStep(o.id, 'SUPERSEDED', '已被进入普通模式取代：受理在后的普通模式已先开始执行（本操作尚未开始，没有写入 Surge），由普通模式从当前状态进入普通模式');
+      }
+      repos.outbox.cancelForOperation(o.id);
+      ended.push(o);
+    }
+  });
+  if (ended.length === 0) return;
+  engine.step(op.id, '结束受理在前、仍在排队的切换或检测（尚未开始，没有写入 Surge），由本次普通模式从当前状态进入普通模式');
+  const envs = ended.map((o) => payloadOf(o).route?.targetEnvironmentId ?? o.environmentId).filter((e): e is string => e !== null && e !== undefined);
+  engine.emit({ operations: ended.map((o) => o.id), environments: envs });
+}
+
+/**
  * 交给本次普通模式、已把入口写入使用中模式（ACTIVE 读回确认、未提交）的切换目标（normal.handedOverActiveTarget，
  * yieldToQueuedNormal），且受理时的旧窗口确认针对的不是它：它的窗口已经过它的出口、未经确认。在执行时重读操作——停下的切换
  * 在受理之后才把目标记入本操作。label 是带引号的环境名（环境不存在时为空）。
@@ -1825,6 +2305,9 @@ async function blockForNormal(
   witnessConfirmed: boolean;
   alreadyNormal: boolean;
   blockKeptOff: boolean;
+  notInstalled: boolean;
+  segmentDamaged: boolean;
+  rewrote: string[] | undefined;
 }> {
   try {
     const rb = await ctrl.transition('BLOCKED', undefined, { ...undo, towardNormal: true });
@@ -1839,6 +2322,9 @@ async function blockForNormal(
       witnessConfirmed: rb.witnessConfirmed !== false,
       alreadyNormal: rb.mode === 'NORMAL',
       blockKeptOff,
+      notInstalled: rb.notInstalled === true,
+      segmentDamaged: rb.segmentDamaged === true,
+      rewrote: rb.rewrote,
     };
   } catch (err) {
     if (err instanceof SfeError && err.code === 'PRECEDENCE_VIOLATION' && confirmedModeFrom(err, 'UNKNOWN') === 'BLOCKED') {
@@ -1850,6 +2336,9 @@ async function blockForNormal(
         witnessConfirmed: err.details?.witnessConfirmed !== false,
         alreadyNormal: false,
         blockKeptOff: false,
+        notInstalled: false,
+        segmentDamaged: false,
+        rewrote: undefined,
       };
     }
     throw err;
@@ -1868,22 +2357,38 @@ function blockingCount(issues: EntryReadback['precedenceIssues']): number {
  */
 function alreadyNormalStep(
   strategy: EntryController['strategy'],
-  rb: { runtimeConfirmed?: boolean; witnessConfirmed?: boolean },
+  rb: { runtimeConfirmed?: boolean; witnessConfirmed?: boolean; notInstalled?: boolean; segmentDamaged?: boolean; rewrote?: string[] },
   kill: boolean,
 ): string {
   const files = '入口 RULE-SET 仍在有效规则中，本应用入口规则集文件已全部为占位规则';
+  const confirmation = rb.runtimeConfirmed === false ? `只按有效规则列表与文件内容判断：${UNCONFIRMED_ENTRY_TEXT}` : 'Safari 与对照的运行时探测读回确认';
   const cause =
     strategy === 'temp_rule'
       ? 'Surge 中没有本应用的入口规则，例如重启时已丢弃或已被移除'
-      : rb.runtimeConfirmed === false
-        ? `${files}，只按文件内容判断：${UNCONFIRMED_ENTRY_TEXT}`
-        : rb.witnessConfirmed === false
-          ? `${files}，有文件没有见证规则（旧格式）：只由 Safari 与对照的运行时探测读回确认，未经见证确认 Surge 已加载的是文件中的这一版`
-          : `${files}，见证与运行时探测读回确认 Surge 已加载`;
+      : rb.segmentDamaged === true
+        ? `本应用入口的 RULE-SET 在 Surge 的有效规则中不完整或顺序不对（工作配置被外部修改）：${
+            rb.rewrote && rb.rewrote.length > 0
+              ? `已把入口规则集文件改写为占位规则（${rb.rewrote.join('、')}；只关闭位，在有效规则中的${
+                  rb.runtimeConfirmed === false ? '未经见证确认已加载（rule match 不可用时按文件监视上限等满）' : '由见证确认已加载'
+                }，不在其中的 Surge 不加载）`
+              : '入口规则集文件已全部为占位规则'
+          }，${
+            // 未经见证与运行时求值确认：文件监视比上限慢时 Surge 仍加载着改写之前的入口（只关闭位，从不新开经 SFE-ROUTE 的路径）
+            rb.runtimeConfirmed === false ? 'Surge 加载占位规则之后 Safari 按原规则发出（文件监视比上限慢时可能仍加载着改写之前的入口）' : 'Safari 按原规则发出'
+          }；${confirmation}；需要在维护中重新合并恢复受管理段`
+        : rb.notInstalled === true
+          ? `本应用入口尚未写入工作配置：四条入口 RULE-SET 都不在 Surge 的有效规则中，例如更改入口策略之后尚未重新合并${
+              rb.rewrote && rb.rewrote.length > 0 ? `，或工作配置中的入口段被外部删去（已把入口规则集文件改写为占位规则：${rb.rewrote.join('、')}，重新合并恢复入口段之后 Surge 加载的也是普通模式）` : ''
+            }；${rb.runtimeConfirmed === false ? `只按有效规则列表判断：${UNCONFIRMED_ENTRY_TEXT}` : 'Safari 与对照的运行时探测读回确认'}`
+          : rb.runtimeConfirmed === false
+            ? `${files}，只按文件内容判断：${UNCONFIRMED_ENTRY_TEXT}`
+            : rb.witnessConfirmed === false
+              ? `${files}，有文件没有见证规则（旧格式）：只由 Safari 与对照的运行时探测读回确认，未经见证确认 Surge 已加载的是文件中的这一版`
+              : `${files}，见证与运行时探测读回确认 Surge 已加载`;
   const tail = kill
     ? '仍结束 Safari 可能经买家出口的旧连接（按原规则发出的连接不在买家出口上，不结束）'
     : '路由记录是空闲的普通模式，且没有 Safari 可能经 SFE-ROUTE 的记录（从未激活，或上一次确认结束 Safari 连接、入口经运行时求值确认的普通模式之后本应用没有写入检测或使用中入口）：不结束 Safari 连接';
-  return `入口已是普通模式（${cause}）：不需要阻断，未写入；${tail}`;
+  return `入口已是普通模式（${cause}）：不需要阻断，${rb.rewrote && rb.rewrote.length > 0 ? '未写入阻断' : '未写入'}；${tail}`;
 }
 
 /**
@@ -1929,18 +2434,34 @@ async function killForNormal(engine: Engine, opId: string, entryBlocksSafari: bo
  * 回滚（先读事实）。经 supersedeWaiting 接手了过渡中路由的激活（路由 epoch 已递增，但它自己的 routeEpoch 仍为空、
  * stage 仍是 pending）以及已开始回滚的操作也属于后者：从不把一次已开始的回滚重放成切换。
  * 已开始写入、而路由已记在另一个操作名下（route.operationId 不是它）：路由已由之后的操作接手（例如受理在后的普通模式已从
- * 当时的状态撤销本应用入口）——不回滚、不写入 Surge，记为 SUPERSEDED，否则旧操作的回滚会覆盖新请求的结果（重新阻断已进入
- * 普通模式的 Safari，方案 1 设计「多环境争抢」）。执行器先领取崩溃恢复中的操作（executor.ts claimPreference），正常不会走到
- * 这里；这是第二道防线。
+ * 当时的状态撤销本应用入口）——不回滚、不改写入口，记为 SUPERSEDED，否则旧操作的回滚会覆盖新请求的结果（重新阻断已进入
+ * 普通模式的 Safari，方案 1 设计「多环境争抢」）；接手的操作已结束而 Safari 仍可能经未验证的出口时，按 §6.3 第 14 步的结束点
+ * 改选 REJECT（supersededAfterCrash → holdAtRouteEnd）。执行器先领取崩溃恢复中的操作（executor.ts claimPreference），正常不会
+ * 走到这里；这是第二道防线。
+ * 等待中的操作已开始结束（RoutePayload.ending：超时、取消或目标已被替换，结束点读写 Surge 期间崩溃）：按记下的结束重新结束
+ * （endRouteOp，结束点照常重新判断），不重新开始等待或检测。Safari 重测的核对已开始（有提交的检测结果）：按已判定的失败重新
+ * 结束或按提交的结果重新核对（recoverProbeCheck），不重新开始等待。结束点读回 REJECT 而本操作已记下改选意图
+ * （OperationPayload.endHold）时按本操作的改选记下（holdAtRouteEnd）。
  */
 export async function recoverRoute(engine: Engine, op: OperationRecord): Promise<void> {
+  const ending = payloadOf(op).route?.ending;
+  if (ending) {
+    await endRouteOp(engine, op.id, { phase: ending.phase, status: ending.status, error: ending.error }, ending.step, {}, { cancelOutbox: ending.cancelOutbox });
+    return;
+  }
   if (op.kind === 'route.normal') {
     await runNormal(engine, { ...op, status: 'queued' });
     return;
   }
   const p = routePayload(op);
-  // Safari 重测从不写入：重新执行
   if (p.flow === 'probe') {
+    // 核对已开始（提交的检测结果已排入执行器，completeVerification 已把操作改为 running）：检测编号已消费，准备页只轮询操作、
+    // 不会再提交——不重新开始等待（重新开始的等待只会按超时结束、不加警告，不符或失败的结果就此丢失，订单与填充继续）
+    if (p.submission) {
+      await recoverProbeCheck(engine, op, p);
+      return;
+    }
+    // 尚未开始等待检测（开始检查或读回入口时崩溃）：Safari 重测从不写入，重新执行
     await runProbeSafari(engine, op);
     return;
   }
@@ -1952,7 +2473,7 @@ export async function recoverRoute(engine: Engine, op: OperationRecord): Promise
     return;
   }
   if (route.operationId !== null && route.operationId !== op.id) {
-    supersededAfterCrash(engine, op.id, route.operationId);
+    await supersededAfterCrash(engine, op.id, route.operationId);
     return;
   }
   // 已开始写入（epoch 已递增：切换中、VERIFY_ONLY 之后的核对或回滚）或负责过渡中的路由：按激活快照回滚，不重放写入
@@ -1967,25 +2488,53 @@ export async function recoverRoute(engine: Engine, op: OperationRecord): Promise
   await rollbackActivation(engine, op.id, body, ctrl, mode);
 }
 
-/** 崩溃恢复：路由已由之后的操作接手（recoverRoute），本操作不回滚、不写入 Surge，记为 SUPERSEDED。 */
-function supersededAfterCrash(engine: Engine, opId: string, ownerId: string): void {
+/**
+ * 崩溃恢复：路由已由之后的操作接手（recoverRoute），本操作不回滚、不改写入口，记为 SUPERSEDED。接手的操作仍未结束（排队或执行中的
+ * 普通模式、负责过渡中路由的操作）时由它结算；它已结束而 Surge 仍可能让 Safari 经未验证的出口时，这同样是结束点，按
+ * holdAtRouteEnd 失败即关闭。
+ */
+async function supersededAfterCrash(engine: Engine, opId: string, ownerId: string): Promise<void> {
   const { repos } = engine;
   const op = repos.operations.get(opId)!;
+  const hold = await holdAtRouteEnd(engine, opId);
+  const activeBefore = repos.routeState.get().activeEnvironmentId;
   repos.tx(() => {
+    recordEndHold(engine, opId, hold);
+    const cur = repos.operations.get(opId)!;
     repos.operations.update(opId, {
       phase: 'SUPERSEDED',
       status: 'superseded',
       supersededBy: ownerId,
-      error: { code: 'SUPERSEDED', message: '已被之后接手路由的操作取代' },
+      error: withEndHold({ code: 'SUPERSEDED', message: '已被之后接手路由的操作取代' }, hold),
+      ...(hold ? { result: { ...(cur.result ?? {}), rejectSelected: hold.confirmed } } : {}),
     });
     repos.operations.appendStep(
       opId,
       'SUPERSEDED',
-      '切换中断：服务重启时切换未完成，而路由已由之后的操作接手：不回滚、不写入 Surge，路由保持它的结果',
+      // 结束点改选了 SFE-ROUTE 时路由已不是接手的操作留下的结果：不再说「路由保持它的结果」
+      `切换中断：服务重启时切换未完成，而路由已由之后的操作接手：不回滚、不改写入口${hold ? endHoldNote(hold) : '，路由保持它的结果'}`,
     );
     repos.outbox.cancelForOperation(opId);
   });
-  engine.emit({ operations: [opId, ownerId], route: true, environments: op.environmentId ? [op.environmentId] : [] });
+  const envs = [...(op.environmentId ? [op.environmentId] : []), ...(hold && activeBefore ? [activeBefore] : [])];
+  engine.emit({ operations: [opId, ownerId], route: true, environments: envs });
+}
+
+/**
+ * 崩溃恢复：Safari 重测的核对已开始（RoutePayload.submission）。已判定失败或不符（RoutePayload.verdict，结束点读写 Surge 期间
+ * 崩溃）→ 按已判定的结果重新结束（结束点照常重新判断：holdAtRouteEnd，本操作已记下改选意图而读回 REJECT 时按改选记下）；
+ * 尚未判定（读取选择或请求记录期间崩溃）→ 按已提交的检测结果重新核对（completeVerification 重读选择与 Surge 请求记录，出口 IP
+ * 用提交的值比较，读不到即失败）。从不重新开始等待。
+ */
+async function recoverProbeCheck(engine: Engine, op: OperationRecord, p: RoutePayload): Promise<void> {
+  if (p.verdict) {
+    engine.step(op.id, '服务重启时重新检测的核对已判定失败、尚未结束：按已判定的结果结束，不重新开始检测');
+    const hold = await holdAtRouteEnd(engine, op.id, { observedSelection: p.verdict.observedSelection });
+    finishProbe(engine, op.id, p, p.verdict.failure, p.verdict.evidence, hold);
+    return;
+  }
+  engine.step(op.id, '服务重启时重新检测的核对未完成：按已提交的检测结果重新核对，不重新开始检测');
+  await completeVerification(engine, op);
 }
 
 async function continueAfterCrash(engine: Engine, op: OperationRecord): Promise<void> {

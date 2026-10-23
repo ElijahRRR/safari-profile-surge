@@ -15,6 +15,7 @@ import {
   ENTRY_RULESET_FILES,
   ENTRY_WITNESS_PROCESS_PATH,
   LEGACY_ENTRY_PLACEHOLDER_RULE,
+  ROUTE_GROUP_NAME,
   SfeError,
   type EntryBits,
   type KnownEntryMode,
@@ -74,6 +75,12 @@ export const DEFAULT_RULESET_WATCH = { timeoutMs: 5000, pollMs: 200 } as const;
  */
 export const WITNESS_PROBE_PROCESS_PATH = ENTRY_WITNESS_PROCESS_PATH;
 
+/**
+ * 入口段不完整、重复或顺序不对时（ruleset_order）撤销入口走向普通模式以外的方向停止的说明：写明恢复路径（先进入普通模式，它把
+ * 入口规则集文件改写为占位规则，再在维护中重新合并恢复受管理段）。
+ */
+const DAMAGED_SEGMENT_MESSAGE = '切换入口失败：本应用入口的 RULE-SET 不在有效规则中、重复或顺序不对（工作配置被外部修改），请先进入普通模式，再在维护中重新合并';
+
 /** 关闭的位的占位规则（规范化）：当前格式与旧格式（不限定进程，只识别、从不写入）。 */
 const LEGACY_PLACEHOLDER_N = normalizeRuleText(LEGACY_ENTRY_PLACEHOLDER_RULE);
 const PLACEHOLDERS_N = [normalizeRuleText(ENTRY_PLACEHOLDER_RULE), LEGACY_PLACEHOLDER_N];
@@ -129,6 +136,22 @@ interface RulesetState {
   ruleMatchUnavailable: boolean;
   /** 未确认的意图（pending_<位>）中，文件已是写入后内容（摘要等于意图的摘要，不是写前内容）的位。 */
   intentWritten: EntryBit[];
+  /**
+   * 本应用入口尚未接入工作配置（例如在空闲的普通模式下改用 ruleset_resource、尚未经 maintenance.remerge 写入四条 RULE-SET）：
+   * 四条入口 RULE-SET 都不在 Surge 的有效规则中，也没有任何规则以 SFE-ROUTE 为策略，入口规则集文件不存在或只是占位规则
+   * （之后接入时 Surge 加载的也是普通模式）。这时 Safari 按原规则发出，见 notInstalledReadbackOf。
+   */
+  notInstalled: boolean;
+  /** 每一位的 RULE-SET 是否出现在 Surge 的有效规则中（不论次数、顺序与策略）；不在其中的文件 Surge 不加载。 */
+  attached: Record<EntryBit, boolean>;
+  /** 有效规则中有本应用 RULE-SET 以外的规则以 SFE-ROUTE 为策略（不由本应用入口控制，撤销入口不能让 Safari 离开它）。 */
+  foreignRoute: boolean;
+  /**
+   * 入口段不完整、重复或顺序不对（ruleset_order），但入口规则集文件已全部为占位规则（在有效规则中的那几位必须存在；不在其中的
+   * 可以缺失），没有其他规则以 SFE-ROUTE 为策略：只要在有效规则中的那几位已加载的是占位规则，Safari 就按原规则发出（见
+   * detachedNormalReadbackOf）。不含 notInstalled（四条都不在有效规则中）。
+   */
+  detachedNormal: boolean;
 }
 
 function sameList(a: readonly string[], b: readonly string[]): boolean {
@@ -311,6 +334,17 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
     const rules = await deps.adapter.listRules();
     if (!rulesetOrderOk(rules)) anomalies.push('ruleset_order');
     const issues = precedenceIssues(cfg, rules);
+    const attached = Object.fromEntries(ENTRY_BITS_IN_ORDER.map((b) => [b, rules.some((r) => bitOfRuleSet(r.text) === b)])) as Record<EntryBit, boolean>;
+    const foreignRoute = rules.some((r) => bitOfRuleSet(r.text) === null && parseRule(r.text)?.policy?.trim() === ROUTE_GROUP_NAME);
+    const notInstalled =
+      !foreignRoute &&
+      ENTRY_BITS_IN_ORDER.every((b) => !attached[b]) &&
+      ENTRY_BITS_IN_ORDER.every((b) => anomalies.includes(`file_missing_${b}`) || fileStates[b].value === false);
+    const detachedNormal =
+      !notInstalled &&
+      !foreignRoute &&
+      anomalies.includes('ruleset_order') &&
+      ENTRY_BITS_IN_ORDER.every((b) => fileStates[b].value === false || (!attached[b] && anomalies.includes(`file_missing_${b}`)));
     const values = ENTRY_BITS_IN_ORDER.map((b) => fileStates[b].value);
     const bits = values.some((v) => v === null) ? null : { udp: values[0]!, verify: values[1]!, block: values[2]!, active: values[3]! };
 
@@ -334,7 +368,16 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
     const assumed = Object.fromEntries(
       ENTRY_BITS_IN_ORDER.map((b) => [b, loaded[b] === 'confirmed' || loaded[b] === 'unwitnessed' ? fileStates[b].value : null]),
     ) as Record<EntryBit, boolean | null>;
-    const judgement = unavailable !== null ? probeReadFailure(unavailable) : bits === null ? null : await probeRuntime({ cfg, files: fileStates }, assumed, issues);
+    // 入口尚未接入（或入口段不完整而文件已全部为占位规则）时按全部关闭核对：Safari 的任何探测都不得命中本应用规则，对照进程
+    // 不得命中本应用规则或 SFE-ROUTE
+    const judgement =
+      unavailable !== null
+        ? probeReadFailure(unavailable)
+        : notInstalled || detachedNormal
+          ? await probeRuntime({ cfg, files: fileStates }, { ...ENTRY_MODE_BITS.NORMAL }, issues)
+          : bits === null
+            ? null
+            : await probeRuntime({ cfg, files: fileStates }, assumed, issues);
     const allOff = bits !== null && ENTRY_BITS_IN_ORDER.every((b) => !bits[b]);
     const known = Object.fromEntries(
       ENTRY_BITS_IN_ORDER.map((b) => {
@@ -359,7 +402,60 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       judgement,
       ruleMatchUnavailable: judgement?.ruleMatchUnavailable === true,
       intentWritten,
+      notInstalled,
+      attached,
+      foreignRoute,
+      detachedNormal,
     };
+  }
+
+  /**
+   * 本应用入口尚未接入（RulesetState.notInstalled）的读回：Surge 的有效规则中没有本应用的入口，Safari 按原规则发出——入口按事实
+   * 已是普通模式，没有可撤销的入口（也没有先后可言，不列优先级问题）。Safari 与对照的运行时探测一致时经运行时求值确认；rule match
+   * 不可用时只按 Surge 的有效规则列表判断（runtimeConfirmed: false，与 temp_rule 按临时规则列表与有效规则顺序确认相同）；探测读不到
+   * 或不一致（Safari 或对照命中了本应用规则）时为 UNKNOWN。
+   */
+  function notInstalledReadbackOf(s: RulesetState): EntryReadback {
+    const files = ENTRY_BITS_IN_ORDER.every((b) => s.anomalies.includes(`file_missing_${b}`))
+      ? '入口规则集文件不存在'
+      : '入口规则集文件不存在或只是占位规则';
+    const evidence = [
+      `本应用入口尚未写入工作配置：四条入口 RULE-SET 都不在 Surge 的有效规则中，也没有规则以 ${ROUTE_GROUP_NAME} 为策略（例如更改入口策略之后尚未重新合并，或工作配置中的入口段被外部删去）；${files}`,
+      ...(s.judgement?.evidence ?? []),
+    ];
+    const base = { bits: s.bits, precedenceIssues: [], changedOwnedFiles: [], notInstalled: true as const };
+    if (s.judgement?.ok === true) return { ...base, mode: 'NORMAL', evidence };
+    // rule match 读不到（不可用，或超时等一次读取失败）：有效规则列表中没有本应用的 RULE-SET、也没有规则以 SFE-ROUTE 为策略，
+    // Surge 不加载这些文件，Safari 不论 rule match 怎样回答都不会经本应用入口或 SFE-ROUTE——按有效规则列表判断为 NORMAL，
+    // 标明未经运行时求值确认。只有探测读到了与有效规则列表不一致的结果（命中本应用规则或 SFE-ROUTE）才是 UNKNOWN。
+    if (s.ruleMatchUnavailable || s.judgement?.readFailed === true) {
+      const why = s.ruleMatchUnavailable ? 'rule match 不可用' : 'rule match 读取失败';
+      return { ...base, mode: 'NORMAL', evidence: [...evidence, `${why}：只按 Surge 的有效规则列表判断，未经运行时求值确认`], runtimeConfirmed: false };
+    }
+    return { ...base, mode: 'UNKNOWN', evidence };
+  }
+
+  /**
+   * 入口段不完整、重复或顺序不对而入口规则集文件已全部为占位规则（RulesetState.detachedNormal）的读回：在有效规则中的那几位由
+   * 见证确认已加载的是占位规则（占位规则只限定合成进程，Safari 与 Chrome 的请求不会命中），不在其中的 Surge 不加载，没有其他
+   * 规则以 SFE-ROUTE 为策略，Safari 与对照的运行时探测一致——Safari 按原规则发出，入口按事实为 NORMAL（segmentDamaged：需要在维护中
+   * 重新合并恢复受管理段）。rule match 不可用时只按文件内容与有效规则列表判断（runtimeConfirmed: false）；见证或探测读不到、
+   * 不一致时为 UNKNOWN。
+   */
+  function detachedNormalReadbackOf(s: RulesetState): EntryReadback {
+    const detached = ENTRY_BITS_IN_ORDER.filter((b) => !s.attached[b]);
+    const evidence = [
+      `本应用入口在工作配置中的 RULE-SET 不完整或顺序不对（${detached.length > 0 ? `不在 Surge 的有效规则中：${detached.join('、')}` : '有重复、顺序或策略不对'}；例如工作配置被外部修改），没有其他规则以 ${ROUTE_GROUP_NAME} 为策略；入口规则集文件已全部为占位规则：在有效规则中的那几位由见证读回确认已加载，不在其中的 Surge 不加载；需要在维护中重新合并恢复受管理段`,
+      ...ENTRY_BITS_IN_ORDER.filter((b) => s.attached[b]).map((b) => `规则集 ${b}：${LOADED_LABEL[s.loaded[b]]}`),
+      ...(s.judgement?.evidence ?? []),
+    ];
+    const base = { bits: s.bits, precedenceIssues: [], changedOwnedFiles: [], segmentDamaged: true as const };
+    const attachedLoaded = ENTRY_BITS_IN_ORDER.every((b) => !s.attached[b] || s.loaded[b] === 'confirmed');
+    if (attachedLoaded && s.judgement?.ok === true) return { ...base, mode: 'NORMAL', evidence };
+    if (s.ruleMatchUnavailable) {
+      return { ...base, mode: 'NORMAL', evidence: [...evidence, 'rule match 不可用：只按文件内容与有效规则列表判断，未经见证与运行时求值确认'], runtimeConfirmed: false };
+    }
+    return { ...base, mode: 'UNKNOWN', evidence };
   }
 
   /** 运行时已确认的模式（不看文件归属与资源异常）：每一位已加载内容已知、探测一致；否则为 null。 */
@@ -404,7 +500,9 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
     }
     // 旧格式文件没有见证：已加载内容只由探测核对（EntryReadback.witnessConfirmed）
     const witnessConfirmed = ENTRY_BITS_IN_ORDER.some((b) => s.loaded[b] === 'unwitnessed') ? { witnessConfirmed: false } : {};
-    return { mode, bits: s.bits, evidence, precedenceIssues: issues, changedOwnedFiles: overwritableBits(s).map((b) => s.files[b].name), ...witnessConfirmed };
+    // 入口段不完整、重复或顺序不对（不是尚未写入）：激活在写入之前停止，普通模式按 undoDamagedSegment 改写文件
+    const damaged = s.anomalies.includes('ruleset_order') && !s.notInstalled ? { segmentDamaged: true } : {};
+    return { mode, bits: s.bits, evidence, precedenceIssues: issues, changedOwnedFiles: overwritableBits(s).map((b) => s.files[b].name), ...witnessConfirmed, ...damaged };
   }
 
   /** 只看文件与归属、资源、规则顺序（不看已加载内容与探测）的模式；有任何异常为 null。 */
@@ -692,11 +790,118 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
     return [...steps.slice(0, at), ...reassert, ...steps.slice(at)];
   }
 
+  /**
+   * 入口段不完整、重复或顺序不对（ruleset_order：例如用户在 Surge 中编辑或恢复了工作配置，入口段被删去、少了一行或两行对调）时
+   * 撤销入口走向普通模式（普通模式的中间阻断与 NORMAL 一段）。按位先后无法规划，中间阻断也无法确认；但走向 NORMAL 的每一步只关闭
+   * 位（先关 active、verify，再关 udp、block），从不新开经 SFE-ROUTE 的路径，Surge 不论按什么顺序加载、加载到哪一步，Safari 都
+   * 只会经仍加载的阻断或落到原规则。否则普通模式永远停在这里（每次都在写入之前失败），而重新合并要求入口已是普通模式——没有
+   * 恢复路径（§5.2「进入普通模式永远可用」）。逐个把本应用拥有的入口规则集文件改写为占位规则：RULE-SET 在有效规则中的位照常
+   * 检查自动重载设置与资源、比较并替换地写入、由见证确认已加载（rule match 不可用时按文件监视上限等满，结果标为未经运行时确认）；
+   * 不在有效规则中的位 Surge 不加载，只写入、不等待（之后重新合并恢复这一行时 Surge 加载的就是占位规则）。已是占位规则且已由见证
+   * 确认加载（或不在有效规则中）的位不写。最终读回为 notInstalled 或 detachedNormal 的 NORMAL（文件全部为占位规则、探测一致）；
+   * 否则停止（READBACK_MISMATCH，不声称任何已确认状态）。返回的读回带 rewrote 列出本次改写的文件。
+   */
+  async function undoDamagedSegment(s: RulesetState, overwrite: readonly EntryBit[], onStep: ((step: EntryStep) => void) | undefined): Promise<EntryReadback> {
+    const unwitnessed: UnwitnessedUndo = { allowed: true, active: s.ruleMatchUnavailable, evidence: [] };
+    const cur = { ...s.files };
+    const rewrote: EntryBit[] = [];
+    const bitsNow: EntryBits = {
+      udp: s.files.udp.value ?? true,
+      verify: s.files.verify.value ?? true,
+      block: s.files.block.value ?? false,
+      active: s.files.active.value ?? true,
+    };
+    for (const bit of ['active', 'verify', 'udp', 'block'] as const) {
+      const f = cur[bit];
+      const loadedPlaceholder = f.value === false && (!s.attached[bit] || s.loaded[bit] === 'confirmed' || unwitnessed.active);
+      if (loadedPlaceholder) continue;
+      bitsNow[bit] = false;
+      const step: EntryStep = { bit, value: false, bits: { ...bitsNow }, effective: 'NORMAL' };
+      await checkAutoReload(null, step);
+      if (s.attached[bit]) uniqueKey(await deps.adapter.listExternalResources(), f.path, null, step);
+      const token = newToken();
+      const content = entryRuleSetFileContent(bit, false, s.cfg, token);
+      const currentDigest = await files.digest(f.name);
+      const isOverwrite = overwrite.includes(bit);
+      const expected = isOverwrite ? s.files[bit].digest : await expectedPrevious(f.name, currentDigest);
+      const newDigest = files.digestContent ? files.digestContent(content) : null;
+      await deps.ownership.recordIntent('entry_ruleset_file', f.name, newDigest, deps.operationId(), 'add');
+      try {
+        await files.writeAtomic(f.name, content, expected);
+      } catch (e) {
+        if (!isOverwrite && currentDigest !== null && expected === currentDigest) {
+          await deps.ownership.confirm('entry_ruleset_file', f.name, 'present', currentDigest).catch(() => undefined);
+        }
+        throw withLastConfirmed(e, null, step);
+      }
+      if (s.attached[bit]) {
+        let waited: { loaded: boolean; waitedMs: number };
+        try {
+          if (unwitnessed.active) waited = await waitFullLimit();
+          else {
+            try {
+              waited = await awaitWitness(bit, token);
+            } catch (e) {
+              if (!isRuleMatchUnavailable(e)) throw e;
+              unwitnessed.active = true;
+              waited = await waitFullLimit();
+            }
+          }
+        } catch (e) {
+          throw withLastConfirmed(e, null, step);
+        }
+        if (!waited.loaded) {
+          // 结果未知：保留新内容（只关闭位，Surge 加载它只会更接近原规则），监视赶上之后由下一次普通模式的见证确认
+          throw stepFailure('READBACK_MISMATCH', '切换入口失败：规则集文件写入后 Surge 没有在时限内重新加载（结果未知）；已写入的内容保留，请等 Surge 的文件监视加载之后再重试', null, {
+            failedStep: { bit, value: false },
+            reason: 'watch_timeout',
+            waitedMs: waited.waitedMs,
+            restored: false,
+            ...(bit === 'verify' || bit === 'active' ? { keptStricter: true } : { keptTowardTarget: true }),
+          });
+        }
+        if (unwitnessed.active) unwitnessed.evidence.push(`${bit}-：写入后按文件监视上限等待 ${(waited.waitedMs / 1000).toFixed(1)} 秒，未经见证与运行时求值确认`);
+      }
+      const digest = await files.digest(f.name);
+      await deps.ownership.confirm('entry_ruleset_file', f.name, 'present', digest);
+      cur[bit] = { ...f, witness: token, bodies: parseEntryRuleSetFile(bit, content).bodies, value: false, digest };
+      rewrote.push(bit);
+      onStep?.(step);
+    }
+    let final: RulesetState;
+    try {
+      final = await load();
+    } catch (e) {
+      throw withLastConfirmed(e, null, null);
+    }
+    if (final.ruleMatchUnavailable) unwitnessed.active = true;
+    const rb = final.notInstalled ? notInstalledReadbackOf(final) : final.detachedNormal ? detachedNormalReadbackOf(final) : readbackOf(final);
+    const detached = ENTRY_BITS_IN_ORDER.filter((b) => !s.attached[b]);
+    const note =
+      rewrote.length > 0
+        ? `入口段不完整或顺序不对（${detached.length > 0 ? `不在有效规则中：${detached.join('、')}` : '有重复、顺序或策略不对'}）：已把入口规则集文件改写为占位规则（${rewrote.join('、')}；只关闭位，在有效规则中的${unwitnessed.active ? '按文件监视上限等满（rule match 不可用，未经见证确认）' : '由见证确认已加载'}，不在其中的 Surge 不加载、未等待）；需要在维护中重新合并恢复受管理段`
+        : '入口段不完整或顺序不对：入口规则集文件已全部为占位规则，未写入；需要在维护中重新合并恢复受管理段';
+    const out: EntryReadback = {
+      ...rb,
+      evidence: [...rb.evidence, note, ...unwitnessed.evidence],
+      segmentDamaged: true,
+      ...(rewrote.length > 0 ? { rewrote: rewrote.map((b) => ENTRY_RULESET_FILES[b]) } : {}),
+      ...(unwitnessed.active ? { runtimeConfirmed: false } : {}),
+    };
+    if (out.mode !== 'NORMAL') {
+      throw new SfeError('READBACK_MISMATCH', '切换入口失败：入口规则集文件已改写为占位规则，但最终读回不是普通模式', {
+        details: { lastConfirmedBits: null, observedMode: out.mode, evidence: out.evidence, segmentDamaged: true, ...(out.runtimeConfirmed === false ? { runtimeConfirmed: false } : {}) },
+      });
+    }
+    return out;
+  }
+
   return {
     strategy: 'ruleset_resource',
 
     async read() {
-      return readbackOf(await load());
+      const s = await load();
+      return s.notInstalled ? notInstalledReadbackOf(s) : s.detachedNormal ? detachedNormalReadbackOf(s) : readbackOf(s);
     },
 
     async transition(to, onStep, opts) {
@@ -706,6 +911,41 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
         if (await settleWitnessedIntents(s)) s = await load();
       } catch (e) {
         throw withLastConfirmed(e, null, null);
+      }
+      // 撤销入口走向普通模式：普通模式的 NORMAL 一段，或它的中间阻断
+      const towardNormal = opts?.undo === true && (to === 'NORMAL' || (to === 'BLOCKED' && opts.towardNormal === true));
+      // 本应用入口尚未接入：没有可撤销的入口。撤销入口走向普通模式时按事实已是普通模式，不写入、不创建或改写入口文件；其他方向
+      // （激活的阻断与放宽、回滚回到阻断）不写入任何文件，按未接入停止（先重新合并）。走向普通模式而读回为 UNKNOWN 只可能是
+      // 探测读到了与有效规则列表不一致的结果（读不到时按有效规则列表判断为 NORMAL，见 notInstalledReadbackOf）：说明稍后再试，
+      // 不指向重新合并——重新合并要求入口已是普通模式，会被拒绝。
+      if (s.notInstalled) {
+        const rb = notInstalledReadbackOf(s);
+        if (towardNormal && rb.mode === 'NORMAL') return rb;
+        const confirmedNormal = rb.mode === 'NORMAL' && rb.runtimeConfirmed !== false;
+        throw stepFailure(
+          rb.mode === 'NORMAL' ? 'RESOURCE_MISSING' : 'UNKNOWN_STATE',
+          towardNormal
+            ? '切换入口失败：本应用入口尚未写入工作配置，但 Safari 或对照的运行时求值与 Surge 的有效规则列表不一致（结果未知），请稍后再进入普通模式'
+            : '切换入口失败：本应用入口尚未写入工作配置（四条入口 RULE-SET 不在 Surge 的有效规则中），请先在维护中重新合并',
+          confirmedNormal ? { ...ENTRY_MODE_BITS.NORMAL } : null,
+          { notInstalled: true, evidence: rb.evidence, ...(rb.mode === 'NORMAL' && !confirmedNormal ? { runtimeConfirmed: false } : {}) },
+        );
+      }
+      // 入口段不完整或顺序不对、而入口规则集文件已全部为占位规则（detachedNormal）：走向普通模式时读回为 NORMAL 即已完成、不写入；
+      // 其他方向不写入、停止（先进入普通模式，再在维护中重新合并），读回确认的普通模式随错误报告为最后确认状态。读回为 UNKNOWN
+      // （例如在有效规则中的某一位已加载的还不是占位规则）时走向普通模式按 undoDamagedSegment 重写。
+      if (s.detachedNormal) {
+        const rb = detachedNormalReadbackOf(s);
+        if (towardNormal && rb.mode === 'NORMAL') return rb;
+        if (!towardNormal) {
+          const confirmedNormal = rb.mode === 'NORMAL' && rb.runtimeConfirmed !== false;
+          throw stepFailure('UNKNOWN_STATE', DAMAGED_SEGMENT_MESSAGE, confirmedNormal ? { ...ENTRY_MODE_BITS.NORMAL } : null, {
+            segmentDamaged: true,
+            anomalies: s.anomalies,
+            evidence: rb.evidence,
+            ...(rb.mode === 'NORMAL' && !confirmedNormal ? { runtimeConfirmed: false } : {}),
+          });
+        }
       }
       // 运行时已确认的状态（见证与探测）；文件或资源的异常不影响它。
       const confirmedMode = runtimeMode(s);
@@ -727,7 +967,13 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       // 要改写的文件已加载的内容未知：第一步确认之前不声称任何已确认状态。
       let lastConfirmed: EntryBits | null = overwrite.length > 0 || confirmedMode === null ? null : { ...ENTRY_MODE_BITS[confirmedMode] };
       if (s.anomalies.includes('ruleset_order')) {
-        throw stepFailure('UNKNOWN_STATE', '切换入口失败：入口规则集不在有效规则中或顺序不对', lastConfirmed, { anomalies: s.anomalies });
+        // 入口段不完整或顺序不对时按位先后无法规划；撤销入口走向普通模式时只关闭位，按 undoDamagedSegment 改写为占位规则（有
+        // 其他规则以 SFE-ROUTE 为策略时不行：撤销入口不能让 Safari 离开它）。其他方向不写入、停止。
+        if (towardNormal && !s.foreignRoute) return undoDamagedSegment(s, overwrite, onStep);
+        throw stepFailure('UNKNOWN_STATE', s.foreignRoute ? `${DAMAGED_SEGMENT_MESSAGE}；另有规则以 ${ROUTE_GROUP_NAME} 为策略，不由本应用入口控制` : DAMAGED_SEGMENT_MESSAGE, lastConfirmed, {
+          anomalies: s.anomalies,
+          segmentDamaged: true,
+        });
       }
       if (to === 'VERIFY_ONLY' || to === 'ACTIVE') {
         if (hasBlockingIssue(s.issues)) {

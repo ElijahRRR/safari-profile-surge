@@ -1,6 +1,7 @@
 // 引擎的共享状态与基础工具：依赖、pepper 派生密钥、Surge 事实缓存、能力上下文、入口控制器、
 // 操作状态更新与事件发布。处理器、对账器、受理与原生桥都通过它访问这些能力。
 
+import { randomBytes } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import {
   CAPABILITY_CONTEXT_DEPS,
@@ -306,6 +307,11 @@ export class Engine {
   private lastLateInstanceFailure: SurgeVersionIssue | null = null;
   private keysCache: EngineKeys | null = null;
   private keysLoading: Promise<EngineKeys> | null = null;
+  /**
+   * 请求摘要中秘密部分的密钥与进程标记（ledger.ts requestDigest）：每个进程随机生成，从不持久保存——持久保存的请求摘要因此不能
+   * 用来离线核对秘密（pepper 与摘要在同一个数据库中）。
+   */
+  readonly requestEphemeral: { key: Buffer; epoch: string } = { key: randomBytes(32), epoch: randomBytes(8).toString('hex') };
 
   constructor(deps: AppServiceDeps) {
     this.deps = deps;

@@ -7,7 +7,8 @@ import type { OperationRecord } from '../../db/index.js';
 import { payloadOf } from '../../domain/operations.js';
 import type { Engine } from '../context.js';
 import { environmentRouteBusy } from '../route-control.js';
-import { resourceNodeNames } from '../resource.js';
+import { entryKey, resourceNodeNames } from '../resource.js';
+import { scrubRetiredDeploymentDigests } from './publish.js';
 import { expireSafariProbe, recordPreflight } from './probes.js';
 
 function envIdOf(op: OperationRecord): string | null {
@@ -67,14 +68,17 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
   const obsolete = repos.operations.listByStatus(['parked'], { kinds: ['environment.create', 'environment.update'] })
     .filter((pending) => pending.environmentId === env.id);
   repos.tx(() => {
+    const retired = new Set<string>();
     for (const r of revisions) {
       if (r.state === 'retired') continue;
       if (inResource.has(r.nodeName)) repos.proxyRevisions.updateState(env.id, r.revision, 'superseded');
       else {
         repos.proxyRevisions.updateState(env.id, r.revision, 'retired');
+        retired.add(entryKey(env.id, r.revision));
         for (const ref of [r.usernameRef, r.passwordRef]) if (ref) engine.secrets.orphanIfUnreferenced(ref);
       }
     }
+    scrubRetiredDeploymentDigests(engine, retired);
     const account = repos.accounts.get(env.id);
     if (account?.passwordRef) engine.secrets.orphan(account.passwordRef);
     repos.accounts.delete(env.id);

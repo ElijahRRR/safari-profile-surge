@@ -4,7 +4,7 @@
 
 import { SfeError, type Accepted } from '@sfe/contract';
 import type { OperationRecord } from '../db/index.js';
-import { keyedRequestDigest } from '../util/keyed-digest.js';
+import { requestDigestParts } from '../util/keyed-digest.js';
 import type { Engine } from './context.js';
 
 // eslint-disable-next-line no-control-regex
@@ -17,13 +17,44 @@ export function requireRequestId(value: unknown): string {
   return value;
 }
 
+/**
+ * 幂等判断用的请求摘要（持久保存在 operations.request_digest 与请求台账中）：`v2:<shape>:<进程标记>:<full>`，带秘密值的请求另加
+ * `:s`。两部分都不能用来离线核对秘密（util/keyed-digest.ts requestDigestParts）。
+ */
 export async function requestDigest(engine: Engine, method: string, target: string | null, body: unknown): Promise<string> {
   const keys = await engine.keys();
-  return keyedRequestDigest(keys.request, { method, target, body });
+  const eph = engine.requestEphemeral;
+  const { shape, full, secret } = requestDigestParts(keys.request, eph.key, { method, target, body });
+  return `v2:${shape}:${eph.epoch}:${full}${secret ? ':s' : ''}`;
+}
+
+function parseDigest(d: string): { shape: string; epoch: string; full: string; secret: boolean } | null {
+  const m = /^v2:([0-9a-f]{64}):([0-9a-f]{16}):([0-9a-f]{64})(:s)?$/.exec(d);
+  return m ? { shape: m[1]!, epoch: m[2]!, full: m[3]!, secret: m[4] !== undefined } : null;
+}
+
+/**
+ * 记下的请求摘要与这一次的是否表示同一请求：除秘密以外的内容（shape）必须相同；同一进程内记下的再比较秘密部分（full）。
+ * 服务重新启动之后，之前进程的秘密部分无从比较（它的密钥从不持久保存）：不带秘密值的请求只比较 shape（相同即按重复返回原操作）；
+ * 带秘密值的请求无法判断两次带的是否是同一个秘密，一律按内容不同（409）——客户端可能在提交结果未知（连接中断、服务重新启动）
+ * 之后改正了密码、用同一编号重新提交，按重复返回原操作会悄悄丢掉改正的密码（网页提示之前的提交已生效，重新打开查看）。
+ * shape 相同说明两次请求的秘密位置相同，所以任一方带秘密值即两方都带（升级前没有 `:s` 标记的记录同样由这一次的请求判断）。
+ * 旧格式（升级前记下、迁移 3 已改写为不可核对的值）与新的摘要从不相同。
+ */
+export function sameRequestDigest(stored: string, current: string): boolean {
+  const a = parseDigest(stored);
+  const b = parseDigest(current);
+  if (!a || !b) return stored === current;
+  if (a.shape !== b.shape) return false;
+  if (a.epoch === b.epoch) return a.full === b.full;
+  return !a.secret && !b.secret;
 }
 
 function mismatch(): SfeError {
-  return new SfeError('DUPLICATE_REQUEST_MISMATCH', '请求失败：request_id 已用于内容不同的请求');
+  return new SfeError(
+    'DUPLICATE_REQUEST_MISMATCH',
+    '请求失败：request_id 已用于之前一次内容不同的请求（服务重新启动之后，带密码的请求无法核对是否相同，同样按不同处理）：之前那次请求已经生效，这一次没有执行，请刷新查看当前状态',
+  );
 }
 
 interface LedgerEntry {
@@ -35,7 +66,7 @@ interface LedgerEntry {
 export function findDuplicateOperation(engine: Engine, requestId: string, digest: string): OperationRecord | null {
   const op = engine.repos.operations.byRequestId(requestId);
   if (op) {
-    if (op.requestDigest !== digest) throw mismatch();
+    if (!sameRequestDigest(op.requestDigest, digest)) throw mismatch();
     return op;
   }
   const entry = engine.kv.get<LedgerEntry>(`req:${requestId}`);
@@ -60,7 +91,7 @@ export function commitOperation(engine: Engine, requestId: string, digest: strin
 export function findLedger<T>(engine: Engine, requestId: string, digest: string): { ref: T } | null {
   const entry = engine.kv.get<LedgerEntry>(`req:${requestId}`);
   if (entry) {
-    if (entry.digest !== digest) throw mismatch();
+    if (!sameRequestDigest(entry.digest, digest)) throw mismatch();
     return { ref: entry.ref as T };
   }
   if (engine.repos.operations.byRequestId(requestId)) throw mismatch();

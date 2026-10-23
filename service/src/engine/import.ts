@@ -23,6 +23,7 @@ import { LIMITS } from '../domain/validate.js';
 import { displayNameKey, parseImport, type ParsedImportRow } from '../importer/index.js';
 import { fingerprint } from '../secrets/pepper.js';
 import { keyedRequestDigest } from '../util/keyed-digest.js';
+import { yieldToEventLoop } from '../util/yield.js';
 import { diffStateOf, insertOperation, reevaluateExitIp, type AcceptDeps } from './accept.js';
 import type { Engine } from './context.js';
 import { acceptedOf, commitOperation, findDuplicateOperation, requestDigest, requireRequestId } from './ledger.js';
@@ -267,6 +268,8 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
     for (const plan of plans) {
       const d = decisions.get(plan.parsed.row);
       if (!d || d.action === 'skip' || plan.status === 'invalid') continue;
+      // 逐行让出事件循环：秘密存储是同步的数据库写入，数千行不让出会把整个服务冻结到写完（原生桥握手超时、普通模式请求失败）
+      await yieldToEventLoop();
       const target = d.action === 'update' ? repos.environments.get(d.environment_id) : null;
       const cur = target ? diffStateOf(engine, target) : null;
       const input = plan.parsed.normalized.input;
@@ -283,7 +286,7 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
       secrets.set(plan.parsed.row, rs);
     }
   } catch (err) {
-    for (const ref of created) await engine.secrets.discard(ref).catch(() => false);
+    await engine.secrets.discardUnused(created);
     throw err;
   }
 
@@ -365,13 +368,11 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
       return repos.operations.get(batch.id)!;
     });
   } catch (err) {
-    for (const ref of created) await engine.secrets.discard(ref).catch(() => false);
+    await engine.secrets.discardUnused(created);
     throw err;
   }
-  // 未被使用的秘密项（版本冲突的行；并发的同一请求已先提交时为全部）
-  for (const ref of created) {
-    if (!repos.secretRefs.isReferenced(ref)) await engine.secrets.discard(ref).catch(() => false);
-  }
+  // 未被使用的秘密项（版本冲突的行；并发的同一请求已先提交时为全部）：逐个让出事件循环，结束时截断一次 -wal
+  await engine.secrets.discardUnused(created);
   const batchOp = committed.op;
   if (committed.duplicate) return storedCommit(batchOp);
   if (childIds.length > 0) deps.kick();

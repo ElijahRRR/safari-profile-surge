@@ -200,8 +200,9 @@ export interface CurrentStateResponse {
   relation: 'this_active' | 'other_active' | 'none_active';
   otherActiveLabel: string | null;
   /**
-   * 当前场景绑定的环境有等待场景到达或实测的路由操作。waiting_route：操作停在 WAITING_ROUTE（活动环境的新版本已部署、尚未
-   * 开始切换，取消只结束等待、路由不变）；活动环境发布进入切换之后（VERIFY_ONLY 等待）为 false，取消与激活一样回滚。
+   * 当前场景绑定的环境有等待场景到达或实测的路由操作（已开始结束的等待不算）。waiting_route：操作停在 WAITING_ROUTE（活动环境的
+   * 新版本已部署、尚未开始切换，取消只结束等待、通常路由不变——结束时 SFE-ROUTE 已不是使用中环境已验证的出口时服务改选 REJECT
+   * 并要求处理）；活动环境发布进入切换之后（VERIFY_ONLY 等待）为 false，取消与激活一样回滚。
    */
   pendingVerification: {
     operation_id: OperationId;
@@ -234,7 +235,7 @@ export type BeginVerificationResponse =
       message: string;
       /**
        * 这是一次切换（激活、活动环境发布在场景到达后的切换），切换期间 Safari 的其他请求会被暂时拒绝。重新检测（从不切换、不阻断，
-       * §6.4）、停在 WAITING_ROUTE 尚未到达、已请求取消或等待路由恢复时为 false。旧版服务没有这个字段：按 false 处理，不声称阻断。
+       * §6.4；含路由已不在已验证状态、重新检测正在结束）、停在 WAITING_ROUTE 尚未到达、已请求取消时为 false。旧版服务没有这个字段：按 false 处理，不声称阻断。
        */
       switching?: boolean;
     }

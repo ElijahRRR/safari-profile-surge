@@ -629,11 +629,50 @@ describe('ruleset_resource strategy', () => {
     expect(await files.digest(ENTRY_RULESET_FILES.block)).toBe(before);
   });
 
-  test('rule set lines missing from the effective rules → UNKNOWN_STATE, nothing written', async () => {
+  test('some rule set lines missing from the effective rules → UNKNOWN_STATE, nothing written', async () => {
     const { ctrl, fake } = await setupRuleset();
-    fake.lieOnNext('listRules', [{ text: 'FINAL,DIRECT', source: 'profile', moduleName: null }]);
+    const rules = await fake.listRules();
+    fake.lieOnNext('listRules', rules.filter((r) => !r.text.includes(ENTRY_RULESET_FILES.verify)));
     await expect(ctrl.transition('BLOCKED')).rejects.toMatchObject({ code: 'UNKNOWN_STATE' });
     expect(fake.calls.getAutoReloadSetting).toBeUndefined();
+  });
+
+  test('none of the four rule set lines in the effective rules, entry files only placeholders → entry not written yet: read back as NORMAL (probes agree); an undo toward NORMAL completes without writing, any other direction stops (RESOURCE_MISSING), nothing written', async () => {
+    const { ctrl, fake, files } = await setupRuleset();
+    const onlyFinal = [{ text: 'FINAL,DIRECT', source: 'profile' as const, moduleName: null }];
+    const digests = await Promise.all(Object.values(ENTRY_RULESET_FILES).map((n) => files.digest(n)));
+    fake.lieOnNext('listRules', onlyFinal);
+    const rb = await ctrl.read();
+    expect(rb).toMatchObject({ mode: 'NORMAL', notInstalled: true, precedenceIssues: [] });
+    expect(rb.runtimeConfirmed).toBeUndefined();
+    expect(rb.evidence.join('\n')).toContain('尚未写入工作配置');
+    fake.lieOnNext('listRules', onlyFinal);
+    await expect(ctrl.transition('BLOCKED')).rejects.toMatchObject({ code: 'RESOURCE_MISSING' });
+    fake.lieOnNext('listRules', onlyFinal);
+    await expect(ctrl.transition('BLOCKED', undefined, { undo: true })).rejects.toMatchObject({ code: 'RESOURCE_MISSING' });
+    fake.lieOnNext('listRules', onlyFinal);
+    expect(await ctrl.transition('BLOCKED', undefined, { undo: true, towardNormal: true })).toMatchObject({ mode: 'NORMAL', notInstalled: true });
+    fake.lieOnNext('listRules', onlyFinal);
+    expect(await ctrl.transition('NORMAL', undefined, { undo: true })).toMatchObject({ mode: 'NORMAL', notInstalled: true });
+    expect(fake.calls.getAutoReloadSetting).toBeUndefined();
+    expect(await Promise.all(Object.values(ENTRY_RULESET_FILES).map((n) => files.digest(n)))).toEqual(digests);
+  });
+
+  test('none of the rule set lines in the effective rules but a rule still names SFE-ROUTE, or an entry file still holds a routing bit → not "not written yet" (UNKNOWN)', async () => {
+    const { ctrl, fake, files } = await setupRuleset();
+    fake.lieOnNext('listRules', [
+      { text: `AND,((PROCESS-NAME,${FAKE_SAFARI_PATH}),(DOMAIN,${FAKE_VERIFY_HOST})),SFE-ROUTE`, source: 'temp_rule', moduleName: null },
+      { text: 'FINAL,DIRECT', source: 'profile', moduleName: null },
+    ]);
+    const viaRoute = await ctrl.read();
+    expect(viaRoute.mode).toBe('UNKNOWN');
+    expect(viaRoute.notInstalled).toBeUndefined();
+    const cur = await files.digest(ENTRY_RULESET_FILES.verify);
+    await files.writeAtomic(ENTRY_RULESET_FILES.verify, entryRuleSetFileContent('verify', true, CFG), cur);
+    fake.lieOnNext('listRules', [{ text: 'FINAL,DIRECT', source: 'profile', moduleName: null }]);
+    const rb = await ctrl.read();
+    expect(rb.mode).toBe('UNKNOWN');
+    expect(rb.notInstalled).toBeUndefined();
   });
 
   test('two resources pointing to the same file → NAME_COLLISION, nothing written', async () => {

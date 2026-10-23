@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { NODE_RESOURCE_FILE, SfeError, WORKING_PROFILE_NAME } from '@sfe/contract';
 import { RELOAD_FULL_RESTART_NOTICE } from '../../src/engine/maintenance.js';
-import { ADMIN, AGENT, PROFILE_A, WEB, activeEnv, createEnv, createHarness, rid, type Harness } from './harness.js';
+import { ADMIN, AGENT, PROFILE_A, WEB, activeEnv, createEnv, createHarness, envInput, rid, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -334,6 +334,44 @@ describe('remerge (user-confirmed maintenance)', () => {
     };
     walk(h.dir);
     expect(hits).toEqual([]);
+  });
+
+  test('the operation keeps no preview digest (only a check under a per-process key): a remerge accepted before a restart and run after it is refused as a stale preview; re-previewing works', async () => {
+    h = await createHarness({ dbFile: true });
+    // 执行器忙于一次发布（挂在等待 Surge 重新读取节点资源上），重新合并排在其后；随后服务重新启动
+    const fake = h.fake as unknown as Record<string, (...args: string[]) => Promise<unknown>>;
+    const members = fake.getGroupMembers!.bind(h.fake);
+    let entered = false;
+    fake.getGroupMembers = (...args: string[]) => {
+      const cur = h.app.executor.currentOperationId;
+      if (cur !== null && h.repos.operations.get(cur)?.kind !== 'maintenance.remerge') {
+        entered = true;
+        return new Promise(() => undefined);
+      }
+      return members(...args);
+    };
+    await h.app.createEnvironment({ request_id: rid('create'), environment: envInput('US-Buyer-A', '203.0.113.10') }, WEB);
+    const end = Date.now() + 5000;
+    while (!entered && Date.now() < end) await new Promise((r) => setTimeout(r, 2));
+    expect(entered).toBe(true);
+    tamperGroup();
+    const p = await h.app.remergePreview(WEB);
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
+    const queued = h.repos.operations.get(acc.operation_id)!;
+    expect(queued.status).toBe('queued');
+    expect(JSON.stringify(queued.payload)).not.toContain(p.preview_digest);
+    expect(queued.payload).not.toHaveProperty('previewDigest');
+    fake.getGroupMembers = members;
+    await h.crash();
+    await h.idle();
+    const op = h.repos.operations.get(acc.operation_id)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error).toMatchObject({ code: 'PREVIEW_STALE', message: '重新合并失败：服务在受理之后重新启动，无法再核对预览，请重新预览后再提交' });
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+    const again = await h.app.remergePreview(WEB);
+    const acc2 = await h.app.remergeCommit({ request_id: rid(), preview_digest: again.preview_digest }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(acc2.operation_id)!.phase).toBe('COMPLETED');
   });
 
   test('keeps at most 5 remerge backups', async () => {

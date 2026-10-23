@@ -138,7 +138,10 @@ export interface ProxyRevisionsRepo {
   list(filter?: { state?: ProxyRevisionState | ProxyRevisionState[]; frontProxyId?: string }): ProxyRevisionRecord[];
   /** 该环境的最大版本号；没有版本时为 0。 */
   maxRevision(environmentId: string): number;
-  /** 改为 retired 时同时记录 retiredAt。 */
+  /**
+   * 改为 retired 时同时记录 retiredAt，并清除用户名/密码指纹：指纹只用于变化检测，退役的版本不再参与；pepper 与指纹在同一个
+   * 数据库中，留着就能从数据目录的副本离线核对猜测的旧代理凭据（§0「秘密的存放」）。
+   */
   updateState(environmentId: string, revision: number, state: ProxyRevisionState): boolean;
 }
 
@@ -183,7 +186,11 @@ export function createProxyRevisionsRepo(ctx: RepoContext): ProxyRevisionsRepo {
     },
     updateState(environmentId, revision, state) {
       const patch: Partial<ProxyRevisionRecord> = { state };
-      if (state === 'retired') patch.retiredAt = nowIso(ctx);
+      if (state === 'retired') {
+        patch.retiredAt = nowIso(ctx);
+        patch.usernameFp = null;
+        patch.passwordFp = null;
+      }
       return revMap.update(db, patch, 'environment_id = ? AND revision = ?', [environmentId, revision]) > 0;
     },
   };

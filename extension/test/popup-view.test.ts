@@ -348,7 +348,9 @@ describe('bound popup', () => {
     const w = await mountPopup(currentState({ pendingVerification: waiting }));
     expect(w.wrapper.find('[data-test="cancel-pending"]').text()).toBe('取消等待');
     await w.wrapper.find('[data-test="cancel-pending"]').trigger('click');
-    expect(w.wrapper.text()).toContain('新版本保持已部署，当前出口不变，下次打开时再切换。');
+    expect(w.wrapper.text()).toContain('新版本保持已部署，下次打开时再切换；通常当前出口不变');
+    // 不无条件承诺出口不变：结束时 SFE-ROUTE 已不是已验证的出口时服务改选 REJECT 并要求处理（§6.3 第 14 步）
+    expect(w.wrapper.text()).toContain('会改选 REJECT（拒绝 Safari 经本应用出口的新连接）并要求处理');
     expect(w.wrapper.text()).not.toContain('将尝试恢复切换前的节点选择');
     w.wrapper.unmount();
 
@@ -370,7 +372,8 @@ describe('bound popup', () => {
     const r = await mountPopup(currentState({ pendingVerification: retest }));
     expect(r.wrapper.find('[data-test="cancel-pending"]').text()).toBe('取消重测');
     await r.wrapper.find('[data-test="cancel-pending"]').trigger('click');
-    expect(r.wrapper.text()).toContain('将结束本次出口检测，路由不变');
+    expect(r.wrapper.text()).toContain('将结束本次出口检测，通常路由不变（不切换、不阻断 Safari）');
+    expect(r.wrapper.text()).toContain('会改选 REJECT（拒绝 Safari 经本应用出口的新连接）并要求处理');
     expect(r.wrapper.text()).not.toContain('将尝试恢复切换前的节点选择');
   });
 
@@ -471,6 +474,36 @@ describe('popup polling lifecycle', () => {
     const box = wrapper.find('[data-test="operation-progress"]');
     expect(box.find('[data-test="operation-phase"]').text()).toBe('正在同步到 Surge');
     expect(box.text()).toContain('候选配置校验通过');
+  });
+
+  it('a cancelled wait whose end moved SFE-ROUTE to REJECT is shown as needing attention, not as an unchanged route', async () => {
+    const retest = { operation_id: 'op_r', kind: 'probe_safari' as const, waiting_route: false, deadline: iso(120) };
+    const { wrapper } = await mountPopup(currentState({ pendingVerification: retest }), {
+      cancelOperation: () => accepted('op_r'),
+      getOperation: () =>
+        ok({
+          ...operationView(),
+          id: 'op_r',
+          kind: 'probe.safari',
+          probeKind: 'safari',
+          phase: 'BLOCKED_NEEDS_ATTENTION',
+          status: 'needs_attention',
+          error: { code: 'SUPERSEDED', message: '已取消重新检测；结束时路由仍未回到已确认的状态（…），失败即关闭：SFE-ROUTE 已改选 REJECT（读回确认）' },
+          result: { rejectSelected: true },
+          steps: [{ at: iso(-1), phase: 'BLOCKED_NEEDS_ATTENTION', message: '已取消重新检测；…' }],
+        }),
+    });
+    await wrapper.find('[data-test="cancel-pending"]').trigger('click');
+    await wrapper.find('[data-test="confirm-cancel"]').trigger('click');
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(1000);
+    const box = wrapper.find('[data-test="operation-progress"]');
+    expect(box.find('[data-test="operation-phase"]').text()).toBe('未能确认，需要处理');
+    const held = box.find('[data-test="operation-reject-held"]');
+    expect(held.exists()).toBe(true);
+    expect(held.text()).toContain('服务已把它改选 REJECT');
+    expect(held.text()).toContain('自动打开订单与填充已停止');
+    expect(box.text()).not.toContain('路由未改变');
   });
 
   it('stops polling on pagehide', async () => {

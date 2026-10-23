@@ -9,7 +9,7 @@ import KeyValueList from './KeyValueList.vue';
 import RouteWarnings from './RouteWarnings.vue';
 import { useConsole } from '../store/context';
 import { ENTRY_MODE_LABELS, PROBE_OUTCOME_LABELS, ROUTE_PHASE_LABELS, ROUTE_WARNING_TEXT, type StatusLabel } from '../lib/labels';
-import { cancelActionLabel, envLabel, isCancellableRouteOperation, isSafariRetest, normalModeOffered, probeDisplay } from '../lib/environments';
+import { HELD_ON_END, cancelActionLabel, envLabel, isCancellableRouteOperation, isSafariRetest, normalModeOffered, probeDisplay } from '../lib/environments';
 import { formatDateTime, formatRevision } from '../lib/format';
 import { newRequestId } from '../lib/request-id';
 
@@ -20,11 +20,11 @@ const active = computed(() => store.activeEnvironment.value);
 const probe = computed(() => probeDisplay(route.value?.lastSafariProbe, store.state.now));
 const routeOp = computed(() => store.operationById(route.value?.operationId));
 const cancellable = computed(() => (routeOp.value ? isCancellableRouteOperation(routeOp.value) : false));
-/** 取消的后果按操作说明（与取消确认相同）：只有切换才尝试恢复原节点；等待场景与重测取消后路由不变。 */
+/** 取消的后果按操作说明（与取消确认相同）：只有切换才尝试恢复原节点；等待场景与重测取消后通常路由不变（例外见 HELD_ON_END）。 */
 const cancelNote = computed(() => {
   const o = routeOp.value;
-  if (o?.phase === 'WAITING_ROUTE') return '有等待场景打开的新版本。取消只结束等待，新版本保持已部署，当前出口不变。';
-  if (o && isSafariRetest(o)) return '有等待中的 Safari 重测。取消只结束本次检测，路由不变（不切换、不阻断 Safari）。';
+  if (o?.phase === 'WAITING_ROUTE') return `有等待场景打开的新版本。取消只结束等待，新版本保持已部署，通常当前出口不变；${HELD_ON_END}`;
+  if (o && isSafariRetest(o)) return `有等待中的 Safari 重测。取消只结束本次检测，通常路由不变（不切换、不阻断 Safari）；${HELD_ON_END}`;
   return '有等待中的路由操作。取消会尝试恢复原节点并保持 Safari 阻断；无法确认时不恢复，改选 REJECT 拒绝 Safari 经本应用出口的新连接并要求处理。不会进入普通模式。';
 });
 const windowsWarning = computed(() => (route.value?.warnings ?? []).some((w) => w === 'old_windows_kept_open' || w === 'managed_windows_on_original_rules'));

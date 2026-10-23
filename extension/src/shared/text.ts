@@ -176,6 +176,38 @@ export function rollbackText(rollback: RollbackResult): string {
   return text;
 }
 
+/**
+ * 路由操作结束时服务改选了 SFE-ROUTE（OperationView.result.rejectSelected；§6.3 第 14 步的结束点）：路由已改变、需要处理。
+ * confirmed 为 false 时改选或读回失败。
+ */
+export function rejectHeldText(confirmed: boolean): string {
+  return confirmed
+    ? '结束时 SFE-ROUTE 已不是使用中环境已验证的出口，服务已把它改选 REJECT：Safari 经本应用出口的新连接被拒绝，自动打开订单与填充已停止。请重新使用此环境，或进入普通模式。'
+    : '结束时 SFE-ROUTE 已不是使用中环境已验证的出口，服务未能把它改选 REJECT：Safari 请求可能仍经买家出口发出，请立即进入普通模式。';
+}
+
+/** 使路由不再已验证的警告（失控类与受管理段被修改；写入重测结束说明用）。 */
+const ROUTE_LEFT_WARNINGS: readonly RouteWarning[] = [
+  'surge_unreachable',
+  'surge_restarted',
+  'entry_unverified',
+  'takeover_lost',
+  'outbound_mode_changed',
+  'external_selection_change',
+  'external_profile_change',
+  'precedence_violation',
+  'managed_segments_changed',
+];
+
+/**
+ * Safari 重测等待期间路由已不在已验证的使用中状态（OperationView.result.routeLeftVerified：结束时路由的警告；等待期间对账发现
+ * Surge 重启、出站模式改变等，不是这次重测改变的）：路由已需要处理，不能说「路由与之前的检测结果都未改变」。
+ */
+export function retestRouteLeftText(warnings: readonly string[]): string {
+  const causes = ROUTE_LEFT_WARNINGS.filter((w) => warnings.includes(w)).map((w) => WARNING_TEXT[w]);
+  return `这次重新检测等待期间，路由已不在已验证的使用中状态${causes.length > 0 ? `（${causes.join('；')}）` : ''}，不是这次重新检测改变的：自动打开订单与填充已停止。可以关闭此页面，在扩展弹窗中重新使用此环境或进入普通模式。`;
+}
+
 export function confirmationTitle(kind: 'activate' | 'normal'): string {
   return kind === 'activate' ? '确定要切换到此环境吗？' : '确定要进入普通模式吗？';
 }

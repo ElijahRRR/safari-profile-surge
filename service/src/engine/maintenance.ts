@@ -82,6 +82,34 @@ function fileDigest(engine: Engine, content: string): string {
   return hmacHex(engine.keysLoaded()!.file, `sfe-file\0${content}`);
 }
 
+/**
+ * 维护提交在操作中记下的预览核对（docs/ARCHITECTURE.md §0「秘密的存放」、§4）。预览摘要按 pepper 派生的密钥对含秘密的内容计算
+ * （工作配置中用户自己的节点凭据、节点资源中的买家代理凭据），持久保存它会让拿到数据目录副本的人离线核对猜测的旧凭据（已替换、
+ * 已清扫的代理密码）。操作中只保存它在本进程随机密钥下的 HMAC 与进程标识（engine.requestEphemeral，从不持久保存）：进程结束之后
+ * 任何人都无法再用它核对。
+ */
+interface PreviewCheck {
+  epoch: string;
+  mac: string;
+}
+
+function previewCheckOf(engine: Engine, previewDigest: string): PreviewCheck {
+  const { key, epoch } = engine.requestEphemeral;
+  return { epoch, mac: hmacHex(key, `preview-check\0${previewDigest}`) };
+}
+
+/**
+ * 执行时重新计算的预览摘要是否就是受理时核对过的那一个。受理之后服务重新启动（进程标识不同，随机密钥已丢失）时无法核对：
+ * 按预览已过期处理（PREVIEW_STALE，what 写明是哪一项维护），用户重新预览后再提交。
+ */
+function requirePreviewCheck(engine: Engine, op: OperationRecord, previewDigest: string, what: string, changed: string): void {
+  const check = (op.payload as { previewCheck?: Partial<PreviewCheck> }).previewCheck;
+  if (!check || typeof check.mac !== 'string' || check.epoch !== engine.requestEphemeral.epoch) {
+    throw new SfeError('PREVIEW_STALE', `${what}失败：服务在受理之后重新启动，无法再核对预览，请重新预览后再提交`);
+  }
+  if (check.mac !== previewCheckOf(engine, previewDigest).mac) throw new SfeError('PREVIEW_STALE', changed);
+}
+
 // ---------- 初始化 ----------
 
 interface InitPlan {
@@ -254,7 +282,7 @@ export async function initCommit(deps: AcceptDeps, req: InitCommitRequest, actor
   if (plan.response.preview_digest !== req.preview_digest) throw new SfeError('PREVIEW_STALE', '初始化失败：配置或引用文件已变化，请重新预览');
   if (plan.blocking) throw new SfeError(plan.blocking.code, plan.blocking.message);
   const { op, duplicate } = commitOperation(engine, requestId, digest, () =>
-    insertOperation(engine, { kind: 'maintenance.init', requestId, digest, actor, payload: { previewDigest: req.preview_digest }, step: '已受理初始化固定工作配置' }),
+    insertOperation(engine, { kind: 'maintenance.init', requestId, digest, actor, payload: { previewCheck: previewCheckOf(engine, req.preview_digest) }, step: '已受理初始化固定工作配置' }),
   );
   if (duplicate) return acceptedOf(op, true);
   deps.kick();
@@ -321,8 +349,7 @@ export async function runInit(engine: Engine, op: OperationRecord): Promise<void
   try {
     if (engine.workingProfile()) throw new SfeError('NAME_COLLISION', '初始化失败：已有固定工作配置');
     const plan = await buildInitPlan(engine, {});
-    const expected = (op.payload as { previewDigest?: string }).previewDigest;
-    if (plan.response.preview_digest !== expected) throw new SfeError('PREVIEW_STALE', '初始化失败：配置或引用文件已变化，请重新预览');
+    requirePreviewCheck(engine, op, plan.response.preview_digest, '初始化', '初始化失败：配置或引用文件已变化，请重新预览');
     if (plan.blocking) throw new SfeError(plan.blocking.code, plan.blocking.message);
     engine.updateOp(op.id, { phase: 'DEPLOYING' }, '备份当前配置与引用文件');
     const sourcePath = plan.response.sourceProfilePath;
@@ -537,7 +564,7 @@ export async function remergeCommit(deps: AcceptDeps, req: RemergeCommitRequest,
   if (plan.response.preview_digest !== req.preview_digest) throw new SfeError('PREVIEW_STALE', '重新合并失败：工作配置或本应用文件已变化，请重新预览');
   if (plan.blocking) throw new SfeError(plan.blocking.code, plan.blocking.message);
   const { op, duplicate } = commitOperation(engine, requestId, digest, () =>
-    insertOperation(engine, { kind: 'maintenance.remerge', requestId, digest, actor, payload: { previewDigest: req.preview_digest }, step: '已受理重新合并' }),
+    insertOperation(engine, { kind: 'maintenance.remerge', requestId, digest, actor, payload: { previewCheck: previewCheckOf(engine, req.preview_digest) }, step: '已受理重新合并' }),
   );
   if (duplicate) return acceptedOf(op, true);
   deps.kick();
@@ -550,7 +577,7 @@ export async function runRemerge(engine: Engine, op: OperationRecord, enqueuePub
   engine.updateOp(op.id, { status: 'running', phase: 'VALIDATING' }, '开始重新合并：重新核对预览');
   try {
     const plan = await buildRemergePlan(engine);
-    if ((op.payload as { previewDigest?: string }).previewDigest !== plan.response.preview_digest) throw new SfeError('PREVIEW_STALE', '重新合并失败：工作配置或本应用文件已变化，请重新预览');
+    requirePreviewCheck(engine, op, plan.response.preview_digest, '重新合并', '重新合并失败：工作配置或本应用文件已变化，请重新预览');
     if (plan.blocking) throw new SfeError(plan.blocking.code, plan.blocking.message);
     const files = engine.profileFiles()!;
     const wp = engine.workingProfile()!;

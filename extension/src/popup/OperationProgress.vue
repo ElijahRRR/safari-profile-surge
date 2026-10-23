@@ -2,7 +2,7 @@
 // 操作进度：阶段、步骤与结果。202 只代表已保存，进度以服务读回为准。
 import { computed } from 'vue';
 import type { OperationView } from '@sfe/contract';
-import { PHASE_TEXT, formatRelative, rollbackText, statusIsTerminal } from '../shared/text';
+import { PHASE_TEXT, formatRelative, rejectHeldText, rollbackText, statusIsTerminal } from '../shared/text';
 
 const props = defineProps<{ operation: OperationView; now: Date }>();
 
@@ -10,6 +10,8 @@ const done = computed(() => statusIsTerminal(props.operation.status));
 const failed = computed(() => ['failed', 'needs_attention', 'superseded'].includes(props.operation.status));
 const steps = computed(() => props.operation.steps.slice(-5));
 const rollback = computed(() => props.operation.result?.rollback ?? null);
+/** 结束时服务改选了 SFE-ROUTE（result.rejectSelected）：路由已改变、需要处理，不是「路由不变」（普通模式完成时另有完成说明）。 */
+const held = computed(() => (props.operation.phase === 'NORMAL_RESTORED' ? undefined : props.operation.result?.rejectSelected));
 </script>
 
 <template>
@@ -30,6 +32,7 @@ const rollback = computed(() => props.operation.result?.rollback ?? null);
       </ol>
       <p v-if="failed && props.operation.error" class="text-sm text-danger" data-test="operation-error">{{ props.operation.error.message }}</p>
       <p v-if="rollback" class="text-sm text-gray-700 dark:text-gray-300" data-test="operation-rollback">{{ rollbackText(rollback) }}</p>
+      <p v-if="held !== undefined" class="text-sm text-warning" data-test="operation-reject-held">{{ rejectHeldText(held) }}</p>
     </div>
   </div>
 </template>

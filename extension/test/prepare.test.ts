@@ -309,6 +309,81 @@ describe('prepare page flow', () => {
         note: '路由与之前的检测结果都未改变',
         notNote: '已停止自动打开订单与填充',
       },
+      // 结束时服务改选了 SFE-ROUTE（result.rejectSelected：等待期间 SFE-ROUTE 在 Surge 中被改选到别的买家节点）：路由已改变，
+      // 订单与填充已停止——不能说「路由与之前的检测结果都未改变」
+      {
+        op: operation({
+          phase: 'BLOCKED_NEEDS_ATTENTION',
+          status: 'needs_attention',
+          probeKind: 'safari',
+          error: { code: 'SUPERSEDED', message: '已取消重新检测；结束时路由仍未回到已确认的状态（…），失败即关闭：SFE-ROUTE 已改选 REJECT（读回确认）' },
+          result: { rejectSelected: true },
+        }),
+        outcome: 'attention',
+        title: '重新检测已结束，路由需要处理',
+        guarantee: false,
+        note: '服务已把它改选 REJECT',
+        notNote: '未改变',
+      },
+      // 同一结果以失败（旧版服务的形状）给出时同样按 rejectSelected 说明
+      {
+        op: operation({
+          phase: 'FAILED',
+          status: 'failed',
+          probeKind: 'safari',
+          error: { code: 'SAFARI_VERIFY_TIMEOUT', message: 'Safari 实测超时：绑定场景未在截止时间内到达；…SFE-ROUTE 已改选 REJECT（读回确认）' },
+          result: { rejectSelected: true },
+        }),
+        outcome: 'probe_failed',
+        title: '重新检测超时',
+        guarantee: false,
+        note: '自动打开订单与填充已停止',
+        notNote: '不受这次重新检测影响',
+      },
+      {
+        op: operation({
+          kind: 'environment.update',
+          phase: 'BLOCKED_NEEDS_ATTENTION',
+          status: 'needs_attention',
+          error: { code: 'UNKNOWN_STATE', message: '已取消切换：新版本已部署；结束时路由仍未回到已确认的状态（…），失败即关闭：SFE-ROUTE 未能改选 REJECT（改选失败）' },
+          result: { rejectSelected: false },
+        }),
+        outcome: 'attention',
+        title: '操作已结束，路由需要处理',
+        guarantee: false,
+        note: '请立即进入普通模式',
+        notNote: '未改变',
+      },
+      // 等待期间路由已不在已验证的使用中状态（result.routeLeftVerified：例如 Surge 重启，不是这次重测改变的）：不能说「路由与之前
+      // 的检测结果都未改变」或「不受这次重新检测影响」
+      {
+        op: operation({
+          phase: 'FAILED',
+          status: 'failed',
+          probeKind: 'safari',
+          error: { code: 'UNKNOWN_STATE', message: '重新检测已结束：绑定场景已到达，但无法开始检测；这次重新检测等待期间路由已不在已验证的使用中状态（Surge 已重启），…' },
+          result: { routeLeftVerified: ['surge_restarted', 'probe_expired'] },
+        }),
+        outcome: 'probe_failed',
+        title: '重新检测已结束，路由需要处理',
+        guarantee: false,
+        note: 'Surge 已重启',
+        notNote: '未改变',
+      },
+      {
+        op: operation({
+          phase: 'FAILED',
+          status: 'failed',
+          probeKind: 'safari',
+          error: { code: 'SAFARI_VERIFY_TIMEOUT', message: 'Safari 实测超时：绑定场景未在截止时间内到达；这次重新检测等待期间路由已不在已验证的使用中状态（…）' },
+          result: { routeLeftVerified: ['outbound_mode_changed'] },
+        }),
+        outcome: 'probe_failed',
+        title: '重新检测已结束，路由需要处理',
+        guarantee: false,
+        note: '自动打开订单与填充已停止',
+        notNote: '不受这次重新检测影响',
+      },
       // 核对后失败：服务把 probe_failed 加到路由上（result.probeWarning），自动打开订单与填充确实已停止
       {
         op: operation({
@@ -458,7 +533,7 @@ describe('prepare page while pending', () => {
   it.each([
     ['a retest that is still queued', { status: 'pending', phase: 'SAVED', message: '正在开始重新检测，请稍候（不切换、不阻断 Safari）', switching: false }],
     ['a cancelled WAITING_ROUTE wait', { status: 'pending', phase: 'WAITING_ROUTE', message: '已请求取消，正在处理', switching: false }],
-    ['a retest waiting for the route to recover', { status: 'pending', phase: 'VALIDATING', message: '等待路由恢复到使用中状态', switching: false }],
+    ['a retest whose route is no longer verified (ending)', { status: 'pending', phase: 'VALIDATING', message: '路由已不在已验证的使用中状态，无法开始检测：正在结束本次重新检测（不切换、不阻断 Safari）', switching: false }],
     ['an older service without the switching flag', { status: 'pending', phase: 'SAVED', message: '正在切换出口，请稍候' }],
   ] as const)('%s: never claims that Safari is being rejected', async (_name, reply) => {
     const wrapper = await pendingPage(reply as BeginVerificationResponse);

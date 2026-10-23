@@ -7,6 +7,7 @@ import { SfeError } from '@sfe/contract';
 import type { Clock, IdGenerator, SecretStore } from '../ports.js';
 import type { Repositories } from '../db/index.js';
 import type { SecretKind } from '../db/repos/secret-refs.js';
+import { yieldToEventLoop } from '../util/yield.js';
 import { secretStoreError } from './errors.js';
 
 export const DEFAULT_PENDING_TTL_MS = 10 * 60 * 1000;
@@ -112,8 +113,45 @@ export class SecretRefManager {
   }
 
   /**
+   * 批量丢弃尚未被使用的引用（例如导入写入秘密之后主事务失败、版本冲突的行）：仍被引用的跳过（不抛错），其余与 discard 相同。
+   * 每个引用之间让出事件循环、删除时推迟 -wal 截断，结束时截断一次（SecretStore.flush）——成千上万个秘密的同步删除与每次的
+   * 写回加 fsync 不会把整个服务冻结到它结束（原生桥握手、普通模式请求、HTTP 照常处理）。返回删除的个数。从不抛出。
+   */
+  async discardUnused(refs: readonly string[]): Promise<number> {
+    if (this.repos.db.inTransaction()) throw new Error('discardUnused must not be called inside a database transaction');
+    let n = 0;
+    try {
+      for (const ref of refs) {
+        await yieldToEventLoop();
+        try {
+          const referenced = this.repos.tx(() => this.repos.secretRefs.isReferenced(ref));
+          if (referenced) continue;
+          try {
+            await this.store.delete(ref, { deferTruncate: true });
+          } catch {
+            this.repos.tx(() => {
+              this.repos.secretRefs.markOrphaned(ref);
+            });
+            continue;
+          }
+          this.repos.tx(() => {
+            if (!this.repos.secretRefs.isReferenced(ref)) this.repos.secretRefs.delete(ref);
+          });
+          n++;
+        } catch {
+          // 引用行的读写失败：留给清扫（pending 超时或 orphaned 之后按引用情况删除）
+        }
+      }
+    } finally {
+      await this.store.flush?.().catch(() => undefined);
+    }
+    return n;
+  }
+
+  /**
    * 回收：orphaned 引用与超过 pendingOlderThanMs 的 pending 引用，只在没有任何引用时删除。
-   * 仍被引用的恢复为 committed（共享的 keep 引用）。应在执行器内串行调用（启动时与每小时）。
+   * 仍被引用的恢复为 committed（共享的 keep 引用）。应在执行器内串行调用（启动时与每小时）。每个引用之间让出事件循环、
+   * 删除时推迟 -wal 截断，结束时截断一次（见 discardUnused）。
    */
   async sweep(opts: { now?: Date; pendingOlderThanMs?: number } = {}): Promise<SweepResult> {
     if (this.repos.db.inTransaction()) throw new Error('sweep must not be called inside a database transaction');
@@ -123,6 +161,7 @@ export class SecretRefManager {
     const candidates = this.repos.tx(() => [...this.repos.secretRefs.listOrphaned(), ...this.repos.secretRefs.listStalePending(before)]);
     const result: SweepResult = { deleted: [], kept: [], failed: [] };
     for (const cand of candidates) {
+      await yieldToEventLoop();
       const keep = this.repos.tx(() => {
         if (!this.repos.secretRefs.isReferenced(cand.ref)) return false;
         this.repos.secretRefs.restoreCommitted(cand.ref);
@@ -133,7 +172,7 @@ export class SecretRefManager {
         continue;
       }
       try {
-        await this.store.delete(cand.ref);
+        await this.store.delete(cand.ref, { deferTruncate: true });
       } catch {
         result.failed.push(cand.ref);
         continue;
@@ -146,7 +185,7 @@ export class SecretRefManager {
       if (removed) result.deleted.push(cand.ref);
       else result.kept.push(cand.ref);
     }
-    // 之前的删除因其他程序持有读快照而推迟的 -wal 截断：每次清扫（启动时与每小时）再试一次
+    // 本次推迟的 -wal 截断，以及之前因其他程序持有读快照而没有完成的：每次清扫（启动时与每小时）结束时截断一次
     await this.store.flush?.();
     return result;
   }

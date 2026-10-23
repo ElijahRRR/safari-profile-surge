@@ -237,7 +237,9 @@ describe('docs/ARCHITECTURE.md §0', () => {
 
   it('§6.1 states what cancelling does per operation kind and that an accepted cancel wins over a queued verification result', () => {
     expect(text).not.toContain('取消（`cancelOperation`）只适用于等待中的路由操作：激活/重测按 §6.3.14 回滚');
-    expect(text).toContain('Safari 重测（`probeKind` safari，含第 1 步复用时改为重测的激活，§6.4）只把检测结束为 FAILED，路由不变、不回滚');
+    expect(text).toContain('Safari 重测（`probeKind` safari，含第 1 步复用时改为重测的激活，§6.4）只把检测结束为 FAILED，不回滚');
+    // 通常不改变路由，例外是共同结束点（§6.3 第 14 步）：不无条件承诺路由不变
+    expect(text).toContain('这两种通常不改变路由，例外是 §6.3 第 14 步的共同结束点');
     expect(text).toContain('已受理的取消优先，旧请求的结果不能覆盖新请求');
   });
 
@@ -372,7 +374,7 @@ describe('docs/INSTALL.md', () => {
   it('describes how deleted secrets are removed from disk instead of denying secure_delete', () => {
     expect(text).not.toContain('服务没有开启 SQLite 的 `secure_delete`');
     expect(text).toContain('数据库开启了 SQLite 的 `secure_delete`');
-    expect(text).toContain('每删除一个值就把 `-wal` 写回数据库并截断为 0 字节');
+    expect(text).toContain('每删除一个值（清理与导入一次删除一批时，在这一批结束时）就把 `-wal` 写回数据库并截断为 0 字节');
   });
 
   it('§6 separates account passwords (next sweep) from proxy credentials (only after the old revision retires)', () => {
@@ -438,5 +440,57 @@ describe('docs/ARCHITECTURE.md §0.1 and apps/macos/README.md (Apple documentati
     const order = ['进入普通模式', '临时规则', '停止后台服务', '退出', '改名保存', '新的数据目录', '日常-Safari环境.conf', '重新初始化', '重新导入'].map((k) => note.indexOf(k));
     expect(order.every((i) => i >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+});
+
+describe('docs/ARCHITECTURE.md §6.1, §6.3 step 14 and §6.4 (route end points)', () => {
+  const text = read('ARCHITECTURE.md');
+
+  it('the crash-superseded switch is an end point that may move SFE-ROUTE to REJECT, consistently in §6.1 and §6.3 step 14', () => {
+    expect(text).not.toContain('不回滚、不写入 Surge，记为 `SUPERSEDED`');
+    expect(text).toContain('不回滚、不改写入口，记为 `SUPERSEDED`（`superseded_by` 为接手的操作，步骤写明）；接手的操作已结束而 Safari 仍可能经未验证的出口时');
+    expect(text).toContain('崩溃恢复中被之后的操作取代的切换（接手的操作已结束时）');
+  });
+
+  it('waiting and re-test cancels and timeouts do not promise an unchanged route unconditionally; an end point that selected REJECT ends as needing attention', () => {
+    expect(text).not.toContain('只把检测结束为 FAILED，路由不变、不回滚');
+    expect(text).not.toContain('超时或取消只把本次重测结束为 FAILED，路由不变（');
+    expect(text).not.toContain('截止仍未到达 → 结束为 `READY_FOR_NEXT_OPEN`（下一步「切换到新版本」），路由不变。');
+    expect(text).toContain('都结束为 `BLOCKED_NEEDS_ATTENTION`（needs_attention；错误保留原来的代码，没有错误时 `UNKNOWN_STATE`）');
+    expect(text).toContain('或路由记在另一个未结束（排队、执行中、等待中）的操作名下——不论路由阶段');
+  });
+});
+
+describe('the Surge-directory temp files of atomic writes are listed where secrets live and in the delete lists (ARCHITECTURE §2, INSTALL §5–§7)', () => {
+  it('lists `.<file>.sfe-tmp-<hex>` with the startup sweep and in the uninstall and upgrade delete steps', () => {
+    const arch = read('ARCHITECTURE.md');
+    const install = read('INSTALL.md');
+    const s2 = arch.slice(arch.indexOf('## 2.'), arch.indexOf('## 3.'));
+    expect(s2).toContain('`.<文件名>.sfe-tmp-<16 位十六进制>`');
+    expect(s2).toContain('sweepProfileTempFiles');
+    const s5 = install.slice(install.indexOf('## 5.'), install.indexOf('## 6.'));
+    const s6 = install.slice(install.indexOf('## 6.'), install.indexOf('## 7.'));
+    const s7 = install.slice(install.indexOf('## 7.'));
+    expect(s5).toContain('.sfe-tmp-<16 位十六进制>');
+    expect(s6).toContain('.sfe-tmp-<16 位十六进制>');
+    expect(s7).toContain('.sfe-tmp-<16 位十六进制>');
+  });
+});
+
+describe('persisted digests cannot verify replaced passwords offline (ARCHITECTURE §0 and §4, INSTALL §6, ACCEPTANCE)', () => {
+  it('describes the v2 request digest, the fingerprints cleared at retirement and migration 3 instead of "unchanged fingerprint rules"', () => {
+    const arch = read('ARCHITECTURE.md');
+    expect(arch).not.toContain('回收、指纹与 pepper 的规则不变');
+    expect(arch).not.toContain('`request_digest`（对秘密值做 HMAC 后的规范形式的带密钥摘要）');
+    expect(arch).toContain('`v2:<shape>:<进程标记>:<full>`');
+    expect(arch).toContain('代理版本退役时清除它的用户名与密码指纹');
+    expect(arch).toContain('`scrubbed-v1`');
+    expect(arch).toContain('服务重新启动之后，同一 `request_id`、不带秘密值、内容相同的请求按重复返回原操作；带秘密值');
+    expect(arch).not.toContain('服务重新启动之后，同一 `request_id`、秘密以外的内容相同的请求按重复返回原操作');
+    // 维护操作不保存预览摘要（迁移 4 删除升级前的）
+    expect(arch).toContain('操作中只保存进程内随机密钥下的核对值（`previewCheck`）');
+    expect(arch).toContain('迁移 4 删除升级前保存的 `previewDigest`');
+    expect(read('INSTALL.md')).toContain('数据库里也没有能用来离线核对猜测旧值的摘要');
+    expect(read('ACCEPTANCE.md')).toContain('不能用于离线核对已替换、已清扫的旧密码');
   });
 });

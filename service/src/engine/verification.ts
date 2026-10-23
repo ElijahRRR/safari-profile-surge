@@ -7,7 +7,7 @@ import { SfeError, buildVerifyUrl, type BeginVerificationResponse, type NativeRe
 import type { OperationRecord } from '../db/index.js';
 import { payloadOf, type RoutePayload, type VerificationSubmission } from '../domain/operations.js';
 import type { Engine } from './context.js';
-import { currentSelection } from './handlers/route.js';
+import { currentSelection, retestRouteLost } from './handlers/route.js';
 
 type SubmitMessage = Extract<NativeRequest, { type: 'submitSafariVerification' }>;
 
@@ -42,6 +42,40 @@ function inProgress(op: OperationRecord, p: RoutePayload): BeginVerificationResp
   return { status: 'pending', phase: op.phase, message: '正在切换出口，请稍候', switching: true };
 }
 
+/**
+ * 等待已开始结束（超时、取消或目标版本已被替换，RoutePayload.ending；结束点还在读写 Surge）：不签发检测编号、不记到达，也不说
+ * 正在切换——它马上结束（结果见操作），不再切换或检测。
+ */
+function endingResponse(op: OperationRecord): BeginVerificationResponse {
+  return { status: 'pending', phase: op.phase, message: '本次等待已超时、已取消或已被替换，正在结束（不再切换或检测）', switching: false };
+}
+
+/**
+ * 等待中的重新检测（probe_waiting），而路由已不在已验证的使用中状态（retestRouteLost：对账发现 Surge 重启、出站模式改变、选择被
+ * 外部修改等）：路由只有经之后的激活才回到已验证状态，而新的激活会取代这次重测——它再也无法签发检测编号，不能回答「等待路由
+ * 恢复」让准备页一直等到到达截止时间。记下到达（不说「场景未到达」），排入 route_lost，由执行器立即结束这次重测
+ * （handlers/route.ts endLostRetest，说明写明路由的状态）。已受理取消或已开始结束时只回答 pending，由它们结束。
+ */
+function retestRouteLostResponse(engine: Engine, op: OperationRecord, ctx: ArrivalContext): BeginVerificationResponse {
+  const { repos } = engine;
+  const queued = repos.tx(() => {
+    const fresh = repos.operations.get(op.id);
+    const fp = fresh ? payloadOf(fresh).route : undefined;
+    if (!fresh || !fp || fresh.status !== 'waiting' || fp.stage !== 'probe_waiting' || fp.ending || fp.cancelRequested) return false;
+    if (fp.arrivedAt === null) {
+      savePayload(engine, fresh, { arrivedAt: engine.nowIso(), arrivedProfileId: ctx.profileId, amazonTabsAtVerify: fp.amazonTabsAtVerify ?? ctx.amazonTabsOpen });
+      repos.operations.appendStep(op.id, fresh.phase, '绑定场景已到达，但路由已不在已验证的使用中状态：无法开始检测，结束本次重新检测');
+    }
+    if (!repos.outbox.pendingForOperation(op.id).some((r) => r.resumeReason === 'route_lost')) repos.outbox.enqueue(op.id, 'route_lost', engine.now());
+    return true;
+  });
+  if (queued) {
+    ctx.kick();
+    engine.emit({ operations: [op.id] });
+  }
+  return { status: 'pending', phase: op.phase, message: '路由已不在已验证的使用中状态，无法开始检测：正在结束本次重新检测（不切换、不阻断 Safari）', switching: false };
+}
+
 export async function beginVerification(engine: Engine, op: OperationRecord, ctx: ArrivalContext): Promise<BeginVerificationResponse> {
   const { repos } = engine;
   const p = payloadOf(op).route!;
@@ -64,6 +98,7 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
   if (op.status === 'failed' || op.status === 'superseded' || op.status === 'needs_attention' || op.status === 'succeeded' || op.status === 'parked') {
     throw opError(op);
   }
+  if (p.ending) return endingResponse(op);
   if (op.status === 'queued' || op.status === 'running') return inProgress(op, p);
   // waiting
   if (op.phase === 'WAITING_ROUTE') {
@@ -87,9 +122,7 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
   if (p.cancelRequested) return { status: 'pending', phase: op.phase, message: '已请求取消，正在处理', switching: false };
   const route = repos.routeState.get();
   if (op.routeEpoch !== route.routeEpoch) throw new SfeError('STALE_ROUTE_EPOCH', '检测失败：路由已变化，请重新开始');
-  if (p.stage === 'probe_waiting' && (route.entryMode !== 'ACTIVE' || route.phase !== 'active_verified')) {
-    return { status: 'pending', phase: op.phase, message: '等待路由恢复到使用中状态', switching: false };
-  }
+  if (p.stage === 'probe_waiting' && retestRouteLost(route)) return retestRouteLostResponse(engine, op, ctx);
   const now = engine.now();
   if (p.verifyDeadline !== null && Date.parse(p.verifyDeadline) <= now.getTime()) {
     throw new SfeError('SAFARI_VERIFY_TIMEOUT', 'Safari 实测超时：请重新开始');
@@ -106,12 +139,14 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
     const fresh = repos.operations.get(op.id)!;
     const fp = payloadOf(fresh).route!;
     const fr = repos.routeState.get();
+    // 读取选择期间等待已开始结束（超时或取消在执行器中读写 Surge）：不签发
+    if (fp.ending && fresh.status === 'running') return 'ending' as const;
     if (fresh.status !== 'waiting' || (fp.stage !== 'verify_only' && fp.stage !== 'probe_waiting')) throw opError(fresh);
     if (fp.cancelRequested) return 'cancel_requested' as const;
     if (fresh.routeEpoch !== fr.routeEpoch || fr.routeEpoch !== route.routeEpoch) throw new SfeError('STALE_ROUTE_EPOCH', '检测失败：路由已变化，请重新开始');
     // 切换的 VERIFY_ONLY 等待由本操作负责路由；重测不写路由，只要求路由仍是使用中且已验证
     if (fp.stage === 'verify_only' && fr.operationId !== op.id) throw new SfeError('SUPERSEDED', '检测已结束：路由已由其他操作接手');
-    if (fp.stage === 'probe_waiting' && (fr.entryMode !== 'ACTIVE' || fr.phase !== 'active_verified')) return null;
+    if (fp.stage === 'probe_waiting' && retestRouteLost(fr)) return 'route_lost' as const;
     const at = engine.now();
     if (fp.verifyDeadline !== null && Date.parse(fp.verifyDeadline) <= at.getTime()) throw new SfeError('SAFARI_VERIFY_TIMEOUT', 'Safari 实测超时：请重新开始');
     const existing = repos.verificationTests
@@ -144,7 +179,9 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
     return { testId, routeEpoch: fr.routeEpoch, deadline, first };
   });
   if (issued === 'cancel_requested') return { status: 'pending', phase: op.phase, message: '已请求取消，正在处理', switching: false };
-  if (!issued) return { status: 'pending', phase: op.phase, message: '等待路由恢复到使用中状态', switching: false };
+  if (issued === 'ending') return endingResponse(op);
+  // 读取选择期间对账已把路由改为不再已验证：同上，结束这次重测
+  if (issued === 'route_lost') return retestRouteLostResponse(engine, op, ctx);
   if (issued.first) {
     ctx.kick();
     engine.emit({ operations: [op.id], route: true });

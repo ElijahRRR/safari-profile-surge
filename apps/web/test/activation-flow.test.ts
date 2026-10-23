@@ -217,10 +217,11 @@ describe('activation from the environments page', () => {
     ctx.viewer.open('op_1', 'US-买家01');
     await flush();
     const retest = document.body.querySelector('[data-test="scene-guidance"]')?.textContent ?? '';
-    // 重测超时只结束检测（§6.4）：不承诺恢复原节点、阻断 Safari 或改选 REJECT
-    expect(retest).toContain('超时则本次重新检测失败，路由不变（不切换、不阻断 Safari）');
+    // 重测超时只结束检测（§6.4）：不承诺恢复原节点或阻断 Safari；也不无条件承诺路由不变——结束时 SFE-ROUTE 已不是已验证的出口
+    // 时服务改选 REJECT 并要求处理（§6.3 第 14 步）
+    expect(retest).toContain('超时则本次重新检测失败，通常路由不变（不切换、不阻断 Safari）');
+    expect(retest).toContain('若此时 SFE-ROUTE 已不是使用中环境已验证的出口（例如在 Surge 中被改选），会改选 REJECT');
     expect(retest).not.toContain('恢复原节点');
-    expect(retest).not.toContain('REJECT');
     ctx.viewer.close();
     await flush();
     // 活动环境发布进入切换后的 VERIFY_ONLY 等待：超时按第 14 步回滚
@@ -277,21 +278,22 @@ describe('activation from the environments page', () => {
     }, snapshot({ route: route({ operationId: 'op_1', phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: 'env_1', activeProxyRevision: 1, awaitingDeadline: deadline }), pendingOperations: [reuseOp] }));
     const Page = defineComponent({ render: () => [h(RouteCard), h(RouteActionHost)] });
     const m = await mountWith(Page, ctx);
-    // 路由卡：取消只结束检测，路由不变
+    // 路由卡：取消只结束检测，通常路由不变（例外：SFE-ROUTE 已不是已验证的出口时改选 REJECT）
     expect(document.body.querySelector('[data-test="route-cancel"]')?.textContent?.trim()).toBe('取消重测');
-    expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).toContain('取消只结束本次检测，路由不变');
+    expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).toContain('取消只结束本次检测，通常路由不变');
+    expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).toContain('会改选 REJECT');
     expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).not.toContain('恢复原节点');
     ctx.viewer.open('op_1', 'US-买家01');
     await flush();
     const guidance = document.body.querySelector('[data-test="scene-guidance"]')?.textContent ?? '';
-    expect(guidance).toContain('超时则本次重新检测失败，路由不变（不切换、不阻断 Safari）');
+    expect(guidance).toContain('超时则本次重新检测失败，通常路由不变（不切换、不阻断 Safari）');
     expect(guidance).not.toContain('恢复原节点');
-    expect(guidance).not.toContain('REJECT');
     expect(document.body.querySelector('[data-test="cancel-operation"]')?.textContent?.trim()).toBe('取消重测');
     click(document.body.querySelector('[data-test="cancel-operation"]'));
     await flush();
     expect(document.body.textContent).toContain('确定要取消这次 Safari 重测吗？');
-    expect(document.body.textContent).toContain('只结束本次检测，路由不变（不切换、不阻断 Safari）');
+    expect(document.body.textContent).toContain('只结束本次检测，不会进入普通模式。通常路由不变（不切换、不阻断 Safari）');
+    expect(document.body.textContent).toContain('会改选 REJECT（拒绝 Safari 经本应用出口的新连接）并要求处理');
     expect(document.body.textContent).not.toContain('确定要取消此次切换吗？');
     expect(document.body.textContent).not.toContain('服务会尝试恢复切换前的节点选择');
     click(byText('.modal-footer button', '取消重测'));
@@ -299,5 +301,39 @@ describe('activation from the environments page', () => {
     expect(calls.some((c) => c.url === '/api/operations/op_1/cancel')).toBe(true);
     m.unmount();
   });
-});
 
+  it('cancelling a WAITING_ROUTE publish does not promise an unchanged exit unconditionally, and an operation whose end moved SFE-ROUTE to REJECT says the route changed (§6.3 step 14)', async () => {
+    const waitOp = operation({ id: 'op_2', kind: 'environment.update', phase: 'WAITING_ROUTE', status: 'waiting' });
+    const heldOp = operation({
+      id: 'op_3',
+      kind: 'probe.safari',
+      probeKind: 'safari',
+      phase: 'BLOCKED_NEEDS_ATTENTION',
+      status: 'needs_attention',
+      error: { code: 'SUPERSEDED', message: '已取消重新检测；结束时路由仍未回到已确认的状态（…），失败即关闭：SFE-ROUTE 已改选 REJECT（读回确认）' },
+      result: { rejectSelected: true },
+    });
+    const { ctx } = testContext((call: Call) => {
+      if (call.url === '/api/operations/op_2') return { status: 200, body: waitOp };
+      if (call.url === '/api/operations/op_3') return { status: 200, body: heldOp };
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: '找不到' } } };
+    }, snapshot({ route: route({ operationId: null, phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: 'env_1', activeProxyRevision: 1 }), pendingOperations: [waitOp] }));
+    const m = await mountWith(RouteActionHost, ctx);
+    ctx.viewer.open('op_2', 'US-买家01');
+    await flush();
+    click(document.body.querySelector('[data-test="cancel-operation"]'));
+    await flush();
+    expect(document.body.textContent).toContain('确定要取消等待场景打开吗？');
+    expect(document.body.textContent).toContain('通常当前出口不变；若此时 SFE-ROUTE 已不是使用中环境已验证的出口');
+    expect(document.body.textContent).not.toContain('当前出口不变，不会进入普通模式');
+    ctx.viewer.finishCancel();
+    await flush();
+    ctx.viewer.open('op_3', 'US-买家01');
+    await flush();
+    const held = document.body.querySelector('[data-test="reject-held"]')?.textContent ?? '';
+    expect(held).toContain('路由已改变，需要处理');
+    expect(held).toContain('服务已把它改选 REJECT');
+    expect(held).toContain('自动打开订单与填充已停止');
+    m.unmount();
+  });
+});

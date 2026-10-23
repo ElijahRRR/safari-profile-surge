@@ -124,6 +124,46 @@ describe('environments page', () => {
     m.unmount();
   });
 
+  it('a corrected password resubmitted after a lost response is refused by the service (same request_id): the dialog says the earlier save took effect and this one did not, never "修改已保存"', async () => {
+    let puts = 0;
+    const { ctx, calls } = testContext((c: Call) => {
+      if (c.url === '/api/environments/env_1/account') return { status: 200, body: { environment_id: 'env_1', label: 'buyer01', loginIdentifier: 'buyer01@example.test', hasPassword: true } };
+      if (c.method !== 'GET' && c.url === '/api/environments/env_1') {
+        puts++;
+        if (puts === 1) throw new TypeError('Failed to fetch');
+        return { status: 409, body: { error: { code: 'DUPLICATE_REQUEST_MISMATCH', message: '请求失败：request_id 已用于内容不同的请求' } } };
+      }
+      return NOT_FOUND;
+    }, snapshot());
+    const m = await mountWith(EnvironmentsView, ctx, {}, '/environments');
+    click(document.body.querySelector('[data-test="edit-env"]'));
+    await flush();
+    const secret = () => document.body.querySelector<HTMLElement>('[data-secret="账号密码"]')!;
+    const type = async (value: string) => {
+      const el = secret().querySelector<HTMLInputElement>('input')!;
+      el.value = value;
+      el.dispatchEvent(new Event('input'));
+      await nextTick();
+    };
+    secret().querySelector<HTMLButtonElement>('[data-action="replace"]')!.click();
+    await nextTick();
+    await type('P1-typo');
+    click(document.body.querySelector('[data-test="env-save"]'));
+    await flush();
+    expect(document.body.querySelector('[data-test="env-form"]')).not.toBeNull();
+    await type('P2-correct');
+    click(document.body.querySelector('[data-test="env-save"]'));
+    await flush();
+    const sent = calls.filter((c) => c.url === '/api/environments/env_1' && c.method !== 'GET').map((c) => c.body as { request_id: string });
+    expect(sent).toHaveLength(2);
+    expect(sent[1]!.request_id).toBe(sent[0]!.request_id);
+    const form = document.body.querySelector('[data-test="env-form"]');
+    expect(form).not.toBeNull();
+    expect(form!.textContent).toContain('之前一次提交（例如连接中断或服务重新启动之前）已经生效，这次的修改没有保存');
+    expect(document.body.textContent).not.toContain('修改已保存');
+    m.unmount();
+  });
+
   it('opening the edit dialog never puts secrets into the page', async () => {
     const { ctx } = testContext(
       (c: Call) => (c.url === '/api/environments/env_1/account' ? { status: 200, body: { environment_id: 'env_1', label: 'buyer01', loginIdentifier: 'buyer01@example.test', hasPassword: true } } : NOT_FOUND),

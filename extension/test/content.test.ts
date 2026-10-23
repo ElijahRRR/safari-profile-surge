@@ -309,6 +309,11 @@ describe('runLoginAssist', () => {
       expect(shown[0]?.detail).toContain(message);
       expect(shown[0]?.detail).toContain(expected);
       expect(shown[0]?.detail).not.toContain('可手动填充');
+      // 拒绝时只知道普通模式已受理：不能断言请求已不经买家出口（普通模式可能失败或未能确认），请用户在弹窗中确认
+      if (reason === 'normal_pending') {
+        expect(shown[0]?.detail).not.toContain('不经买家出口');
+        expect(shown[0]?.detail).toContain('请在扩展弹窗中确认已进入普通模式');
+      }
       expect((document.getElementById('ap_password') as HTMLInputElement).value).toBe('');
       expectNoSubmitOrClick();
     }

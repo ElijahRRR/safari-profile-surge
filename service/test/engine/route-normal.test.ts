@@ -4,11 +4,12 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { ENTRY_RULESET_FILES, type ProtocolCoverage } from '@sfe/contract';
+import { ENTRY_PLACEHOLDER_RULE, ENTRY_RULESET_FILES, SfeError, type ProtocolCoverage } from '@sfe/contract';
 import { processPathsDigest } from '../../src/engine/capabilities.js';
 import { capabilityUnverified } from '../../src/surge/primitives.js';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST, FakeSurge } from '../../src/surge/fake.js';
-import { entryRuleSetFileContent, tempRuleText } from '../../src/surge/generate.js';
+import { entryRuleSetFileContent, parseEntryRuleSetFile, tempRuleText } from '../../src/surge/generate.js';
+import { normalizeRuleText } from '../../src/surge/rules.js';
 import { AGENT, ALL_CAPS, PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, anyContext, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
@@ -1205,5 +1206,290 @@ describe('a failed or unconfirmed normal mode reports only what was read back (�
     const view = h.app.views.environmentView(a)!;
     expect(view.facets.route).toBe('active');
     expect(view.nextActions[0]!.message).toContain('路由状态需要处理');
+  });
+});
+
+describe('entry strategy changed on an idle NORMAL route, before maintenance.remerge writes the new entry (§5.2, §5.5, §6.5)', () => {
+  /** temp_rule、空闲的普通模式、从未激活；确认 runtime_entry_modes 的提议改用 ruleset_resource（工作配置里还没有四条 RULE-SET）。 */
+  async function strategyChangedBeforeRemerge(): Promise<void> {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, activationSnapshot: null });
+    const { proposal_id } = await h.app.proposeCapability(
+      {
+        request_id: rid('prop'),
+        key: 'runtime_entry_modes',
+        proposed_status: 'supported',
+        context: { ...anyContext(), surgeVersion: '6.10.0', surgeBuild: '12500' },
+        summary: '入口模式（合成）',
+        evidence_digest: 'sha256:0123456789abcdef',
+        entry_strategy: 'ruleset_resource',
+      },
+      AGENT,
+    );
+    await h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id }, WEB);
+    expect(h.repos.settings.get('entryStrategy')).toBe('ruleset_resource');
+    expect(readFileSync(h.profilePath, 'utf8')).not.toContain('sfe-entry-');
+  }
+
+  test('normal mode still succeeds on the original rules without writing anything, and remerge stays available afterwards', async () => {
+    await strategyChangedBeforeRemerge();
+    const writes = { ...h.fake.calls };
+    const n = await enterNormal(null);
+    const op = h.repos.operations.get(n)!;
+    expect(op.error).toBeNull();
+    expect(op).toMatchObject({ phase: 'NORMAL_RESTORED', status: 'succeeded' });
+    const last = h.repos.operations.listSteps(n).at(-1)!.message;
+    expect(last).toBe('已进入普通模式：Safari 按 Surge 原规则发出请求');
+    expect(h.repos.operations.listSteps(n).map((st) => st.message).join('\n')).toContain('尚未写入工作配置');
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+    expect(route.warnings).toEqual([]);
+    expect(h.app.views.routeView().normalModeOffered).toBe(false);
+    // 没有写入 Surge 或入口文件：不加临时规则、不创建入口规则集文件、不改选 SFE-ROUTE、不结束连接
+    for (const k of ['addTempRule', 'removeTempRule', 'selectGroupPolicy', 'killRequest', 'reloadProfile'] as const) expect(h.fake.calls[k] ?? 0).toBe(writes[k] ?? 0);
+    for (const name of Object.values(ENTRY_RULESET_FILES)) expect(() => readFileSync(join(h.surgeDir, name), 'utf8')).toThrow();
+    expectOriginalRules();
+    // 恢复路径仍在：重新合并的入口检查通过（入口为普通模式），没有被普通模式留下的 UNKNOWN 卡住
+    const p = await h.app.remergePreview(WEB);
+    expect(p.checks.find((c) => c.name === 'entry')!.ok).toBe(true);
+    expect(p.managedDiff).toContain('RULE-SET');
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
+    expect(readFileSync(h.profilePath, 'utf8')).toContain('sfe-entry-');
+    // 重新合并之后（经用户确认的那一次同一配置重载）普通模式照常：入口文件为占位规则，已是普通模式
+    const reloads = h.fake.calls.reloadProfile ?? 0;
+    const n2 = await enterNormal(null);
+    expect(h.repos.operations.get(n2)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+    expect(safariOutcome(h, 'daily.example.test').policyName).toBe('Daily');
+    expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(reloads);
+  });
+
+  test('ruleset_resource entry not yet written: an activation stops before its first write (RESOURCE_MISSING), the route is untouched, and normal mode still succeeds', async () => {
+    await strategyChangedBeforeRemerge();
+    // 改用新策略让依赖入口策略的能力回到待验证：按新策略重新记录（测试专用），只剩入口尚未写入这一条
+    h.grant(ALL_CAPS);
+    expect(h.repos.settings.get('entryStrategy')).toBe('ruleset_resource');
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    const before = h.repos.routeState.get();
+    const writes = { ...h.fake.calls };
+    const a = await h.app.activate(env, { request_id: rid('act') }, WEB);
+    await h.idle();
+    const op = h.repos.operations.get(a.operation_id)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('RESOURCE_MISSING');
+    expect(op.error?.message).toContain('重新合并');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', routeEpoch: before.routeEpoch, activationSnapshot: null, selectedNode: before.selectedNode });
+    for (const k of ['addTempRule', 'removeTempRule', 'selectGroupPolicy', 'killRequest'] as const) expect(h.fake.calls[k] ?? 0).toBe(writes[k] ?? 0);
+    for (const name of Object.values(ENTRY_RULESET_FILES)) expect(() => readFileSync(join(h.surgeDir, name), 'utf8')).toThrow();
+    const n = await enterNormal(null);
+    expect(h.repos.operations.get(n)!.phase).toBe('NORMAL_RESTORED');
+    expectOriginalRules();
+  });
+
+  test('rule match unavailable: the not-yet-written entry is judged from Surge\'s effective rule list only; normal mode still succeeds and says so', async () => {
+    await strategyChangedBeforeRemerge();
+    h.fake.matchRule = async () => {
+      throw capabilityUnverified('matchRule');
+    };
+    const n = await enterNormal(null);
+    expect(h.repos.operations.get(n)!).toMatchObject({ phase: 'NORMAL_RESTORED', status: 'succeeded' });
+    const steps = h.repos.operations.listSteps(n).map((st) => st.message);
+    expect(steps.some((m) => m.includes('尚未写入工作配置') && m.includes('只按有效规则列表判断'))).toBe(true);
+    // 有效规则列表已表明没有规则能把 Safari 交给 SFE-ROUTE：路由不带 entry_unverified（§5.2），完成说明照常
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', warnings: [] });
+    expect(steps.at(-1)).toBe('已进入普通模式：Safari 按 Surge 原规则发出请求');
+    expectOriginalRules();
+    const p = await h.app.remergePreview(WEB);
+    expect(p.checks.find((c) => c.name === 'entry')!.ok).toBe(true);
+  });
+});
+
+describe('entry strategy changed before remerge, and rule match fails transiently (not "unavailable") during normal mode (§5.2)', () => {
+  test('normal mode completes from Surge\'s effective rule list (no entry rule, nothing routed to SFE-ROUTE): no REJECT hold, no buyer-exit warning, and remerge stays available', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const { proposal_id } = await h.app.proposeCapability(
+      {
+        request_id: rid('prop'),
+        key: 'runtime_entry_modes',
+        proposed_status: 'supported',
+        context: { ...anyContext(), surgeVersion: '6.10.0', surgeBuild: '12500' },
+        summary: '入口模式（合成）',
+        evidence_digest: 'sha256:0123456789abcdef',
+        entry_strategy: 'ruleset_resource',
+      },
+      AGENT,
+    );
+    await h.app.confirmCapability({ request_id: rid(), action: 'confirm', proposal_id }, WEB);
+    expect(h.repos.settings.get('entryStrategy')).toBe('ruleset_resource');
+    // 命令超时（CLI 适配器的形状）：不是「rule match 不可用」，结果未知
+    h.fake.matchRule = async () => {
+      throw new SfeError('SURGE_UNREACHABLE', '连接 Surge 失败：命令超时');
+    };
+    const selects = h.fake.calls.selectGroupPolicy ?? 0;
+    const n = await enterNormal(null);
+    const op = h.repos.operations.get(n)!;
+    expect(op.error).toBeNull();
+    expect(op).toMatchObject({ phase: 'NORMAL_RESTORED', status: 'succeeded' });
+    const steps = h.repos.operations.listSteps(n).map((st) => st.message);
+    expect(steps.some((m) => m.includes('尚未写入工作配置') && m.includes('只按有效规则列表判断'))).toBe(true);
+    expect(steps.join('\n')).not.toContain('请先在维护中重新合并');
+    // 没有改选 SFE-ROUTE、没有声称 Safari 的连接可能在买家出口上（它从未经过 SFE-ROUTE）
+    expect(h.fake.calls.selectGroupPolicy ?? 0).toBe(selects);
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+    // 也不带 entry_unverified：判断只依据有效规则列表，而它已表明没有规则能把 Safari 交给 SFE-ROUTE（§5.2）
+    expect(route.warnings).toEqual([]);
+    expect(route.selectedNode).not.toBe('REJECT');
+    expectOriginalRules();
+    const p = await h.app.remergePreview(WEB);
+    expect(p.checks.find((c) => c.name === 'entry')!.ok).toBe(true);
+  });
+});
+
+describe('the entry RULE-SET lines removed or reordered in the working profile outside the app while an environment is in use (ruleset_resource, §5.2, §5.5)', () => {
+  /** 文件中除见证规则之外只有占位规则（parseEntryRuleSetFile 去掉注释与见证行）。 */
+  const placeholderOnly = (bit: 'udp' | 'verify' | 'block' | 'active'): boolean => {
+    const { bodies, witness } = parseEntryRuleSetFile(bit, readFileSync(join(h.surgeDir, ENTRY_RULESET_FILES[bit]), 'utf8'));
+    return witness !== null && bodies.length === 1 && bodies[0] === normalizeRuleText(ENTRY_PLACEHOLDER_RULE);
+  };
+
+  /** 用户在 Surge 的编辑器中改动工作配置（或恢复了一份旧副本）并保存，Surge 重新加载它。 */
+  async function editEntrySegment(mode: 'block' | 'one-line' | 'reorder'): Promise<void> {
+    const lines = readFileSync(h.profilePath, 'utf8').split('\n');
+    let out: string[];
+    if (mode === 'block') {
+      const b = lines.findIndex((l) => l.startsWith('# SFE-BEGIN entry'));
+      const e = lines.findIndex((l) => l.startsWith('# SFE-END entry'));
+      expect(b).toBeGreaterThanOrEqual(0);
+      out = [...lines.slice(0, b), ...lines.slice(e + 1)];
+    } else if (mode === 'one-line') {
+      out = lines.filter((l) => !l.startsWith('RULE-SET,sfe-entry-udp'));
+    } else {
+      out = [...lines];
+      const bi = out.findIndex((l) => l.startsWith('RULE-SET,sfe-entry-block'));
+      const ai = out.findIndex((l) => l.startsWith('RULE-SET,sfe-entry-active'));
+      [out[bi], out[ai]] = [out[ai]!, out[bi]!];
+    }
+    writeFileSync(h.profilePath, out.join('\n'));
+    await h.fake.reloadProfile();
+    await h.app.runPeriodicReconcile();
+  }
+
+  test.each(['block', 'one-line', 'reorder'] as const)('%s: normal mode rewrites the entry files to placeholders and completes on the original rules; remerge then restores the segment and the environment can be used again', async (mode) => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    await editEntrySegment(mode);
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'UNKNOWN' });
+    expect(h.repos.routeState.get().warnings).toContain('managed_segments_changed');
+    const reloads = h.fake.calls.reloadProfile ?? 0;
+    const n = await enterNormal(envId);
+    const op = h.repos.operations.get(n)!;
+    expect(op.error).toBeNull();
+    expect(op).toMatchObject({ phase: 'NORMAL_RESTORED', status: 'succeeded' });
+    expect(h.repos.operations.listSteps(n).map((st) => st.message).join('\n')).toContain('已把入口规则集文件改写为占位规则');
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+    expect(route.warnings).toContain('managed_segments_changed');
+    expect(route.warnings).not.toContain('entry_unverified');
+    for (const bit of ['udp', 'verify', 'block', 'active'] as const) expect(placeholderOnly(bit)).toBe(true);
+    // Safari 按原规则发出（不是 DIRECT 或 FINAL 的复制，也不经 SFE-ROUTE）；Chrome 从不命中本应用规则
+    expect(safariOutcome(h, 'daily.example.test').policyName).toBe('Daily');
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    expect(safariOutcome(h, FAKE_VERIFY_HOST)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    expect(safariOutcome(h, 'www.example.test', 'udp').rule).toBe('FINAL,DIRECT');
+    expect(h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: FAKE_VERIFY_HOST, protocol: 'tcp' }).policyName).not.toBe('SFE-ROUTE');
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(reloads);
+    // 恢复路径：重新合并的入口检查通过，恢复入口段之后 Surge 加载的是占位规则（普通模式）
+    const p = await h.app.remergePreview(WEB);
+    expect(p.checks.find((c) => c.name === 'entry')!.ok).toBe(true);
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
+    const restored = readFileSync(h.profilePath, 'utf8');
+    expect(['udp', 'verify', 'block', 'active'].map((b) => restored.indexOf(`RULE-SET,sfe-entry-${b}.list`))).toEqual(
+      [...['udp', 'verify', 'block', 'active'].map((b) => restored.indexOf(`RULE-SET,sfe-entry-${b}.list`))].sort((x, y) => x - y),
+    );
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    const n2 = await enterNormal(null);
+    expect(h.repos.operations.get(n2)!.phase).toBe('NORMAL_RESTORED');
+    // 之后可以照常使用环境
+    const act = await h.app.activate(envId, { request_id: rid('act') }, WEB);
+    await h.idle();
+    const r = await verify(h, PROFILE_A, act.operation_id);
+    expect(r.ok).toBe(true);
+    expect(h.repos.operations.get(act.operation_id)!.phase).toBe('ACTIVE_VERIFIED');
+  });
+
+  test('rule match unavailable: the rewritten placeholder files are not claimed as witness-confirmed and Safari is not claimed to be on the original rules unconditionally', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    await editEntrySegment('one-line');
+    h.fake.matchRule = async () => {
+      throw capabilityUnverified('matchRule');
+    };
+    const n = await enterNormal(envId);
+    expect(h.repos.operations.get(n)!).toMatchObject({ phase: 'NORMAL_RESTORED', status: 'succeeded' });
+    const step = h.repos.operations.listSteps(n).map((st) => st.message).find((m) => m.includes('已把入口规则集文件改写为占位规则'))!;
+    expect(step).toBeDefined();
+    expect(step).not.toContain('由见证确认已加载');
+    expect(step).toContain('未经见证确认已加载（rule match 不可用时按文件监视上限等满）');
+    expect(step).not.toMatch(/，Safari 按原规则发出；/);
+    expect(step).toContain('文件监视比上限慢时可能仍加载着改写之前的入口');
+    expect(step).toContain('未经运行时求值确认');
+    // 收紧未经确认：路由带 entry_unverified，SFE-ROUTE 改选 REJECT（失败即关闭）
+    expect(h.repos.routeState.get().warnings).toEqual(expect.arrayContaining(['entry_unverified', 'buyer_exit_connections_unconfirmed']));
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
+  });
+
+  test('an activation while the segment is damaged stops before its first write (no block written, SFE-ROUTE untouched) and says how to recover', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeA = h.repos.routeState.get().selectedNode!;
+    await editEntrySegment('one-line');
+    const files = Object.fromEntries(Object.values(ENTRY_RULESET_FILES).map((n) => [n, readFileSync(join(h.surgeDir, n), 'utf8')]));
+    const selects = h.fake.calls.selectGroupPolicy ?? 0;
+    const a = await h.app.activate(envId, { request_id: rid('act') }, WEB);
+    await h.idle();
+    const op = h.repos.operations.get(a.operation_id)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('RESOURCE_MISSING');
+    expect(op.error?.message).toContain('请先进入普通模式，再在维护中重新合并');
+    expect(h.repos.operations.listSteps(a.operation_id).some((st) => st.phase === 'SAFARI_BLOCKED' || st.phase === 'ROLLING_BACK')).toBe(false);
+    expect(h.fake.calls.selectGroupPolicy ?? 0).toBe(selects);
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe(nodeA);
+    for (const [n, text] of Object.entries(files)) expect(readFileSync(join(h.surgeDir, n), 'utf8')).toBe(text);
+  });
+});
+
+describe('an older queued activation never runs after a newer normal mode that already started (claim order broken by a backward wall-clock step)', () => {
+  test.each(['ruleset_resource', 'temp_rule'] as const)('%s: activation accepted, clock steps back 1 s, normal mode accepted → the activation is superseded, the route stays idle NORMAL and Safari keeps the original rules', async (entryStrategy) => {
+    h = await createHarness({ entryStrategy });
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    const daily = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    // 执行器忙（这里停下）：两个请求都排队；受理之间墙上时钟回拨（例如 NTP 校正），普通模式的可用时间反而更早
+    await h.app.executor.stop();
+    const act = (await h.app.activate(env, { request_id: rid('act') }, WEB)).operation_id;
+    h.clock.set(h.clock.now().getTime() - 1000);
+    const n = (await h.app.enterNormal({ request_id: rid('normal') }, WEB)).operation_id;
+    expect(h.repos.operations.get(n)!.payload).toMatchObject({ normal: { queuedBehind: [act] } });
+    const writes = h.fake.calls.selectGroupPolicy ?? 0;
+    h.app.executor.start();
+    await h.idle();
+    await h.clock.advanceAsync(2000);
+    await h.idle();
+    expect(h.repos.operations.get(n)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.operations.get(act)).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: n });
+    expect(h.repos.operations.listSteps(act).some((s) => s.phase === 'SAFARI_BLOCKED' || s.phase === 'VERIFY_ONLY')).toBe(false);
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'idle', entryMode: 'NORMAL', operationId: n, activationSnapshot: null });
+    expect(h.fake.calls.selectGroupPolicy ?? 0).toBe(writes);
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    expect(safariOutcome(h, FAKE_VERIFY_HOST)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    // 按原规则发出的 Safari 长连接没有被结束
+    expect((await h.fake.listActiveRequests()).some((r) => r.id === daily.id)).toBe(true);
   });
 });

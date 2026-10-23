@@ -931,6 +931,8 @@ export async function acceptCancel(deps: AcceptDeps, id: string, req: CancelOper
   const op = repos.operations.get(id);
   if (!op || (scope && !scope(op))) throw new SfeError('NOT_FOUND', '取消失败：操作不存在');
   const p = payloadOf(op).route;
+  // 等待已开始结束（超时、取消或目标版本已被替换，结束点还在读写 Surge）：不再受理取消，结果见操作
+  if (p?.ending) throw new SfeError('ROUTE_BUSY', '取消失败：该等待已超时、已取消或已被替换，正在结束');
   if (op.status !== 'waiting' || !p) throw new SfeError('ROUTE_BUSY', '取消失败：只能取消等待中的切换或检测');
   repos.tx(() => {
     repos.operations.update(op.id, { payload: { ...payloadOf(op), route: { ...p, cancelRequested: true } } });

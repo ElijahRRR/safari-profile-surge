@@ -84,3 +84,44 @@ describe('import: oversized secret cells', () => {
     expect(h.repos.routeState.get().entryMode).toBe('NORMAL');
   });
 });
+
+describe('import: bulk secret writes and discards let the event loop run (native bridge, normal mode and HTTP keep being served)', () => {
+  test('a commit whose rows all conflict (stale tab) yields between the secrets it writes and between the secrets it discards', async () => {
+    h = await createHarness();
+    const envs: string[] = [];
+    for (let i = 0; i < 4; i++) envs.push((await createEnv(h, `US-Buyer-0${i + 1}`, `203.0.113.${10 + i}`)).environment_id!);
+    const req = csv(envs.map((id, i) => `${id},US-Buyer-0${i + 1},socks5,203.0.113.${10 + i},1080,synthuser${i},synthpass${i},,US,,,acct-pw-${i},,,`));
+    const preview = await h.app.importPreview(req, WEB);
+    expect(preview.rows.map((r) => r.status)).toEqual(['update', 'update', 'update', 'update']);
+    // 另一个标签页已修改这些环境：每一行都是版本冲突，写入的秘密全部丢弃
+    const decisions = preview.rows.map((r, i) => ({ row: r.row, action: 'update' as const, environment_id: envs[i]!, expected_revision: r.current_revision! + 7 }));
+    let ticks = 0;
+    let counting = true;
+    const tick = (): void => {
+      if (!counting) return;
+      ticks++;
+      setImmediate(tick);
+    };
+    setImmediate(tick);
+    const at: { put: number[]; del: number[] } = { put: [], del: [] };
+    const put = h.store.put.bind(h.store);
+    const del = h.store.delete.bind(h.store);
+    h.store.put = async (ref, value, kind) => {
+      at.put.push(ticks);
+      return put(ref, value, kind);
+    };
+    h.store.delete = async (ref) => {
+      at.del.push(ticks);
+      return del(ref);
+    };
+    const result = await h.app.importCommit({ ...req, request_id: rid('imp'), preview_digest: preview.preview_digest, decisions }, WEB);
+    counting = false;
+    expect(result.items.map((i) => i.status)).toEqual(['revision_conflict', 'revision_conflict', 'revision_conflict', 'revision_conflict']);
+    // 每行三个秘密（代理用户名、密码、账号密码）：写入的行之间与丢弃的秘密之间都让出了事件循环
+    expect(at.put).toHaveLength(12);
+    expect(at.del).toHaveLength(12);
+    expect(at.put.at(-1)! - at.put[0]!).toBeGreaterThanOrEqual(3);
+    expect(at.del.at(-1)! - at.del[0]!).toBeGreaterThanOrEqual(10);
+    expect(h.repos.secretRefs.listStalePending('2999-01-01T00:00:00.000Z')).toEqual([]);
+  });
+});

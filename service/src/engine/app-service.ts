@@ -2,8 +2,12 @@
 // Surge 写入只在唯一执行器中发生。启动顺序：pepper → 主机事实 → 对账 → 恢复未完成操作 → 执行器 → 周期任务。
 // 停止只停执行器与计时器，从不改变入口状态或 SFE-ROUTE 选择。
 
+import { basename } from 'node:path';
 import {
+  ENTRY_RULESET_FILES,
+  NODE_RESOURCE_FILE,
   SfeError,
+  WORKING_PROFILE_NAME,
   type AccountDetail,
   type CapabilityView,
   type ImportCommitResult,
@@ -17,6 +21,7 @@ import {
 } from '@sfe/contract';
 import type { Actor, AppService, SurgePolicyCandidates } from '../app.js';
 import { importTemplateCsv } from '../importer/index.js';
+import { sweepProfileTempFiles } from '../surge/files.js';
 import { BUILTIN_POLICIES } from '../surge/rules.js';
 import { sweepTempFiles } from '../util/secure-files.js';
 import {
@@ -318,6 +323,17 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
         if (removed.length > 0) engine.log('warn', 'startup.candidate_dirs_removed', { count: removed.length });
       } catch (err) {
         engine.log('error', 'startup.candidate_sweep_failed', { error: err instanceof Error ? err.name : 'unknown' });
+      }
+      // 上次进程在原子写入 Surge 配置目录中的文件期间被终止时遗留的临时文件（节点资源的含明文买家凭据，工作配置的含用户自己
+      // 节点的凭据）：执行器开始之前删除（surge/files.ts sweepProfileTempFiles）
+      const wp = engine.workingProfile();
+      if (wp) {
+        try {
+          const removed = await sweepProfileTempFiles(wp.directory, [NODE_RESOURCE_FILE, ...Object.values(ENTRY_RULESET_FILES), basename(wp.path), `${WORKING_PROFILE_NAME}.conf`]);
+          if (removed.length > 0) engine.log('warn', 'startup.profile_temp_files_removed', { count: removed.length });
+        } catch (err) {
+          engine.log('error', 'startup.profile_temp_sweep_failed', { error: err instanceof Error ? err.name : 'unknown' });
+        }
       }
       await engine.refreshHostFacts();
       // 启动：放回上次未完成的领取，读 Surge 事实对账，再开始执行器（未完成操作由执行器按事实恢复）

@@ -310,9 +310,22 @@ export interface OperationView extends OperationSummary {
     uncheckedFields?: string[];
     /**
      * Safari 重测失败或出口不符时加到路由上的警告（自动打开订单与填充因此停止）。取消、超时与开始等待之前的失败没有这一项：
-     * 路由与之前的检测结果都不变。
+     * 通常路由与之前的检测结果都不变——除非结束时 SFE-ROUTE 已不是使用中环境已验证的出口而服务改选了 REJECT（rejectSelected），
+     * 或等待期间路由已不在已验证的使用中状态（routeLeftVerified）。
      */
     probeWarning?: 'probe_failed' | 'exit_ip_mismatch';
+    /**
+     * 路由操作结束时服务失败即关闭地把 SFE-ROUTE 改选 REJECT（docs/ARCHITECTURE.md §6.3 第 14 步的结束点、普通模式）：true 为读回
+     * 确认，false 为改选或读回失败。有这一项就说明路由已改变（Safari 经本应用出口的新连接被拒绝、订单与填充停止），界面不能说
+     * 「路由未改变」或「不受影响」；结束点改选时操作结束为 BLOCKED_NEEDS_ATTENTION。
+     */
+    rejectSelected?: boolean;
+    /**
+     * Safari 重测已开始等待检测（开始时路由是使用中且已验证的），结束时路由已不在已验证的使用中状态（等待期间对账发现 Surge
+     * 重启、出站模式改变、选择被外部修改等；不是这次重测改变的）：结束时路由记录的警告。有这一项时界面不能说「路由与之前的检测
+     * 结果都未改变」或「不受这次重新检测影响」：自动打开订单与填充已因路由状态停止，需要重新使用此环境或进入普通模式。
+     */
+    routeLeftVerified?: RouteWarning[];
     [key: string]: unknown;
   } | null;
   createdAt: IsoTime;

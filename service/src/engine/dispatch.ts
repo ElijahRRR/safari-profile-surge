@@ -25,7 +25,7 @@ export function createDispatcher(engine: Engine, hooks: DispatchHooks) {
       await inner(op, row);
     } catch (err) {
       // 否则执行器只把操作标为失败，过渡中的路由无人负责（Surge 可能仍加载着检测或使用中入口、SFE-ROUTE 选着未验证的节点），
-      // 对账从不写 Surge。本操作不负责过渡中的路由时什么也不做。
+      // 对账从不写 Surge。不负责过渡中路由的路由操作按共同结束点处理（holdAtRouteEnd）；其他操作什么也不做。
       await settleAbandonedTransition(engine, op.id, err);
       throw err;
     }

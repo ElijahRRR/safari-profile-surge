@@ -268,6 +268,8 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
 
   const before = await controller.read();
   if (before.mode !== 'NORMAL') throw refused(`前置条件不满足：入口读回为 ${before.mode}，不是 NORMAL。先运行 entry --strategy ${strategy} --to NORMAL`);
+  // ruleset_resource：四条入口 RULE-SET 不在 Surge 的有效规则中时读回按事实为 NORMAL，但没有可测试的入口
+  if (before.notInstalled) throw refused('前置条件不满足：测试配置中没有四条入口 RULE-SET（不在 Surge 的有效规则中），没有可测试的入口');
   const snap = await takeSnapshot(ctx, session, dir, 'entry-before');
   printSnapshot(out, snap);
   const precedenceTests = new Set(ctx.args.lists['precedence-test'] ?? []);

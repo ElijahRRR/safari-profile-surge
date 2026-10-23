@@ -9,7 +9,7 @@ import KeyValueList from './KeyValueList.vue';
 import NoticeBox from './NoticeBox.vue';
 import { formatClock, formatDateTime, formatRelative, formatRevision } from '../lib/format';
 import { ENTRY_MODE_LABELS, OPERATION_KIND_LABELS, OPERATION_PHASE_LABELS, OPERATION_STATUS_LABELS, PROBE_OUTCOME_LABELS, operationStatusDot } from '../lib/labels';
-import { cancelActionLabel, envLabel, isCancellableRouteOperation, isSafariRetest } from '../lib/environments';
+import { HELD_ON_END, cancelActionLabel, envLabel, isCancellableRouteOperation, isSafariRetest } from '../lib/environments';
 import { useConsole } from '../store/context';
 
 const { api, store, viewer } = useConsole();
@@ -94,12 +94,27 @@ const waitingForScene = computed(() => {
 // 操作自己的截止时间（服务端按实测截止时间或到达截止时间给出）：不用路由记录的 awaitingDeadline——重新检测与 WAITING_ROUTE 不负责
 // 路由，那里可能是之前一次检测或切换留下的、早已过去的时间
 const deadline = computed(() => (waitingForScene.value ? (op.value?.waitDeadline ?? null) : null));
-/** 实测超时的后果按操作说明：重新检测（含激活复用时改为的重测）从不切换、阻断或进入普通模式（§6.4），超时只结束检测；切换超时按第 14 步回滚。 */
+/**
+ * 实测超时的后果按操作说明：重新检测（含激活复用时改为的重测）从不切换或进入普通模式（§6.4），超时只结束检测（例外见
+ * HELD_ON_END）；切换超时按第 14 步回滚。
+ */
 const timeoutText = computed(() =>
   op.value && isSafariRetest(op.value)
-    ? '超时则本次重新检测失败，路由不变（不切换、不阻断 Safari）。'
+    ? `超时则本次重新检测失败，通常路由不变（不切换、不阻断 Safari）；${HELD_ON_END}`
     : '超时会尝试恢复原节点并保持 Safari 阻断（无法确认时改选 REJECT 并要求处理）。',
 );
+/**
+ * 结束时服务改选了 SFE-ROUTE（result.rejectSelected，§6.3 第 14 步的结束点；普通模式完成时另有完成说明）：路由已改变，订单与
+ * 填充停止，需要处理——不是「路由不变」。
+ */
+const rejectHeld = computed(() => {
+  const o = op.value;
+  const r = o?.result?.rejectSelected;
+  if (!o || r === undefined || o.phase === 'NORMAL_RESTORED') return null;
+  return r
+    ? '结束时 SFE-ROUTE 已不是使用中环境已验证的出口，服务已把它改选 REJECT：Safari 经本应用出口的新连接被拒绝，自动打开订单与填充已停止。请重新使用环境，或进入普通模式。'
+    : '结束时 SFE-ROUTE 已不是使用中环境已验证的出口，服务未能把它改选 REJECT：Safari 请求可能仍经买家出口发出，请立即进入普通模式。';
+});
 const cancellable = computed(() => (op.value ? isCancellableRouteOperation(op.value) : false));
 const windowsWarning = computed(() => {
   const o = op.value;
@@ -155,7 +170,8 @@ const rollbackItems = computed(() => {
       </div>
 
       <NoticeBox v-if="waitingForScene && op.phase === 'WAITING_ROUTE'" tone="info" title="等待场景打开" data-test="waiting-route-guidance">
-        新版本已部署。在 Safari 切换到场景 {{ sceneName ?? '（未知）' }}，点击扩展图标即可切换到新版本；在此之前当前出口不变。
+        新版本已部署。在 Safari 切换到场景 {{ sceneName ?? '（未知）' }}，点击扩展图标即可切换到新版本；在此之前当前出口不变（SFE-ROUTE
+        在 Surge 中被改选到别的节点时，等待结束时会改选 REJECT 并要求处理）。
         <template v-if="deadline"> 截止 {{ formatClock(deadline) }}。</template>
       </NoticeBox>
       <NoticeBox v-else-if="waitingForScene" tone="info" title="等待 Safari 实测" data-test="scene-guidance">
@@ -164,6 +180,7 @@ const rollbackItems = computed(() => {
       </NoticeBox>
 
       <NoticeBox v-if="op.error" tone="danger" :title="op.error.code">{{ op.error.message }}</NoticeBox>
+      <NoticeBox v-if="rejectHeld" tone="warning" title="路由已改变，需要处理" data-test="reject-held">{{ rejectHeld }}</NoticeBox>
       <NoticeBox v-if="op.supersededBy" tone="warning">
         此操作已被新的操作取代。
         <button type="button" class="ml-1 font-medium underline" @click="viewer.open(op.supersededBy!)">查看新操作</button>

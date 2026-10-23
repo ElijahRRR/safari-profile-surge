@@ -246,6 +246,87 @@ describe('deleted values do not linger on disk', () => {
     t2.db.close();
   });
 
+  test('a sweep of many orphaned values lets the event loop run between values and truncates the -wal once at the end (not once per value)', async () => {
+    const path = join(tempDir(), 'sfe.sqlite');
+    const t = setup({ path });
+    const refs: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      const ref = await t.mgr.createSecret(`${CANARY}-${i}`, 'account', { kind: 'account', id: `env_${i}` });
+      t.repos.tx(() => t.mgr.markCommitted(ref));
+      refs.push(ref);
+    }
+    // 每个进程的第一次截断（启动时的清扫）已经做过
+    await t.store.flush();
+    t.repos.tx(() => {
+      for (const ref of refs) t.mgr.orphan(ref);
+    });
+    let truncations = 0;
+    const checkpoint = t.db.checkpointTruncate.bind(t.db);
+    t.db.checkpointTruncate = () => {
+      truncations++;
+      return checkpoint();
+    };
+    // 事件循环的轮数：同步数据库操作包成的 Promise 只是微任务，不让出事件循环时这个计数在清扫期间不变
+    let ticks = 0;
+    let counting = true;
+    const tick = (): void => {
+      if (!counting) return;
+      ticks++;
+      setImmediate(tick);
+    };
+    setImmediate(tick);
+    const del = t.store.delete.bind(t.store);
+    const ticksAtDelete: number[] = [];
+    t.store.delete = async (ref, opts) => {
+      ticksAtDelete.push(ticks);
+      return del(ref, opts);
+    };
+    const r = await t.mgr.sweep();
+    counting = false;
+    expect(r.deleted).toHaveLength(refs.length);
+    expect(truncations).toBe(1);
+    expect(ticksAtDelete).toHaveLength(refs.length);
+    expect(ticksAtDelete.at(-1)! - ticksAtDelete[0]!).toBeGreaterThanOrEqual(refs.length - 2);
+    for (const f of [path, `${path}-wal`]) expect(onDisk(f), f).toBe(false);
+    t.db.close();
+  });
+
+  test('discarding a batch of unused values (an import whose rows all conflict) also yields between values and truncates once, leaving no copy', async () => {
+    const path = join(tempDir(), 'sfe.sqlite');
+    const t = setup({ path });
+    await t.store.flush();
+    const refs: string[] = [];
+    for (let i = 0; i < 8; i++) refs.push(await t.mgr.createSecret(`${CANARY}-${i}`, 'proxy', { kind: 'import', id: 'batch_1' }));
+    // 其中一个已被提交并引用（例如别的行用上了它）：跳过，不删除
+    const env = seedEnvironment(t.repos);
+    t.repos.tx(() => {
+      t.repos.accounts.insert({ environmentId: env.id, label: null, loginIdentifier: null, passwordRef: refs[0]!, passwordFp: null });
+      t.mgr.markCommitted(refs[0]!);
+    });
+    let truncations = 0;
+    const checkpoint = t.db.checkpointTruncate.bind(t.db);
+    t.db.checkpointTruncate = () => {
+      truncations++;
+      return checkpoint();
+    };
+    let ticks = 0;
+    let counting = true;
+    const tick = (): void => {
+      if (!counting) return;
+      ticks++;
+      setImmediate(tick);
+    };
+    setImmediate(tick);
+    const settled = t.mgr.discardUnused(refs).then((n) => ({ n, ticks }));
+    const { n, ticks: atEnd } = await settled;
+    counting = false;
+    expect(n).toBe(refs.length - 1);
+    expect(atEnd).toBeGreaterThanOrEqual(refs.length - 1);
+    expect(truncations).toBe(1);
+    for (let i = 1; i < refs.length; i++) expect(onDisk(`${path}-wal`) && readFileSync(`${path}-wal`).includes(Buffer.from(`${CANARY}-${i}`, 'utf8'))).toBe(false);
+    t.db.close();
+  });
+
   test('checkpointTruncate is skipped inside a transaction and is a no-op for memory databases', () => {
     const t = setup();
     expect(t.db.checkpointTruncate()).toBe(true);

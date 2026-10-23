@@ -76,8 +76,10 @@ export class LocalSecretStore implements SecretStore {
    * 旧帧仍有明文副本。checkpoint 不等待锁（Db.checkpointTruncate）：其他程序持有读快照时立即返回，不冻结服务；没有完成或
    * 失败不影响删除结果（值已从表中删除），下一次删除或清扫（flush，启动时与每小时；重启之后的第一次清扫总会截断一次）时再试，
    * 服务停止时 SQLite 关闭最后一个连接也会写回并删除 -wal。
+   * deferTruncate（批量删除：清扫、丢弃一批未使用的引用）：只记下需要截断，由调用方在批次结束时 flush 一次——每次截断都要把
+   * -wal 写回数据库并 fsync，同步的 node:sqlite 会让成千上万次删除把整个服务冻结十几秒（原生桥握手超时，普通模式请求失败）。
    */
-  async delete(ref: string): Promise<void> {
+  async delete(ref: string, opts: { deferTruncate?: boolean } = {}): Promise<void> {
     assertRef('delete', ref);
     let removed: boolean;
     try {
@@ -85,11 +87,12 @@ export class LocalSecretStore implements SecretStore {
     } catch {
       throw secretStoreError('delete', 'other');
     }
-    if (!removed && !this.truncatePending) return;
+    if (removed) this.truncatePending = true;
+    if (opts.deferTruncate === true || !this.truncatePending) return;
     this.truncate();
   }
 
-  /** 清扫结束时补做推迟的 -wal 截断（每个进程的第一次清扫总会截断一次，见 truncatePending）。 */
+  /** 清扫或批量删除结束时补做推迟的 -wal 截断（每个进程的第一次清扫总会截断一次，见 truncatePending）。 */
   async flush(): Promise<void> {
     if (this.truncatePending) this.truncate();
   }

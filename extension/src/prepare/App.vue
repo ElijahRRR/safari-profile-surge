@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted } from 'vue';
 import { Icon } from '@sfe/easyquick';
 import { OPERATION_PHASES, type OperationPhase } from '@sfe/contract';
-import { PHASE_TEXT, rollbackText } from '../shared/text';
+import { PHASE_TEXT, rejectHeldText, retestRouteLeftText, rollbackText } from '../shared/text';
 import type { PrepareController } from './controller';
 
 const props = defineProps<{ controller: PrepareController }>();
@@ -15,6 +15,19 @@ function phaseLabel(phase: string | null): string | null {
 }
 
 const busy = computed(() => ['arriving', 'pending', 'verifying', 'submitting', 'waiting_result'].includes(s.stage));
+/**
+ * 结束时服务改选了 SFE-ROUTE（result.rejectSelected，§6.3 第 14 步的结束点）：路由已改变，订单与填充已停止——不能再说「路由未
+ * 改变」或「不受这次重新检测影响」。没有这一项为 undefined。
+ */
+const held = computed<boolean | undefined>(() => s.operation?.result?.rejectSelected);
+/**
+ * 重测等待期间路由已不在已验证的使用中状态（result.routeLeftVerified：结束时路由的警告，例如等待期间 Surge 重启；不是这次重测
+ * 改变的）：不能说「路由与之前的检测结果都未改变」或「不受这次重新检测影响」。没有这一项为 null。
+ */
+const routeLeft = computed<readonly string[] | null>(() => {
+  const v = s.operation?.result?.routeLeftVerified;
+  return Array.isArray(v) ? v : null;
+});
 const title = computed(() => {
   switch (s.stage) {
     case 'invalid':
@@ -44,7 +57,13 @@ const title = computed(() => {
 const VERIFY_FAILURE_CODES = new Set(['SAFARI_VERIFY_FAILED', 'SAFARI_VERIFY_TIMEOUT', 'EXIT_IP_MISMATCH']);
 const failedTitle = computed(() => {
   if (s.outcome === 'superseded') return '切换未完成：已被之后的请求取代';
+  // 结束点改选了 SFE-ROUTE（重测或等待的取消、超时）：不是切换未能确认，而是结束时路由已改变
+  if (s.outcome === 'attention' && held.value !== undefined && !s.operation?.result?.rollback) {
+    return s.operation?.probeKind === 'safari' ? '重新检测已结束，路由需要处理' : '操作已结束，路由需要处理';
+  }
   if (s.outcome === 'attention') return '切换未能确认，需要处理';
+  // 等待期间路由已不在已验证的状态（检测本身没有失败）：说路由需要处理，不说超时或未完成就算了
+  if (s.outcome === 'probe_failed' && routeLeft.value && !probeStopped.value) return '重新检测已结束，路由需要处理';
   const code = s.operation?.error?.code;
   if (code === 'SAFARI_VERIFY_TIMEOUT' && s.outcome === 'probe_failed') return '重新检测超时';
   if (code && VERIFY_FAILURE_CODES.has(code)) return '出口检测未通过';
@@ -52,7 +71,8 @@ const failedTitle = computed(() => {
   return s.outcome === 'probe_failed' ? '重新检测未完成' : '切换未完成';
 });
 // 重测结束时是否真的停止了自动打开订单与填充：只有核对后失败或出口不符（服务把警告加到路由上，result.probeWarning；旧版服务
-// 按错误代码）才停止。取消、超时与开始等待之前的失败只结束这次重测，路由与之前的检测结果都不变（§6.4）
+// 按错误代码）才停止。取消、超时与开始等待之前的失败只结束这次重测，路由与之前的检测结果都不变（§6.4）——结束时服务改选了
+// SFE-ROUTE（result.rejectSelected）除外，见 held；等待期间路由已不在已验证的使用中状态（result.routeLeftVerified）同样除外，见 routeLeft
 const PROBE_STOP_CODES = new Set(['SAFARI_VERIFY_FAILED', 'EXIT_IP_MISMATCH']);
 const probeStopped = computed(() => {
   const op = s.operation;
@@ -61,10 +81,12 @@ const probeStopped = computed(() => {
 });
 // 失败后的说明只写读回确认过的：「不会改用直连或其他环境的出口」只在回滚读回确认 Safari 保持阻断时成立
 const failedNote = computed(() => {
+  if (held.value !== undefined && s.outcome !== 'rolled_back' && s.outcome !== 'superseded') return rejectHeldText(held.value);
   switch (s.outcome) {
     case 'rolled_back':
       return '不会改用直连或其他环境的出口。可以关闭此页面，在扩展弹窗中查看状态与下一步。';
     case 'probe_failed':
+      if (routeLeft.value) return retestRouteLeftText(routeLeft.value);
       return probeStopped.value
         ? '路由未改变，已停止自动打开订单与填充。可以关闭此页面，在扩展弹窗中查看状态与下一步。'
         : '这次重新检测已结束，路由与之前的检测结果都未改变，自动打开订单与填充不受这次重新检测影响。可以关闭此页面，在扩展弹窗中查看状态与下一步。';

@@ -125,7 +125,13 @@ export function isCancellableRouteOperation(op: Pick<OperationView, 'status' | '
 }
 
 /**
- * 当前环境的 Safari 重测（§6.4：不切换、不阻断、不回滚；超时或取消只结束检测）：重测操作本身，或激活第 1 步复用时改为重测的
+ * 等待场景（WAITING_ROUTE）与 Safari 重测的取消、超时通常不改变路由；例外（§6.3 第 14 步的结束点）：结束时 SFE-ROUTE 已不是
+ * 使用中环境已验证的出口（例如在 Surge 中被改选到别的节点），服务失败即关闭改选 REJECT，操作结束为需要处理。
+ */
+export const HELD_ON_END = '若此时 SFE-ROUTE 已不是使用中环境已验证的出口（例如在 Surge 中被改选），会改选 REJECT（拒绝 Safari 经本应用出口的新连接）并要求处理。';
+
+/**
+ * 当前环境的 Safari 重测（§6.4：不切换、不阻断、不回滚；超时或取消只结束检测，例外见 HELD_ON_END）：重测操作本身，或激活第 1 步复用时改为重测的
  * 激活（环境已在使用中而实测过期：操作仍是 route.activate，服务端记 probeKind 'safari'）。
  */
 export function isSafariRetest(op: Pick<OperationView, 'kind' | 'probeKind'>): boolean {

@@ -42,8 +42,12 @@ export interface SecretStore {
   put(ref: string, value: string, kind: 'proxy' | 'account' | 'system'): Promise<void>;
   /** 任何种类都可读取（账号密码只在登录填充按 §6.10 把关通过后读出）；读到的值由调用方登记到脱敏器。 */
   get(ref: string): Promise<string | null>;
-  delete(ref: string): Promise<void>;
-  /** 可选：清扫结束时调用，补做之前因忙推迟的清理（LocalSecretStore：截断 -wal，清除已删除值的旧帧）。从不抛出。 */
+  /**
+   * 删除（不存在时视为成功）。deferTruncate：批量删除（清扫、丢弃一批未使用的引用）时不在每次删除之后做清理（LocalSecretStore：
+   * 截断 -wal，每次都要写回并 fsync），由调用方在批次结束时调用一次 flush。
+   */
+  delete(ref: string, opts?: { deferTruncate?: boolean }): Promise<void>;
+  /** 可选：清扫或批量删除结束时调用，补做推迟的清理（LocalSecretStore：截断 -wal，清除已删除值的旧帧）。从不抛出。 */
   flush?(): Promise<void>;
 }
 
@@ -293,6 +297,21 @@ export interface EntryReadback {
    * 但不能宣称已阻断——mode 为 BLOCKED 只表示中间阻断这一段已满足。
    */
   keptTowardNormal?: Array<'udp' | 'block'>;
+  /**
+   * ruleset_resource：true 表示本应用入口尚未写入工作配置（四条入口 RULE-SET 都不在 Surge 的有效规则中、没有规则以 SFE-ROUTE
+   * 为策略、入口规则集文件不存在或只是占位规则；例如在空闲的普通模式下改用 ruleset_resource、尚未重新合并）。mode 按事实为
+   * NORMAL（探测不一致或读不到时为 UNKNOWN）：普通模式没有可撤销的入口、不写入；激活在写入之前停止（先重新合并）。
+   */
+  notInstalled?: boolean;
+  /**
+   * ruleset_resource：true 表示本应用入口在工作配置中的四条 RULE-SET 不完整、重复或顺序不对（例如用户在 Surge 中编辑或恢复了
+   * 工作配置，入口段被删去或改动），但不是「尚未写入」（notInstalled）。激活在写入之前停止（先进入普通模式，再在维护中重新合并）；
+   * 普通模式把本应用的入口规则集文件全部改写为占位规则（在有效规则中的由见证确认已加载，不在其中的 Surge 不加载、不等待），
+   * 文件全部为占位规则、没有其他规则以 SFE-ROUTE 为策略且探测一致时 mode 为 NORMAL，之后重新合并恢复受管理段。
+   */
+  segmentDamaged?: boolean;
+  /** 撤销入口时本次切换改写为占位规则的入口规则集文件（入口段不完整、不在有效规则中时，见 segmentDamaged）；没有改写时缺省。 */
+  rewrote?: string[];
 }
 
 /** 撤销清理的一步：temp_rule 撤销入口时逐条加入或移除的一整条本应用临时规则（不是单个位的变更，§5.5）。 */

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, test } from 'vitest';
-import { canonicalJson, canonicalRequestForm, deriveKey, hmacHex, keyedRequestDigest } from '../../src/util/keyed-digest.js';
+import { canonicalJson, canonicalRequestForm, deriveKey, hmacHex, keyedRequestDigest, requestDigestParts } from '../../src/util/keyed-digest.js';
 
 const pepper = Buffer.alloc(32, 7);
 const key = deriveKey(pepper, 'request');
@@ -113,8 +113,21 @@ describe('keyedRequestDigest', () => {
     for (const secret of ['Csv-Pw-1', 'csv-user-1', 'Csv-Login-1', 'plain-proxy-user', 'top-pw-1', body.content_base64]) {
       expect(form).not.toContain(secret);
     }
-    expect(form).toContain('"proxy_password":null');
-    expect(form).toContain('198.51.100.7');
+    // 导入的 records 整体替换（键可以是别名，逐键识别靠不住）；其余字段照旧
+    expect(form).toMatch(/"records":"hmac:[0-9a-f]{64}"/);
+    expect(form).not.toContain('198.51.100.7');
+    expect(form).toContain('"format":"json"');
+  });
+
+  test('JSON import records keyed by aliases (Chinese template headers, camelCase, other spellings) are secret as a whole: the persisted shape and the secret flag do not depend on the password', () => {
+    for (const pwKey of ['代理密码', '登录密码', 'proxyPassword', 'loginPassword', 'proxy_pass', 'account_password', 'Proxy Password', '账号密码']) {
+      const body = (pw: string) => ({ method: 'importCommit', target: null, body: { request_id: 'imp-2', format: 'json', preview_digest: 'x', records: [{ 环境名称: 'A', 代理地址: '198.51.100.7', 代理端口: 1080, 代理账号: 'synth-user', [pwKey]: pw }] } });
+      const a = requestDigestParts(key, Buffer.alloc(32, 7), body('Summer2025'));
+      const b = requestDigestParts(key, Buffer.alloc(32, 7), body('Winter2024'));
+      expect(a.shape).toBe(b.shape);
+      expect(a.secret).toBe(true);
+      expect(a.full).not.toBe(b.full);
+    }
   });
 
   test('keep/clear SecretChange are kept verbatim', () => {

@@ -88,12 +88,14 @@ const primary = computed<'continue' | 'orders' | 'activate'>(() => {
 });
 
 // 取消的后果按操作所处的阶段说明（§6.3 第 14 步、§6.4）：活动环境发布只有停在 WAITING_ROUTE（尚未切换）时取消才只结束等待；
-// 进入切换之后（VERIFY_ONLY 等待：Safari 已阻断、已选择新节点）与激活一样回滚；重新检测只结束检测，路由不变
+// 进入切换之后（VERIFY_ONLY 等待：Safari 已阻断、已选择新节点）与激活一样回滚；重新检测只结束检测。等待与重测的取消通常不改变
+// 路由，但结束时 SFE-ROUTE 已不是使用中环境已验证的出口（例如在 Surge 中被改选）时服务失败即关闭改选 REJECT 并要求处理
+const HELD_NOTE = '若此时 SFE-ROUTE 已不是使用中环境已验证的出口（例如在 Surge 中被改选），会改选 REJECT（拒绝 Safari 经本应用出口的新连接）并要求处理。';
 const cancelText = computed(() =>
   pending.value?.waiting_route
-    ? '新版本保持已部署，当前出口不变，下次打开时再切换。'
+    ? `新版本保持已部署，下次打开时再切换；通常当前出口不变，${HELD_NOTE}`
     : pending.value?.kind === 'probe_safari'
-      ? '将结束本次出口检测，路由不变（不切换、不阻断 Safari）。'
+      ? `将结束本次出口检测，通常路由不变（不切换、不阻断 Safari）；${HELD_NOTE}`
       : '将尝试恢复切换前的节点选择并保持 Safari 阻断，之后需要重新核验；无法确认时不恢复，改选 REJECT 拒绝 Safari 经本应用出口的新连接并要求处理。不会进入普通模式。',
 );
 /** 取消按钮按效果命名（与网页后台相同：取消等待、取消重测、取消切换）。 */

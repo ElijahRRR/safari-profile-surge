@@ -308,4 +308,51 @@ export const MIGRATIONS: readonly string[] = [
   DELETE FROM capabilities WHERE key = 'bridge_keychain_access';
   DELETE FROM capability_proposals WHERE key = 'bridge_keychain_access';
   `,
+  /* 3 */ `
+  -- pepper 与按它派生的 HMAC 在同一个数据库中（迁移 2）：持久保存的、由秘密值计算的带密钥摘要能让拿到数据目录副本的人离线
+  -- 核对猜测的旧密码（已替换、已清扫的账号密码与代理密码）。见 docs/ARCHITECTURE.md §0「秘密的存放」。
+  -- 旧格式（v1）的幂等请求摘要按秘密值的 HMAC 计算：改写为不可核对的值（之后同一 request_id 的重试按内容不同返回 409）；
+  -- 新格式（v2:）不依赖秘密（engine/ledger.ts requestDigest）
+  UPDATE operations SET request_digest = 'scrubbed-v1' WHERE request_digest NOT LIKE 'v2:%';
+  UPDATE meta SET value = json_set(value, '$.digest', 'scrubbed-v1')
+    WHERE key LIKE 'engine:req:%' AND json_valid(value) AND json_type(value, '$.digest') = 'text' AND json_extract(value, '$.digest') NOT LIKE 'v2:%';
+  -- 已退役的代理版本：指纹只用于变化检测，退役之后不再需要
+  UPDATE proxy_revisions SET username_fp = NULL, password_fp = NULL WHERE state = 'retired';
+  -- 含已退役版本的发布记录：资源摘要覆盖当时的明文代理凭据，这些发布已无法重建
+  UPDATE deployments SET resource_digest = 'scrubbed', working_profile_digest = NULL
+    WHERE EXISTS (
+      SELECT 1 FROM json_each(deployments.node_manifest) AS m
+      JOIN proxy_revisions AS r
+        ON r.environment_id = json_extract(m.value, '$.environmentId') AND r.revision = json_extract(m.value, '$.proxyRevision')
+      WHERE r.state = 'retired'
+    );
+  `,
+  /* 4 */ `
+  -- 同一类（迁移 3）的其余两处：维护提交在操作中保存的预览摘要（previewDigest）按 pepper 派生的密钥对含秘密的内容计算——重新
+  -- 合并覆盖当时 sfe-nodes.list 的明文买家代理凭据，初始化与重新合并覆盖工作配置中用户自己的节点凭据；与 backups/ 中的工作配置
+  -- 副本一起，拿到数据目录副本的人能离线核对猜测的旧代理密码。改为只保存进程内随机密钥下的核对值（engine/maintenance.ts
+  -- previewCheckOf），这里删除旧值（升级前受理、尚未执行的维护操作执行时按预览已过期处理，需要重新预览）。
+  UPDATE operations SET payload = json_remove(payload, '$.previewDigest')
+    WHERE kind IN ('maintenance.init', 'maintenance.remerge') AND json_valid(payload) AND json_type(payload, '$.previewDigest') IS NOT NULL;
+  -- 早期版本的维护备份复制过本应用生成的文件（sfe-nodes.list 与四个 sfe-entry-*.list，含明文代理凭据），并在 backups.files 中
+  -- 记下其内容的带密钥摘要：删去这些条目（用户按 INSTALL §6 删除复制的文件之后，摘要不能留下）
+  UPDATE backups SET files = (
+      SELECT json_group_array(json(f.value)) FROM json_each(backups.files) AS f
+      WHERE NOT (ltrim(json_extract(f.value, '$.relativePath'), './') = 'sfe-nodes.list'
+        OR ltrim(json_extract(f.value, '$.relativePath'), './') IN ('sfe-entry-udp.list', 'sfe-entry-verify.list', 'sfe-entry-block.list', 'sfe-entry-active.list'))
+    )
+    WHERE json_valid(files) AND EXISTS (
+      SELECT 1 FROM json_each(backups.files) AS f
+      WHERE ltrim(json_extract(f.value, '$.relativePath'), './') = 'sfe-nodes.list'
+        OR ltrim(json_extract(f.value, '$.relativePath'), './') IN ('sfe-entry-udp.list', 'sfe-entry-verify.list', 'sfe-entry-block.list', 'sfe-entry-active.list')
+    );
+  `,
+  /* 5 */ `
+  -- 同一类（迁移 3）：JSON 导入的 records 用别名或驼峰写法的键（「代理密码」「登录密码」、proxy_pass、proxyPassword 等）提交时，
+  -- 之前的请求摘要只认规范字段名，持久保存的 shape 按 pepper 派生的密钥覆盖了明文密码（没有 :s 标记）。现在 records 整体按秘密
+  -- 处理（util/keyed-digest.ts）；这里把没有 :s 标记的导入批次摘要改写为不可核对的值（之后同一 request_id 的重试返回 409）。
+  -- 带 :s 的（content_base64 或规范字段名）本来就不依赖秘密，保留。
+  UPDATE operations SET request_digest = 'scrubbed-v1'
+    WHERE kind = 'import.batch' AND request_digest LIKE 'v2:%' AND request_digest NOT LIKE '%:s';
+  `,
 ];

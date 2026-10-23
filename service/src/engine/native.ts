@@ -196,7 +196,8 @@ async function currentState(deps: NativeDeps, profileId: string | null, envId: s
   if (envId) {
     const open = repos.operations
       .listByStatus([...OPEN_STATUSES])
-      .filter((op) => payloadOf(op).route?.targetEnvironmentId === envId)
+      // 已开始结束的等待（RoutePayload.ending）不再是待完成的检测：不提供「继续验证」与取消
+      .filter((op) => payloadOf(op).route?.targetEnvironmentId === envId && !payloadOf(op).route?.ending)
       .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
     const op = open[0];
     if (op) {

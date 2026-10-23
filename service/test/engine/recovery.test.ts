@@ -1,9 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, type RollbackResult } from '@sfe/contract';
+import { ENTRY_RULESET_FILES, NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, type RollbackResult } from '@sfe/contract';
 import { FAKE_CHROME_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
 import { capabilityUnverified } from '../../src/surge/primitives.js';
+import { payloadOf } from '../../src/domain/operations.js';
+import type { SurgeAdapter } from '../../src/ports.js';
 import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, envInput, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
@@ -329,6 +331,32 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
     expect(readFileSync(join(h.dir, 'outside', 'keep.txt'), 'utf8')).toBe('keep');
     expect(existsSync(join(tmpDir, 'unrelated.txt'))).toBe(true);
   });
+
+  test('a temp file of an atomic write into the Surge profile directory, left by a process killed between write and rename (plaintext buyer credentials), is removed at the next start; other dot-files are kept', async () => {
+    h = await createHarness({ dbFile: true });
+    const leftovers = [
+      `.${NODE_RESOURCE_FILE}.sfe-tmp-0123456789abcdef`,
+      `.${ENTRY_RULESET_FILES.active}.sfe-tmp-89abcdef01234567`,
+      `.${basename(h.profilePath)}.sfe-tmp-fedcba9876543210`,
+    ];
+    const LEFTOVER_PW = 'synthLeftPw7788';
+    for (const n of leftovers) writeFileSync(join(h.surgeDir, n), `SFE-N-E0001-US01-v001 = socks5, 203.0.113.10, 1080, username=synthUser, password=${LEFTOVER_PW}\n`, { mode: 0o600 });
+    // 不是本应用文件的临时文件名、名称不完整的、不是点开头的、其他点文件：一概不碰
+    const kept = ['.DS_Store', '.other.list.sfe-tmp-0123456789abcdef', `.${NODE_RESOURCE_FILE}.sfe-tmp-short`, `${NODE_RESOURCE_FILE}.sfe-tmp-0123456789abcdef`];
+    for (const n of kept) writeFileSync(join(h.surgeDir, n), 'x');
+    // 名称相符的符号链接不跟随、不删除
+    writeFileSync(join(h.dir, 'outside.txt'), 'keep');
+    const link = `.${ENTRY_RULESET_FILES.udp}.sfe-tmp-0011223344556677`;
+    symlinkSync(join(h.dir, 'outside.txt'), join(h.surgeDir, link));
+    await h.crash();
+    await h.idle();
+    for (const n of leftovers) expect(existsSync(join(h.surgeDir, n))).toBe(false);
+    for (const n of kept) expect(existsSync(join(h.surgeDir, n))).toBe(true);
+    expect(lstatSync(join(h.surgeDir, link)).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(h.dir, 'outside.txt'), 'utf8')).toBe('keep');
+    expect(h.logs.join('\n')).not.toContain(LEFTOVER_PW);
+    expect(h.logs.join('\n')).toContain('startup.profile_temp_files_removed');
+  });
 });
 
 describe('crash recovery with a normal mode accepted behind the interrupted operation (§6.1 claim order)', () => {
@@ -446,6 +474,54 @@ describe('crash recovery with a normal mode accepted behind the interrupted oper
     expectOriginalRules(N);
   });
 
+  test('…and when the later operation ended without confirming its undo (SFE-ROUTE still on an unverified node), the superseded switch is an end point: it moves SFE-ROUTE to REJECT and says so instead of "the route keeps its result" (§6.1, §6.3 step 14)', async () => {
+    h = await createHarness();
+    const { P, N } = await crashMidPublishSwitchWithQueuedNormal();
+    const origMatch = h.fake.matchRule.bind(h.fake);
+    const fake = h.fake as unknown as Record<string, (...args: string[]) => Promise<unknown>>;
+    const origSelect = fake.selectGroupPolicy!.bind(h.fake);
+    const selects: string[][] = [];
+    let running: 'N' | 'P' | null = null;
+    let failRejectInN = true;
+    fake.selectGroupPolicy = async (...args: string[]) => {
+      selects.push([running ?? '-', ...args]);
+      // 普通模式改选 REJECT 失败一次：它结束时 SFE-ROUTE 仍选着切换写入的未验证节点
+      if (running === 'N' && args[1] === 'REJECT' && failRejectInN) {
+        failRejectInN = false;
+        throw new Error('改选失败（测试）');
+      }
+      return origSelect(...args);
+    };
+    // 模拟错误的领取顺序（同上）；普通模式的撤销无法经运行时求值确认（rule match 不可用）
+    const claim = h.repos.outbox.claimNext.bind(h.repos.outbox);
+    h.repos.outbox.claimNext = (now, prefer) => {
+      const row = claim(now, [[N], ...(prefer ?? [])]);
+      if (row?.operationId === N) {
+        running = 'N';
+        (h.fake as unknown as { matchRule: unknown }).matchRule = async () => {
+          throw capabilityUnverified('matchRule');
+        };
+      }
+      if (row?.operationId === P) {
+        running = 'P';
+        (h.fake as unknown as { matchRule: unknown }).matchRule = origMatch;
+      }
+      return row;
+    };
+    await h.crash();
+    await h.idle();
+    expect(h.repos.operations.get(N)!.phase).toBe('NORMAL_RESTORED');
+    const pub = h.repos.operations.get(P)!;
+    expect(pub).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: N });
+    expect(pub.result).toMatchObject({ rejectSelected: true });
+    expect(selects.filter((c) => c[0] === 'P')).toEqual([['P', ROUTE_GROUP_NAME, 'REJECT']]);
+    const last = h.repos.operations.listSteps(P).at(-1)!.message;
+    expect(last).toContain('不回滚、不改写入口');
+    expect(last).toContain('SFE-ROUTE 已改选 REJECT（读回确认）');
+    expect(last).not.toContain('路由保持它的结果');
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
+  });
+
   test('crash while a normal mode runs → after the restart it resumes before an operation accepted earlier that is not a route operation', async () => {
     h = await createHarness();
     const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
@@ -483,5 +559,310 @@ describe('crash recovery with a normal mode accepted behind the interrupted oper
     expect(order.indexOf(createId!)).toBeGreaterThan(0);
     expectOriginalRules(normalId!);
     expect(h.repos.operations.get(createId!)!.status).toBe('succeeded');
+  });
+});
+
+/**
+ * 引擎看到的 Surge 适配器：gate 返回 'hang' 时这次调用挂起（模拟进程在调用中途崩溃），'after' 时先照常执行、再挂起（写入已生效，
+ * 读回之前崩溃），'fail' 时这次调用失败（模拟 surge-cli 超时）。崩溃之后的新实例同样经它，测试在崩溃之前清除或换掉 gate。
+ */
+type Gate = (name: string, args: unknown[]) => 'hang' | 'after' | 'fail' | null;
+let gate: Gate | null = null;
+let gateHits = 0;
+function gated(fake: object): SurgeAdapter {
+  return new Proxy(fake, {
+    get(target, prop) {
+      const v = Reflect.get(target, prop, target) as unknown;
+      if (typeof v !== 'function') return v;
+      const fn = v as (...args: unknown[]) => unknown;
+      return (...args: unknown[]) => {
+        const g = gate?.(String(prop), args) ?? null;
+        if (g === null) return fn.apply(target, args);
+        gateHits++;
+        if (g === 'hang') return new Promise(() => undefined);
+        if (g === 'fail') return Promise.reject(new Error('模拟：surge-cli 超时'));
+        return (async () => {
+          await fn.apply(target, args);
+          await new Promise(() => undefined);
+        })();
+      };
+    },
+  }) as unknown as SurgeAdapter;
+}
+
+describe('crash at a route operation end point: a decided failure or REJECT hold survives the restart (§6.1, §6.3 step 14, §6.4)', () => {
+  afterEach(() => {
+    gate = null;
+  });
+
+  async function crashWhenGated(): Promise<void> {
+    await until(() => gateHits > 0);
+    gate = null;
+    await h.crash();
+    await h.idle();
+  }
+
+  async function ordersAllowed(): Promise<boolean> {
+    const st = (await h.native(PROFILE_A, { type: 'getCurrentState' })) as { ok: true; data: { ordersAllowed: boolean } };
+    return st.data.ordersAllowed;
+  }
+
+  async function mismatchingRetest(): Promise<{ a: string; p: string; probeBefore: string }> {
+    gateHits = 0;
+    h = await createHarness({ dbFile: true, surge: (fake) => gated(fake) });
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const env = h.repos.environments.get(a)!;
+    await h.app.updateEnvironment(a, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { expectedExitIp: '192.0.2.50' } } }, WEB);
+    await h.idle();
+    const probeBefore = h.repos.probes.latest(a, 'safari')!.id;
+    const p = (await h.app.probe(a, { request_id: rid(), kind: 'safari' }, WEB)).operation_id;
+    await h.idle();
+    expect(h.repos.operations.get(p)!.status).toBe('waiting');
+    return { a, p, probeBefore };
+  }
+
+  function expectMismatchRecorded(a: string, p: string, probeBefore: string): void {
+    const op = h.repos.operations.get(p)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('EXIT_IP_MISMATCH');
+    expect(op.result?.probeWarning).toBe('exit_ip_mismatch');
+    expect(h.repos.routeState.get().warnings).toContain('exit_ip_mismatch');
+    const probe = h.repos.probes.latest(a, 'safari')!;
+    expect(probe.id).not.toBe(probeBefore);
+    expect(probe.outcome).toBe('mismatch');
+    // 没有重新开始等待检测（检测编号已消费，准备页不会再提交）
+    expect(h.repos.operations.listSteps(p).filter((s) => s.message.includes('等待在绑定的 Safari 场景中完成出口检测'))).toHaveLength(1);
+    expect(h.repos.outbox.pendingForOperation(p)).toEqual([]);
+  }
+
+  test('a mismatching retest result is being checked (Surge request records read) when the service dies → after the restart the check is redone from the submitted result: exit_ip_mismatch, orders and fill stop', async () => {
+    const { a, p, probeBefore } = await mismatchingRetest();
+    gate = (name) => (name === 'listRecentRequests' && h.app.executor.currentOperationId === p ? 'hang' : null);
+    void verify(h, PROFILE_A, p, { observedIp: '192.0.2.77' });
+    await crashWhenGated();
+    expectMismatchRecorded(a, p, probeBefore);
+    expect(await ordersAllowed()).toBe(false);
+    expect((await h.app.ensureInControl()).ok).toBe(false);
+    // 之前的检测截止时间到期也不改变结果
+    await h.clock.advanceAsync(200_000);
+    await h.idle();
+    expectMismatchRecorded(a, p, probeBefore);
+  });
+
+  test('…and when the mismatch was already decided and the end point is reading SFE-ROUTE: after the restart it ends with that decision', async () => {
+    const { a, p, probeBefore } = await mismatchingRetest();
+    let listed = false;
+    gate = (name) => {
+      if (h.app.executor.currentOperationId !== p) return null;
+      if (name === 'listRecentRequests') listed = true;
+      else if (name === 'getGroupSelection' && listed) return 'hang';
+      return null;
+    };
+    void verify(h, PROFILE_A, p, { observedIp: '192.0.2.77' });
+    await crashWhenGated();
+    expectMismatchRecorded(a, p, probeBefore);
+    expect(h.repos.operations.listSteps(p).some((s) => s.message.includes('按已判定的结果结束'))).toBe(true);
+    expect(await ordersAllowed()).toBe(false);
+  });
+
+  test('…and when that end point had already moved SFE-ROUTE (changed in Surge) to REJECT: after the restart the hold is recorded as this operation\'s, like without the crash', async () => {
+    const run = async (crash: boolean) => {
+      const { a, p } = await mismatchingRetest();
+      const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+      const nodeB = h.repos.proxyRevisions.get(b, 1)!.nodeName;
+      // 核对开始时用户在 Surge 中把 SFE-ROUTE 改选到别的买家节点（签发检测编号时它还是目标节点）
+      let moved = false;
+      gate = (name, args) => {
+        if (h.app.executor.currentOperationId !== p) return null;
+        if (name === 'getGroupSelection' && !moved) {
+          moved = true;
+          void h.fake.selectGroupPolicy(ROUTE_GROUP_NAME, nodeB);
+        }
+        return crash && name === 'selectGroupPolicy' && args[1] === 'REJECT' ? 'after' : null;
+      };
+      const r = verify(h, PROFILE_A, p, { observedIp: '192.0.2.77' });
+      if (crash) await crashWhenGated();
+      else await r;
+      const op = h.repos.operations.get(p)!;
+      const route = h.repos.routeState.get();
+      const out = {
+        op: { phase: op.phase, status: op.status, code: op.error?.code, rejectSelected: op.result?.rejectSelected, probeWarning: op.result?.probeWarning },
+        route: { phase: route.phase, selectedNode: route.selectedNode, warnings: [...route.warnings].sort() },
+        orders: await ordersAllowed(),
+      };
+      expect(h.repos.probes.latest(a, 'safari')!.outcome).toBe('failed');
+      await h.close();
+      return out;
+    };
+    const baseline = await run(false);
+    expect(baseline).toEqual({
+      op: { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', code: 'SAFARI_VERIFY_FAILED', rejectSelected: true, probeWarning: 'probe_failed' },
+      route: { phase: 'attention', selectedNode: 'REJECT', warnings: ['buyer_exit_connections_unconfirmed', 'entry_unverified', 'probe_failed'] },
+      orders: false,
+    });
+    expect(await run(true)).toEqual(baseline);
+  });
+
+  test('…and when the check had read SFE-ROUTE on another buyer\'s node and, after the restart, every selection read fails until the hold: the decided verdict keeps what the check read and the end point still holds REJECT', async () => {
+    const { a, p } = await mismatchingRetest();
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    const nodeB = h.repos.proxyRevisions.get(b, 1)!.nodeName;
+    // 核对开始时用户在 Surge 中把 SFE-ROUTE 改选到 B 的节点（核对读到它，判定失败）；结束点重读时进程退出
+    let reads = 0;
+    gate = (name) => {
+      if (h.app.executor.currentOperationId !== p || name !== 'getGroupSelection') return null;
+      reads += 1;
+      if (reads === 1) {
+        void h.fake.selectGroupPolicy(ROUTE_GROUP_NAME, nodeB);
+        return null;
+      }
+      return 'hang';
+    };
+    void verify(h, PROFILE_A, p, { observedIp: '192.0.2.77' });
+    await until(() => gateHits > 0);
+    expect(payloadOf(h.repos.operations.get(p)!).route?.verdict).toMatchObject({ failure: { code: 'SAFARI_VERIFY_FAILED' }, observedSelection: nodeB });
+    // 重启之后 Surge 的选择读取一直失败（启动对账因此记不下外部改选），直到结束点改选 REJECT
+    let rejected = false;
+    gate = (name, args) => {
+      if (name === 'selectGroupPolicy' && args[1] === 'REJECT') rejected = true;
+      return name === 'getGroupSelection' && !rejected ? 'fail' : null;
+    };
+    await h.crash();
+    await h.idle();
+    gate = null;
+    const op = h.repos.operations.get(p)!;
+    expect(op).toMatchObject({ phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention' });
+    expect(op.error?.code).toBe('SAFARI_VERIFY_FAILED');
+    expect(op.result).toMatchObject({ rejectSelected: true, probeWarning: 'probe_failed' });
+    expect(h.repos.operations.listSteps(p).at(-1)!.message).not.toContain('路由未改变');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', selectedNode: 'REJECT' });
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
+    expect(h.repos.probes.latest(a, 'safari')!.outcome).toBe('failed');
+  });
+
+  // 结束点改选 REJECT（holdAtRouteEnd）之后、记下之前服务崩溃：after = 改选已生效、读回之前；readback = 读回挂起
+  describe.each([
+    ['after', (): Gate => (name, args) => (name === 'selectGroupPolicy' && args[1] === 'REJECT' ? 'after' : null)],
+    [
+      'readback',
+      (): Gate => {
+        let selected = false;
+        return (name, args) => {
+          if (name === 'selectGroupPolicy' && args[1] === 'REJECT') selected = true;
+          else if (name === 'getGroupSelection' && selected) return 'hang';
+          return null;
+        };
+      },
+    ],
+  ] as const)('crash %s the end point selected REJECT', (_label, crashGateOf) => {
+    async function endWithMovedSelection(start: (a: string) => Promise<string>, crash: boolean) {
+      gateHits = 0;
+      h = await createHarness({ dbFile: true, surge: (fake) => gated(fake) });
+      const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+      const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+      const p = await start(a);
+      // 用户在 Surge 中把 SFE-ROUTE 改选到别的买家节点；等待截止时间到期，结束点改选 REJECT
+      await h.fake.selectGroupPolicy(ROUTE_GROUP_NAME, h.repos.proxyRevisions.get(b, 1)!.nodeName);
+      const crashGate = crashGateOf();
+      const fresh = (() => {
+        let armed = true;
+        return (name: string, args: unknown[]) => {
+          if (!armed || h.app.executor.currentOperationId !== p) return null;
+          const g = crashGate(name, args);
+          if (g === 'hang' || g === 'after') armed = false;
+          return g;
+        };
+      })();
+      if (crash) gate = fresh;
+      await h.clock.advanceAsync((h.repos.settings.get('profileArrivalTimeoutSec') + 1) * 1000);
+      if (crash) {
+        await until(() => gateHits > 0);
+        expect(payloadOf(h.repos.operations.get(p)!).route?.ending).toBeDefined();
+        expect(payloadOf(h.repos.operations.get(p)!).endHold).toBeDefined();
+        gate = null;
+        await h.crash();
+      }
+      await h.idle();
+      const op = h.repos.operations.get(p)!;
+      const route = h.repos.routeState.get();
+      const out = {
+        op: { phase: op.phase, status: op.status, code: op.error?.code, rejectSelected: op.result?.rejectSelected, unchanged: (h.repos.operations.listSteps(p).at(-1)?.message ?? '').includes('路由未改变') },
+        route: { phase: route.phase, selectedNode: route.selectedNode, operationId: route.operationId === p, warnings: [...route.warnings].sort() },
+        actual: await h.fake.getGroupSelection(ROUTE_GROUP_NAME),
+      };
+      await h.close();
+      return out;
+    }
+
+    test('a retest arrival timeout → after the restart: BLOCKED_NEEDS_ATTENTION with rejectSelected, route attention / REJECT / entry_unverified, exactly as without the crash', async () => {
+      const start = async (a: string) => {
+        const p = (await h.app.probe(a, { request_id: rid(), kind: 'safari' }, WEB)).operation_id;
+        await h.idle();
+        return p;
+      };
+      const baseline = await endWithMovedSelection(start, false);
+      expect(baseline).toMatchObject({
+        op: { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', code: 'SAFARI_VERIFY_TIMEOUT', rejectSelected: true, unchanged: false },
+        route: { phase: 'attention', selectedNode: 'REJECT', operationId: true },
+        actual: 'REJECT',
+      });
+      expect(baseline.route.warnings).toEqual(expect.arrayContaining(['entry_unverified', 'buyer_exit_connections_unconfirmed']));
+      expect(await endWithMovedSelection(start, true)).toEqual(baseline);
+    });
+
+    test('a WAITING_ROUTE timeout → after the restart: needs_attention with rejectSelected (never "succeeded, route unchanged"), exactly as without the crash', async () => {
+      const start = async (a: string) => {
+        const env = h.repos.environments.get(a)!;
+        const p = (await h.app.updateEnvironment(a, { request_id: rid('upd'), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.20' } } }, WEB)).operation_id;
+        await h.idle();
+        expect(h.repos.operations.get(p)!.phase).toBe('WAITING_ROUTE');
+        return p;
+      };
+      const baseline = await endWithMovedSelection(start, false);
+      expect(baseline).toMatchObject({
+        op: { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', code: 'UNKNOWN_STATE', rejectSelected: true, unchanged: false },
+        route: { phase: 'attention', selectedNode: 'REJECT', operationId: true },
+        actual: 'REJECT',
+      });
+      expect(baseline.route.warnings).toEqual(expect.arrayContaining(['entry_unverified', 'buyer_exit_connections_unconfirmed']));
+      expect(await endWithMovedSelection(start, true)).toEqual(baseline);
+    });
+  });
+
+  test('a WAITING_ROUTE timeout whose end point selected REJECT while a normal mode was accepted (queued behind it), then the service died before recording the hold → after the restart the hold is still recorded as this operation\'s (never "succeeded, route unchanged"); the normal mode then restores the original rules', async () => {
+    gateHits = 0;
+    h = await createHarness({ dbFile: true, surge: (fake) => gated(fake) });
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    const env = h.repos.environments.get(a)!;
+    const w = (await h.app.updateEnvironment(a, { request_id: rid('upd'), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.20' } } }, WEB)).operation_id;
+    await h.idle();
+    expect(h.repos.operations.get(w)!.phase).toBe('WAITING_ROUTE');
+    // 用户在 Surge 中把 SFE-ROUTE 改选到别的买家节点；等待截止时间到期，结束点改选 REJECT（已生效，读回之前进程退出）
+    await h.fake.selectGroupPolicy(ROUTE_GROUP_NAME, h.repos.proxyRevisions.get(b, 1)!.nodeName);
+    let armed = true;
+    gate = (name, args) => {
+      if (!armed || h.app.executor.currentOperationId !== w || name !== 'selectGroupPolicy' || args[1] !== 'REJECT') return null;
+      armed = false;
+      return 'after';
+    };
+    await h.clock.advanceAsync((h.repos.settings.get('profileArrivalTimeoutSec') + 1) * 1000);
+    await until(() => gateHits > 0);
+    expect(payloadOf(h.repos.operations.get(w)!).endHold).toBeDefined();
+    // 改选期间用户点击「进入普通模式」：受理（从不拒绝），排在结束中的发布之后
+    const n = (await h.app.enterNormal({ request_id: rid('n'), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB)).operation_id;
+    expect(h.repos.operations.get(n)!.status).toBe('queued');
+    gate = null;
+    await h.crash();
+    await h.idle();
+    const op = h.repos.operations.get(w)!;
+    expect(op).toMatchObject({ phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention' });
+    expect(op.result?.rejectSelected).toBe(true);
+    expect(h.repos.operations.listSteps(w).at(-1)!.message).not.toContain('路由未改变');
+    // 普通模式接着从需要处理的路由撤销本应用入口：Safari 按 Surge 原规则发出，Chrome 从不命中 Safari 规则
+    expect(h.repos.operations.get(n)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'idle', entryMode: 'NORMAL', activeEnvironmentId: null, operationId: n });
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    expect(h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp' }).rule).toBe('FINAL,DIRECT');
   });
 });

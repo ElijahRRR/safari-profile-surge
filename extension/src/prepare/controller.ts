@@ -29,8 +29,9 @@ export type PrepareStage =
 /**
  * 操作结束时这一页能如实说什么（finish）：verified 只用于以 ACTIVE_VERIFIED 结束（Safari 实测通过，或复用实测有效的使用中
  * 环境）；not_checked 是没有做检测就结束（READY_FOR_NEXT_OPEN 等，status 为 succeeded 也不是检测通过）；rolled_back 是失败后
- * 回滚读回确认 Safari 保持阻断（result.rollback）；probe_failed 是重测失败或取消（路由未改变）；superseded 是被之后的请求取代
- * （普通模式或另一次切换，Safari 已按它们处理）；attention 是回滚或切换无法确认，需要处理；failed 是其他失败（多为写入之前）。
+ * 回滚读回确认 Safari 保持阻断（result.rollback）；probe_failed 是重测失败或取消（通常路由未改变）；superseded 是被之后的请求取代
+ * （普通模式或另一次切换，Safari 已按它们处理）；attention 是回滚或切换无法确认，或结束时服务改选了 SFE-ROUTE（result.rejectSelected，
+ * 重测或等待的取消、超时也可能如此），需要处理；failed 是其他失败（多为写入之前）。
  */
 export type PrepareOutcome = 'verified' | 'not_checked' | 'rolled_back' | 'probe_failed' | 'superseded' | 'attention' | 'failed';
 
@@ -50,7 +51,7 @@ export interface PrepareState {
   message: string | null;
   /**
    * 服务说明这是一次切换（beginSafariVerification 的 switching）：只有这时才说「切换期间 Safari 的其他请求会被暂时拒绝」。
-   * 重新检测从不切换、不阻断；停在 WAITING_ROUTE 尚未到达、已请求取消、等待路由恢复时也不阻断。旧版服务没有该字段，按 false。
+   * 重新检测从不切换、不阻断（含路由已不在已验证状态、重新检测正在结束）；停在 WAITING_ROUTE 尚未到达、已请求取消时也不阻断。旧版服务没有该字段，按 false。
    */
   switching: boolean;
   operation: OperationView | null;
