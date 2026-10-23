@@ -12,10 +12,11 @@ final class InstallConfigTests: XCTestCase {
     func testFreshConfigHasAllPrimitivesUnavailable() {
         let config = InstallConfig.merged(existing: nil, fields: fields)
         let mechanisms = config["adapterMechanism"] as? [String: String]
-        XCTAssertEqual(mechanisms?.count, 22)
+        XCTAssertEqual(mechanisms?.count, 23)
         XCTAssertEqual(Set(mechanisms.map { Array($0.values) } ?? []), ["unavailable"])
         XCTAssertEqual(mechanisms?["reloadProfile"], "unavailable")
         XCTAssertEqual(mechanisms?["selectGroupPolicy"], "unavailable")
+        XCTAssertEqual(mechanisms?["matchRule"], "unavailable")
     }
 
     func testFreshConfigFields() {
