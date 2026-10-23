@@ -119,7 +119,13 @@ xcodebuild -scheme SafariProfileSurge test     # 运行 XCTest
 - 本项目不读写 macOS 钥匙串，App、扩展与服务都不会触发钥匙串授权提示；App 包内没有钥匙串工具，entitlements 不含 `keychain-access-groups`。
 - 代理凭据、亚马逊账号密码与 pepper 等秘密由本机服务以**明文**保存在自己的资料中（数据目录 `~/Library/Application Support/SafariProfileSurge` 下服务的 SQLite 数据库 `sfe.sqlite`），只靠文件权限保护：数据目录 0700，文件 0600，只有本机这个用户可以读取。宿主 App 每次启动都把数据目录收紧为 0700（`App/SecureFile.swift` 的 `ensurePrivateDirectory`）。能以这个用户身份读文件的程序、以及数据目录的备份（例如时间机器）都能读到这些明文。代理凭据另外按 Surge 语法明文写在节点资源文件中（含秘密的完整位置见 docs/ARCHITECTURE.md §2）。
 - 登录填充：何时允许填充全部由服务按 docs/ARCHITECTURE.md §6.10 判断；允许时服务从本机资料读出账号密码，直接放在 `requestLoginFill` 的应答中（`{ field, value }`，与扩展收到的 `LoginFillResponse` 同形）。原生桥原样交给扩展，不读取、不改写、不缓存、不记录；扩展只在内存中短暂持有。
-- 用旧的钥匙串版本创建的数据目录不能直接沿用（秘密值在钥匙串里，新版本不会去读）：服务启动时检测到后报告 `SECRET_STORE_FAILED` 并说明原因（不读钥匙串，也不重新生成 pepper），需要重新初始化（重新导入）。旧版本留在钥匙串中的项按「卸载」第 4 步手动删除。
+- 用旧的钥匙串版本创建的数据目录不能直接沿用（秘密值在钥匙串里，新版本不会去读）：服务启动时检测到后报告 `SECRET_STORE_FAILED` 并拒绝启动（说明只写在数据目录的 `service.log` 中；不读钥匙串，也不重新生成 pepper，数据库原样保留）。按 docs/INSTALL.md §7 的完整步骤处理，**顺序不能颠倒**：
+  1. 先撤销旧版本在 Surge 中的入口：最好在升级之前用旧版本进入普通模式（已经升级时可以装回旧版本进入普通模式）；或在 Surge 中手动切回原配置，并逐条移除本应用留下的临时规则（含 Safari 进程路径、策略为 `REJECT` 或 `SFE-ROUTE`；不要用 `rule temp flush`）。在此之前，Safari 可能仍按旧版本的入口经旧的买家出口发出，或一直被拒绝。
+  2. 菜单「停止后台服务」，再「退出」App。
+  3. 把旧数据目录**改名保存**（不要直接删除：其中有初始备份 `backups/` 与 P0 证据 `p0/`）；新版本需要**新的数据目录**，在旧目录上不会启动。
+  4. 删除 Surge 配置目录中旧版本的「日常-Safari环境.conf」、`sfe-nodes.list` 与 `sfe-entry-*.list`（这些文件或其中的 `SFE-` 对象还在时，新的初始化会拒绝）。
+  5. 重新打开 App，在新的数据目录中重新初始化，并重新导入代理与账号资料。
+  6. 旧版本留在钥匙串中的项最后按 §7 第 7 步（或下面「卸载」第 4 步）手动删除。
 
 ## 秘密与日志
 

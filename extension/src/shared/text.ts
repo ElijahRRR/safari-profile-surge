@@ -108,11 +108,14 @@ export function summaryOffersNormal(summary: RouteSummaryView): boolean {
 
 /**
  * 弹窗顶栏的入口状态：入口记为普通模式、但服务端仍提供「进入普通模式」时不显示成单纯的「普通模式」；读取之前没有完成对账
- * （reconciled 为 false：执行器正忙或读取 Surge 超时，例如 Surge 刚重启）时不按记录的入口声称托管中、已阻断或只允许检测。
+ * （reconciled 为 false：执行器正忙或读取 Surge 超时，例如 Surge 刚重启）时不按记录的入口声称托管中、已阻断或只允许检测；
+ * 记录的入口没有经运行时求值确认、或有规则排在本应用入口之前（entryUnconfirmed：例如回滚或普通模式的阻断只读回了入口位）时
+ * 同样不声称——被排在前面的规则匹配的 Safari 请求按它们发出（可能直连）。
  */
 export function entryModeHeaderText(summary: RouteSummaryView): string {
-  if (summary.entryMode === 'NORMAL' && summaryOffersNormal(summary)) return '普通模式（未确认）';
+  if (summary.entryMode === 'NORMAL' && (summaryOffersNormal(summary) || summary.entryUnconfirmed === true)) return '普通模式（未确认）';
   if (summary.reconciled === false && summary.entryMode !== 'NORMAL' && summary.entryMode !== 'UNKNOWN') return '正在确认入口状态';
+  if (summary.entryUnconfirmed === true && summary.entryMode !== 'UNKNOWN') return '入口状态未能确认';
   return ENTRY_MODE_TEXT[summary.entryMode];
 }
 
@@ -122,7 +125,7 @@ export function entryModeHeaderText(summary: RouteSummaryView): string {
  */
 export function unsettledRouteText(summary: RouteSummaryView): string {
   if (summary.entryMode !== 'NORMAL') {
-    return `当前没有使用中的环境，入口为「${ENTRY_MODE_TEXT[summary.entryMode]}」（上一次切换没有完成）：Safari 的请求可能被阻断，或仍有经买家出口的连接。进入普通模式会撤销本应用入口并结束这些连接。`;
+    return `当前没有使用中的环境，入口为「${summary.entryUnconfirmed === true ? '入口状态未能确认' : ENTRY_MODE_TEXT[summary.entryMode]}」（上一次切换没有完成）：Safari 的请求可能被阻断，或仍有经买家出口的连接。进入普通模式会撤销本应用入口并结束这些连接。`;
   }
   return '上一次切换没有回到已确认的状态：Safari 可能仍有经买家出口的连接。进入普通模式会结束这些连接，之后按 Surge 原规则发出请求。';
 }

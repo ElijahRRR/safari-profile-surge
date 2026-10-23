@@ -11,7 +11,7 @@ import { capabilityUnverified } from '../../src/surge/primitives.js';
 import { FakeSurge } from '../../src/surge/fake.js';
 
 const FakeSurgeProto = FakeSurge.prototype;
-import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, grantForCurrentHost, rid, safariOutcome, verify, type Harness } from './harness.js';
+import { AGENT, PROFILE_A, PROFILE_B, PROFILE_C, WEB, TEST_ENDPOINT, activeEnv, bind, createEnv, createHarness, grantForCurrentHost, instanceContext, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -303,7 +303,9 @@ describe('an interrupted switch never becomes the "previous route" of the next a
     await h.idle();
     expect(h.repos.operations.get(n.operation_id)!.phase).toBe('FAILED');
     // 失败即关闭：入口最后确认的是 VERIFY_ONLY、选择是 B 的未验证节点——SFE-ROUTE 改选 REJECT（读回确认），检测主机不经 B 发出
-    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', activeEnvironmentId: a, selectedNode: 'REJECT' });
+    // 改选过 REJECT：路由需要处理（与回滚无法确认相同），入口未经确认
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', activeEnvironmentId: a, selectedNode: 'REJECT' });
+    expect(h.repos.routeState.get().warnings).toContain('entry_unverified');
     expect(h.repos.routeState.get().activationSnapshot).toMatchObject({ previousEnvironmentId: a, previousSelectedNode: nodeA });
     expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
     expect(safariOutcome(h, FAKE_VERIFY_HOST).leafPolicyName).not.toBe(nodeB);
@@ -549,7 +551,7 @@ describe('a rollback that cannot confirm its return to BLOCKED never leaves Safa
     expect(op.phase).toBe('FAILED');
     expect(op.result).toMatchObject({ rejectSelected: true });
     expect(h.repos.operations.listSteps(n.operation_id).at(-1)!.message).toContain('SFE-ROUTE 已改选 REJECT（读回确认）');
-    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', entryMode: 'UNKNOWN', selectedNode: 'REJECT', activeEnvironmentId: a });
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'UNKNOWN', selectedNode: 'REJECT', activeEnvironmentId: a });
     expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
     const v = verifyHostRequest();
     expect(v.leafPolicyName).toBe('REJECT');
@@ -564,8 +566,8 @@ describe('a rollback that cannot confirm its return to BLOCKED never leaves Safa
     expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
   });
 
-  test('an unexpected error escaping the rollback (e.g. a database error) does not orphan the VERIFY_ONLY wait on B\'s exit: the executor guard moves SFE-ROUTE to REJECT and marks the operation needs-attention', async () => {
-    const { a, opB } = await switchingToB();
+  test('an unexpected error escaping the rollback (e.g. a database error) does not orphan the VERIFY_ONLY wait on B\'s exit: the executor guard moves SFE-ROUTE to REJECT and marks the operation needs-attention; both environments are re-sent', async () => {
+    const { a, b, opB } = await switchingToB();
     const routeState = h.repos.routeState as { update: typeof h.repos.routeState.update };
     const orig = routeState.update.bind(h.repos.routeState);
     let thrown = false;
@@ -589,6 +591,14 @@ describe('a rollback that cannot confirm its return to BLOCKED never leaves Safa
     const v = verifyHostRequest();
     expect(v.leafPolicyName).toBe('REJECT');
     expect(v.failed).toBe(true);
+    // 网页后台只在 environment.updated 中更新环境：B（切换中 → 未使用）与 A（→ 路由状态需要处理）的最后一个事件与服务端视图一致
+    for (const id of [b, a]) {
+      const last = h.events.filter((e) => e.type === 'environment.updated' && e.environment.id === id).at(-1);
+      const ev = last && last.type === 'environment.updated' ? last.environment : null;
+      const fresh = h.app.views.environmentView(id)!;
+      expect({ id, route: ev?.facets.route, readiness: ev?.readiness }).toEqual({ id, route: fresh.facets.route, readiness: fresh.readiness });
+    }
+    expect(h.app.views.environmentView(b)!.facets.route).toBe('inactive');
     const n = await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
     await h.idle();
     expect(h.repos.operations.get(n.operation_id)!.phase).toBe('NORMAL_RESTORED');
@@ -688,6 +698,11 @@ describe('what a rollback that cannot confirm its return to BLOCKED reports and 
     const www = safariOutcome(h);
     expect(www.rule).toBe('DOMAIN-SUFFIX,example.test,DIRECT');
     expect(www.policyName).not.toBe(ROUTE_GROUP_NAME);
+    // 其他场景的弹窗紧接着读取状态（上一次对账仍在 5 秒有效期内，不再对账）：摘要标明入口未经确认，顶栏不声称「Safari 已阻断」
+    for (const profile of [PROFILE_C, null]) {
+      const d = (await h.native(profile, { type: 'getCurrentState' })) as { ok: true; data: { routeSummary: { entryMode: string; entryUnconfirmed: boolean } } };
+      expect(d.data.routeSummary).toMatchObject({ entryMode: 'BLOCKED', entryUnconfirmed: true });
+    }
   });
 
   // 切换中途（第 2 步检查之后）出现排在入口之前的模块规则（用户启用或模块自动更新、其他工具 `rule temp add`）：第 9 步写入
@@ -922,5 +937,131 @@ describe('what a rollback that cannot confirm its return to BLOCKED reports and 
     expect(messages.some((m) => m.includes('恢复原节点并保持阻断') || m.includes('恢复切换前节点并保持阻断'))).toBe(false);
     expect(messages).toContain('已取消切换；开始回滚：尝试回到阻断并恢复切换前的节点（回到阻断无法确认时不恢复，SFE-ROUTE 改选 REJECT，并要求处理）');
     expect((op.result as { failure: { message: string } }).failure.message).toBe('已取消切换');
+  });
+});
+
+describe('entry settings (strategy, process paths, verify endpoint) never change under an open route operation (§5.2 normal mode always available)', () => {
+  type Strategy = 'temp_rule' | 'ruleset_resource';
+
+  async function proposeStrategy(strategy: Strategy): Promise<string> {
+    const r = await h.app.proposeCapability(
+      {
+        request_id: rid('prop'),
+        key: 'runtime_entry_modes',
+        proposed_status: 'supported',
+        context: instanceContext(h.fake),
+        summary: 'P0 实测入口策略（合成）',
+        evidence_digest: 'sha256:0123456789abcdef',
+        entry_strategy: strategy,
+      },
+      AGENT,
+    );
+    return r.proposal_id;
+  }
+
+  /** 激活第 2 步受控检查读 SFE-ROUTE 成员时（入口仍记为普通模式，尚未写入阻断）执行一次 during。 */
+  function duringPreWriteRead(during: () => Promise<void>): { fired: () => boolean } {
+    const fake = h.fake as unknown as { getGroupMembers: (group: string) => Promise<string[]> };
+    const orig = fake.getGroupMembers.bind(h.fake);
+    let fired = false;
+    fake.getGroupMembers = async (group) => {
+      if (!fired) {
+        fired = true;
+        expect(h.repos.routeState.get().entryMode).toBe('NORMAL');
+        await during();
+      }
+      return orig(group);
+    };
+    return { fired: () => fired };
+  }
+
+  for (const [from, to] of [['temp_rule', 'ruleset_resource'], ['ruleset_resource', 'temp_rule']] as Array<[Strategy, Strategy]>) {
+    test(`${from} → ${to} confirmed during an activation's pre-write reads is refused (ROUTE_BUSY); cancel and normal mode then undo the entry the activation wrote, and the change is accepted once the route is idle NORMAL`, async () => {
+      h = await createHarness({ entryStrategy: from });
+      const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+      await bind(h, PROFILE_A, env);
+      const proposalId = await proposeStrategy(to);
+      let refusal: { code?: string } | null = null;
+      const hook = duringPreWriteRead(async () => {
+        refusal = await h.app.confirmCapability({ request_id: rid('conf'), action: 'confirm', proposal_id: proposalId }, WEB).then(
+          () => null,
+          (e: { code?: string }) => e,
+        );
+      });
+      const opId = await startSwitch(env);
+      expect(hook.fired()).toBe(true);
+      expect(refusal).not.toBeNull();
+      expect(refusal!.code).toBe('ROUTE_BUSY');
+      expect(h.repos.settings.get('entryStrategy')).toBe(from);
+      expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
+      // 取消：按写入它的策略回到阻断并恢复（没有切换前的路由），Safari 全部拒绝
+      await h.app.cancelOperation(opId, { request_id: rid('cancel') }, WEB);
+      await h.idle();
+      expect(h.repos.operations.get(opId)!.phase).toBe('FAILED');
+      expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'BLOCKED', phase: 'failed' });
+      // 普通模式撤销本应用入口：Safari 回到原规则（合成配置的 FINAL），检测主机不再经 SFE-ROUTE
+      const n = await h.app.enterNormal({ request_id: rid('normal') }, WEB);
+      await h.idle();
+      expect(h.repos.operations.get(n.operation_id)!.phase).toBe('NORMAL_RESTORED');
+      expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle' });
+      expect(h.fake.tempRules).toEqual([]);
+      for (const host of ['www.example.test', FAKE_VERIFY_HOST]) {
+        const o = safariOutcome(h, host);
+        expect(o.failed).toBe(false);
+        expect(o.policyName).not.toBe('SFE-ROUTE');
+      }
+      // 路由空闲的普通模式、没有未结束的路由操作：同一条提议可以确认
+      await h.app.confirmCapability({ request_id: rid('conf'), action: 'confirm', proposal_id: proposalId }, WEB);
+      expect(h.repos.settings.get('entryStrategy')).toBe(to);
+    });
+  }
+
+  test('a verify-endpoint change during an activation\'s pre-write reads is refused (ROUTE_BUSY)', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    (h.app.engine.deps as { verifyEndpoints: unknown }).verifyEndpoints = [TEST_ENDPOINT, { id: 'alt', url: 'https://verify2.example.test/', host: 'verify2.example.test', label: 'b' }];
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    let refusal: { code?: string } | null = null;
+    duringPreWriteRead(async () => {
+      refusal = await h.app.updateSettings({ request_id: rid('set'), verifyEndpointId: 'alt' }, WEB).then(
+        () => null,
+        (e: { code?: string }) => e,
+      );
+    });
+    const opId = await startSwitch(env);
+    expect(refusal!.code).toBe('ROUTE_BUSY');
+    expect(h.repos.settings.get('verifyEndpointId')).toBe('ipify');
+    expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
+  });
+
+  test('a process-path or strategy change refused while a normal mode is queued or the route is not idle NORMAL', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const proposalId = await proposeStrategy('ruleset_resource');
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    await expect(h.app.confirmCapability({ request_id: rid('conf'), action: 'confirm', proposal_id: proposalId }, WEB)).rejects.toMatchObject({ code: 'ENVIRONMENT_ACTIVE' });
+    // 普通模式已受理、尚未执行（入口仍是 ACTIVE）：拒绝
+    await h.app.enterNormal({ request_id: rid('normal'), old_session_policy: 'closed_confirmed', confirmed_environment_id: envId }, WEB);
+    await expect(h.app.confirmCapability({ request_id: rid('conf'), action: 'confirm', proposal_id: proposalId }, WEB)).rejects.toMatchObject({ code: 'ROUTE_BUSY' });
+    await h.idle();
+    await h.app.confirmCapability({ request_id: rid('conf'), action: 'confirm', proposal_id: proposalId }, WEB);
+    expect(h.repos.settings.get('entryStrategy')).toBe('ruleset_resource');
+  });
+
+  test('defence in depth: entry settings changed outside acceptance during the pre-write reads → the activation stops before its first write (route untouched, no app rule in Surge)', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    const epoch = h.repos.routeState.get().routeEpoch;
+    duringPreWriteRead(async () => {
+      h.repos.settings.set('entryStrategy', 'ruleset_resource');
+    });
+    const opId = await startSwitch(env);
+    const op = h.repos.operations.get(opId)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('CAPABILITY_UNVERIFIED');
+    expect(op.error?.message).toContain('路由未改变');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', routeEpoch: epoch, activationSnapshot: null });
+    expect(h.fake.tempRules).toEqual([]);
+    expect(safariOutcome(h).failed).toBe(false);
   });
 });

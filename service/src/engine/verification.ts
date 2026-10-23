@@ -33,6 +33,15 @@ export interface ArrivalContext {
   kick: () => void;
 }
 
+/**
+ * 排队或执行中（含等待中但尚未进入检测阶段）的操作：按它实际要做的说明。重新检测（含激活复用时改为的重测，flow probe）从不切换、
+ * 不阻断 Safari（§6.4），准备页不能说「正在切换出口」或「切换期间 Safari 的其他请求会被暂时拒绝」；激活与活动环境发布的切换才是。
+ */
+function inProgress(op: OperationRecord, p: RoutePayload): BeginVerificationResponse {
+  if (p.flow === 'probe') return { status: 'pending', phase: op.phase, message: '正在开始重新检测，请稍候（不切换、不阻断 Safari）', switching: false };
+  return { status: 'pending', phase: op.phase, message: '正在切换出口，请稍候', switching: true };
+}
+
 export async function beginVerification(engine: Engine, op: OperationRecord, ctx: ArrivalContext): Promise<BeginVerificationResponse> {
   const { repos } = engine;
   const p = payloadOf(op).route!;
@@ -41,19 +50,25 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
     case 'NORMAL_RESTORED':
     case 'COMPLETED':
       return { status: 'not_needed', message: '已完成，不需要再次检测' };
-    case 'READY_FOR_NEXT_OPEN':
+    case 'READY_FOR_NEXT_OPEN': {
+      // 目标版本已被之后保存的修改替换（§6.3 第 2 步）：不切换到它，也不提示「重新使用此环境」——那会选用已部署的这一版
+      const env = repos.environments.get(p.targetEnvironmentId);
+      if (p.purpose === 'apply_new_revision' && env && !env.deletedAt && env.desiredProxyRevision !== p.proxyRevision) {
+        return { status: 'not_needed', message: '等待已结束：之后又修改了代理，不切换到这一版本，当前出口不变' };
+      }
       return { status: 'not_needed', message: '等待已结束：新版本已部署，请重新使用此环境以切换' };
+    }
     default:
       break;
   }
   if (op.status === 'failed' || op.status === 'superseded' || op.status === 'needs_attention' || op.status === 'succeeded' || op.status === 'parked') {
     throw opError(op);
   }
-  if (op.status === 'queued' || op.status === 'running') {
-    return { status: 'pending', phase: op.phase, message: '正在切换出口，请稍候' };
-  }
+  if (op.status === 'queued' || op.status === 'running') return inProgress(op, p);
   // waiting
   if (op.phase === 'WAITING_ROUTE') {
+    // 已受理取消（执行器忙时排在之后处理）：不再记到达、不排入 profile_arrived，等取消结束本操作（READY_FOR_NEXT_OPEN，当前出口不变）
+    if (p.cancelRequested) return { status: 'pending', phase: op.phase, message: '已请求取消，正在处理', switching: false };
     if (p.arrivedAt === null) {
       repos.tx(() => {
         savePayload(engine, op, { arrivedAt: engine.nowIso(), arrivedProfileId: ctx.profileId, amazonTabsAtVerify: ctx.amazonTabsOpen });
@@ -65,15 +80,15 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
     }
     ctx.kick();
     engine.emit({ operations: [op.id] });
-    return { status: 'pending', phase: op.phase, message: '已到达，正在切换到新版本' };
+    return { status: 'pending', phase: op.phase, message: '已到达，正在切换到新版本', switching: true };
   }
-  if (p.stage !== 'verify_only' && p.stage !== 'probe_waiting') {
-    return { status: 'pending', phase: op.phase, message: '正在切换出口，请稍候' };
-  }
+  if (p.stage !== 'verify_only' && p.stage !== 'probe_waiting') return inProgress(op, p);
+  // 已受理取消（执行器忙时排在之后处理）：不再签发检测编号，等取消结束本操作
+  if (p.cancelRequested) return { status: 'pending', phase: op.phase, message: '已请求取消，正在处理', switching: false };
   const route = repos.routeState.get();
   if (op.routeEpoch !== route.routeEpoch) throw new SfeError('STALE_ROUTE_EPOCH', '检测失败：路由已变化，请重新开始');
   if (p.stage === 'probe_waiting' && (route.entryMode !== 'ACTIVE' || route.phase !== 'active_verified')) {
-    return { status: 'pending', phase: op.phase, message: '等待路由恢复到使用中状态' };
+    return { status: 'pending', phase: op.phase, message: '等待路由恢复到使用中状态', switching: false };
   }
   const now = engine.now();
   if (p.verifyDeadline !== null && Date.parse(p.verifyDeadline) <= now.getTime()) {
@@ -92,6 +107,7 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
     const fp = payloadOf(fresh).route!;
     const fr = repos.routeState.get();
     if (fresh.status !== 'waiting' || (fp.stage !== 'verify_only' && fp.stage !== 'probe_waiting')) throw opError(fresh);
+    if (fp.cancelRequested) return 'cancel_requested' as const;
     if (fresh.routeEpoch !== fr.routeEpoch || fr.routeEpoch !== route.routeEpoch) throw new SfeError('STALE_ROUTE_EPOCH', '检测失败：路由已变化，请重新开始');
     // 切换的 VERIFY_ONLY 等待由本操作负责路由；重测不写路由，只要求路由仍是使用中且已验证
     if (fp.stage === 'verify_only' && fr.operationId !== op.id) throw new SfeError('SUPERSEDED', '检测已结束：路由已由其他操作接手');
@@ -127,7 +143,8 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
     }
     return { testId, routeEpoch: fr.routeEpoch, deadline, first };
   });
-  if (!issued) return { status: 'pending', phase: op.phase, message: '等待路由恢复到使用中状态' };
+  if (issued === 'cancel_requested') return { status: 'pending', phase: op.phase, message: '已请求取消，正在处理', switching: false };
+  if (!issued) return { status: 'pending', phase: op.phase, message: '等待路由恢复到使用中状态', switching: false };
   if (issued.first) {
     ctx.kick();
     engine.emit({ operations: [op.id], route: true });
@@ -153,6 +170,8 @@ export function submitVerification(engine: Engine, msg: SubmitMessage, ctx: { pr
   if (!op || !p || op.status !== 'waiting' || (p.stage !== 'verify_only' && p.stage !== 'probe_waiting')) {
     throw new SfeError('SUPERSEDED', '提交检测结果失败：该检测已结束或已被取代');
   }
+  // 已受理取消：结果不能覆盖之后的取消（执行器同样按取消处理已排入的结果，completeVerification）
+  if (p.cancelRequested) throw new SfeError('SUPERSEDED', '提交检测结果失败：已请求取消');
   const route = repos.routeState.get();
   if (msg.route_epoch !== test.routeEpoch || test.routeEpoch !== route.routeEpoch || op.routeEpoch !== route.routeEpoch) {
     throw new SfeError('STALE_ROUTE_EPOCH', '提交检测结果失败：路由已变化，结果不能用于当前切换');

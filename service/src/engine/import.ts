@@ -26,6 +26,7 @@ import { keyedRequestDigest } from '../util/keyed-digest.js';
 import { diffStateOf, insertOperation, reevaluateExitIp, type AcceptDeps } from './accept.js';
 import type { Engine } from './context.js';
 import { acceptedOf, commitOperation, findDuplicateOperation, requestDigest, requireRequestId } from './ledger.js';
+import { endWaitingRouteForNewRevision } from './route-control.js';
 
 interface RowPlan {
   parsed: ParsedImportRow;
@@ -290,6 +291,7 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
   const childIds: string[] = [];
   const touchedEnvs = new Set<string>();
   let routeChanged = false;
+  const endedWaits: string[] = [];
   let committed: { op: OperationRecord; duplicate: boolean };
   try {
     // 幂等在主事务内再核对一次：并发的同一请求可能在写秘密存储期间已提交
@@ -348,6 +350,7 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
         items.push({ row, environment_id: env.id, status: 'update', operation_id: res.opId });
         if (res.queued) childIds.push(res.opId);
         if (res.routeChanged) routeChanged = true;
+        endedWaits.push(...res.endedWaits);
         touchedEnvs.add(env.id);
       }
       const result = { batchId, commit: { batch_id: batchId, operation_id: batch.id, items } };
@@ -372,7 +375,7 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
   const batchOp = committed.op;
   if (committed.duplicate) return storedCommit(batchOp);
   if (childIds.length > 0) deps.kick();
-  engine.emit({ operations: [batchOp.id, ...items.map((i) => i.operation_id).filter((x): x is string => x !== null)], environments: touchedEnvs, route: routeChanged });
+  engine.emit({ operations: [batchOp.id, ...items.map((i) => i.operation_id).filter((x): x is string => x !== null), ...endedWaits], environments: touchedEnvs, route: routeChanged });
   void acceptedOf;
   return { batch_id: batchId, operation_id: batchOp.id, items };
 }
@@ -445,7 +448,7 @@ function updateFromRow(
   after: EnvironmentDiffState,
   rs: RowSecrets,
   ctx: ChildContext & { expected: number },
-): { opId: string; queued: boolean; routeChanged: boolean } {
+): { opId: string; queued: boolean; routeChanged: boolean; endedWaits: string[] } {
   const { repos } = engine;
   const curRev = env.desiredProxyRevision !== null ? repos.proxyRevisions.get(env.id, env.desiredProxyRevision) : null;
   const frontId = plan.frontId ?? curRev?.frontProxyId ?? null;
@@ -525,5 +528,7 @@ function updateFromRow(
     enqueue: false,
     step: queued ? '导入：已保存代理新版本，等待批次发布' : '导入：已保存（不涉及 Surge 节点）',
   });
-  return { opId: op.id, queued, routeChanged };
+  // 停在 WAITING_ROUTE 的旧版本已被替换：同一事务中结束，之后不再切到它（§6.3 第 2 步）
+  const endedWaits = newProxyRevision !== null ? endWaitingRouteForNewRevision(engine, env.id, newProxyRevision, op.id) : [];
+  return { opId: op.id, queued, routeChanged, endedWaits };
 }

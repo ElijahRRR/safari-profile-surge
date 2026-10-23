@@ -186,6 +186,66 @@ describe('deleted values do not linger on disk', () => {
     t.db.close();
   });
 
+  test('another program holding a read snapshot never freezes the service: each delete returns at once, and the deferred -wal truncation is done by a later sweep once the reader is gone', async () => {
+    const path = join(tempDir(), 'sfe.sqlite');
+    const t = setup({ path });
+    const refs: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const ref = await t.mgr.createSecret(`${CANARY}-${i}`, 'account', { kind: 'account', id: `env_${i}` });
+      t.repos.tx(() => t.mgr.markCommitted(ref));
+      refs.push(ref);
+    }
+    // 数据库浏览器或 sqlite3 中开着的读事务：持有旧快照
+    const { DatabaseSync } = await import('node:sqlite');
+    const other = new DatabaseSync(path);
+    other.exec('BEGIN');
+    other.prepare('SELECT COUNT(*) AS n FROM secret_values').get();
+    t.repos.tx(() => {
+      for (const ref of refs) t.mgr.orphan(ref);
+    });
+    const started = Date.now();
+    expect((await t.mgr.sweep()).deleted).toHaveLength(3);
+    // 不经忙等待：不会每个值等 busy_timeout（5 秒）
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(rows(t)).toEqual([]);
+    expect(onDisk(`${path}-wal`), '-wal still has the old frames while the reader pins them').toBe(true);
+    other.exec('COMMIT');
+    other.close();
+    // 读者离开之后的清扫补做截断：旧帧不再留在 -wal 中
+    await t.mgr.sweep();
+    expect(onDisk(`${path}-wal`)).toBe(false);
+    expect(onDisk(path)).toBe(false);
+    t.db.close();
+  });
+
+  test('a deferred -wal truncation survives a service restart: the first sweep of the new process truncates once the reader is gone', async () => {
+    const path = join(tempDir(), 'sfe.sqlite');
+    const t = setup({ path });
+    const ref = await t.mgr.createSecret(CANARY, 'account', { kind: 'account', id: 'env_1' });
+    t.repos.tx(() => t.mgr.markCommitted(ref));
+    // 数据库浏览器中开着的读事务，跨过服务的停止与重新启动（App 升级、菜单停止再启动）
+    const { DatabaseSync } = await import('node:sqlite');
+    const other = new DatabaseSync(path);
+    other.exec('BEGIN');
+    other.prepare('SELECT COUNT(*) AS n FROM secret_values').get();
+    t.repos.tx(() => t.mgr.orphan(ref));
+    expect((await t.mgr.sweep()).deleted).toEqual([ref]);
+    // 服务停止：关闭的不是最后一个连接，SQLite 不写回、不删除 -wal
+    t.db.close();
+    expect(onDisk(`${path}-wal`), '-wal after the service stopped while the reader is open').toBe(true);
+    // 重新启动：新进程的启动清扫（读者仍在时截断不能完成，之后每小时再试）
+    const t2 = setup({ path });
+    expect(await t2.mgr.sweep()).toEqual({ deleted: [], kept: [], failed: [] });
+    expect(onDisk(`${path}-wal`), '-wal while the reader still pins the old frames').toBe(true);
+    other.exec('COMMIT');
+    other.close();
+    // 读者离开之后的下一次清扫（每小时）：旧帧不再留在 -wal 中
+    await t2.mgr.sweep();
+    expect(onDisk(`${path}-wal`)).toBe(false);
+    expect(onDisk(path)).toBe(false);
+    t2.db.close();
+  });
+
   test('checkpointTruncate is skipped inside a transaction and is a no-op for memory databases', () => {
     const t = setup();
     expect(t.db.checkpointTruncate()).toBe(true);

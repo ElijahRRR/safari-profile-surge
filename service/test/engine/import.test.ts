@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { SfeError, type ImportPreviewRequest } from '@sfe/contract';
-import { WEB, AGENT, createEnv, createHarness, rid, type Harness } from './harness.js';
+import { WEB, AGENT, PROFILE_A, activeEnv, createEnv, createHarness, rid, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -202,5 +202,24 @@ describe('import commit', () => {
     );
     expect(h.repos.environments.list()).toHaveLength(0);
     expect(h.repos.operations.listRecent(100).filter((o) => o.kind === 'import.batch')).toHaveLength(0);
+  });
+
+  test('an import row that changes the active environment\'s proxy ends its replaced WAITING_ROUTE in the same transaction', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const env = h.repos.environments.get(envId)!;
+    const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(u1.operation_id)!.phase).toBe('WAITING_ROUTE');
+    const req = csv([`${envId},US-Buyer-A,socks5,203.0.113.30,1080,,,,US,,,,,,`]);
+    const p = await h.app.importPreview(req, WEB);
+    expect(p.rows[0]!.status).toBe('update');
+    // 更正的版本暂停待部署（发布能力被重置）：旧的等待仍不能切到被替换的版本
+    h.revoke(['connection_continuity']);
+    const r = await h.app.importCommit({ ...req, request_id: rid(), preview_digest: p.preview_digest, decisions: [{ row: 2, action: 'update', environment_id: envId, expected_revision: p.rows[0]!.current_revision! }] }, WEB);
+    expect(h.repos.operations.get(u1.operation_id)!).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', supersededBy: r.items[0]!.operation_id, error: null });
+    await h.idle();
+    expect(h.repos.environments.get(envId)!).toMatchObject({ desiredProxyRevision: 3, deployedProxyRevision: 2 });
+    expect(h.repos.routeState.get().activeProxyRevision).toBe(1);
   });
 });

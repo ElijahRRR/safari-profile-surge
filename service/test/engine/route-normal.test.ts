@@ -365,7 +365,7 @@ describe('normal mode is always available (§5.2)', () => {
     for (const profile of [PROFILE_A, PROFILE_B]) {
       const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: { relation: string; routeSummary: Record<string, unknown> } }).data;
       expect(d.relation).toBe('none_active');
-      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'attention', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true });
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'attention', buyerExitConnectionsUnconfirmed: false, entryUnconfirmed: true, normalModeOffered: true, reconciled: true });
     }
     const n = await h.native(PROFILE_B, { type: 'enterNormalMode', request_id: rid() });
     expect(n.ok).toBe(true);
@@ -412,7 +412,7 @@ describe('normal mode is always available (§5.2)', () => {
     for (const profile of [PROFILE_A, PROFILE_B]) {
       const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: { relation: string; routeSummary: Record<string, unknown> } }).data;
       expect(d.relation).toBe('none_active');
-      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true, reconciled: true });
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, entryUnconfirmed: false, normalModeOffered: true, reconciled: true });
     }
     // 下一次普通模式（未绑定场景发起）结束买家出口上的连接，警告清除、不再提供
     const n = await h.native(PROFILE_B, { type: 'enterNormalMode', request_id: rid() });
@@ -837,7 +837,9 @@ describe('normal mode is always available (§5.2)', () => {
       phases.push(h.repos.operations.get(last)!.phase);
       if (phases.at(-1) === 'NORMAL_RESTORED') break;
       // 失败时 Safari 不会比已确认的状态更宽松，也从不被当作 NORMAL
-      expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', activeEnvironmentId: envId });
+      // 入口状态未知时路由需要处理（attention），确认停在阻断时为 failed
+      expect(['failed', 'attention']).toContain(h.repos.routeState.get().phase);
+      expect(h.repos.routeState.get().activeEnvironmentId).toBe(envId);
       expect(h.repos.routeState.get().entryMode).not.toBe('NORMAL');
       h.clock.advance(120_000);
     }
@@ -863,7 +865,9 @@ describe('normal mode is always available (§5.2)', () => {
       ops.push(await enterNormal(envId));
       const op = h.repos.operations.get(ops.at(-1)!)!;
       if (op.phase === 'NORMAL_RESTORED') break;
-      expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', activeEnvironmentId: envId });
+      // 入口状态未知时路由需要处理（attention），确认停在阻断时为 failed
+      expect(['failed', 'attention']).toContain(h.repos.routeState.get().phase);
+      expect(h.repos.routeState.get().activeEnvironmentId).toBe(envId);
       expect(h.repos.routeState.get().entryMode).not.toBe('NORMAL');
       expect(op.error?.message).toContain('请等 Surge 的文件监视加载之后再重试');
       h.clock.advance(30_000);
@@ -1108,7 +1112,8 @@ describe('a failed or unconfirmed normal mode reports only what was read back (�
     expect(done).not.toContain('最后经运行时求值确认的状态（BLOCKED）');
     expect(done).toContain('入口状态未知');
     const route = h.repos.routeState.get();
-    expect(route).toMatchObject({ entryMode: 'UNKNOWN', phase: 'failed' });
+    // 入口状态未知：路由需要处理（与回滚无法确认相同），不显示为普通的失败
+    expect(route).toMatchObject({ entryMode: 'UNKNOWN', phase: 'attention' });
     expect(route.warnings).toContain('entry_unverified');
   });
 
@@ -1144,10 +1149,61 @@ describe('a failed or unconfirmed normal mode reports only what was read back (�
     expect(steps.at(-1)).not.toContain('最后经运行时求值确认的状态（BLOCKED）');
     expect(steps.at(-1)).not.toContain('未回退到其他出口');
     const route = h.repos.routeState.get();
-    expect(route).toMatchObject({ entryMode: 'UNKNOWN', phase: 'failed', selectedNode: 'REJECT' });
+    expect(route).toMatchObject({ entryMode: 'UNKNOWN', phase: 'attention', selectedNode: 'REJECT' });
     expect(route.warnings).toContain('entry_unverified');
     expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
     expect(await h.fake.getGroupSelection('SFE-ROUTE')).not.toBe(nodeB);
     expect(op.result).toMatchObject({ rejectSelected: true });
+  });
+
+  test('ruleset_resource: after a successful rollback (「已恢复原节点并保持阻断」), a normal mode that fails with the entry unknown drops rollback_needs_reverify and the environment shows the route needs attention', async () => {
+    h = await createHarness();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeA = h.repos.routeState.get().selectedNode!;
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const act = await h.app.activate(b, { request_id: rid('act'), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await h.idle();
+    await h.clock.advanceAsync((h.repos.settings.get('profileArrivalTimeoutSec') + 1) * 1000);
+    await h.idle();
+    expect(h.repos.operations.get(act.operation_id)!.phase).toBe('FAILED');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeA });
+    expect(h.repos.routeState.get().warnings).toContain('rollback_needs_reverify');
+    // 文件监视比入口等待慢：撤销入口的第一步超时，写入保留——入口状态未知
+    h.fake.localWatchLatencyMs = 60_000;
+    const n = await enterNormal(a);
+    const op = h.repos.operations.get(n)!;
+    expect(op.status).toBe('failed');
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ entryMode: 'UNKNOWN', phase: 'attention', activeEnvironmentId: a, selectedNode: nodeA });
+    expect(route.warnings).toContain('entry_unverified');
+    expect(route.warnings).not.toContain('rollback_needs_reverify');
+    const view = h.app.views.environmentView(a)!;
+    expect(view.facets.route).toBe('active');
+    expect(view.nextActions[0]!.message).toContain('路由状态需要处理');
+  });
+
+  test('temp_rule: after a successful rollback, a Surge restart (temp rules discarded) makes reconcile record the entry unknown and drop rollback_needs_reverify', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    await h.app.activate(b, { request_id: rid('act'), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await h.idle();
+    await h.clock.advanceAsync((h.repos.settings.get('profileArrivalTimeoutSec') + 1) * 1000);
+    await h.idle();
+    expect(h.repos.routeState.get().warnings).toContain('rollback_needs_reverify');
+    h.fake.restart();
+    await h.app.ensureInControl();
+    await h.idle();
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ phase: 'attention', entryMode: 'UNKNOWN' });
+    expect(route.warnings).toContain('entry_unverified');
+    expect(route.warnings).not.toContain('rollback_needs_reverify');
+    // Safari 已按原规则发出（临时规则随重启丢弃）：不再显示「已恢复原节点并保持阻断」
+    expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+    const view = h.app.views.environmentView(a)!;
+    expect(view.facets.route).toBe('active');
+    expect(view.nextActions[0]!.message).toContain('路由状态需要处理');
   });
 });

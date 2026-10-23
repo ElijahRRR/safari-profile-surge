@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { SfeError, type ActivateRequest, type RollbackResult } from '@sfe/contract';
+import { payloadOf } from '../../src/domain/operations.js';
 import type { SurgeAdapter } from '../../src/ports.js';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
 import {
@@ -233,6 +234,34 @@ describe('reuse and Safari re-probe', () => {
     expect(h.repos.routeState.get().routeEpoch).toBe(epoch);
   });
 
+  test('reuse reconciles first (§6.6): Surge switched to Direct outbound right after a popup reconcile → no reuse claim; the activation is refused before any write and orders stay blocked', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.clock.advance(6_000);
+    const state = async () => ((await h.native(PROFILE_A, { type: 'getCurrentState' })) as { ok: true; data: { ordersAllowed: boolean; ordersBlockedReason: string | null } }).data;
+    expect((await state()).ordersAllowed).toBe(true);
+    // 弹窗对账之后几秒内，用户在 Surge 菜单中把出站模式改为直连
+    h.fake.takeover = { ...h.fake.takeover, outboundMode: 'direct' };
+    h.clock.advance(1_000);
+    const before = writesCount();
+    const epoch = h.repos.routeState.get().routeEpoch;
+    const a = await h.native(PROFILE_A, { type: 'activateCurrentEnvironment', request_id: rid('act'), environment_id: envId, amazon_tabs_open: false });
+    expect(a.ok).toBe(true);
+    await h.idle();
+    const op = h.repos.operations.get((a as { data: { operation_id: string } }).data.operation_id)!;
+    expect(op.result).not.toMatchObject({ reused: true });
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('TAKEOVER_LOST');
+    expect(writesCount()).toEqual(before);
+    const route = h.repos.routeState.get();
+    expect(route.routeEpoch).toBe(epoch);
+    expect(route.warnings).toContain('outbound_mode_changed');
+    // 准备页在 5 秒内读取状态：不允许打开订单页
+    h.clock.advance(1_000);
+    const d = await state();
+    expect(d.ordersAllowed).toBe(false);
+  });
+
   test('reuse with an expired probe becomes a Safari re-probe (no switch)', async () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
@@ -276,7 +305,157 @@ describe('reuse and Safari re-probe', () => {
     expect(route.activeEnvironmentId).toBe(envId);
     expect(writesCount()).toEqual(before);
     expect(h.repos.probes.latest(envId, 'safari')!.outcome).toBe('mismatch');
+    // 准备页据此才说「已停止自动打开订单与填充」
+    expect(op2.result).toMatchObject({ probeWarning: 'exit_ip_mismatch' });
     expect((await h.app.ensureInControl()).ok).toBe(false);
+  });
+
+  test('probe.safari cancelled or timed out ends only the re-test: no warning is added, the earlier probe stays current, orders and fill stay allowed (no probeWarning for the prepare page)', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const env = h.repos.environments.get(envId)!;
+    await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { autoFillLogin: true } }, WEB);
+    const probeBefore = h.repos.probes.latest(envId, 'safari')!.id;
+    type State = { data: { ordersAllowed: boolean } };
+    // 取消
+    const p1 = await h.app.probe(envId, { request_id: rid(), kind: 'safari' }, WEB);
+    await h.idle();
+    await h.app.cancelOperation(p1.operation_id, { request_id: rid() }, WEB);
+    await h.idle();
+    const op1 = h.repos.operations.get(p1.operation_id)!;
+    expect(op1).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op1.error?.code).toBe('SUPERSEDED');
+    expect(op1.result?.probeWarning).toBeUndefined();
+    // 超时（签发检测编号之后）
+    const p2 = await h.app.probe(envId, { request_id: rid(), kind: 'safari' }, WEB);
+    await h.idle();
+    const begin = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: p2.operation_id, amazon_tabs_open: false });
+    expect((begin as { data: { status: string } }).data.status).toBe('ready');
+    await h.clock.advanceAsync(121_000);
+    await h.idle();
+    const op2 = h.repos.operations.get(p2.operation_id)!;
+    expect(op2.error?.code).toBe('SAFARI_VERIFY_TIMEOUT');
+    expect(op2.result?.probeWarning).toBeUndefined();
+    expect(h.repos.routeState.get().warnings).toEqual([]);
+    expect(h.repos.probes.latest(envId, 'safari')!.id).toBe(probeBefore);
+    const state = await h.native(PROFILE_A, { type: 'getCurrentState' });
+    expect((state as State).data.ordersAllowed).toBe(true);
+  });
+
+  test('a waiting retest or WAITING_ROUTE shows its own deadline (waitDeadline), and every retest ending clears the deadline it wrote into the route record', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    expect(h.repos.routeState.get().awaitingDeadline).toBeNull();
+    type Ready = { data: { status: string; deadline: string } };
+    const begin = async (opId: string): Promise<string> => {
+      const r = (await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: opId, amazon_tabs_open: false })) as Ready;
+      expect(r.data.status).toBe('ready');
+      expect(h.repos.routeState.get().awaitingDeadline).toBe(r.data.deadline);
+      expect((await h.app.getOperation(opId, WEB)).waitDeadline).toBe(r.data.deadline);
+      return r.data.deadline;
+    };
+    // 通过
+    const p1 = await h.app.probe(envId, { request_id: rid(), kind: 'safari' }, WEB);
+    await h.idle();
+    await begin(p1.operation_id);
+    expect((await verify(h, PROFILE_A, p1.operation_id)).ok).toBe(true);
+    expect(h.repos.operations.get(p1.operation_id)!.phase).toBe('ACTIVE_VERIFIED');
+    expect(h.repos.routeState.get().awaitingDeadline).toBeNull();
+    expect((await h.app.getOperation(p1.operation_id, WEB)).waitDeadline).toBeNull();
+    // 失败（浏览器检测请求没有成功）
+    const p2 = await h.app.probe(envId, { request_id: rid(), kind: 'safari' }, WEB);
+    await h.idle();
+    await begin(p2.operation_id);
+    await verify(h, PROFILE_A, p2.operation_id, { httpStatus: 502 });
+    expect(h.repos.operations.get(p2.operation_id)!.phase).toBe('FAILED');
+    expect(h.repos.routeState.get().awaitingDeadline).toBeNull();
+    // 取消
+    const p3 = await h.app.probe(envId, { request_id: rid(), kind: 'safari' }, WEB);
+    await h.idle();
+    await begin(p3.operation_id);
+    await h.app.cancelOperation(p3.operation_id, { request_id: rid() }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(p3.operation_id)!.status).toBe('failed');
+    expect(h.repos.routeState.get().awaitingDeadline).toBeNull();
+    // 超时
+    const p4 = await h.app.probe(envId, { request_id: rid(), kind: 'safari' }, WEB);
+    await h.idle();
+    await begin(p4.operation_id);
+    await h.clock.advanceAsync(121_000);
+    await h.idle();
+    expect(h.repos.operations.get(p4.operation_id)!.error?.code).toBe('SAFARI_VERIFY_TIMEOUT');
+    expect(h.repos.routeState.get().awaitingDeadline).toBeNull();
+    // 三小时后再次重新检测（尚未到达）：网页显示的是本次的到达截止时间，不是之前留下的时间
+    await h.clock.advanceAsync(3 * 3600_000);
+    await h.idle();
+    const p5 = await h.app.probe(envId, { request_id: rid(), kind: 'safari' }, WEB);
+    await h.idle();
+    const view5 = await h.app.getOperation(p5.operation_id, WEB);
+    expect(view5.status).toBe('waiting');
+    expect(view5.waitDeadline).toBe(payloadOf(h.repos.operations.get(p5.operation_id)!).route!.arrivalDeadline);
+    expect(Date.parse(view5.waitDeadline!)).toBeGreaterThan(h.clock.now().getTime());
+    await h.app.cancelOperation(p5.operation_id, { request_id: rid() }, WEB);
+    await h.idle();
+    // 活动环境改代理停在 WAITING_ROUTE：等待场景打开的截止时间
+    const env = h.repos.environments.get(envId)!;
+    const u = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.20' } } }, WEB);
+    await h.idle();
+    const viewU = await h.app.getOperation(u.operation_id, WEB);
+    expect(viewU.phase).toBe('WAITING_ROUTE');
+    expect(viewU.waitDeadline).toBe(payloadOf(h.repos.operations.get(u.operation_id)!).route!.arrivalDeadline);
+    expect(Date.parse(viewU.waitDeadline!)).toBeGreaterThan(h.clock.now().getTime());
+    expect(h.repos.routeState.get().awaitingDeadline).toBeNull();
+  });
+
+  test('the prepare page\'s pending reply says whether the operation is a switch: a queued retest and a cancelled wait never claim switching or blocking', async () => {
+    h = await createHarness();
+    const { a, b } = await twoEnvs();
+    const hold = async (): Promise<{ release: () => Promise<void> }> => {
+      let open!: () => void;
+      const gate = new Promise<void>((r) => (open = r));
+      let entered!: () => void;
+      const enteredP = new Promise<void>((r) => (entered = r));
+      const held = h.app.executor.runInternal('hold', async () => {
+        entered();
+        await gate;
+      });
+      await enteredP;
+      return {
+        release: async () => {
+          open();
+          await held;
+          await h.idle();
+        },
+      };
+    };
+    type Pending = { data: { status: string; message: string; switching?: boolean } };
+    const begin = async (profile: string, opId: string) =>
+      ((await h.native(profile, { type: 'beginSafariVerification', operation_id: opId, amazon_tabs_open: false })) as Pending).data;
+    const before = writesCount();
+    // 排队中的重新检测（执行器忙）：不说正在切换，也不声称阻断
+    let held = await hold();
+    const probe = await h.app.probe(a, { request_id: rid(), kind: 'safari' }, WEB);
+    expect(h.repos.operations.get(probe.operation_id)!.status).toBe('queued');
+    expect(await begin(PROFILE_A, probe.operation_id)).toEqual({ status: 'pending', phase: 'SAVED', message: '正在开始重新检测，请稍候（不切换、不阻断 Safari）', switching: false });
+    await held.release();
+    await h.app.cancelOperation(probe.operation_id, { request_id: rid() }, WEB);
+    await h.idle();
+    expect(writesCount()).toEqual(before);
+    // 活动环境改代理：到达后是切换；之后受理的取消不切换、不阻断
+    const env = h.repos.environments.get(a)!;
+    const u = await h.app.updateEnvironment(a, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.20' } } }, WEB);
+    await h.idle();
+    held = await hold();
+    expect(await begin(PROFILE_A, u.operation_id)).toMatchObject({ status: 'pending', message: '已到达，正在切换到新版本', switching: true });
+    await h.native(PROFILE_A, { type: 'cancelOperation', request_id: rid('cancel'), operation_id: u.operation_id });
+    expect(await begin(PROFILE_A, u.operation_id)).toMatchObject({ status: 'pending', message: '已请求取消，正在处理', switching: false });
+    await held.release();
+    expect(h.repos.operations.get(u.operation_id)!.phase).toBe('READY_FOR_NEXT_OPEN');
+    // 排队中的激活：是切换
+    held = await hold();
+    const act = await h.app.activate(b, { request_id: rid('act'), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    expect(await begin(PROFILE_B, act.operation_id)).toMatchObject({ status: 'pending', message: '正在切换出口，请稍候', switching: true });
+    await held.release();
   });
 
   test('probe.safari is refused for a non-active environment and while a switch is waiting', async () => {
@@ -542,35 +721,155 @@ describe('concurrency matrix', () => {
     },
   );
 
-  test('normal mode accepted while ACTIVE is being written: the activation does not commit; the normal mode undoes the ACTIVE entry (temp_rule)', async () => {
+  test.each([
+    ['temp_rule', true],
+    ['temp_rule', false],
+    ['ruleset_resource', true],
+    ['ruleset_resource', false],
+  ] as const)(
+    'normal mode accepted while ACTIVE is being written (%s, earlier environment active: %s): the activation does not commit; the normal mode undoes the ACTIVE entry, and since Safari (including the target profile\'s windows) already went through the target\'s exit and the confirmation did not cover it, the route carries the window warning',
+    async (entryStrategy, withA) => {
+      let afterCheck = false;
+      let hook: (() => Promise<void>) | null = null;
+      h = await createHarness({
+        entryStrategy,
+        surge: (fake) => beforeCall(beforeCall(fake, 'listRecentRequests', () => (afterCheck = true, null)), 'matchRule', () => (afterCheck ? hook : null)),
+      });
+      let a: string | null = null;
+      let b: string;
+      if (withA) {
+        ({ a, b } = await twoEnvs());
+      } else {
+        b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+        await bind(h, PROFILE_B, b);
+      }
+      afterCheck = false;
+      const opId = await startSwitch(b);
+      let normalId: string | null = null;
+      hook = async () => {
+        hook = null;
+        normalId = (await h.app.enterNormal(withA ? { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a } : { request_id: rid() }, WEB)).operation_id;
+      };
+      expect((await verify(h, PROFILE_B, opId)).ok).toBe(true);
+      await h.idle();
+      expect(normalId).not.toBeNull();
+      const stopped = h.repos.operations.get(opId)!;
+      expect(stopped).toMatchObject({ phase: 'SUPERSEDED', supersededBy: normalId });
+      expect(h.repos.operations.listSteps(opId).at(-1)!.message).toContain('入口已进入使用中模式（ACTIVE，读回确认），在提交之前停下，未提交');
+      expect(h.repos.operations.listSteps(opId).at(-1)!.message).toContain('目标环境的窗口已经过它的出口');
+      expect(h.repos.probes.latest(b, 'safari')).toBeNull();
+      const n = h.repos.operations.get(normalId!)!;
+      expect(n.phase).toBe('NORMAL_RESTORED');
+      expect((n.payload as { normal: { handedOverActiveTarget?: string } }).normal.handedOverActiveTarget).toBe(b);
+      expect(h.repos.operations.listSteps(normalId!).at(-1)!.message).toMatch(/^已进入普通模式：切换目标环境「US-Buyer-B · E000\d」的入口已写入使用中模式.*后续请求将按 Surge 原规则发出（可能直连）$/);
+      // 普通模式从读回的 ACTIVE 撤销本应用入口；B 的窗口未经确认，路由带旧窗口警告（与选择不关闭旧窗口相同）
+      const route = h.repos.routeState.get();
+      expect(route).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+      expect(route.warnings).toContain('managed_windows_on_original_rules');
+      expect(h.fake.tempRules).toEqual([]);
+      expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+    },
+  );
+
+  test.each(['temp_rule', 'ruleset_resource'] as const)(
+    'normal mode handed an ACTIVE-written switch fails (%s, Surge unreachable): the route needs attention instead of showing the old environment as managed, the target cannot be deleted while SFE-ROUTE selects its node, and the window warning survives to the next normal mode',
+    async (entryStrategy) => {
+      let afterCheck = false;
+      let hook: (() => Promise<void>) | null = null;
+      let opId = '';
+      let normalId: string | null = null;
+      let broke = false;
+      // 切换已交给普通模式（SUPERSEDED）且普通模式开始执行之后，Surge 变得不可达
+      const breakWhenNormalRuns = (adapter: object): SurgeAdapter =>
+        new Proxy(adapter, {
+          get(target, prop) {
+            const v = Reflect.get(target, prop, target) as unknown;
+            if (typeof v !== 'function') return v;
+            const fn = v as (...args: unknown[]) => unknown;
+            return (...args: unknown[]) => {
+              if (!broke && normalId !== null && h.repos.operations.get(opId)?.status === 'superseded' && h.repos.operations.get(normalId)?.status === 'running') {
+                broke = true;
+                h.fake.reachable = false;
+              }
+              return fn.apply(target, args);
+            };
+          },
+        }) as unknown as SurgeAdapter;
+      h = await createHarness({
+        entryStrategy,
+        surge: (fake) => breakWhenNormalRuns(beforeCall(beforeCall(fake, 'listRecentRequests', () => (afterCheck = true, null)), 'matchRule', () => (afterCheck ? hook : null))),
+      });
+      const { a, b } = await twoEnvs();
+      const nodeB = h.repos.proxyRevisions.get(b, 1)!.nodeName;
+      afterCheck = false;
+      opId = await startSwitch(b);
+      hook = async () => {
+        hook = null;
+        normalId = (await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB)).operation_id;
+      };
+      expect((await verify(h, PROFILE_B, opId)).ok).toBe(true);
+      await h.idle();
+      expect(broke).toBe(true);
+      expect(h.repos.operations.get(opId)).toMatchObject({ phase: 'SUPERSEDED', supersededBy: normalId });
+      const n1 = h.repos.operations.get(normalId!)!;
+      expect(n1).toMatchObject({ phase: 'FAILED', status: 'failed' });
+      expect(h.repos.operations.listSteps(normalId!).at(-1)!.message).toContain('切换目标环境「US-Buyer-B · E0002」的入口已写入使用中模式');
+      // SFE-ROUTE 选着 B 的节点（REJECT 改选失败），路由记录的使用中环境仍是 A：需要处理，入口未经确认，带 B 的窗口警告
+      const route = h.repos.routeState.get();
+      expect(route).toMatchObject({ phase: 'attention', entryMode: 'ACTIVE', activeEnvironmentId: a, selectedNode: nodeB });
+      expect(route.warnings).toEqual(expect.arrayContaining(['entry_unverified', 'buyer_exit_connections_unconfirmed', 'managed_windows_on_original_rules']));
+      h.fake.reachable = true;
+      await h.app.runPeriodicReconcile();
+      await h.idle();
+      const state = await h.native(PROFILE_A, { type: 'getCurrentState' });
+      const d = (state as { data: { relation: string; routeSummary: { entryUnconfirmed: boolean; phase: string }; environment: { nextActions: Array<{ message: string }> }; ordersAllowed: boolean } }).data;
+      expect(d.relation).toBe('this_active');
+      expect(d.routeSummary).toMatchObject({ phase: 'attention', entryUnconfirmed: true });
+      expect(d.environment.nextActions[0]!.message).toContain('路由状态需要处理');
+      expect(d.ordersAllowed).toBe(false);
+      // SFE-ROUTE 仍选着 B 的节点、入口不是普通模式：B 不能删除或解除绑定
+      const envB = h.repos.environments.get(b)!;
+      await expectError(h.app.deleteEnvironment(b, { request_id: rid(), expected_revision: envB.revision }, WEB), 'ENVIRONMENT_ACTIVE');
+      await expectError(h.app.unbind(b, { request_id: rid(), expected_revision: envB.revision }, WEB), 'ENVIRONMENT_ACTIVE');
+      // 再次进入普通模式：完成，B 的窗口警告保留并写明
+      const n2 = await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+      await h.idle();
+      expect(h.repos.operations.get(n2.operation_id)!.phase).toBe('NORMAL_RESTORED');
+      expect(h.repos.operations.listSteps(n2.operation_id).at(-1)!.message).toContain('旧环境窗口未关闭');
+      expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle' });
+      expect(h.repos.routeState.get().warnings).toContain('managed_windows_on_original_rules');
+      // 普通模式之后可以删除（删除先把仍选着 B 节点的 SFE-ROUTE 改选 REJECT）
+      const del = await h.app.deleteEnvironment(b, { request_id: rid(), expected_revision: h.repos.environments.get(b)!.revision }, WEB);
+      await h.idle();
+      expect(h.repos.operations.get(del.operation_id)!.phase).toBe('COMPLETED');
+      expect(await h.fake.getGroupSelection('SFE-ROUTE')).not.toBe(nodeB);
+    },
+  );
+
+  test('a normal mode whose confirmation named the handed-over target (re-verify of the active environment) adds no extra window warning', async () => {
     let afterCheck = false;
     let hook: (() => Promise<void>) | null = null;
     h = await createHarness({
       entryStrategy: 'temp_rule',
-      surge: (fake) =>
-        beforeCall(beforeCall(fake, 'listRecentRequests', () => (afterCheck = true, null)), 'addTempRule', () => (afterCheck ? hook : null)),
+      surge: (fake) => beforeCall(beforeCall(fake, 'listRecentRequests', () => (afterCheck = true, null)), 'matchRule', () => (afterCheck ? hook : null)),
     });
-    const { a, b } = await twoEnvs();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    // A 的回滚需要重新核验：再次使用 A 是一次完整切换（目标就是使用中的环境）
+    h.repos.routeState.update({ warnings: ['rollback_needs_reverify'] });
     afterCheck = false;
-    const opId = await startSwitch(b);
+    const opId = await startSwitch(a);
+    expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
     let normalId: string | null = null;
     hook = async () => {
       hook = null;
       normalId = (await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB)).operation_id;
     };
-    expect((await verify(h, PROFILE_B, opId)).ok).toBe(true);
+    expect((await verify(h, PROFILE_A, opId)).ok).toBe(true);
     await h.idle();
-    expect(normalId).not.toBeNull();
-    const stopped = h.repos.operations.get(opId)!;
-    expect(stopped).toMatchObject({ phase: 'SUPERSEDED', supersededBy: normalId });
-    expect(h.repos.operations.listSteps(opId).at(-1)!.message).toContain('入口已进入使用中模式（ACTIVE，读回确认），在提交之前停下，未提交');
-    expect(h.repos.probes.latest(b, 'safari')).toBeNull();
-    const n = h.repos.operations.get(normalId!)!;
-    expect(n.phase).toBe('NORMAL_RESTORED');
-    // 普通模式从读回的 ACTIVE 撤销本应用入口
-    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
-    expect(h.fake.tempRules).toEqual([]);
-    expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+    expect(h.repos.operations.get(opId)).toMatchObject({ phase: 'SUPERSEDED', supersededBy: normalId });
+    expect(h.repos.operations.get(normalId!)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get().warnings).not.toContain('managed_windows_on_original_rules');
+    expect(h.repos.operations.listSteps(normalId!).at(-1)!.message).toBe('已进入普通模式：Safari 按 Surge 原规则发出请求');
   });
 
   test('normal mode accepted while a Safari re-test is starting: queued, then it ends the waiting re-test (test id invalid) and restores the original rules', async () => {
@@ -879,6 +1178,102 @@ describe('rollback (§6.3 step 14)', () => {
     expect(safariOutcome(h).failed).toBe(true);
   });
 
+  test('a cancel accepted while a submitted verification is still queued (executor busy) wins: the switch rolls back instead of committing', async () => {
+    h = await createHarness();
+    const { a, b } = await twoEnvs();
+    const nodeA = h.repos.proxyRevisions.get(a, 1)!.nodeName;
+    const opId = await startSwitch(b);
+    const begin = await h.native(PROFILE_B, { type: 'beginSafariVerification', operation_id: opId, amazon_tabs_open: false });
+    const d = (begin as { data: { status: string; test_id: string; route_epoch: number } }).data;
+    expect(d.status).toBe('ready');
+    // 执行器忙（周期对账、其他操作）：提交只排入结果，操作仍在等待中
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const enteredP = new Promise<void>((r) => (entered = r));
+    const held = h.app.executor.runInternal('hold', async () => {
+      entered();
+      await gate;
+    });
+    await enteredP;
+    const started = h.clock.now().toISOString();
+    h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: FAKE_VERIFY_HOST, protocol: 'tcp' });
+    const sub = await h.native(PROFILE_B, {
+      type: 'submitSafariVerification',
+      operation_id: opId,
+      test_id: d.test_id,
+      route_epoch: d.route_epoch,
+      observed_ip: '192.0.2.50',
+      http_status: 200,
+      error: null,
+      started_at: started,
+      finished_at: h.clock.now().toISOString(),
+    });
+    expect(sub.ok).toBe(true);
+    expect(h.repos.operations.get(opId)!.status).toBe('waiting');
+    // 取消照常受理（202）：排在已排入的结果之后
+    const acc = await h.app.cancelOperation(opId, { request_id: rid('cancel') }, WEB);
+    expect(acc.duplicate).toBe(false);
+    // 已受理取消之后不再签发检测编号
+    const again = await h.native(PROFILE_B, { type: 'beginSafariVerification', operation_id: opId, amazon_tabs_open: false });
+    expect((again as { data: { status: string } }).data.status).toBe('pending');
+    release();
+    await held;
+    await h.idle();
+    const op = h.repos.operations.get(opId)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.message).toBe('已取消切换');
+    expect((op.result as { rollback: RollbackResult }).rollback).toMatchObject({ previousEnvironmentId: a, restoredSelection: nodeA, entryModeAfter: 'BLOCKED' });
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeA });
+    expect(h.repos.probes.latest(b, 'safari')).toBeNull();
+    expect(safariOutcome(h).failed).toBe(true);
+  });
+
+  test('a cancel accepted while a submitted Safari re-test result is still queued ends the re-test without recording a probe', async () => {
+    h = await createHarness();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const probeBefore = h.repos.probes.latest(a, 'safari')!.id;
+    const r = await h.app.probe(a, { request_id: rid('probe'), kind: 'safari' }, WEB);
+    await h.idle();
+    const opId = r.operation_id;
+    expect(h.repos.operations.get(opId)).toMatchObject({ status: 'waiting', probeKind: 'safari' });
+    const begin = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: opId, amazon_tabs_open: false });
+    const d = (begin as { data: { status: string; test_id: string; route_epoch: number } }).data;
+    expect(d.status).toBe('ready');
+    let release!: () => void;
+    const gate = new Promise<void>((res) => (release = res));
+    let entered!: () => void;
+    const enteredP = new Promise<void>((res) => (entered = res));
+    const held = h.app.executor.runInternal('hold', async () => {
+      entered();
+      await gate;
+    });
+    await enteredP;
+    const started = h.clock.now().toISOString();
+    h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: FAKE_VERIFY_HOST, protocol: 'tcp' });
+    const sub = await h.native(PROFILE_A, {
+      type: 'submitSafariVerification',
+      operation_id: opId,
+      test_id: d.test_id,
+      route_epoch: d.route_epoch,
+      observed_ip: '192.0.2.50',
+      http_status: 200,
+      error: null,
+      started_at: started,
+      finished_at: h.clock.now().toISOString(),
+    });
+    expect(sub.ok).toBe(true);
+    await h.app.cancelOperation(opId, { request_id: rid('cancel') }, WEB);
+    release();
+    await held;
+    await h.idle();
+    const op = h.repos.operations.get(opId)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.message).toBe('已取消重新检测：路由未改变');
+    expect(h.repos.probes.latest(a, 'safari')!.id).toBe(probeBefore);
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: a });
+  });
+
   test('cancel is only for waiting route operations', async () => {
     h = await createHarness();
     const created = await createEnv(h, 'US-Buyer-A', '203.0.113.10');
@@ -935,6 +1330,34 @@ describe('active environment proxy change → WAITING_ROUTE', () => {
     expect(safariOutcome(h).leafPolicyName).toBe('SFE-N-E0001-US01-v002');
   });
 
+  test('arrived in WAITING_ROUTE, switched to VERIFY_ONLY, but no test issued (prepare page closed): the new arrival deadline still rolls back per step 14', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+    const env = h.repos.environments.get(envId)!;
+    const u = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.20' } } }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(u.operation_id)!.phase).toBe('WAITING_ROUTE');
+    // 准备页只在 WAITING_ROUTE 调用一次（写入到达），之后在切换期间被关闭：VERIFY_ONLY 等待中没有签发检测编号
+    const first = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u.operation_id, amazon_tabs_open: false });
+    expect((first as { data: { status: string } }).data.status).toBe('pending');
+    await h.idle();
+    const waiting = h.repos.operations.get(u.operation_id)!;
+    expect(waiting.phase).toBe('VERIFY_ONLY');
+    expect((waiting.payload as { route: { verifyDeadline: string | null } }).route.verifyDeadline).toBeNull();
+    const deadline = h.repos.routeState.get().awaitingDeadline;
+    expect(deadline).not.toBeNull();
+    // 网页与弹窗显示的截止时间（awaitingDeadline / arrivalDeadline）到达时照常按第 14 步回滚
+    await h.clock.advanceAsync(601_000);
+    await h.idle();
+    const op = h.repos.operations.get(u.operation_id)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('SAFARI_VERIFY_TIMEOUT');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeProxyRevision: 1, selectedNode: nodeV1, awaitingDeadline: null });
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe(nodeV1);
+    expect(safariOutcome(h, FAKE_VERIFY_HOST).failed).toBe(true);
+  });
+
   test('WAITING_ROUTE deadline → READY_FOR_NEXT_OPEN, route unchanged', async () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
@@ -959,6 +1382,323 @@ describe('active environment proxy change → WAITING_ROUTE', () => {
     const op = h.repos.operations.get(u.operation_id)!;
     expect(op.phase).toBe('READY_FOR_NEXT_OPEN');
     expect(op.supersededBy).toBe(second);
+  });
+
+  test.each(['ruleset_resource', 'temp_rule'] as const)(
+    '[%s] a cancel accepted after the bound profile arrived (executor busy, profile_arrived still queued) wins: WAITING_ROUTE ends READY_FOR_NEXT_OPEN without touching Surge',
+    async (entryStrategy) => {
+      h = await createHarness({ entryStrategy });
+      const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+      const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+      const env = h.repos.environments.get(envId)!;
+      const u = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.20' } } }, WEB);
+      await h.idle();
+      expect(h.repos.operations.get(u.operation_id)!.phase).toBe('WAITING_ROUTE');
+      const oldSafari = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+      // 执行器忙（周期对账、其他环境的发布或预检）：到达只排入 profile_arrived，操作仍停在 WAITING_ROUTE
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      let entered!: () => void;
+      const enteredP = new Promise<void>((r) => (entered = r));
+      const held = h.app.executor.runInternal('hold', async () => {
+        entered();
+        await gate;
+      });
+      await enteredP;
+      const arrived = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u.operation_id, amazon_tabs_open: false });
+      expect((arrived as { data: { status: string } }).data.status).toBe('pending');
+      expect(h.repos.outbox.pendingForOperation(u.operation_id).map((r) => r.resumeReason)).toContain('profile_arrived');
+      type Pending = { data: { pendingVerification: { waiting_route: boolean } } };
+      const state = await h.native(PROFILE_A, { type: 'getCurrentState' });
+      expect((state as Pending).data.pendingVerification.waiting_route).toBe(true);
+      const before = writesCount();
+      // 弹窗「取消等待」照常受理，排在已排入的到达之后
+      const cancel = await h.native(PROFILE_A, { type: 'cancelOperation', request_id: rid('cancel'), operation_id: u.operation_id });
+      expect(cancel.ok).toBe(true);
+      // 已受理取消之后的到达不再排入切换
+      const again = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u.operation_id, amazon_tabs_open: false });
+      expect((again as { data: { status: string; message: string } }).data).toMatchObject({ status: 'pending', message: '已请求取消，正在处理' });
+      release();
+      await held;
+      await h.idle();
+      const op = h.repos.operations.get(u.operation_id)!;
+      expect(op).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', error: null });
+      expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeProxyRevision: 1, selectedNode: nodeV1, warnings: [] });
+      // 没有阻断、没有结束连接、没有改选节点：当前出口不变（弹窗与网页的取消说明）
+      expect(writesCount()).toEqual(before);
+      expect((await h.fake.listActiveRequests()).map((r) => r.id)).toContain(oldSafari.id);
+      expect(safariOutcome(h).leafPolicyName).toBe(nodeV1);
+    },
+  );
+
+  test('a second proxy edit while the first one waits ends the first as READY_FOR_NEXT_OPEN: the popup and arrivals only ever switch to the newest revision', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    let env = h.repos.environments.get(envId)!;
+    // 第一次修改指向了另一个买家的代理（随后更正）
+    const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(u1.operation_id)!.phase).toBe('WAITING_ROUTE');
+    env = h.repos.environments.get(envId)!;
+    const u2 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.30' } } }, WEB);
+    await h.idle();
+    expect(h.repos.environments.get(envId)!.deployedProxyRevision).toBe(3);
+    expect(h.repos.operations.get(u2.operation_id)!.phase).toBe('WAITING_ROUTE');
+    const first = h.repos.operations.get(u1.operation_id)!;
+    expect(first).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', supersededBy: u2.operation_id, error: null });
+    expect(h.repos.outbox.pendingForOperation(u1.operation_id)).toEqual([]);
+    type Pending = { data: { pendingVerification: { operation_id: string } | null } };
+    const state = await h.native(PROFILE_A, { type: 'getCurrentState' });
+    expect((state as Pending).data.pendingVerification?.operation_id).toBe(u2.operation_id);
+    // 旧的准备页再到达：已结束，不切换
+    const stale = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u1.operation_id, amazon_tabs_open: false });
+    expect((stale as { data: { status: string } }).data.status).toBe('not_needed');
+    const arrived = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u2.operation_id, amazon_tabs_open: false });
+    expect((arrived as { data: { status: string } }).data.status).toBe('pending');
+    await h.idle();
+    await verify(h, PROFILE_A, u2.operation_id);
+    expect(h.repos.operations.get(u2.operation_id)!.phase).toBe('ACTIVE_VERIFIED');
+    expect(h.repos.routeState.get()).toMatchObject({ activeProxyRevision: 3, phase: 'active_verified' });
+    const after = await h.native(PROFILE_A, { type: 'getCurrentState' });
+    expect((after as Pending).data.pendingVerification).toBeNull();
+    expect(safariOutcome(h).leafPolicyName).toBe('SFE-N-E0001-US01-v003');
+  });
+
+  test('a WAITING_ROUTE publish whose revision was replaced (left over from before the upgrade) ends READY_FOR_NEXT_OPEN on arrival without touching Surge', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+    let env = h.repos.environments.get(envId)!;
+    const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+    await h.idle();
+    env = h.repos.environments.get(envId)!;
+    const u2 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.30' } } }, WEB);
+    await h.idle();
+    // 升级前留下的数据：同一环境的两个发布都停在 WAITING_ROUTE
+    h.repos.operations.update(u1.operation_id, { phase: 'WAITING_ROUTE', status: 'waiting', supersededBy: null });
+    const before = writesCount();
+    const arrived = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u1.operation_id, amazon_tabs_open: false });
+    expect((arrived as { data: { status: string } }).data.status).toBe('pending');
+    await h.idle();
+    const op = h.repos.operations.get(u1.operation_id)!;
+    expect(op).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', error: null });
+    expect(h.repos.operations.listSteps(u1.operation_id).at(-1)!.message).toContain('已被之后的修改替换');
+    expect(writesCount()).toEqual(before);
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeProxyRevision: 1, selectedNode: nodeV1 });
+    expect(h.repos.operations.get(u2.operation_id)!.phase).toBe('WAITING_ROUTE');
+  });
+
+  test('a publish switch whose revision is replaced while it waits in VERIFY_ONLY is not committed: it rolls back per step 14 and the newer revision switches next', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+    let env = h.repos.environments.get(envId)!;
+    const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+    await h.idle();
+    await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u1.operation_id, amazon_tabs_open: false });
+    await h.idle();
+    expect(h.repos.operations.get(u1.operation_id)!.phase).toBe('VERIFY_ONLY');
+    // 等待实测期间更正代理：更新的版本已部署
+    env = h.repos.environments.get(envId)!;
+    const u2 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.30' } } }, WEB);
+    await h.idle();
+    expect(h.repos.environments.get(envId)!.deployedProxyRevision).toBe(3);
+    expect(h.repos.operations.get(u2.operation_id)!.phase).toBe('WAITING_ROUTE');
+    // 旧准备页的实测通过：不提交被替换的版本
+    await verify(h, PROFILE_A, u1.operation_id);
+    const op = h.repos.operations.get(u1.operation_id)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('NODE_NOT_DEPLOYED');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeProxyRevision: 1, selectedNode: nodeV1 });
+    expect(h.repos.environments.get(envId)!.lastVerifiedProxyRevision).toBe(1);
+    expect(safariOutcome(h).failed).toBe(true);
+    // 更新的版本在下次到达时切换
+    await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u2.operation_id, amazon_tabs_open: false });
+    await h.idle();
+    await verify(h, PROFILE_A, u2.operation_id);
+    expect(h.repos.operations.get(u2.operation_id)!.phase).toBe('ACTIVE_VERIFIED');
+    expect(h.repos.routeState.get()).toMatchObject({ activeProxyRevision: 3, phase: 'active_verified', entryMode: 'ACTIVE' });
+    expect(safariOutcome(h).leafPolicyName).toBe('SFE-N-E0001-US01-v003');
+  });
+
+  // 更正的版本已保存但没有部署成功（发布失败、暂停待部署）：被替换的版本从不切换（§6.3 第 2、13 步：替换指之后保存了更新的版本）
+  const failCorrection = {
+    failed: () => h.fake.failNext('listPolicies'),
+    parked: () => h.revoke(['connection_continuity']),
+  } as const;
+
+  test.each(['failed', 'parked'] as const)(
+    'saving a correction ends the replaced WAITING_ROUTE at once, even when the correction is %s: the popup and a stale arrival never switch to the replaced revision',
+    async (how) => {
+      h = await createHarness();
+      const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+      const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+      let env = h.repos.environments.get(envId)!;
+      // 第一次修改指向了另一个买家的代理（随后更正）
+      const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+      await h.idle();
+      expect(h.repos.operations.get(u1.operation_id)!.phase).toBe('WAITING_ROUTE');
+      failCorrection[how]();
+      env = h.repos.environments.get(envId)!;
+      const u2 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.30' } } }, WEB);
+      // 保存事务中即结束（不等更正的版本部署）
+      const first = h.repos.operations.get(u1.operation_id)!;
+      expect(first).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', supersededBy: u2.operation_id, error: null });
+      expect(h.repos.operations.listSteps(u1.operation_id).at(-1)!.message).toContain('已保存 v003');
+      expect(h.repos.outbox.pendingForOperation(u1.operation_id)).toEqual([]);
+      await h.idle();
+      const second = h.repos.operations.get(u2.operation_id)!;
+      expect(second.phase).toBe(how === 'failed' ? 'FAILED' : 'WAITING_DEPLOYMENT');
+      expect(h.repos.environments.get(envId)!).toMatchObject({ desiredProxyRevision: 3, deployedProxyRevision: 2 });
+      type Pending = { data: { pendingVerification: { operation_id: string } | null } };
+      const state = await h.native(PROFILE_A, { type: 'getCurrentState' });
+      expect((state as Pending).data.pendingVerification).toBeNull();
+      const before = writesCount();
+      // 旧准备页再到达：已结束，不切换，也不提示「重新使用此环境」（那会选用被替换的版本）
+      const stale = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u1.operation_id, amazon_tabs_open: false });
+      expect((stale as { data: { status: string; message: string } }).data).toEqual({ status: 'not_needed', message: '等待已结束：之后又修改了代理，不切换到这一版本，当前出口不变' });
+      await h.idle();
+      expect(writesCount()).toEqual(before);
+      expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeProxyRevision: 1, selectedNode: nodeV1 });
+      expect(safariOutcome(h).leafPolicyName).toBe(nodeV1);
+    },
+  );
+
+  test('a WAITING_ROUTE publish left over with a saved-but-undeployed newer revision ends READY_FOR_NEXT_OPEN on arrival without touching Surge', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+    let env = h.repos.environments.get(envId)!;
+    const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+    await h.idle();
+    h.fake.failNext('listPolicies');
+    env = h.repos.environments.get(envId)!;
+    await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.30' } } }, WEB);
+    await h.idle();
+    expect(h.repos.environments.get(envId)!).toMatchObject({ desiredProxyRevision: 3, deployedProxyRevision: 2 });
+    // 升级前留下的数据：保存时没有结束等待
+    h.repos.operations.update(u1.operation_id, { phase: 'WAITING_ROUTE', status: 'waiting', supersededBy: null });
+    const before = writesCount();
+    const arrived = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u1.operation_id, amazon_tabs_open: false });
+    expect((arrived as { data: { status: string } }).data.status).toBe('pending');
+    await h.idle();
+    expect(h.repos.operations.get(u1.operation_id)!).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', error: null });
+    expect(h.repos.operations.listSteps(u1.operation_id).at(-1)!.message).toContain('已被之后的修改替换（已保存 v003，尚未部署）');
+    expect(writesCount()).toEqual(before);
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeProxyRevision: 1, selectedNode: nodeV1 });
+    expect(safariOutcome(h).leafPolicyName).toBe(nodeV1);
+  });
+
+  test('a publish switch waiting in VERIFY_ONLY is not committed when a correction is saved but fails to deploy: it rolls back per step 14', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+    let env = h.repos.environments.get(envId)!;
+    const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+    await h.idle();
+    await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u1.operation_id, amazon_tabs_open: false });
+    await h.idle();
+    expect(h.repos.operations.get(u1.operation_id)!.phase).toBe('VERIFY_ONLY');
+    h.fake.failNext('listPolicies');
+    env = h.repos.environments.get(envId)!;
+    const u2 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.30' } } }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(u2.operation_id)!.phase).toBe('FAILED');
+    expect(h.repos.environments.get(envId)!).toMatchObject({ desiredProxyRevision: 3, deployedProxyRevision: 2 });
+    // 旧准备页的实测通过：不提交被替换的版本
+    await verify(h, PROFILE_A, u1.operation_id);
+    const op = h.repos.operations.get(u1.operation_id)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('NODE_NOT_DEPLOYED');
+    expect(op.error?.message).toContain('已保存 v003，尚未部署');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeProxyRevision: 1, selectedNode: nodeV1 });
+    expect(h.repos.environments.get(envId)!.lastVerifiedProxyRevision).toBe(1);
+    expect(safariOutcome(h).failed).toBe(true);
+  });
+
+  test.each(['ruleset_resource', 'temp_rule'] as const)(
+    '[%s] a correction saved during the switch\'s step 1–3 reads stops the switch before its first Surge write',
+    async (entryStrategy) => {
+      let save: (() => Promise<void>) | null = null;
+      h = await createHarness({ entryStrategy, surge: (fake) => beforeCall(fake, 'getGroupMembers', () => { const s = save; save = null; return s; }) });
+      const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+      const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+      let env = h.repos.environments.get(envId)!;
+      const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+      await h.idle();
+      expect(h.repos.operations.get(u1.operation_id)!.phase).toBe('WAITING_ROUTE');
+      let u2 = '';
+      // 第 2 步读取 SFE-ROUTE 成员时用户保存了更正（更正的发布随后失败）
+      save = async () => {
+        expect(h.repos.operations.get(u1.operation_id)!.status).toBe('running');
+        h.fake.failNext('listPolicies');
+        env = h.repos.environments.get(envId)!;
+        u2 = (await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.30' } } }, WEB)).operation_id;
+      };
+      const routeWrites = () => ({ ...writesCount(), update: 0, addTemp: h.fake.calls.addTempRule ?? 0, removeTemp: h.fake.calls.removeTempRule ?? 0 });
+      const before = routeWrites();
+      const entryBefore = entryWrites(h.fake);
+      await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u1.operation_id, amazon_tabs_open: false });
+      await h.idle();
+      expect(u2).not.toBe('');
+      const op = h.repos.operations.get(u1.operation_id)!;
+      expect(op).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', error: null });
+      expect(h.repos.operations.listSteps(u1.operation_id).at(-1)!.message).toContain('已被之后的修改替换');
+      // 没有阻断、没有结束连接、没有改选节点（入口规则集文件与临时规则都没有写入）
+      expect(routeWrites()).toEqual(before);
+      expect(entryWrites(h.fake)).toEqual(entryBefore);
+      expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeProxyRevision: 1, selectedNode: nodeV1 });
+      expect(safariOutcome(h).leafPolicyName).toBe(nodeV1);
+    },
+  );
+
+  test('a revision replaced while its publish was still deploying never enters WAITING_ROUTE', async () => {
+    let save: (() => Promise<void>) | null = null;
+    h = await createHarness({ surge: (fake) => beforeCall(fake, 'getGroupMembers', () => { const s = save; save = null; return s; }) });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+    let env = h.repos.environments.get(envId)!;
+    let u2 = '';
+    save = async () => {
+      h.fake.failNext('listPolicies');
+      env = h.repos.environments.get(envId)!;
+      u2 = (await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.30' } } }, WEB)).operation_id;
+    };
+    // v2 的发布读取组成员时（已越过第 0 步的期望版本核对）用户保存了更正；更正的发布随后失败
+    const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+    await h.idle();
+    expect(u2).not.toBe('');
+    expect(h.repos.environments.get(envId)!).toMatchObject({ desiredProxyRevision: 3, deployedProxyRevision: 2 });
+    expect(h.repos.operations.get(u2)!.phase).toBe('FAILED');
+    const op = h.repos.operations.get(u1.operation_id)!;
+    expect(op).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', error: null });
+    expect(h.repos.operations.listSteps(u1.operation_id).at(-1)!.message).toContain('发布期间又修改了代理（已保存 v003）');
+    expect(h.repos.outbox.pendingForOperation(u1.operation_id)).toEqual([]);
+    type Pending = { data: { pendingVerification: { operation_id: string } | null } };
+    expect(((await h.native(PROFILE_A, { type: 'getCurrentState' })) as Pending).data.pendingVerification).toBeNull();
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE', activeProxyRevision: 1, selectedNode: nodeV1 });
+  });
+
+  test('replacing the front proxy ends the replaced WAITING_ROUTE in the same transaction', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    let env = h.repos.environments.get(envId)!;
+    const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(u1.operation_id)!.phase).toBe('WAITING_ROUTE');
+    const front = await h.app.registerFrontProxy({ request_id: rid(), surgeName: 'Front-B' }, WEB);
+    const preview = await h.app.replaceFrontPreview(h.frontId, { to_front_id: front.id, environment_ids: [envId] }, WEB);
+    env = h.repos.environments.get(envId)!;
+    h.revoke(['connection_continuity']);
+    const acc = await h.app.replaceFrontCommit(
+      h.frontId,
+      { request_id: rid(), to_front_id: front.id, environment_ids: [envId], preview_digest: preview.preview_digest, expected_revisions: { [envId]: env.revision } },
+      WEB,
+    );
+    expect(h.repos.operations.get(u1.operation_id)!).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', supersededBy: acc.operation_id, error: null });
+    await h.idle();
+    expect(h.repos.environments.get(envId)!).toMatchObject({ desiredProxyRevision: 3, deployedProxyRevision: 2 });
+    expect(h.repos.routeState.get().activeProxyRevision).toBe(1);
   });
 
   test('cancel WAITING_ROUTE → READY_FOR_NEXT_OPEN', async () => {
@@ -1070,6 +1810,37 @@ describe('delete / unbind (§6.7)', () => {
     for (const name of ['getGroupSelection', 'selectGroupPolicy', 'updateExternalResource', 'reloadProfile', 'killRequest', 'addTempRule', 'removeTempRule']) {
       expect(h.fake.calls[name] ?? 0).toBe(before[name] ?? 0);
     }
+  });
+
+  test('an uninitialized draft whose proxy was edited (v1 superseded, v2 desired) is still deleted without querying the absent route group; secrets orphaned, parked create and update ops superseded', async () => {
+    h = await createHarness({ sourceProfile: uninitializedProfile, capabilities: [] });
+    const a = await createEnv(h, 'Draft-A', '203.0.113.10', { username: 'synth-user', password: 'synth-proxy-pw', login: 'buyer01@example.test', accountPassword: 'synth-account-pw' });
+    const envId = a.environment_id!;
+    const env0 = h.repos.environments.get(envId)!;
+    const u = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env0.revision, changes: { proxy: { host: '203.0.113.20' } } }, WEB);
+    await h.idle();
+    expect(h.repos.proxyRevisions.listByEnvironment(envId).map((r) => [r.revision, r.state])).toEqual([
+      [1, 'superseded'],
+      [2, 'desired'],
+    ]);
+    expect(h.repos.operations.get(u.operation_id)!.status).toBe('parked');
+    const accountRef = h.repos.accounts.get(envId)!.passwordRef!;
+    const proxyRefs = h.repos.proxyRevisions.listByEnvironment(envId).flatMap((r) => [r.usernameRef, r.passwordRef]).filter((x): x is string => !!x);
+    expect(proxyRefs.length).toBeGreaterThan(0);
+    // 真实 CLI 对不存在的组报错
+    h.fake.failNext('getGroupSelection', new SfeError('SURGE_COMMAND_FAILED', 'Policy group does not exist.'));
+    const before = h.fake.calls.getGroupSelection ?? 0;
+    const env = h.repos.environments.get(envId)!;
+    const d = await h.app.deleteEnvironment(envId, { request_id: rid(), expected_revision: env.revision }, ADMIN);
+    await h.idle();
+    expect(h.repos.operations.get(d.operation_id)!.status).toBe('succeeded');
+    expect(h.fake.calls.getGroupSelection ?? 0).toBe(before);
+    expect(h.repos.environments.get(envId)!.deletedAt).not.toBeNull();
+    expect(h.repos.proxyRevisions.listByEnvironment(envId).every((r) => r.state === 'retired')).toBe(true);
+    expect(h.repos.accounts.get(envId)).toBeNull();
+    for (const ref of [accountRef, ...proxyRefs]) expect(h.repos.secretRefs.get(ref)!.state).toBe('orphaned');
+    expect(h.repos.operations.get(a.operation_id)).toMatchObject({ status: 'superseded', supersededBy: d.operation_id });
+    expect(h.repos.operations.get(u.operation_id)).toMatchObject({ status: 'superseded', supersededBy: d.operation_id });
   });
 
   test('draft deletion fails closed if runtime policy inventory cannot be read', async () => {

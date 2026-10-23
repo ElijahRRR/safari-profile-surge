@@ -37,7 +37,16 @@ import { LIMITS, validateEnvironmentChanges, validateEnvironmentInput } from '..
 import { fingerprint } from '../secrets/pepper.js';
 import type { Engine } from './context.js';
 import { acceptedOf, commitOperation, findDuplicateOperation, findLedger, recordLedger, requestDigest, requireRequestId } from './ledger.js';
-import { confirmationNeeded, needsConfirmationError, routeBusyError, routeOps, supersedeWaiting, waitingEnvironments } from './route-control.js';
+import {
+  confirmationNeeded,
+  endWaitingRouteForNewRevision,
+  environmentRouteBusy,
+  needsConfirmationError,
+  routeBusyError,
+  routeOps,
+  supersedeWaiting,
+  waitingEnvironments,
+} from './route-control.js';
 import type { ViewService } from './view-service.js';
 
 export interface AcceptDeps {
@@ -433,6 +442,7 @@ export async function acceptUpdate(deps: AcceptDeps, id: string, req: UpdateEnvi
 
   let committed: { op: OperationRecord; duplicate: boolean };
   const routeChanged = { value: false };
+  const endedWaits: string[] = [];
   try {
     // 幂等在主事务内、版本检查之前再核对一次：并发的同一请求可能在写秘密存储期间已提交（否则会误报版本冲突）
     committed = commitOperation(engine, requestId, digest, () => {
@@ -512,7 +522,7 @@ export async function acceptUpdate(deps: AcceptDeps, id: string, req: UpdateEnvi
       if (exitChanged) routeChanged.value = reevaluateExitIp(engine, env.id, patch.expectedExitIp ?? null);
 
       if (newProxyRevision !== null) {
-        return insertOperation(engine, {
+        const created = insertOperation(engine, {
           kind: 'environment.update',
           requestId,
           digest,
@@ -523,6 +533,9 @@ export async function acceptUpdate(deps: AcceptDeps, id: string, req: UpdateEnvi
           payload: { targets: [{ environmentId: env.id, proxyRevision: newProxyRevision }] },
           step: `已保存代理新版本 v${String(newProxyRevision).padStart(3, '0')}，等待同步到 Surge`,
         });
+        // 停在 WAITING_ROUTE 的旧版本已被替换：同一事务中结束，之后不再切到它（§6.3 第 2 步）
+        endedWaits.push(...endWaitingRouteForNewRevision(engine, env.id, newProxyRevision, created.id));
+        return created;
       }
       return insertOperation(engine, {
         kind: 'environment.update',
@@ -548,7 +561,7 @@ export async function acceptUpdate(deps: AcceptDeps, id: string, req: UpdateEnvi
     return acceptedOf(op, true);
   }
   if (op.status === 'queued') deps.kick();
-  engine.emit({ operations: [op.id], environments: [env.id], route: routeChanged.value });
+  engine.emit({ operations: [op.id, ...endedWaits], environments: [env.id], route: routeChanged.value });
   return acceptedOf(op, false);
 }
 
@@ -574,10 +587,7 @@ export function reevaluateExitIp(engine: Engine, environmentId: string, expected
 // ---------- 删除与解除绑定 ----------
 
 function environmentBusy(engine: Engine, envId: string): boolean {
-  const route = engine.repos.routeState.get();
-  if (route.activeEnvironmentId === envId && route.entryMode !== 'NORMAL') return true;
-  const ops = routeOps(engine);
-  return [...ops.busy, ...ops.waitingVerification].some((o) => payloadOf(o).route?.targetEnvironmentId === envId);
+  return environmentRouteBusy(engine, envId);
 }
 
 export async function acceptDelete(deps: AcceptDeps, id: string, req: DeleteEnvironmentRequest, actor: Actor): Promise<Accepted> {

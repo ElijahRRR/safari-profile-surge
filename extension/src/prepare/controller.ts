@@ -26,6 +26,14 @@ export type PrepareStage =
   | 'parked'
   | 'error';
 
+/**
+ * 操作结束时这一页能如实说什么（finish）：verified 只用于以 ACTIVE_VERIFIED 结束（Safari 实测通过，或复用实测有效的使用中
+ * 环境）；not_checked 是没有做检测就结束（READY_FOR_NEXT_OPEN 等，status 为 succeeded 也不是检测通过）；rolled_back 是失败后
+ * 回滚读回确认 Safari 保持阻断（result.rollback）；probe_failed 是重测失败或取消（路由未改变）；superseded 是被之后的请求取代
+ * （普通模式或另一次切换，Safari 已按它们处理）；attention 是回滚或切换无法确认，需要处理；failed 是其他失败（多为写入之前）。
+ */
+export type PrepareOutcome = 'verified' | 'not_checked' | 'rolled_back' | 'probe_failed' | 'superseded' | 'attention' | 'failed';
+
 export interface VerificationResult {
   observed_ip: string | null;
   http_status: number | null;
@@ -40,13 +48,22 @@ export interface PrepareState {
   intent: PrepareIntent;
   phase: string | null;
   message: string | null;
+  /**
+   * 服务说明这是一次切换（beginSafariVerification 的 switching）：只有这时才说「切换期间 Safari 的其他请求会被暂时拒绝」。
+   * 重新检测从不切换、不阻断；停在 WAITING_ROUTE 尚未到达、已请求取消、等待路由恢复时也不阻断。旧版服务没有该字段，按 false。
+   */
+  switching: boolean;
   operation: OperationView | null;
+  /** 操作结束后的结论（见 PrepareOutcome）；未结束为 null。 */
+  outcome: PrepareOutcome | null;
   verification: VerificationResult | null;
   error: string | null;
   exitIp: string | null;
   ordersResult: OrdersResult | null;
   ordersBlockedReason: string | null;
   ordersOfferable: boolean;
+  /** 环境开启了自动打开订单，但服务不允许自动打开（autoOpenAllowed 为 false）：只提供手动按钮，并写明原因。 */
+  autoOpenNotice: string | null;
   now: Date;
 }
 
@@ -101,13 +118,16 @@ export function createPrepareController(operationId: string | null, intent: Prep
     intent,
     phase: null,
     message: null,
+    switching: false,
     operation: null,
+    outcome: null,
     verification: null,
     error: null,
     exitIp: null,
     ordersResult: null,
     ordersBlockedReason: null,
     ordersOfferable: false,
+    autoOpenNotice: null,
     now: now(),
   });
 
@@ -164,7 +184,7 @@ export function createPrepareController(operationId: string | null, intent: Prep
     return result;
   }
 
-  async function readOrdersPermission(): Promise<{ site: SiteCode; autoOpen: boolean } | null> {
+  async function readOrdersPermission(): Promise<{ site: SiteCode; autoOpen: boolean; autoOpenAllowed: boolean; autoOpenBlockedReason: string | null } | null> {
     const st = await client.call({ type: 'getCurrentState' });
     if (!st.ok) {
       state.ordersBlockedReason = st.error.message;
@@ -181,7 +201,13 @@ export function createPrepareController(operationId: string | null, intent: Prep
       return null;
     }
     state.ordersBlockedReason = null;
-    return { site: env.site, autoOpen: env.autoOpenOrders };
+    // 自动打开另需 fillAndAutoOpen 门槛（§5.2）：只认服务明确给出的 true（旧版服务没有这个字段，按不允许）
+    return {
+      site: env.site,
+      autoOpen: env.autoOpenOrders,
+      autoOpenAllowed: st.data.autoOpenAllowed === true,
+      autoOpenBlockedReason: typeof st.data.autoOpenBlockedReason === 'string' ? st.data.autoOpenBlockedReason : null,
+    };
   }
 
   async function afterActiveVerified(): Promise<void> {
@@ -189,10 +215,13 @@ export function createPrepareController(operationId: string | null, intent: Prep
     ordersHandled = true;
     const permission = await readOrdersPermission();
     if (!permission) return;
-    if (permission.autoOpen || state.intent === 'orders') {
+    // 用户在弹窗中点击「打开或定位订单页」而先激活（intent orders）是手动打开，只需 ordersAllowed；按环境设置自动打开另需
+    // autoOpenAllowed，否则只提供手动按钮并写明原因
+    if (state.intent === 'orders' || (permission.autoOpen && permission.autoOpenAllowed)) {
       state.ordersResult = await openOrLocateOrders(deps.browser, permission.site, { navigateCurrent: deps.navigate });
     } else {
       state.ordersOfferable = true;
+      if (permission.autoOpen) state.autoOpenNotice = permission.autoOpenBlockedReason ?? '自动打开订单页暂不可用，可以手动打开';
     }
   }
 
@@ -212,14 +241,29 @@ export function createPrepareController(operationId: string | null, intent: Prep
     if (FAILED_STATUSES.has(op.status) || FAILED_PHASES.has(op.phase)) {
       state.stage = 'failed';
       state.error = op.error?.message ?? null;
+      state.outcome =
+        op.status === 'superseded' || op.phase === 'SUPERSEDED'
+          ? 'superseded'
+          : op.status === 'needs_attention' || op.phase === 'BLOCKED_NEEDS_ATTENTION'
+            ? 'attention'
+            : op.result?.rollback?.entryModeAfter === 'BLOCKED'
+              ? 'rolled_back'
+              : op.probeKind === 'safari'
+                ? 'probe_failed'
+                : 'failed';
       return;
     }
-    if (op.status === 'succeeded' || op.phase === 'ACTIVE_VERIFIED') {
+    // 只有 ACTIVE_VERIFIED 是出口检测通过（或复用实测有效的使用中环境）。其他以 succeeded 结束的阶段（READY_FOR_NEXT_OPEN：
+    // 等待被普通模式、另一次切换、截止时间或取消结束）没有做任何检测，Safari 可能仍在旧版本、其他环境的出口或 Surge 原规则上
+    if (op.phase === 'ACTIVE_VERIFIED') {
       state.stage = 'succeeded';
-      if (op.phase === 'ACTIVE_VERIFIED') await afterActiveVerified();
+      state.outcome = 'verified';
+      await afterActiveVerified();
       return;
     }
     state.stage = 'parked';
+    state.outcome = 'not_checked';
+    state.message = op.steps.at(-1)?.message ?? state.message;
   }
 
   async function waitForOperation(id: string): Promise<void> {
@@ -280,6 +324,7 @@ export function createPrepareController(operationId: string | null, intent: Prep
     running = true;
     state.stage = 'arriving';
     state.error = null;
+    state.outcome = null;
     const ps = await client.profileState(false);
     // 读不到时按“已有 Amazon 标签页”处理，本次记为未经启动验证。
     const amazonTabsOpen = ps.ok ? ps.data.amazon_tabs_open : true;
@@ -297,6 +342,7 @@ export function createPrepareController(operationId: string | null, intent: Prep
         state.stage = 'pending';
         state.phase = data.phase;
         state.message = data.message;
+        state.switching = data.switching === true;
         await sleep(pollMs);
         continue;
       }

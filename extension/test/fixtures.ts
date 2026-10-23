@@ -116,7 +116,7 @@ export function currentState(overrides: Partial<CurrentStateResponse> = {}): Cur
     profile: { identified: true, profileIdShort: '3fa2c1d0' },
     environment: environment(),
     route: route(),
-    routeSummary: { routeEpoch: 7, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true },
+    routeSummary: { routeEpoch: 7, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, entryUnconfirmed: false, normalModeOffered: true, reconciled: true },
     relation: 'this_active',
     otherActiveLabel: null,
     pendingVerification: null,
@@ -125,6 +125,8 @@ export function currentState(overrides: Partial<CurrentStateResponse> = {}): Cur
     activationBlockedReason: null,
     ordersAllowed: true,
     ordersBlockedReason: null,
+    autoOpenAllowed: true,
+    autoOpenBlockedReason: null,
     ...overrides,
   };
 }
@@ -145,6 +147,7 @@ export function operation(overrides: Partial<OperationView> = {}): OperationView
     routeEpoch: 8,
     probeKind: null,
     supersededBy: null,
+    waitDeadline: null,
     steps: [{ at: iso(-2), phase: 'SAFARI_BLOCKED', message: '入口已阻断' }],
     effective: { desiredProxyRevision: 3, deployedProxyRevision: 3, activeProxyRevision: 3, configurationGeneration: 4, routeEpoch: 8 },
     result: null,

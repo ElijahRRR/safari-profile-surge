@@ -225,6 +225,22 @@ describe('docs/ARCHITECTURE.md §0', () => {
     expect(text).toContain('完整的中文说明 `message`');
   });
 
+  it('the -wal truncation never waits for another reader (deferred to a later delete, sweep or stop), and profile backups never copy the generated files that hold buyer proxy credentials', () => {
+    expect(s0).toContain('这次 checkpoint 不等待锁（执行时临时把 `busy_timeout` 设为 0）');
+    expect(s0).toContain('`SecretStore.flush`');
+    expect(s0).toContain('配置备份从不复制本应用生成的文件（`sfe-nodes.list` 与四个 `sfe-entry-*.list`');
+    const install = read('INSTALL.md');
+    expect(install).not.toContain('截断可能推迟到下一次删除或服务停止）');
+    expect(install).toContain('服务不等待它：这次截断不做，推迟到之后的删除、下一次清理');
+    expect(install).toContain('不复制本应用生成的 `sfe-nodes.list` 与 `sfe-entry-*.list`');
+  });
+
+  it('§6.1 states what cancelling does per operation kind and that an accepted cancel wins over a queued verification result', () => {
+    expect(text).not.toContain('取消（`cancelOperation`）只适用于等待中的路由操作：激活/重测按 §6.3.14 回滚');
+    expect(text).toContain('Safari 重测（`probeKind` safari，含第 1 步复用时改为重测的激活，§6.4）只把检测结束为 FAILED，路由不变、不回滚');
+    expect(text).toContain('已受理的取消优先，旧请求的结果不能覆盖新请求');
+  });
+
   it('does not promise that replaced proxy credentials leave secret_values at the next sweep (they wait for the old revision to retire)', () => {
     expect(s0).not.toContain('被替换、清除或回收的旧值在清扫（启动时与每小时）时删除');
     expect(s0).toContain('被替换或清除的账号密码（以及删除环境时的账号密码）在同一事务中标为 orphaned，下一次清扫（启动时与每小时）删除');
@@ -411,5 +427,16 @@ describe('docs/ARCHITECTURE.md §0.1 and apps/macos/README.md (Apple documentati
     expect(macReadme).not.toContain('各场景（含默认场景）');
     expect(macReadme).toContain('Safari 17.6 或更高');
     expect(macReadme).toContain('**只需一次**');
+  });
+
+  it('apps/macos/README.md gives the INSTALL §7 upgrade order for a legacy keychain data directory', () => {
+    const note = macReadme.slice(macReadme.indexOf('- 用旧的钥匙串版本创建的数据目录不能直接沿用'), macReadme.indexOf('## 秘密与日志'));
+    expect(note).toContain('docs/INSTALL.md §7');
+    expect(note).toContain('**顺序不能颠倒**');
+    expect(note).not.toContain('需要重新初始化（重新导入）。旧版本留在钥匙串中的项');
+    // 先撤销旧入口，再停服务、退出 App、改名数据目录、删除旧 Surge 文件，最后重新初始化与导入
+    const order = ['进入普通模式', '临时规则', '停止后台服务', '退出', '改名保存', '新的数据目录', '日常-Safari环境.conf', '重新初始化', '重新导入'].map((k) => note.indexOf(k));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
   });
 });

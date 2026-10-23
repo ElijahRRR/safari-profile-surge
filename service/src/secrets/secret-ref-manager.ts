@@ -146,6 +146,8 @@ export class SecretRefManager {
       if (removed) result.deleted.push(cand.ref);
       else result.kept.push(cand.ref);
     }
+    // 之前的删除因其他程序持有读快照而推迟的 -wal 截断：每次清扫（启动时与每小时）再试一次
+    await this.store.flush?.();
     return result;
   }
 }

@@ -43,6 +43,8 @@ export interface SecretStore {
   /** 任何种类都可读取（账号密码只在登录填充按 §6.10 把关通过后读出）；读到的值由调用方登记到脱敏器。 */
   get(ref: string): Promise<string | null>;
   delete(ref: string): Promise<void>;
+  /** 可选：清扫结束时调用，补做之前因忙推迟的清理（LocalSecretStore：截断 -wal，清除已删除值的旧帧）。从不抛出。 */
+  flush?(): Promise<void>;
 }
 
 // ---------- 事件 ----------

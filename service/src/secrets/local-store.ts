@@ -25,6 +25,12 @@ export class LocalSecretStore implements SecretStore {
   private readonly db: Db;
   private readonly clock: Clock;
   private readonly scrubber: Pick<Scrubber, 'register'> | undefined;
+  /**
+   * 删除了值之后的 -wal 截断没有完成（其他程序持有读快照）：下一次删除或清扫时再试。这一状态只在内存中：之前的进程推迟的
+   * 截断（其他程序持有读快照时服务停止、升级或崩溃——关闭不是最后一个连接，SQLite 不写回、不删除 -wal）重启后无从得知，
+   * 所以每个进程开始时都按推迟处理：启动时的清扫（flush）无条件做一次截断，没有完成则之后每小时再试。
+   */
+  private truncatePending = true;
 
   constructor(opts: LocalSecretStoreOptions) {
     this.db = opts.db;
@@ -67,7 +73,9 @@ export class LocalSecretStore implements SecretStore {
 
   /**
    * 不存在时视为成功（幂等）。删除了值时随即 checkpoint 并截断 -wal：secure_delete 只清零数据库页，WAL 中写入该值时的
-   * 旧帧仍有明文副本。checkpoint 失败不影响删除结果（值已从表中删除），下次删除时再试。
+   * 旧帧仍有明文副本。checkpoint 不等待锁（Db.checkpointTruncate）：其他程序持有读快照时立即返回，不冻结服务；没有完成或
+   * 失败不影响删除结果（值已从表中删除），下一次删除或清扫（flush，启动时与每小时；重启之后的第一次清扫总会截断一次）时再试，
+   * 服务停止时 SQLite 关闭最后一个连接也会写回并删除 -wal。
    */
   async delete(ref: string): Promise<void> {
     assertRef('delete', ref);
@@ -77,11 +85,21 @@ export class LocalSecretStore implements SecretStore {
     } catch {
       throw secretStoreError('delete', 'other');
     }
-    if (!removed) return;
+    if (!removed && !this.truncatePending) return;
+    this.truncate();
+  }
+
+  /** 清扫结束时补做推迟的 -wal 截断（每个进程的第一次清扫总会截断一次，见 truncatePending）。 */
+  async flush(): Promise<void> {
+    if (this.truncatePending) this.truncate();
+  }
+
+  private truncate(): void {
     try {
-      this.db.checkpointTruncate();
+      this.truncatePending = !this.db.checkpointTruncate();
     } catch {
       // 只影响旧帧何时被清除；不外传数据库错误原文
+      this.truncatePending = true;
     }
   }
 }
@@ -126,7 +144,9 @@ export function findLegacyKeychainData(db: Db): LegacyKeychainData | null {
 
 export const LEGACY_KEYCHAIN_DATA_MESSAGE =
   '启动失败：数据目录由使用钥匙串的旧版本创建，本版本不读取钥匙串，其中的代理凭据、账号密码与 pepper 无法使用。' +
-  '请换用新的数据目录重新初始化，并重新导入代理与账号资料；旧的钥匙串项可以按 docs/INSTALL.md 用 security delete-generic-password 手动删除。';
+  '请按 docs/INSTALL.md §7 的完整步骤处理，顺序不能颠倒：先撤销旧版本在 Surge 中的入口（装回旧版本进入普通模式；或在 Surge 中手动切回原配置并逐条移除本应用的临时规则），' +
+  'Safari 在此之前可能仍按旧版本的入口经买家出口发出；然后停止后台服务、退出 App、把数据目录改名保存，删除 Surge 配置目录中旧版本的「日常-Safari环境.conf」、sfe-nodes.list 与 sfe-entry-*.list，' +
+  '再用新的数据目录重新初始化并重新导入代理与账号资料。旧的钥匙串项最后按同一节用 security delete-generic-password 手动删除。';
 
 /**
  * 启动时 fail closed（在迁移之前，拒绝时不改动数据库，旧版本仍能打开它）：旧版数据目录中已提交的引用与 pepper 的值

@@ -1,6 +1,7 @@
 // 能力提议与确认（docs/ARCHITECTURE.md §5.2）、设置、前置代理（§6.8）。
 // 提议只来自 P0 工具/agent 或维护通道；supported/unsupported 只能由网页会话确认一个提议。进程路径与入口策略
-// 只来自已确认的提议，确认新值时入口必须是 NORMAL，并让依赖它们的能力回到待验证。演示模式不能记录能力。
+// 只来自已确认的提议，确认新值时路由必须是空闲的普通模式、没有未结束的路由操作（entrySettingsChangeRefusal），并让依赖它们的
+// 能力回到待验证。演示模式不能记录能力。
 
 import {
   CAPABILITY_CONTEXT_DEPS,
@@ -38,6 +39,7 @@ import { insertOperation, type AcceptDeps } from './accept.js';
 import type { Engine } from './context.js';
 import { acceptedOf, commitOperation, findDuplicateOperation, findLedger, recordLedger, requestDigest, requireRequestId } from './ledger.js';
 import { expireSafariProbe } from './handlers/probes.js';
+import { endWaitingRouteForNewRevision, entrySettingsChangeRefusal } from './route-control.js';
 import { markSafariMayUseRoute, safariMayUseRoute } from './safari-route-marker.js';
 
 function forbidden(message: string): SfeError {
@@ -190,8 +192,9 @@ export async function confirmCapability(deps: AcceptDeps, req: ConfirmCapability
     const newStrategy = key === 'runtime_entry_modes' && proposal.proposedStatus === 'supported' ? proposal.entryStrategy : null;
     const pathsChange = newPaths !== null && JSON.stringify([...newPaths].sort()) !== JSON.stringify([...s.safariProcessPaths].sort());
     const strategyChange = newStrategy !== null && newStrategy !== s.entryStrategy;
-    if ((pathsChange || strategyChange) && route.entryMode !== 'NORMAL') {
-      throw new SfeError('ENVIRONMENT_ACTIVE', '确认能力失败：入口不是普通模式，请先进入普通模式再更改进程路径或入口策略');
+    if (pathsChange || strategyChange) {
+      const refusal = entrySettingsChangeRefusal(engine, '确认能力', '进程路径或入口策略');
+      if (refusal) throw refusal;
     }
     if (newPaths !== null) {
       const errs = validateSafariProcessPaths(newPaths, { exists: (p) => engine.host.processPathExists(p) });
@@ -247,7 +250,6 @@ export async function updateSettings(deps: AcceptDeps, req: UpdateSettingsReques
   const digest = await requestDigest(engine, 'updateSettings', null, req);
   if (findLedger(engine, requestId, digest)) return views.settingsView();
   const errors: Array<{ field: string; message: string }> = [];
-  const route = repos.routeState.get();
   if (req.verifyEndpointId !== undefined) {
     if (!engine.verifyEndpoints().some((e) => e.id === req.verifyEndpointId)) errors.push({ field: 'verifyEndpointId', message: '检测服务不在固定清单中' });
   }
@@ -263,8 +265,10 @@ export async function updateSettings(deps: AcceptDeps, req: UpdateSettingsReques
   }
   if (errors.length > 0) throw new SfeError('VALIDATION_FAILED', '修改设置失败：字段校验未通过', { fieldErrors: errors });
   const endpointChange = req.verifyEndpointId !== undefined && req.verifyEndpointId !== repos.settings.get('verifyEndpointId');
-  if (endpointChange && route.entryMode !== 'NORMAL') {
-    throw new SfeError('ENVIRONMENT_ACTIVE', '修改设置失败：检测服务只能在普通模式下修改，请先进入普通模式');
+  if (endpointChange) {
+    // 检测主机是入口规则的一部分（VERIFY_ONLY 的检测入口），与入口策略、进程路径同一规则（entrySettingsChangeRefusal）
+    const refusal = entrySettingsChangeRefusal(engine, '修改设置', '检测服务');
+    if (refusal) throw refusal;
   }
   repos.tx(() => {
     if (endpointChange) {
@@ -424,6 +428,7 @@ export async function replaceFrontCommit(deps: AcceptDeps, fromId: string, req: 
     throw new SfeError('PREVIEW_STALE', '更换前置失败：环境或前置已变化，请重新预览');
   }
   const expected = req.expected_revisions ?? {};
+  const endedWaits: string[] = [];
   const { op, duplicate } = commitOperation(engine, requestId, digest, () => {
     const targets: Array<{ environmentId: string; proxyRevision: number }> = [];
     const items: Array<{ environment_id: string; status: 'replaced' | 'revision_conflict' | 'unchanged'; revision: number }> = [];
@@ -473,10 +478,12 @@ export async function replaceFrontCommit(deps: AcceptDeps, fromId: string, req: 
       step: `已为 ${targets.length} 个环境生成使用新前置的版本${items.some((i) => i.status === 'revision_conflict') ? '；部分环境版本冲突未更换' : ''}`,
     });
     repos.operations.update(created.id, { result: { items } });
+    // 停在 WAITING_ROUTE 的旧版本已被替换（使用新前置的版本已保存）：同一事务中结束，之后不再切到它（§6.3 第 2 步）
+    for (const t of targets) endedWaits.push(...endWaitingRouteForNewRevision(engine, t.environmentId, t.proxyRevision, created.id));
     return repos.operations.get(created.id)!;
   });
   if (duplicate) return acceptedOf(op, true);
   if (op.status === 'queued') deps.kick();
-  engine.emit({ operations: [op.id], environments: ids, fronts: true });
+  engine.emit({ operations: [op.id, ...endedWaits], environments: ids, fronts: true });
   return acceptedOf(op, false);
 }

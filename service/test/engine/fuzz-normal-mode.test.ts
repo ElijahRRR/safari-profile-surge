@@ -1245,7 +1245,13 @@ async function exec(w: World, ev: Ev): Promise<void> {
           'I6|popup-summary-stale-within-response',
           `扩展同一响应中：路由摘要 entry=${summary.entryMode} phase=${summary.phase}，完整路由 entry=${resp.route.entryMode} phase=${resp.route.phase} warnings=${JSON.stringify(resp.route.warnings)}`,
         );
-      } else if (summary.entryMode !== route.entryMode || summary.normalModeOffered !== view.normalModeOffered || summary.buyerExitConnectionsUnconfirmed !== route.warnings.includes('buyer_exit_connections_unconfirmed')) {
+      } else if (
+        summary.entryMode !== route.entryMode ||
+        summary.normalModeOffered !== view.normalModeOffered ||
+        summary.buyerExitConnectionsUnconfirmed !== route.warnings.includes('buyer_exit_connections_unconfirmed') ||
+        // 顶栏不按未经确认的入口声称已阻断或托管中（entryUnconfirmed）
+        summary.entryUnconfirmed !== (route.warnings.includes('entry_unverified') || route.warnings.includes('precedence_violation'))
+      ) {
         if (raced) w.cov.popupRaceSkipped++;
         else w.violate('I6', 'I6|popup-summary-mismatch', `扩展路由摘要 ${JSON.stringify(summary)} 与原生调用返回时的服务视图（entry=${route.entryMode} offered=${view.normalModeOffered} warnings=${JSON.stringify(route.warnings)}）不一致`);
       }

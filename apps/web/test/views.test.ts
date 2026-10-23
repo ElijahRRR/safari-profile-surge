@@ -164,12 +164,20 @@ describe('settings page', () => {
     const m = await mountWith(SettingsPageView, ctx, {}, '/settings');
     const select = document.body.querySelector<HTMLButtonElement>('[data-test="verify-endpoint"] .select-trigger')!;
     expect(select.disabled).toBe(true);
-    expect(document.body.textContent).toContain('只能在普通模式下修改');
+    expect(document.body.textContent).toContain('只能在空闲的普通模式下修改');
     const ro = document.body.querySelector('[data-test="readonly-settings"]')!;
     expect(ro.textContent).toContain('临时规则（temp_rule）');
     expect(ro.textContent).toContain('com.apple.WebKit.Networking');
     expect(ro.textContent).toContain('surge-cli');
     expect(ro.querySelectorAll('input')).toHaveLength(0);
+    m.unmount();
+  });
+
+  it('disables the verify endpoint while the route is NORMAL but not idle (same rule as the service)', async () => {
+    const { ctx } = testContext(() => NOT_FOUND, snapshot({ route: route({ entryMode: 'NORMAL', phase: 'failed', activeEnvironmentId: null }) }));
+    const m = await mountWith(SettingsPageView, ctx, {}, '/settings');
+    expect(document.body.querySelector<HTMLButtonElement>('[data-test="verify-endpoint"] .select-trigger')!.disabled).toBe(true);
+    expect(document.body.textContent).toContain('只能在空闲的普通模式下修改');
     m.unmount();
   });
 
@@ -324,6 +332,25 @@ describe('route card control state', () => {
     const m = await mountWith(RouteCard, ctx);
     expect(document.body.querySelector('[data-test="route-cancel"]')?.textContent?.trim()).toBe('取消等待');
     m.unmount();
+  });
+
+  it('an active-environment publish waiting in VERIFY_ONLY after its switch can be cancelled from the route card and the operation dialog, like an activation (same as the popup)', async () => {
+    for (const kind of ['environment.update', 'deploy.publish'] as const) {
+      const op = operation({ id: 'op_9', kind, phase: 'VERIFY_ONLY', status: 'waiting' });
+      const { ctx } = testContext((c: Call) => (c.url === '/api/operations/op_9' ? { status: 200, body: op } : NOT_FOUND), snapshot({
+        route: route({ operationId: 'op_9', phase: 'awaiting_safari_verify', entryMode: 'VERIFY_ONLY', activeEnvironmentId: 'env_1' }),
+        pendingOperations: [op],
+      }));
+      const card = await mountWith(RouteCard, ctx);
+      expect(document.body.querySelector('[data-test="route-cancel"]')?.textContent?.trim()).toBe('取消切换');
+      expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).toContain('取消会尝试恢复原节点并保持 Safari 阻断');
+      card.unmount();
+      const host = await mountWith(RouteActionHost, ctx);
+      ctx.viewer.open('op_9', 'US-买家01');
+      await flush();
+      expect(document.body.querySelector('[data-test="cancel-operation"]')?.textContent?.trim()).toBe('取消切换');
+      host.unmount();
+    }
   });
 
   it('the operation dialog keeps 关闭 for dismissing and names the cancel action', async () => {

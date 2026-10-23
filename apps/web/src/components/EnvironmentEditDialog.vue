@@ -225,7 +225,7 @@ function submit() {
           <input v-model="form.autoOpenOrders" type="checkbox" class="mt-0.5 h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500 dark:border-dark-600 dark:bg-dark-800" data-field="autoOpenOrders" />
           <span>
             <span class="block text-sm font-medium text-gray-900 dark:text-white">自动打开订单</span>
-            <span class="block text-xs text-gray-500 dark:text-dark-400">出口经 Safari 实测后打开或定位订单页；已登录不进入登录流程。默认开启。</span>
+            <span class="block text-xs text-gray-500 dark:text-dark-400">出口经 Safari 实测后打开或定位订单页；已登录不进入登录流程。与登录填充同一能力门槛（场景 ID 稳定性、首请求与旧连接）尚未通过实测时不自动打开，只提供手动按钮。默认开启。</span>
           </span>
         </label>
         <label class="flex cursor-pointer items-start gap-3">

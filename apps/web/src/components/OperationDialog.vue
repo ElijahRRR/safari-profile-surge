@@ -91,7 +91,9 @@ const waitingForScene = computed(() => {
   // 活动环境发布进入切换后与激活一样停在 VERIFY_ONLY 等待
   return o.kind === 'route.activate' || o.kind === 'probe.safari' || o.phase === 'WAITING_ROUTE' || o.phase === 'VERIFY_ONLY';
 });
-const deadline = computed(() => (waitingForScene.value ? (store.route.value?.awaitingDeadline ?? null) : null));
+// 操作自己的截止时间（服务端按实测截止时间或到达截止时间给出）：不用路由记录的 awaitingDeadline——重新检测与 WAITING_ROUTE 不负责
+// 路由，那里可能是之前一次检测或切换留下的、早已过去的时间
+const deadline = computed(() => (waitingForScene.value ? (op.value?.waitDeadline ?? null) : null));
 /** 实测超时的后果按操作说明：重新检测（含激活复用时改为的重测）从不切换、阻断或进入普通模式（§6.4），超时只结束检测；切换超时按第 14 步回滚。 */
 const timeoutText = computed(() =>
   op.value && isSafariRetest(op.value)
@@ -152,7 +154,7 @@ const rollbackItems = computed(() => {
         <span class="code">{{ op.id }}</span>
       </div>
 
-      <NoticeBox v-if="waitingForScene && op.phase === 'WAITING_ROUTE'" tone="info" title="等待场景打开">
+      <NoticeBox v-if="waitingForScene && op.phase === 'WAITING_ROUTE'" tone="info" title="等待场景打开" data-test="waiting-route-guidance">
         新版本已部署。在 Safari 切换到场景 {{ sceneName ?? '（未知）' }}，点击扩展图标即可切换到新版本；在此之前当前出口不变。
         <template v-if="deadline"> 截止 {{ formatClock(deadline) }}。</template>
       </NoticeBox>

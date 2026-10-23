@@ -127,6 +127,7 @@ export function operation(over: Partial<OperationView> = {}): OperationView {
     routeEpoch: 2,
     probeKind: null,
     supersededBy: null,
+    waitDeadline: null,
     steps: [{ at: T0, phase: 'SAFARI_BLOCKED', message: '入口已阻断' }],
     effective: { desiredProxyRevision: 1, deployedProxyRevision: 1, activeProxyRevision: null, configurationGeneration: 4, routeEpoch: 2 },
     result: null,

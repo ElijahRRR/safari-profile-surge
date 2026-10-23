@@ -6,7 +6,7 @@ import { CAPABILITY_GATES, NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, SfeError } from
 import type { OperationRecord } from '../../db/index.js';
 import { payloadOf } from '../../domain/operations.js';
 import type { Engine } from '../context.js';
-import { routeOps } from '../route-control.js';
+import { environmentRouteBusy } from '../route-control.js';
 import { resourceNodeNames } from '../resource.js';
 import { expireSafariProbe, recordPreflight } from './probes.js';
 
@@ -15,10 +15,7 @@ function envIdOf(op: OperationRecord): string | null {
 }
 
 function environmentInUse(engine: Engine, environmentId: string): boolean {
-  const route = engine.repos.routeState.get();
-  if (route.activeEnvironmentId === environmentId && route.entryMode !== 'NORMAL') return true;
-  const ops = routeOps(engine);
-  return [...ops.busy, ...ops.waitingVerification].some((o) => payloadOf(o).route?.targetEnvironmentId === environmentId);
+  return environmentRouteBusy(engine, environmentId);
 }
 
 export async function runDelete(engine: Engine, op: OperationRecord): Promise<void> {
@@ -41,9 +38,13 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
   try {
     if (route.entryMode === 'NORMAL') {
       // 初始化前允许删除仅保存在本机的草稿。CLI 对不存在的组会报错而非返回 null；
-      // 只在没有工作配置、没有已部署版本且运行时确认组不存在时跳过选择查询。
-      const localOnly = engine.profileFiles() === null && env.deployedProxyRevision === null
-        && revisions.every((r) => r.state === 'desired');
+      // 只在没有工作配置、没有已部署或已验证的版本且运行时确认组不存在时跳过选择查询。初始化之前改过代理的草稿也是本机
+      // 草稿：编辑把从未部署、也不是最近验证的旧版本标为 superseded（acceptUpdate），这时还没有任何资源写入过 Surge
+      const localOnly =
+        engine.profileFiles() === null &&
+        env.deployedProxyRevision === null &&
+        env.lastVerifiedProxyRevision === null &&
+        revisions.every((r) => r.state === 'desired' || r.state === 'superseded');
       const groupAbsent = localOnly && !(await engine.surge.listPolicies()).groups.includes(ROUTE_GROUP_NAME);
       const sel = groupAbsent ? null : await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
       if (sel !== null && names.has(sel)) {

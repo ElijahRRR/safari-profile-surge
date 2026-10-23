@@ -297,6 +297,23 @@ describe('runLoginAssist', () => {
     expect(shown[0]?.detail).toContain('可手动填充');
   });
 
+  it('a refusal because normal mode was requested or the exit is switching explains that instead of suggesting a manual fill', async () => {
+    for (const [reason, message, expected] of [
+      ['normal_pending', '填充失败：正在进入普通模式', '按 Surge 原规则发出（可能直连）'],
+      ['route_busy', '填充失败：正在切换出口或检测，请稍后再试', '完成后刷新页面再试'],
+    ] as const) {
+      page(BOTH);
+      const { d, shown } = deps({ reply: { ok: false, error: { code: 'FILL_NOT_ALLOWED', message, details: { reason } } } });
+      expect(await runLoginAssist(d)).toBe('refused');
+      expect(shown[0]?.title).toBe('未自动填充');
+      expect(shown[0]?.detail).toContain(message);
+      expect(shown[0]?.detail).toContain(expected);
+      expect(shown[0]?.detail).not.toContain('可手动填充');
+      expect((document.getElementById('ap_password') as HTMLInputElement).value).toBe('');
+      expectNoSubmitOrClick();
+    }
+  });
+
   describe('malformed fill replies (the native bridge forwards the service reply unchanged)', () => {
     // 旧版（钥匙串）服务在替换 App 后仍在运行时的应答：密码项只有 keychainRef/expiresAt，没有 value。
     const KEYCHAIN_ERA_REPLY = {
@@ -317,6 +334,10 @@ describe('runLoginAssist', () => {
       expect(shown[0]?.tone).toBe('warning');
       expect(shown[0]?.detail).toContain('格式不符');
       expect(shown[0]?.detail).toContain('可手动填充');
+      // 唯一现实的原因是旧版服务仍在运行：先用它进入普通模式再按 INSTALL §7 升级；不建议重新注册（新版本在旧数据目录上无法启动）
+      expect(shown[0]?.detail).toContain('请先在扩展弹窗或网页后台进入普通模式');
+      expect(shown[0]?.detail).toContain('docs/INSTALL.md §7');
+      expect(shown[0]?.detail).not.toContain('「注册后台服务」后重试');
       expectNoSubmitOrClick();
     }
 

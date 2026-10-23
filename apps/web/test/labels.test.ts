@@ -9,8 +9,8 @@ import {
   warningText,
 } from '../src/lib/labels';
 import { formatHostPort, formatNumber, formatRelative, formatSeconds, isExpired } from '../src/lib/format';
-import { cancelActionLabel, hasPendingDeploy, isCancellableRouteOperation, matchesFilter, needsAttention, probeDisplay, proxyAddress } from '../src/lib/environments';
-import { environment, operation, revision } from './fixtures';
+import { cancelActionLabel, hasPendingDeploy, isCancellableRouteOperation, isEnvironmentInUse, matchesFilter, needsAttention, probeDisplay, proxyAddress } from '../src/lib/environments';
+import { environment, operation, revision, route } from './fixtures';
 
 const ALL_READINESS: EnvironmentReadiness[] = [
   'invalid',
@@ -129,6 +129,17 @@ describe('format helpers', () => {
 });
 
 describe('environment helpers', () => {
+  it('an environment whose node SFE-ROUTE still selects while the entry is not normal counts as in use (delete and unbind ask for normal mode first)', () => {
+    const env = environment();
+    const node = env.proxy.deployed!.nodeName;
+    // 交给普通模式、已写入使用中模式的切换目标，普通模式失败：路由的使用中环境是另一个
+    expect(isEnvironmentInUse(env, route({ entryMode: 'ACTIVE', phase: 'attention', activeEnvironmentId: 'env_9', selectedNode: node }))).toBe(true);
+    expect(isEnvironmentInUse(env, route({ entryMode: 'BLOCKED', phase: 'failed', activeEnvironmentId: 'env_9', selectedNode: node }))).toBe(true);
+    // 普通模式下删除会先改选 REJECT：不算使用中
+    expect(isEnvironmentInUse(env, route({ entryMode: 'NORMAL', phase: 'idle', selectedNode: node }))).toBe(false);
+    expect(isEnvironmentInUse(env, route({ entryMode: 'BLOCKED', phase: 'failed', activeEnvironmentId: 'env_9', selectedNode: 'SFE-N-E0009-US09-v001' }))).toBe(false);
+  });
+
   it('shows an expired probe as last result, never as live', () => {
     const now = Date.parse('2026-10-21T09:00:00.000Z');
     const probe = {
@@ -165,6 +176,13 @@ describe('environment helpers', () => {
     expect(isCancellableRouteOperation(operation({ kind: 'route.activate', status: 'running' }))).toBe(false);
     expect(isCancellableRouteOperation(operation({ kind: 'deploy.publish', phase: 'WAITING_ROUTE', status: 'waiting' }))).toBe(true);
     expect(isCancellableRouteOperation(operation({ kind: 'route.normal', status: 'waiting', phase: 'SAFARI_BLOCKED' }))).toBe(false);
+    // 活动环境发布进入切换之后的 VERIFY_ONLY 等待：与激活相同，可以取消切换（与弹窗一致）
+    for (const kind of ['environment.update', 'deploy.publish'] as const) {
+      const op = operation({ kind, phase: 'VERIFY_ONLY', status: 'waiting' });
+      expect(isCancellableRouteOperation(op)).toBe(true);
+      expect(cancelActionLabel(op)).toBe('取消切换');
+      expect(isCancellableRouteOperation(operation({ kind, phase: 'VERIFY_ONLY', status: 'running' }))).toBe(false);
+    }
   });
 
   it('names the cancel action by its effect (a bare 取消 only dismisses)', () => {

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, type RollbackResult } from '@sfe/contract';
@@ -297,6 +297,37 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
     for (let i = 0; i < 50 && h.store.has('sec_stale0001'); i++) await new Promise((r) => setImmediate(r));
     expect(h.store.has('sec_stale0001')).toBe(false);
     expect(h.repos.secretRefs.get('sec_stale0001')).toBeNull();
+  });
+
+  test('a candidate --check directory left by a process killed during --check (plaintext proxy credentials) is removed at the next start', async () => {
+    h = await createHarness({ dbFile: true });
+    const tmpDir = join(h.dir, 'tmp');
+    const fake = h.fake as unknown as { checkProfile: (path: string) => Promise<unknown> };
+    const orig = fake.checkProfile.bind(h.fake);
+    let entered = false;
+    // surge-cli --check 卡住，随后进程被强制终止：checkCandidate 的 finally 不执行
+    fake.checkProfile = () => {
+      entered = true;
+      return new Promise(() => undefined);
+    };
+    await h.app.createEnvironment({ request_id: rid('create'), environment: envInput('US-Buyer-A', '203.0.113.10', { password: 'synthOrphanPw7788' }) }, WEB);
+    await until(() => entered);
+    const left = readdirSync(tmpDir).filter((n) => n.startsWith('candidate-'));
+    expect(left).toHaveLength(1);
+    expect(readFileSync(join(tmpDir, left[0]!, NODE_RESOURCE_FILE), 'utf8')).toContain('synthOrphanPw7788');
+    // tmp 中不是候选目录的条目，以及名称相符的符号链接，都不删除；候选目录内指向真实文件的符号链接只删除链接本身
+    mkdirSync(join(h.dir, 'outside'));
+    writeFileSync(join(h.dir, 'outside', 'keep.txt'), 'keep');
+    symlinkSync(join(h.dir, 'outside', 'keep.txt'), join(tmpDir, left[0]!, 'linked-real.list'));
+    symlinkSync(join(h.dir, 'outside'), join(tmpDir, 'candidate-link01'));
+    writeFileSync(join(tmpDir, 'unrelated.txt'), 'x');
+    fake.checkProfile = orig;
+    await h.crash();
+    await h.idle();
+    expect(readdirSync(tmpDir).filter((n) => n.startsWith('candidate-')).sort()).toEqual(['candidate-link01']);
+    expect(existsSync(join(tmpDir, left[0]!))).toBe(false);
+    expect(readFileSync(join(h.dir, 'outside', 'keep.txt'), 'utf8')).toBe('keep');
+    expect(existsSync(join(tmpDir, 'unrelated.txt'))).toBe(true);
   });
 });
 

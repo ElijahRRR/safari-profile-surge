@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { NATIVE_PERMISSIONS, type NativeRequest, type NativeRequestType } from '@sfe/contract';
-import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, envInput, rid, verify, type Harness } from './harness.js';
+import { ALL_CAPS, PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, envInput, rid, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -144,7 +144,7 @@ describe('getCurrentState', () => {
     await bind(h, PROFILE_B, b);
     const other = ((await h.native(PROFILE_B, { type: 'getCurrentState' })) as { data: Record<string, unknown> }).data;
     expect(other.route).toBeNull();
-    expect(other.routeSummary).toEqual({ routeEpoch: 1, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true });
+    expect(other.routeSummary).toEqual({ routeEpoch: 1, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, entryUnconfirmed: false, normalModeOffered: true, reconciled: true });
     expect(other.relation).toBe('other_active');
     expect(other.ordersAllowed).toBe(false);
     expect(other.activationAvailable).toBe(true);
@@ -168,7 +168,7 @@ describe('getCurrentState', () => {
       const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: Record<string, unknown> }).data;
       expect(d.relation).toBe('none_active');
       expect(d.route).toBeNull();
-      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true, reconciled: true });
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, entryUnconfirmed: false, normalModeOffered: true, reconciled: true });
     }
     const again = await h.native(PROFILE_C, { type: 'enterNormalMode', request_id: rid() });
     expect(again.ok).toBe(true);
@@ -309,6 +309,65 @@ describe('getCurrentState', () => {
       expect(d.routeSummary).toMatchObject({ entryMode: 'UNKNOWN', phase: 'attention', reconciled: true });
     }
     expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'UNKNOWN', phase: 'attention' });
+  });
+
+  test('automatic opening of orders needs the fillAndAutoOpen gate (§5.2): with native_profile_id and first_request_and_old_connections unverified, orders stay manually allowed but autoOpenAllowed is false with the reason', async () => {
+    h = await createHarness({ capabilities: ALL_CAPS.filter((k) => k !== 'native_profile_id' && k !== 'first_request_and_old_connections') });
+    await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.clock.advance(6_000);
+    const d = (await h.native(PROFILE_A, { type: 'getCurrentState' })) as { ok: true; data: { ordersAllowed: boolean; autoOpenAllowed: boolean; autoOpenBlockedReason: string | null; environment: { autoOpenOrders: boolean } } };
+    expect(d.data.environment.autoOpenOrders).toBe(true);
+    expect(d.data.ordersAllowed).toBe(true);
+    expect(d.data.autoOpenAllowed).toBe(false);
+    expect(d.data.autoOpenBlockedReason).toContain('自动打开订单页所需能力尚未通过实测');
+    // 两项能力通过实测之后允许自动打开
+    h.grant(['native_profile_id', 'first_request_and_old_connections']);
+    const e = (await h.native(PROFILE_A, { type: 'getCurrentState' })) as { ok: true; data: { ordersAllowed: boolean; autoOpenAllowed: boolean; autoOpenBlockedReason: string | null } };
+    expect(e.data).toMatchObject({ ordersAllowed: true, autoOpenAllowed: true, autoOpenBlockedReason: null });
+  });
+
+  test.each([
+    ['ruleset_resource', 'listExternalResources'],
+    ['temp_rule', 'listTempRules'],
+  ] as const)('%s: while an accepted normal mode runs its first readback (route still active_verified, reconcile reused within 5 s), orders and auto-open are blocked', async (entryStrategy, method) => {
+    h = await createHarness({ entryStrategy });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.clock.advance(1_000);
+    // 普通模式开始执行后第一次读取入口时挂起：路由仍是使用中且已验证
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const reached = new Promise<void>((r) => (entered = r));
+    const fake = h.fake as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    const orig = fake[method]!.bind(h.fake);
+    fake[method] = async (...a: unknown[]) => {
+      entered();
+      await gate;
+      return orig(...a);
+    };
+    const n = (await h.native(PROFILE_A, { type: 'enterNormalMode', request_id: rid('n'), old_session_policy: 'keep_open_acknowledged', confirmed_environment_id: envId })) as { ok: true; data: { operation_id: string } };
+    await reached;
+    expect(h.repos.operations.get(n.data.operation_id)!.status).toBe('running');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', entryMode: 'ACTIVE' });
+    const d = (await h.native(PROFILE_A, { type: 'getCurrentState' })) as { ok: true; data: StateData & { autoOpenAllowed: boolean } };
+    expect(d.data.routeSummary.reconciled).toBe(true);
+    expect(d.data.ordersAllowed).toBe(false);
+    expect(d.data.autoOpenAllowed).toBe(false);
+    expect(d.data.ordersBlockedReason).toBe('正在进入普通模式');
+    fake[method] = orig;
+    release();
+    await h.idle();
+    expect(h.repos.operations.get(n.data.operation_id)!.phase).toBe('NORMAL_RESTORED');
+  });
+
+  test('autoOpenAllowed is never true when orders are not allowed', async () => {
+    h = await createHarness();
+    const a = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, a);
+    const d = (await h.native(PROFILE_A, { type: 'getCurrentState' })) as { ok: true; data: { ordersAllowed: boolean; ordersBlockedReason: string | null; autoOpenAllowed: boolean; autoOpenBlockedReason: string | null } };
+    expect(d.data.ordersAllowed).toBe(false);
+    expect(d.data.autoOpenAllowed).toBe(false);
+    expect(d.data.autoOpenBlockedReason).toBe(d.data.ordersBlockedReason);
   });
 
   test('an idle normal-mode route needs no precheck: getCurrentState does not read Surge and the summary counts as reconciled', async () => {
@@ -607,6 +666,150 @@ describe('requestLoginFill (§6.10)', () => {
     await popup;
     expect(errCode(await fill)).toBe('OK');
     expect((h.fake.calls.getTakeoverState ?? 0) - before).toBeGreaterThanOrEqual(1);
+  });
+
+  /** 填充自己的动作前对账停在 listPolicies 上时执行 during（模拟真实 Surge 读取的延迟），之后放开。 */
+  async function fillWithChangeDuringPrecheck(epoch: number, during: () => Promise<void>): Promise<Awaited<ReturnType<Harness['native']>>> {
+    let reached!: () => void;
+    const atListPolicies = new Promise<void>((r) => (reached = r));
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    const orig = h.fake.listPolicies.bind(h.fake);
+    h.fake.listPolicies = async () => {
+      reached();
+      await gate;
+      return orig();
+    };
+    const fill = h.native(PROFILE_A, req(epoch));
+    await atListPolicies;
+    await during();
+    h.fake.listPolicies = orig;
+    open();
+    return fill;
+  }
+  const reasonOf = (r: unknown) => (r as { error: { details: { reason: string } } }).error.details.reason;
+
+  test('refused: fill turned off in the web console while the fill\'s own precheck runs → no value is returned (the save already committed)', async () => {
+    const { envId, epoch } = await fillSetup();
+    const r = await fillWithChangeDuringPrecheck(epoch, async () => {
+      const env = h.repos.environments.get(envId)!;
+      await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { autoFillLogin: false } }, WEB);
+    });
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect(reasonOf(r)).toBe('disabled');
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
+    expect(passwordReads(envId)).toBe(0);
+  });
+
+  test('refused: account identifier and password replaced while the precheck runs → neither the old nor the new values are returned', async () => {
+    const { envId, epoch } = await fillSetup();
+    const r = await fillWithChangeDuringPrecheck(epoch, async () => {
+      const env = h.repos.environments.get(envId)!;
+      await h.app.updateEnvironment(
+        envId,
+        { request_id: rid(), expected_revision: env.revision, changes: { account: { loginIdentifier: 'buyer99@example.test', password: { action: 'replace', value: 'synth-new-pw' } } } },
+        WEB,
+      );
+    });
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect(reasonOf(r)).toBe('account_changed');
+    const text = JSON.stringify(r);
+    expect(text).not.toContain('synth-account-pw');
+    expect(text).not.toContain('buyer01@example.test');
+    // 刷新页面后的新请求按新的资料填充
+    const again = await h.native(PROFILE_A, req(epoch));
+    expect((again as { data: { fills: unknown[] } }).data.fills).toEqual([
+      { field: 'identifier', value: 'buyer99@example.test' },
+      { field: 'password', value: 'synth-new-pw' },
+    ]);
+  });
+
+  test('refused: password cleared while the precheck runs → the orphaned old value is never read or returned, even before the sweep deletes it', async () => {
+    const { envId, epoch } = await fillSetup();
+    const oldRef = h.repos.accounts.get(envId)!.passwordRef!;
+    const r = await fillWithChangeDuringPrecheck(epoch, async () => {
+      const env = h.repos.environments.get(envId)!;
+      await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { account: { password: { action: 'clear' } } } }, WEB);
+    });
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect(reasonOf(r)).toBe('account_changed');
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
+    expect(h.store.calls.filter((c) => c.op === 'get' && c.ref === oldRef)).toHaveLength(0);
+  });
+
+  test('refused: a normal mode accepted while the fill\'s own precheck runs → nothing is returned, and the normal mode then restores the original rules', async () => {
+    const { envId, epoch } = await fillSetup();
+    let normalId = '';
+    const r = await fillWithChangeDuringPrecheck(epoch, async () => {
+      // 弹窗「进入普通模式」：执行器被填充的动作前对账占用，普通模式排队，路由仍是使用中且已验证、epoch 不变
+      const n = await h.app.enterNormal({ request_id: rid('normal'), old_session_policy: 'keep_open_acknowledged', confirmed_environment_id: envId }, WEB);
+      normalId = n.operation_id;
+      expect(h.repos.operations.get(normalId)!.status).toBe('queued');
+    });
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect(reasonOf(r)).toBe('normal_pending');
+    const text = JSON.stringify(r);
+    expect(text).not.toContain('synth-account-pw');
+    expect(text).not.toContain('buyer01@example.test');
+    expect(passwordReads(envId)).toBe(0);
+    await h.idle();
+    expect(h.repos.operations.get(normalId)!.phase).toBe('NORMAL_RESTORED');
+  });
+
+  test('refused: a normal mode accepted while the password is being read → the value read is not returned', async () => {
+    const { envId, epoch } = await fillSetup();
+    const store = h.store as unknown as { get: (ref: string) => Promise<string | null> };
+    const orig = store.get.bind(h.store);
+    let accepted = false;
+    store.get = async (ref) => {
+      const v = await orig(ref);
+      if (!accepted) {
+        accepted = true;
+        await h.app.enterNormal({ request_id: rid('normal'), old_session_policy: 'keep_open_acknowledged', confirmed_environment_id: envId }, WEB);
+      }
+      return v;
+    };
+    const r = await h.native(PROFILE_A, req(epoch));
+    expect(accepted).toBe(true);
+    // 受理普通模式不改 epoch，路由记录在它开始撤销入口之前仍是使用中且已验证
+    expect(h.repos.routeState.get()).toMatchObject({ routeEpoch: epoch, activeEnvironmentId: envId, phase: 'active_verified' });
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect(reasonOf(r)).toBe('normal_pending');
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
+  });
+
+  test('refused: a switch to another environment accepted while the fill\'s own precheck runs → nothing is returned', async () => {
+    const { envId, epoch } = await fillSetup();
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const r = await fillWithChangeDuringPrecheck(epoch, async () => {
+      await h.app.activate(b, { request_id: rid('act'), old_session_policy: 'keep_open_acknowledged', confirmed_environment_id: envId }, WEB);
+    });
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect(reasonOf(r)).toBe('route_busy');
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
+    expect(passwordReads(envId)).toBe(0);
+  });
+
+  test('refused: a change committed while the password is being read → the value read is not returned', async () => {
+    const { envId, epoch } = await fillSetup();
+    const store = h.store as unknown as { get: (ref: string) => Promise<string | null> };
+    const orig = store.get.bind(h.store);
+    let changed = false;
+    store.get = async (ref) => {
+      const v = await orig(ref);
+      if (!changed) {
+        changed = true;
+        const env = h.repos.environments.get(envId)!;
+        await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { autoFillLogin: false } }, WEB);
+      }
+      return v;
+    };
+    const r = await h.native(PROFILE_A, req(epoch));
+    expect(changed).toBe(true);
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect(reasonOf(r)).toBe('disabled');
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
   });
 
   test('refused: missing password for the account', async () => {

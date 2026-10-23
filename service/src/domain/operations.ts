@@ -76,6 +76,12 @@ export interface NormalPayload {
   hadManagedEnvironment: boolean;
   /** 受理时已排队或正在执行的路由操作（普通模式排在它们之后，§6.3 并发矩阵）；早先的记录没有这一项。 */
   queuedBehind?: string[];
+  /**
+   * 交给本次普通模式的切换已把入口写入使用中模式（ACTIVE 已读回确认、未提交）的目标环境：Safari 的全部请求（含该环境场景中
+   * 已打开的窗口）已经过它的出口，而受理时的旧窗口确认针对的是当时的使用中环境（或没有）。完成时它的窗口同样按 Surge 原规则
+   * 发出，确认没有覆盖它时路由带 managed_windows_on_original_rules（§6.1、§6.5）。
+   */
+  handedOverActiveTarget?: string;
 }
 
 export interface OperationPayload {

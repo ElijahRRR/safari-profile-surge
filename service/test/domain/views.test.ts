@@ -286,13 +286,18 @@ describe('route views and control', () => {
 
   test('summary hides probe, selection, operation id and warnings other than the buyer-exit one', () => {
     const s = buildRouteSummary(r, true, true);
-    expect(Object.keys(s).sort()).toEqual(['buyerExitConnectionsUnconfirmed', 'entryMode', 'normalModeOffered', 'phase', 'reconciled', 'routeEpoch']);
+    expect(Object.keys(s).sort()).toEqual(['buyerExitConnectionsUnconfirmed', 'entryMode', 'entryUnconfirmed', 'normalModeOffered', 'phase', 'reconciled', 'routeEpoch']);
     expect(s.reconciled).toBe(true);
     expect(buildRouteSummary(r, true, false).reconciled).toBe(false);
     expect(s.buyerExitConnectionsUnconfirmed).toBe(false);
     expect(s.normalModeOffered).toBe(true);
     expect(buildRouteSummary({ ...r, warnings: ['probe_failed'] }, true, true).buyerExitConnectionsUnconfirmed).toBe(false);
     expect(buildRouteSummary({ ...r, entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, warnings: ['buyer_exit_connections_unconfirmed'] }, true, true).buyerExitConnectionsUnconfirmed).toBe(true);
+    // 记录的入口未经运行时确认、或有规则排在入口之前：摘要只给这一项判断
+    expect(s.entryUnconfirmed).toBe(false);
+    expect(buildRouteSummary({ ...r, warnings: ['probe_failed', 'takeover_unknown'] }, true, true).entryUnconfirmed).toBe(false);
+    expect(buildRouteSummary({ ...r, entryMode: 'BLOCKED', phase: 'attention', warnings: ['precedence_violation'] }, true, true).entryUnconfirmed).toBe(true);
+    expect(buildRouteSummary({ ...r, entryMode: 'BLOCKED', phase: 'failed', warnings: ['entry_unverified'] }, true, true).entryUnconfirmed).toBe(true);
     const full = buildRouteView(r, probe(), true);
     expect(full.normalModeOffered).toBe(true);
     expect(full.lastSafariProbe!.exitIp).toBe('192.0.2.50');

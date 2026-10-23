@@ -262,6 +262,13 @@ export async function initCommit(deps: AcceptDeps, req: InitCommitRequest, actor
   return acceptedOf(op, false);
 }
 
+/**
+ * 本应用生成的文件（节点资源与四个入口规则集）：内容全部由数据库重新生成，不是需要恢复的用户内容，备份不复制。节点资源
+ * 含明文代理凭据——复制进备份会让被替换、已从 secret_values 删除的旧代理凭据一直留在数据目录中（备份按次数保留，与秘密的
+ * 清扫无关；INSTALL §6、ARCHITECTURE §0/§2）。
+ */
+const GENERATED_FILES: ReadonlySet<string> = new Set([NODE_RESOURCE_FILE, ...Object.values(ENTRY_RULESET_FILES)]);
+
 async function backup(engine: Engine, reason: 'init' | 'remerge', sourcePath: string, sourceText: string, directory: string): Promise<string> {
   const stamp = engine.nowIso().replace(/[:.]/g, '-');
   const dir = join(engine.deps.paths.backupsDir, `${reason}-${stamp}`);
@@ -273,6 +280,7 @@ async function backup(engine: Engine, reason: 'init' | 'remerge', sourcePath: st
   for (const r of listRelativeReferences(sourceText)) {
     const src = resolve(directory, r.value);
     if (!src.startsWith(`${directory}/`)) continue;
+    if (dirname(src) === directory && GENERATED_FILES.has(basename(src))) continue;
     let content: string;
     try {
       content = await readFile(src, 'utf8');

@@ -147,7 +147,7 @@ async function dispatchNative(deps: NativeDeps, envelope: BridgeEnvelope): Promi
       return submitVerification(engine, msg, { profileId: profileId!, environmentId: envId!, kick: deps.kick });
     }
     case 'requestLoginFill':
-      return loginFill(deps, msg, envId!);
+      return loginFill(deps, msg, envId!, profileId!);
     default:
       throw new SfeError('BAD_REQUEST', '处理扩展请求失败：消息类型不受支持');
   }
@@ -231,8 +231,32 @@ async function currentState(deps: NativeDeps, profileId: string | null, envId: s
       // 按这次读到的路由重新判定（不读 Surge）：检查返回之后、读取路由之前，对账（周期、刷新、路由操作）或受理可能已改写路由
       // ——例如对账发现 Surge 重启、出站模式改为直连；不能沿用检查时的判定
       const fresh = controlAfterReconcile(engine);
-      if (fresh.ok) ordersAllowed = true;
+      // 已受理、尚未结束的路由操作（排队或执行中）：检查可能沿用 5 秒内的对账，而判定只看路由记录——普通模式开始撤销入口之前、
+      // 切换写入之前路由仍是使用中且已验证。用户已请求离开买家出口（普通模式）或正在切换时不打开订单页，否则页面随后按 Surge
+      // 原规则（可能直连）或别的出口加载
+      const busy = routeOps(engine).busy;
+      if (busy.some((o) => o.kind === 'route.normal')) ordersBlockedReason = '正在进入普通模式';
+      else if (busy.length > 0) ordersBlockedReason = '正在切换出口或检测，请稍后再试';
+      else if (fresh.ok) ordersAllowed = true;
       else ordersBlockedReason = fresh.reason;
+    }
+  }
+  // 自动打开订单页与登录填充同一门槛（§5.2 fillAndAutoOpen）：场景 ID 稳定性未经实测时绑定可能认错场景，首请求与旧连接处理
+  // 未经实测时旧连接可能仍在别的出口上。不满足时准备页只提供手动按钮（§6.10 允许，显示警告）
+  let autoOpenAllowed = false;
+  let autoOpenBlockedReason: string | null = ordersBlockedReason;
+  if (ordersAllowed) {
+    const missingAuto = engine.missing(CAPABILITY_GATES.fillAndAutoOpen);
+    if (missingAuto.length === 0) {
+      autoOpenAllowed = true;
+      autoOpenBlockedReason = null;
+    } else {
+      const labels = engine
+        .capabilityViews()
+        .filter((v) => missingAuto.includes(v.key))
+        .map((v) => v.label)
+        .join('、');
+      autoOpenBlockedReason = `自动打开订单页所需能力尚未通过实测（${labels}），可以手动打开`;
     }
   }
   return {
@@ -255,14 +279,23 @@ async function currentState(deps: NativeDeps, profileId: string | null, envId: s
     activationBlockedReason,
     ordersAllowed,
     ordersBlockedReason,
+    autoOpenAllowed,
+    autoOpenBlockedReason,
   };
 }
 
 /**
  * §6.10：逐项把关；全部通过后读出账号标识与密码直接给值（密码从本机后台资料读出，立即登记到脱敏器；
- * 日志只记字段名）。读取之后再次确认 epoch 与活动环境，期间变化则不返回任何值。
+ * 日志只记字段名）。动作前对账（最长约 5 秒）与读取密码都跨越 await：其间网页后台的保存（填充开关、站点、账号标识与密码，
+ * 纯数据修改，立即提交、不经执行器）或解除绑定可能已生效——对账之后按此刻的资料重新检查全部条件，读出密码之后、返回之前
+ * 再检查一次（同时再确认 epoch 与活动环境），资料或路由期间变化则不返回任何值，从不交出用户已关闭填充或已替换、清除的旧值。
  */
-async function loginFill(deps: NativeDeps, msg: Extract<NativeRequest, { type: 'requestLoginFill' }>, envId: string): Promise<LoginFillServiceResponse> {
+async function loginFill(
+  deps: NativeDeps,
+  msg: Extract<NativeRequest, { type: 'requestLoginFill' }>,
+  envId: string,
+  profileId: string,
+): Promise<LoginFillServiceResponse> {
   const { engine } = deps;
   const { repos } = engine;
   const missing = engine.missing(CAPABILITY_GATES.fillAndAutoOpen);
@@ -288,6 +321,33 @@ async function loginFill(deps: NativeDeps, msg: Extract<NativeRequest, { type: '
   if (fields.length === 0) throw fillDenied('页面上没有可以填充的字段', 'fields');
   const account = repos.accounts.get(env.id);
   if (!account) throw fillDenied('该环境没有配置账号', 'account');
+  /**
+   * 跨越 await 之后按此刻的资料重新检查：场景仍绑定这个环境、环境未删除且仍开启填充、页面仍是它的站点的登录页、账号标识与
+   * 密码引用仍是开始时读到的值（用户替换或清除的旧密码在下一次清扫之前仍在本机资料中，不能交出）。
+   */
+  const recheckData = (): void => {
+    const binding = repos.profileBindings.byProfile(profileId);
+    const envNow = repos.environments.get(env.id);
+    if (!binding || binding.environmentId !== env.id || !envNow || envNow.deletedAt) throw fillDenied('当前场景关联的环境已变化，请刷新页面后重试', 'binding');
+    if (!envNow.autoFillLogin) throw fillDenied('该环境没有开启登录填充', 'disabled');
+    if (envNow.site !== env.site || classifySiteUrl(envNow.site, msg.top_url as string) !== 'signin') throw fillDenied('当前页面不是该站点的登录页', 'page');
+    const accNow = repos.accounts.get(env.id);
+    if (!accNow || accNow.loginIdentifier !== account.loginIdentifier || accNow.passwordRef !== account.passwordRef) {
+      throw fillDenied('账号资料已修改，请刷新页面后重试', 'account_changed');
+    }
+  };
+  /**
+   * 已受理、尚未结束的路由操作（排队或执行中），与订单门槛同一规则（currentState）：「受控」只看路由记录，而普通模式开始撤销
+   * 入口之前、切换写入之前路由仍是使用中且已验证（受理普通模式不改 epoch）。用户已请求离开买家出口（普通模式）或正在切换时
+   * 不交出账号与密码，否则填好的登录随后按 Surge 原规则（可能直连）或别的出口发出。动作前对账与读取密码都跨越 await：
+   * 开始时、对账之后与返回之前各检查一次。
+   */
+  const checkRouteOps = (): void => {
+    const busy = routeOps(engine).busy;
+    if (busy.some((o) => o.kind === 'route.normal')) throw fillDenied('正在进入普通模式', 'normal_pending');
+    if (busy.length > 0) throw fillDenied('正在切换出口或检测，请稍后再试', 'route_busy');
+  };
+  checkRouteOps();
   const control = await deps.ensureInControl({ maxAgeMs: 0 });
   if (!control.ok) throw fillDenied(`路由不受控：${control.reason ?? '状态未知'}`, 'control');
   // 对账之后再次确认 epoch 与活动环境（对账不会改变它们，但切换可能在此期间完成），并按此刻的路由记录重新判定受控
@@ -295,6 +355,10 @@ async function loginFill(deps: NativeDeps, msg: Extract<NativeRequest, { type: '
   if (after.routeEpoch !== msg.route_epoch || after.activeEnvironmentId !== env.id) throw fillDenied('路由已变化，请刷新页面后重试', 'epoch');
   const fresh = controlAfterReconcile(engine);
   if (!fresh.ok) throw fillDenied(`路由不受控：${fresh.reason ?? '状态未知'}`, 'control');
+  // 对账期间受理的普通模式或切换（执行器在对账之后才开始执行它）
+  checkRouteOps();
+  // 对账期间的保存（关闭填充、替换或清除账号）：读取密码之前按此刻的资料重新检查
+  recheckData();
   const fills: LoginFillServiceResponse['fills'] = [];
   for (const f of fields) {
     if (f === 'identifier') {
@@ -305,9 +369,11 @@ async function loginFill(deps: NativeDeps, msg: Extract<NativeRequest, { type: '
       fills.push({ field: 'password', value: await readAccountPassword(engine, account.passwordRef) });
     }
   }
-  // 读取跨越了 await：返回之前再确认一次，路由在此期间变化则不交出任何值
+  // 读取跨越了 await：返回之前再确认一次，路由或资料在此期间变化则不交出任何值
   const final = repos.routeState.get();
   if (final.routeEpoch !== msg.route_epoch || final.activeEnvironmentId !== env.id) throw fillDenied('路由已变化，请刷新页面后重试', 'epoch');
+  checkRouteOps();
+  recheckData();
   engine.log('info', 'login_fill.allowed', { environmentId: env.id, fields });
   return { fills };
 }

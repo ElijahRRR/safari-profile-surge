@@ -53,7 +53,11 @@ export const CHECKLISTS: Partial<Record<CapabilityKey, Checklist>> = {
       { id: 'safari_restart', question: 'Safari 退出重开后往返仍成功？' },
       { id: 'reboot', question: '系统重启后往返仍成功？' },
       { id: 'service_restart', question: '菜单「停止后台服务」再「注册后台服务」后往返仍成功？' },
-      { id: 'service_upgrade', question: '重新构建并替换 App（服务升级）后往返仍成功？' },
+      {
+        id: 'service_upgrade',
+        question:
+          '重新构建并替换 App（服务升级）、再在菜单中「停止后台服务」并「注册后台服务」，service.log 中出现替换之后的 service.started 之后往返仍成功？（只替换 App 时旧服务仍在运行并应答，不算升级）',
+      },
       {
         id: 'background_wake',
         question:

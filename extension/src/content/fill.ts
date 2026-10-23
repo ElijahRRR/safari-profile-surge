@@ -112,6 +112,15 @@ export interface AssistDeps {
 // 用户未开启填充或场景未绑定时保持安静，不在页面上显示任何东西。
 const SILENT_REASONS = new Set(['unbound', 'autofill_off']);
 
+/**
+ * 本机服务因已受理、尚未结束的路由操作而拒绝时的说明（docs/ARCHITECTURE.md §6.10）：用户已请求进入普通模式，或出口正在切换。
+ * 不提示手动填充——普通模式之后本场景的请求不再经买家出口。
+ */
+const ROUTE_REFUSAL_DETAIL: ReadonlyMap<string, string> = new Map([
+  ['normal_pending', '已请求进入普通模式：之后本场景的请求按 Surge 原规则发出（可能直连），不经买家出口。扩展不会提交表单。'],
+  ['route_busy', '出口正在切换或检测：完成后刷新页面再试。扩展不会提交表单。'],
+]);
+
 const MANUAL: PanelContent = { title: '可手动填充', detail: '未识别到可填充的登录字段。扩展不会猜测或提交表单。', tone: 'info' };
 
 /**
@@ -154,8 +163,11 @@ function waitForDetection(doc: Document, timeoutMs: number): Promise<Detection> 
   });
 }
 
-// 原生桥原样转发服务的应答，不再检查形状，所以在写入页面之前由这里检查。
-const MALFORMED_FILL_MESSAGE = '本机服务的填充应答格式不符（可能仍在运行旧版本的后台服务）：请在 App 菜单中「停止后台服务」再「注册后台服务」后重试';
+// 原生桥原样转发服务的应答，不再检查形状，所以在写入页面之前由这里检查。唯一现实的原因是替换 App 后旧版（钥匙串）服务
+// 仍在运行：它仍能进入普通模式，而新版本服务在旧版本的数据目录上拒绝启动（docs/INSTALL.md §7）。所以不建议重新注册后台服务
+// ——那会停掉仍能撤销本应用入口的旧服务，换上一个启动不了的新服务；先用旧服务进入普通模式，再按 §7 换用新的数据目录。
+const MALFORMED_FILL_MESSAGE =
+  '本机服务的填充应答格式不符（可能仍在运行旧版本的后台服务）：不要直接重新注册后台服务——本版本无法在旧版本的数据目录上启动，之后弹窗与网页后台都无法进入普通模式。请先在扩展弹窗或网页后台进入普通模式（旧版本的服务仍能处理），再按 docs/INSTALL.md §7 升级（需要换用新的数据目录）';
 
 /**
  * 每一项都必须是 { field: 'identifier' | 'password', value: 非空字符串 }，且字段不重复；任何一项不符就整个拒绝，
@@ -219,7 +231,8 @@ export async function runLoginAssist(deps: AssistDeps): Promise<AssistOutcome> {
   const reply = parseReply(await deps.sendMessage({ type: 'requestLoginFill', form_action: action, fields }));
   if (!reply.ok) {
     if (reply.reason && SILENT_REASONS.has(reply.reason)) return 'silent';
-    show({ title: '未自动填充', detail: `${reply.message.replace(/[。.]+$/, '')}。可手动填充。`, tone: 'warning' });
+    const routeNote = reply.reason ? ROUTE_REFUSAL_DETAIL.get(reply.reason) : undefined;
+    show({ title: '未自动填充', detail: `${reply.message.replace(/[。.]+$/, '')}。${routeNote ?? '可手动填充。'}`, tone: 'warning' });
     return 'refused';
   }
 

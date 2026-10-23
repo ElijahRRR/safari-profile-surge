@@ -213,13 +213,31 @@ export interface CurrentStateResponse {
   bindable: BindableEnvironment[];
   activationAvailable: boolean;
   activationBlockedReason: string | null;
-  /** “打开或定位订单页”是否允许：当前场景是活动环境、实测有效、无接管/外部修改警告。 */
+  /**
+   * “打开或定位订单页”是否允许（用户点击按钮，或在弹窗中点击它而先激活的准备页）：当前场景是活动环境、路由“受控”
+   * （实测有效、无接管/外部修改警告，§6.6）。
+   */
   ordersAllowed: boolean;
   ordersBlockedReason: string | null;
+  /**
+   * 准备页能否在实测通过后自动打开订单页（环境开启“自动打开订单”时）：ordersAllowed，且 `fillAndAutoOpen` 门槛满足
+   * （native_profile_id、first_request_and_old_connections，§5.2）。不满足时只提供手动按钮，autoOpenBlockedReason 写明原因。
+   */
+  autoOpenAllowed: boolean;
+  autoOpenBlockedReason: string | null;
 }
 
 export type BeginVerificationResponse =
-  | { status: 'pending'; phase: string; message: string }
+  | {
+      status: 'pending';
+      phase: string;
+      message: string;
+      /**
+       * 这是一次切换（激活、活动环境发布在场景到达后的切换），切换期间 Safari 的其他请求会被暂时拒绝。重新检测（从不切换、不阻断，
+       * §6.4）、停在 WAITING_ROUTE 尚未到达、已请求取消或等待路由恢复时为 false。旧版服务没有这个字段：按 false 处理，不声称阻断。
+       */
+      switching?: boolean;
+    }
   | { status: 'ready'; test_id: string; route_epoch: number; verify_url: string; deadline: IsoTime }
   | { status: 'not_needed'; message: string };
 

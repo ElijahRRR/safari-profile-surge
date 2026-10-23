@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 设置：只有可编辑的设置可以修改——检测服务（只在普通模式下）、默认前置与超时。
+// 设置：只有可编辑的设置可以修改——检测服务（只在空闲的普通模式下，服务端另拒绝有未结束路由操作时的修改）、默认前置与超时。
 // 入口策略与 Safari 进程路径来自已确认的能力证据，Surge CLI 路径来自安装配置，工作配置路径来自
 // 维护初始化，这里只读显示。
 import { computed, reactive, ref, watch } from 'vue';
@@ -15,7 +15,12 @@ import { newRequestId } from '../lib/request-id';
 
 const { api, store, toasts } = useConsole();
 const settings = computed(() => store.settings.value);
-const entryNormal = computed(() => store.route.value?.entryMode === 'NORMAL');
+// 与服务端同一条件（entrySettingsChangeRefusal）：入口 NORMAL、阶段 idle、没有使用中的环境；有未结束的路由操作（例如激活
+// 尚未写入阻断）时服务端另行拒绝（ROUTE_BUSY），提示中写明
+const entryNormal = computed(() => {
+  const r = store.route.value;
+  return r?.entryMode === 'NORMAL' && r.phase === 'idle' && r.activeEnvironmentId === null;
+});
 
 const TIMEOUTS = [
   { key: 'profileArrivalTimeoutSec', label: '等待场景打开', hint: '激活或重新检测后等待目标场景点击扩展图标的最长时间；激活超时会尝试恢复原节点并保持阻断（无法确认时改选 REJECT 并要求处理），重新检测超时只结束本次检测、路由不变。' },
@@ -136,7 +141,7 @@ async function submit(req: UpdateSettingsRequest | null = buildRequest()) {
             label="出口检测服务"
             :options="endpointOptions"
             :disabled="!entryNormal"
-            :hint="entryNormal ? '只能从固定列表中选择；更换后已有的 Safari 实测全部视为过期。' : '只能在普通模式下修改：当前有托管环境或入口不是普通模式。'"
+            :hint="entryNormal ? '只能从固定列表中选择；更换后已有的 Safari 实测全部视为过期。正在切换出口、检测或进入普通模式时服务会拒绝修改。' : '只能在空闲的普通模式下修改：当前有托管环境、入口不是普通模式，或路由操作尚未结束。'"
             data-test="verify-endpoint"
           />
           <SelectField v-model="form.defaultFrontProxyId" label="默认前置" :options="frontOptions" hint="新建环境未指定前置时使用；保存时记录为具体前置，之后修改默认值不影响已有环境。" />

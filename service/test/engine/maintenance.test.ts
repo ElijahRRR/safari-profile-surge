@@ -299,6 +299,43 @@ describe('remerge (user-confirmed maintenance)', () => {
     expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
   });
 
+  test('remerge backups never copy the app\'s generated files: a buyer proxy password replaced and swept later is not left in the data directory', async () => {
+    const OLD_PW = 'synthOldBuyerPw7788';
+    h = await createHarness({ dbFile: true });
+    const a = await createEnv(h, 'US-Buyer-A', '203.0.113.10', { username: 'synthBuyerUser01', password: OLD_PW });
+    const envId = a.environment_id!;
+    const oldRef = h.repos.proxyRevisions.get(envId, 1)!.passwordRef!;
+    expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).toContain(OLD_PW);
+    const p = await h.app.remergePreview(WEB);
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
+    const [bak] = h.repos.backups.list({ reason: 'remerge' });
+    // 只备份工作配置（及用户自己的引用文件）：节点资源与入口规则集由数据库重新生成
+    expect(bak!.files.map((f) => f.relativePath)).toEqual([`${WORKING_PROFILE_NAME}.conf`]);
+    expect(readdirSync(bak!.backupDirectory)).toEqual([`${WORKING_PROFILE_NAME}.conf`]);
+    // 轮换代理密码，旧版本 retired 后清扫删除旧值：数据目录（Surge 配置目录之外）中不再有它
+    const env = h.repos.environments.get(envId)!;
+    await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { password: { action: 'replace', value: 'synthNewBuyerPw9911' } } } }, WEB);
+    await h.idle();
+    await h.app.publishPending({ request_id: rid() }, WEB);
+    await h.idle();
+    expect(h.repos.proxyRevisions.get(envId, 1)!.state).toBe('retired');
+    await h.app.engine.secrets.sweep();
+    expect(h.store.has(oldRef)).toBe(false);
+    const hits: string[] = [];
+    const walk = (d: string): void => {
+      for (const name of readdirSync(d, { withFileTypes: true })) {
+        const full = join(d, name.name);
+        if (full === h.surgeDir) continue;
+        if (name.isDirectory()) walk(full);
+        else if (readFileSync(full).includes(Buffer.from(OLD_PW))) hits.push(full);
+      }
+    };
+    walk(h.dir);
+    expect(hits).toEqual([]);
+  });
+
   test('keeps at most 5 remerge backups', async () => {
     h = await createHarness();
     for (let i = 0; i < 7; i++) {

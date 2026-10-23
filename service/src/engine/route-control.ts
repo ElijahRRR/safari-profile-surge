@@ -39,8 +39,52 @@ export function routeOps(engine: Engine): RouteOpsState {
   return out;
 }
 
+/**
+ * 环境正在使用或正在验证（删除与解除绑定拒绝，§6.7）：它是入口不为普通模式时的使用中环境、未结束的路由操作的目标，或 SFE-ROUTE
+ * 记录的选择是它某一版本的节点而入口不是普通模式——例如交给普通模式、已写入 ACTIVE 而未提交的切换选着它的节点，普通模式失败；
+ * 回滚无法确认、改选 REJECT 失败时选着本次切换写入的节点。这时路由记录的使用中环境是另一个，Safari 却可能经它的出口发出。
+ */
+export function environmentRouteBusy(engine: Engine, environmentId: string): boolean {
+  const route = engine.repos.routeState.get();
+  if (route.entryMode !== 'NORMAL') {
+    if (route.activeEnvironmentId === environmentId) return true;
+    if (route.selectedNode !== null && engine.repos.proxyRevisions.listByEnvironment(environmentId).some((r) => r.nodeName === route.selectedNode)) return true;
+  }
+  const ops = routeOps(engine);
+  return [...ops.busy, ...ops.waitingVerification].some((o) => payloadOf(o).route?.targetEnvironmentId === environmentId);
+}
+
 export function routeBusyError(action: string): SfeError {
   return new SfeError('ROUTE_BUSY', `${action}失败：正在切换出口或检测，请稍后再试`);
+}
+
+/**
+ * 入口设置（入口策略、Safari 进程路径、检测服务）只能在空闲的普通模式下修改，否则返回拒绝的错误（可以修改时为 null）。
+ * 每个路由操作在开始时按当时的设置建立入口控制器并一直用它写入（激活从第 1–3 步的读取起直到阻断写入之后，路由记录才不再是
+ * 普通模式），之后的回滚、取消与普通模式按新的设置另建控制器：新控制器看不到旧策略写入的入口（临时规则或入口规则集文件），
+ * 普通模式会失败或误报已撤销，Safari 停在被拒绝或检测入口上（§5.2「进入普通模式永远可用」）。所以只看记录的入口模式不够：
+ * 有任何路由操作未结束（排队、执行中、等待中，含排队的普通模式）或路由不是空闲的普通模式（有使用中的环境、激活快照、
+ * 未结束的阶段）时一律拒绝。
+ */
+export function entrySettingsChangeRefusal(engine: Engine, action: string, what: string): SfeError | null {
+  const ops = routeOps(engine);
+  if (ops.busy.length > 0 || ops.waitingVerification.length > 0 || ops.waitingRoute.length > 0) {
+    return new SfeError('ROUTE_BUSY', `${action}失败：正在切换出口、检测或进入普通模式，请等它结束后再更改${what}`);
+  }
+  const route = engine.repos.routeState.get();
+  if (route.entryMode !== 'NORMAL' || route.phase !== 'idle' || route.activeEnvironmentId !== null || route.activationSnapshot !== null) {
+    return new SfeError('ENVIRONMENT_ACTIVE', `${action}失败：入口不是空闲的普通模式，请先进入普通模式再更改${what}`);
+  }
+  return null;
+}
+
+/**
+ * 路由操作建立入口控制器时的入口设置（入口策略、Safari 进程路径、检测服务）：写入之前与它比较，变化了就不写（受理之外的
+ * 第二道防线，见 entrySettingsChangeRefusal）。
+ */
+export function entrySettingsKey(engine: Engine): string {
+  const s = engine.repos.settings;
+  return JSON.stringify([s.get('entryStrategy'), [...s.get('safariProcessPaths')].sort(), s.get('verifyEndpointId')]);
 }
 
 /**
@@ -61,21 +105,24 @@ export function supersedeWaiting(engine: Engine, newOpId: string, state: RouteOp
   const { repos } = engine;
   const touched: string[] = [];
   let bump = false;
+  // 写明取代它的是什么：进入普通模式（Safari 随后按 Surge 原规则发出）或新的切换
+  const byNormal = repos.operations.get(newOpId)?.kind === 'route.normal';
+  const by = byNormal ? '已被进入普通模式取代' : '已被新的切换请求取代';
   for (const op of state.waitingVerification) {
     repos.operations.update(op.id, {
       phase: 'SUPERSEDED',
       status: 'superseded',
       supersededBy: newOpId,
-      error: { code: 'SUPERSEDED', message: '已被新的切换请求取代' },
+      error: { code: 'SUPERSEDED', message: by },
     });
-    repos.operations.appendStep(op.id, 'SUPERSEDED', '已被新的切换请求取代，检测编号作废');
+    repos.operations.appendStep(op.id, 'SUPERSEDED', `${by}，检测编号作废`);
     repos.outbox.cancelForOperation(op.id);
     touched.push(op.id);
     bump = true;
   }
   for (const op of state.waitingRoute) {
     repos.operations.update(op.id, { phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', supersededBy: newOpId });
-    repos.operations.appendStep(op.id, 'READY_FOR_NEXT_OPEN', '新版本已部署，未切换：已有新的切换请求');
+    repos.operations.appendStep(op.id, 'READY_FOR_NEXT_OPEN', byNormal ? '新版本已部署，未切换：已有进入普通模式的请求' : '新版本已部署，未切换：已有新的切换请求');
     repos.outbox.cancelForOperation(op.id);
     touched.push(op.id);
   }
@@ -84,6 +131,29 @@ export function supersedeWaiting(engine: Engine, newOpId: string, state: RouteOp
     repos.routeState.update({ routeEpoch: route.routeEpoch + 1, operationId: newOpId, awaitingDeadline: null });
   }
   return touched;
+}
+
+/**
+ * 保存了环境的代理新版本（单项修改、导入、更换前置）：在保存事务中结束同一环境停在 WAITING_ROUTE 的活动环境发布。它的目标版本
+ * 已被用户替换（§6.3 第 2 步：替换指之后保存了更新的版本，无论它是否已部署）——更新的版本的发布若失败、读回不完整或暂停待部署，
+ * 旧的等待也不能再把 Safari 切到用户已替换的出口（可能正是被更正的、指向另一个买家代理的那一次修改），弹窗与网页也不再提示
+ * 「切换到新版本」。结束为 READY_FOR_NEXT_OPEN（succeeded、没有错误、superseded_by 为保存操作），不碰 Surge，当前出口不变；
+ * 更新的版本部署后由它自己的发布等待切换。已开始切换（排队、执行中）或停在 VERIFY_ONLY 的发布不在这里结束：切换在第一次写入
+ * 之前与提交之前核对版本（replacedTarget），已替换时不切换或按第 14 步回滚。返回结束的操作 id（调用方随保存一起发布）。
+ */
+export function endWaitingRouteForNewRevision(engine: Engine, environmentId: string, newRevision: number, savedByOpId: string): string[] {
+  const { repos } = engine;
+  const label = `v${String(newRevision).padStart(3, '0')}`;
+  const ended: string[] = [];
+  for (const op of routeOps(engine).waitingRoute) {
+    const p = payloadOf(op).route;
+    if (!p || p.targetEnvironmentId !== environmentId || p.proxyRevision === newRevision) continue;
+    repos.operations.update(op.id, { phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', supersededBy: savedByOpId });
+    repos.operations.appendStep(op.id, 'READY_FOR_NEXT_OPEN', `新版本已部署，未切换：之后又修改了代理（已保存 ${label}），不切换到这一版本，路由未改变`);
+    repos.outbox.cancelForOperation(op.id);
+    ended.push(op.id);
+  }
+  return ended;
 }
 
 export const OLD_SESSION_LIMITATION =

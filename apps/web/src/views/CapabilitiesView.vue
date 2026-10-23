@@ -217,7 +217,7 @@ async function doReset() {
       @cancel="confirmState.show = false"
     >
       <p>{{ confirmDetail }}</p>
-      <NoticeBox v-if="pathsNotice" tone="warning">确认新的进程路径或入口策略会让依赖它们的能力回到待验证；入口不是普通模式时服务会拒绝确认。</NoticeBox>
+      <NoticeBox v-if="pathsNotice" tone="warning">确认新的进程路径或入口策略会让依赖它们的能力回到待验证；路由不是空闲的普通模式（有托管环境、入口不是普通模式），或正在切换出口、检测或进入普通模式时，服务会拒绝确认。</NoticeBox>
     </ConfirmDialog>
 
     <ConfirmDialog

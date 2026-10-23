@@ -240,6 +240,7 @@ kill "$SELFTEST_PID"
 - **步骤**：
   1. 打开扩展弹窗，确认显示服务状态（往返成功）。
   2. 依次做：Safari 退出重开；系统重启；菜单「停止后台服务」再「注册后台服务」；重新构建并替换 App（服务升级）。每次之后重复第 1 步。
+     - 服务升级：只替换 App 不会停止或重新启动已在运行的后台服务（App 启动时不重新注册它，launchd 只在它异常退出时重新启动它，INSTALL §7），旧服务会继续应答新版本的扩展，往返成功不能说明升级后的服务能工作。替换 App 并打开一次新版本 App 之后，在菜单中「停止后台服务」再「注册后台服务」，确认数据目录的 `service.log` 中出现一条时间晚于替换的 `"msg":"service.started"`（服务版本号在构建之间不变，不能用它区分），然后才重复第 1 步。
   3. 后台休眠：让 Safari 闲置 5 分钟以上（或在「开发」菜单的扩展后台页确认后台已卸载），再点击扩展图标，确认往返成功。
      - 上报闹钟（结论写进 `background_wake` 项备注）：窗口/标签页事件后的 `reportProfileState` 按 Apple 的要求用 Alarms API 代替 `setTimeout`（“When you make your background page nonpersistent: … Use the `Alarms` API instead of `setTimeout`.”，https://developer.apple.com/documentation/safariservices/optimizing-your-web-extension-for-safari），闹钟名 `sfe-profile-report`，请求 1.5 秒后到点。Safari 对闹钟的最小延迟、后台卸载后闹钟能否唤醒它，Apple 没有写明，这里实测（用已命名的测试场景：默认场景可能没有场景标识，它的上报记入所有未识别场景共用的一条记录，不能与测试场景一一对应；默认场景的上报是否送达另在 `native_profile_id` 备注中记录）：
        - 延迟：从「开发」菜单打开本扩展后台页的检查器，在测试场景新建一个标签页后立即在控制台执行 `const a = await browser.alarms.get('sfe-profile-report'); a ? a.scheduledTime - Date.now() : '已到点'`，记录结果（明显大于 1500 即 Safari 延长了闹钟；显示「已到点」表示闹钟已经触发，需要更快地执行一次）。
@@ -500,7 +501,7 @@ npx tsx tools/p0/src/cli.ts propose <能力> supported              # 发送到 
 - 声明的 `--auto-reload`、`--takeover`、`--signing-identity` 必须有测量证据，对**每个**依赖该字段的能力都适用（不只是 auto_reload_atomic_replace）：具体值必须等于测量时的值（refresh 声明的自动重载设置，或测量时读到的值；测量时没有记录则不能声明）；`--auto-reload any` 需要本能力在自动重载开、关两种设置下的测量都得到与提议相同的结论，`--takeover any` 需要 enhanced、system_proxy、both 三种接管方式下都有，且这些测量的其余依赖上下文与当前一致；任一取值下另有相反结论的测量（不论先后）即拒绝，用作证据的测量次数与时间写入提议摘要。读不到的上下文字段记为 null，服务运行时同样读不到才会匹配；工具会提示。例外：Surge 版本与构建读不到（或不是 `6.10.0`、`12500` 这样的格式）、与 `surge-cli --raw version` 交叉核对不一致、低于最低支持版本 6.10.0（12500）或 Controller 协议 < 22 时，依赖它们的能力不能提议，工具直接拒绝并给出原因——这样的记录在服务中永远不会生效。
 - 提议摘要不超过服务接受的 4000 字（超出部分截断并以“…”结尾）。
 - 原生相关能力需要签名身份：默认读取 `/Applications/SafariProfileSurge.app` 的 Team ID，也可用 `--signing-identity` 提供。
-- 发送后在网页后台「能力门槛」页核对上下文、摘要与覆盖，再确认。工具不能确认。确认新的进程路径或入口策略会让依赖它们的能力回到待验证，且入口必须是 NORMAL。
+- 发送后在网页后台「能力门槛」页核对上下文、摘要与覆盖，再确认。工具不能确认。确认新的进程路径或入口策略会让依赖它们的能力回到待验证，且路由必须是空闲的普通模式、没有未结束的路由操作（激活尚未写入阻断时同样拒绝）。
 
 ## 6. 结束：回到原配置
 

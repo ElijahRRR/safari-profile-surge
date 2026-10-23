@@ -294,6 +294,12 @@ export interface OperationView extends OperationSummary {
   routeEpoch: number | null;
   probeKind: ProbeKind | null;
   supersededBy: OperationId | null;
+  /**
+   * 等待中（status waiting）的路由操作自己的截止时间：签发检测编号之后为实测截止时间，之前为到达截止时间（活动环境发布停在
+   * WAITING_ROUTE 时为等待场景打开的截止时间）；不在等待时为 null。与弹窗的 pendingVerification.deadline 同一来源。网页的等待
+   * 提示用它，不用路由记录的 awaitingDeadline（那是路由当前负责的切换的截止时间；重新检测与 WAITING_ROUTE 不负责路由）。
+   */
+  waitDeadline: IsoTime | null;
   steps: OperationStep[];
   effective: OperationEffective;
   /** 结构化结果（全部脱敏）：路由操作含 killResults / rollback；发布含 readbackLevel；导入含批次条目。 */
@@ -302,6 +308,11 @@ export interface OperationView extends OperationSummary {
     rollback?: RollbackResult;
     readbackLevel?: 'full' | 'partial';
     uncheckedFields?: string[];
+    /**
+     * Safari 重测失败或出口不符时加到路由上的警告（自动打开订单与填充因此停止）。取消、超时与开始等待之前的失败没有这一项：
+     * 路由与之前的检测结果都不变。
+     */
+    probeWarning?: 'probe_failed' | 'exit_ip_mismatch';
     [key: string]: unknown;
   } | null;
   createdAt: IsoTime;
@@ -379,6 +390,12 @@ export interface RouteSummaryView {
    * 普通模式，任何场景（§6.5）仍要能再次进入普通模式结束这些连接；只给这一项，不给其他警告。
    */
   buyerExitConnectionsUnconfirmed: boolean;
+  /**
+   * 路由带 entry_unverified 或 precedence_violation：记录的入口模式没有经运行时求值确认，或有规则排在本应用入口之前（被它们
+   * 匹配的 Safari 请求按它们发出，可能直连；入口位即使读回为阻断也不能声称 Safari 已阻断）。弹窗顶栏据此不按记录的入口声称
+   * 已阻断、只允许检测或托管中（§6.5、§7.2）。只给这一项判断，不给警告本身。
+   */
+  entryUnconfirmed: boolean;
   /** 与 RouteStateView.normalModeOffered 相同：任何场景据此提供「进入普通模式」（§6.5）。 */
   normalModeOffered: boolean;
   /**

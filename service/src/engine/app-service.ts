@@ -45,6 +45,7 @@ import {
   updateSettings,
   verifyFrontProxy,
 } from './admin-ops.js';
+import { sweepCandidateDirs } from './candidate.js';
 import { Engine, type AppServiceDeps } from './context.js';
 import { createDispatcher } from './dispatch.js';
 import { Executor } from './executor.js';
@@ -311,6 +312,13 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
         engine.log('error', 'pepper.unavailable');
       }
       await sweepTempFiles(deps.paths.tmpDir).catch(() => []);
+      // 上次进程在 --check 期间被终止时遗留的候选目录（含明文代理凭据的节点资源副本）：执行器开始之前删除
+      try {
+        const removed = await sweepCandidateDirs(deps.paths.tmpDir);
+        if (removed.length > 0) engine.log('warn', 'startup.candidate_dirs_removed', { count: removed.length });
+      } catch (err) {
+        engine.log('error', 'startup.candidate_sweep_failed', { error: err instanceof Error ? err.name : 'unknown' });
+      }
       await engine.refreshHostFacts();
       // 启动：放回上次未完成的领取，读 Surge 事实对账，再开始执行器（未完成操作由执行器按事实恢复）
       const released = engine.repos.outbox.releaseClaims();

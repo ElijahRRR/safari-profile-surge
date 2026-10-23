@@ -66,9 +66,17 @@ export function matchesSearch(env: EnvironmentView, query: string): boolean {
   return hay.includes(q);
 }
 
-/** 环境正在使用或正在验证：删除、解除绑定会被服务端以 ENVIRONMENT_ACTIVE 拒绝。 */
+/**
+ * 环境正在使用或正在验证：删除、解除绑定会被服务端以 ENVIRONMENT_ACTIVE 拒绝（§6.7）。另含入口不是普通模式而 SFE-ROUTE
+ * 选着它的节点（例如交给普通模式、已写入使用中模式的切换目标，普通模式又失败了）：路由的使用中环境是另一个，Safari 却可能
+ * 经它的出口发出。这里只看视图中的几个版本，服务端按全部版本判断，拒绝时同样提示先进入普通模式。
+ */
 export function isEnvironmentInUse(env: EnvironmentView, route: RouteStateView | null): boolean {
   if (route && route.activeEnvironmentId === env.id) return true;
+  if (route && route.entryMode !== 'NORMAL' && route.selectedNode !== null) {
+    const nodes = [env.proxy.desired, env.proxy.deployed, env.proxy.active, env.proxy.lastVerified].map((r) => r?.nodeName);
+    if (nodes.includes(route.selectedNode)) return true;
+  }
   return env.facets.route === 'active' || env.facets.route === 'activating' || env.facets.route === 'verifying' || env.facets.route === 'waiting_route';
 }
 
@@ -106,10 +114,14 @@ export function probeDisplay(probe: ProbeView | null | undefined, now: number): 
   };
 }
 
-/** 等待中的路由操作可以取消（回滚，从不进入普通模式）。 */
+/**
+ * 等待中的路由操作可以取消（回滚，从不进入普通模式）：激活与重测、停在 WAITING_ROUTE 的活动环境发布，以及活动环境发布进入
+ * 切换之后的 VERIFY_ONLY 等待（操作类型仍是 environment.update / deploy.publish，§6.3 第 14 步「与激活相同」）。与弹窗、服务端
+ * acceptCancel（等待中且带路由参数）一致。
+ */
 export function isCancellableRouteOperation(op: Pick<OperationView, 'status' | 'kind' | 'phase'>): boolean {
   if (op.status !== 'waiting') return false;
-  return op.kind === 'route.activate' || op.kind === 'probe.safari' || op.phase === 'WAITING_ROUTE';
+  return op.kind === 'route.activate' || op.kind === 'probe.safari' || op.phase === 'WAITING_ROUTE' || op.phase === 'VERIFY_ONLY';
 }
 
 /**

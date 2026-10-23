@@ -231,6 +231,11 @@ describe('startService with a data directory created by the Keychain version', (
       .find((e) => e.msg === 'secrets.legacy_keychain_data');
     expect(line).toMatchObject({ level: 'error', pepperMissing: true, missingCommittedRefs: 0, message: LEGACY_KEYCHAIN_DATA_MESSAGE });
     expect(LEGACY_KEYCHAIN_DATA_MESSAGE).toContain('钥匙串');
+    // 只写在 service.log 中的唯一说明：指向 INSTALL §7 的完整步骤，先撤销旧版本在 Surge 中的入口，再换数据目录
+    expect(LEGACY_KEYCHAIN_DATA_MESSAGE).toContain('docs/INSTALL.md §7');
+    expect(LEGACY_KEYCHAIN_DATA_MESSAGE).toContain('先撤销旧版本在 Surge 中的入口');
+    expect(LEGACY_KEYCHAIN_DATA_MESSAGE.indexOf('先撤销旧版本在 Surge 中的入口')).toBeLessThan(LEGACY_KEYCHAIN_DATA_MESSAGE.indexOf('用新的数据目录重新初始化'));
+    expect(LEGACY_KEYCHAIN_DATA_MESSAGE).toContain('sfe-entry-*.list');
   });
 
   test('schema 1 database from the Keychain version: refused before migrating, so the old version can still open it', async () => {

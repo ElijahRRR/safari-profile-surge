@@ -73,7 +73,8 @@ export interface Db {
   inTransaction(): boolean;
   /**
    * 把 WAL 全部写回数据库文件并把 -wal 截断为 0 字节（PRAGMA wal_checkpoint(TRUNCATE)），清除旧帧中的内容副本
-   * （例如刚删除的明文秘密）。事务中不执行；有其他读者时可能只完成一部分。返回是否完整完成。
+   * （例如刚删除的明文秘密）。事务中不执行；不等待锁（不经 busy_timeout），有其他读者持有旧快照时立即返回、可能只完成一部分。
+   * 返回是否完整完成。
    */
   checkpointTruncate(): boolean;
   close(): void;
@@ -131,6 +132,9 @@ export function preparePrivateSidecars(path: string): void {
   }
 }
 
+/** 普通读写等待其他连接释放锁的上限（busy_timeout）。 */
+const BUSY_TIMEOUT_MS = 5000;
+
 export function openDatabase(path: string | ':memory:'): Db {
   const { DatabaseSync } = loadSqlite();
   const isMemory = path === ':memory:';
@@ -140,7 +144,7 @@ export function openDatabase(path: string | ':memory:'): Db {
   }
   const raw = new DatabaseSync(path, { enableForeignKeyConstraints: true });
   raw.exec('PRAGMA foreign_keys = ON');
-  raw.exec('PRAGMA busy_timeout = 5000');
+  raw.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
   // 删除或改写的内容用零覆盖（node 内置 SQLite 缺省关闭）：被删除的明文秘密不留在数据库文件的空闲页中。
   // WAL 中旧帧的副本由删除秘密后的 checkpoint 清除（checkpointTruncate）
   raw.exec('PRAGMA secure_delete = ON');
@@ -260,8 +264,16 @@ export function openDatabase(path: string | ':memory:'): Db {
       if (closed) throw new Error('database is closed');
       if (depth > 0 || raw.isTransaction) return false;
       if (isMemory) return true;
-      const row = raw.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number } | undefined;
-      return Number(row?.busy ?? 1) === 0;
+      // 不经忙等待：TRUNCATE 要等全部读者用上最新快照，经忙处理器（busy_timeout）时另一个程序（数据库浏览器、sqlite3 中开着的
+      // 读事务）持有读快照会让同步的 node:sqlite 冻结整个服务直到超时（每删除一个值一次，清扫还占着执行器）。忙时立即返回
+      // false，由调用方留到之后再试（LocalSecretStore：下一次删除或清扫）
+      raw.exec('PRAGMA busy_timeout = 0');
+      try {
+        const row = raw.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number } | undefined;
+        return Number(row?.busy ?? 1) === 0;
+      } finally {
+        raw.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+      }
     },
     close(): void {
       if (closed) return;

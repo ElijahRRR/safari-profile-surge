@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { defineComponent, h } from 'vue';
 import type { NeedsConfirmationDetails } from '@sfe/contract';
+import { formatClock } from '../src/lib/format';
 import { ApiError } from '../src/api/client';
 import { createRouteActions } from '../src/store/route-actions';
 import EnvironmentsView from '../src/views/EnvironmentsView.vue';
@@ -204,8 +205,8 @@ describe('activation from the environments page', () => {
 
   it('the waiting-for-Safari guidance states each operation\'s own timeout outcome: a retest never restores a node or blocks Safari', async () => {
     const deadline = '2026-10-21T08:02:00.000Z';
-    const probeOp = operation({ kind: 'probe.safari', phase: 'VALIDATING', status: 'waiting', probeKind: 'safari', steps: [{ at: '2026-10-21T08:00:00.000Z', phase: 'VALIDATING', message: '等待在绑定的 Safari 场景中完成出口检测（不切换、不断连）' }] });
-    const switchOp = operation({ id: 'op_2', kind: 'environment.update', phase: 'VERIFY_ONLY', status: 'waiting' });
+    const probeOp = operation({ kind: 'probe.safari', phase: 'VALIDATING', status: 'waiting', probeKind: 'safari', waitDeadline: deadline, steps: [{ at: '2026-10-21T08:00:00.000Z', phase: 'VALIDATING', message: '等待在绑定的 Safari 场景中完成出口检测（不切换、不断连）' }] });
+    const switchOp = operation({ id: 'op_2', kind: 'environment.update', phase: 'VERIFY_ONLY', status: 'waiting', waitDeadline: deadline });
     const { ctx } = testContext((call: Call) => {
       if (call.url === '/api/operations/op_1') return { status: 200, body: probeOp };
       if (call.url === '/api/operations/op_2') return { status: 200, body: switchOp };
@@ -229,6 +230,33 @@ describe('activation from the environments page', () => {
     m.unmount();
   });
 
+  it('the waiting guidance shows the operation\'s own deadline, never a stale route deadline left by an earlier retest', async () => {
+    const stale = '2026-10-21T00:02:00.000Z';
+    const own = '2026-10-21T03:10:00.000Z';
+    const probeOp = operation({ kind: 'probe.safari', phase: 'VALIDATING', status: 'waiting', probeKind: 'safari', waitDeadline: own });
+    const waitOp = operation({ id: 'op_2', kind: 'environment.update', phase: 'WAITING_ROUTE', status: 'waiting', waitDeadline: own });
+    const { ctx } = testContext((call: Call) => {
+      if (call.url === '/api/operations/op_1') return { status: 200, body: probeOp };
+      if (call.url === '/api/operations/op_2') return { status: 200, body: waitOp };
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: '找不到' } } };
+    }, snapshot({ route: route({ phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: 'env_1', activeProxyRevision: 1, awaitingDeadline: stale }), pendingOperations: [probeOp, waitOp] }));
+    const Page = defineComponent({ render: () => [h(RouteCard), h(RouteActionHost)] });
+    const m = await mountWith(Page, ctx);
+    ctx.viewer.open('op_1', 'US-买家01');
+    await flush();
+    const retest = document.body.querySelector('[data-test="scene-guidance"]')?.textContent ?? '';
+    expect(retest).toContain(`请在 ${formatClock(own)} 前完成`);
+    expect(retest).not.toContain(formatClock(stale));
+    ctx.viewer.close();
+    await flush();
+    ctx.viewer.open('op_2', 'US-买家01');
+    await flush();
+    const waiting = document.body.querySelector('[data-test="waiting-route-guidance"]')?.textContent ?? '';
+    expect(waiting).toContain(`截止 ${formatClock(own)}`);
+    expect(waiting).not.toContain(formatClock(stale));
+    m.unmount();
+  });
+
   it('an activation that became a Safari retest (reused active environment, expired probe; kind stays route.activate, probeKind safari) gets the retest timeout and cancel texts, never the switch rollback promise', async () => {
     const deadline = '2026-10-21T08:02:00.000Z';
     const reuseOp = operation({
@@ -236,6 +264,7 @@ describe('activation from the environments page', () => {
       phase: 'VALIDATING',
       status: 'waiting',
       probeKind: 'safari',
+      waitDeadline: deadline,
       steps: [
         { at: '2026-10-21T08:00:00.000Z', phase: 'VALIDATING', message: '环境已在使用中，但实测已过期：改为 Safari 重测，不切换' },
         { at: '2026-10-21T08:00:01.000Z', phase: 'VALIDATING', message: '等待在绑定的 Safari 场景中完成出口检测（不切换、不断连）' },

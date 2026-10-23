@@ -100,6 +100,7 @@ export interface OperationViewContext {
 
 export function buildOperationView(op: OperationRecord, steps: readonly OperationStepRecord[], ctx: OperationViewContext): OperationView {
   const env = ctx.env;
+  const rp = payloadOf(op).route;
   return {
     ...operationSummary(op),
     requestId: op.requestId,
@@ -110,6 +111,8 @@ export function buildOperationView(op: OperationRecord, steps: readonly Operatio
     routeEpoch: op.routeEpoch,
     probeKind: op.probeKind,
     supersededBy: op.supersededBy,
+    // 操作自己的截止时间（与 native.ts 的 pendingVerification.deadline 相同）：签发之后为实测截止时间，之前为到达截止时间
+    waitDeadline: op.status === 'waiting' && rp ? (rp.verifyDeadline ?? rp.arrivalDeadline) : null,
     steps: steps.map((s) => ({ at: s.at, phase: s.phase, message: s.message })),
     effective: {
       desiredProxyRevision: env?.desiredProxyRevision ?? null,
@@ -154,6 +157,7 @@ export function buildRouteSummary(route: RouteStateRecord, normalModeOffered: bo
     entryMode: route.entryMode,
     phase: route.phase,
     buyerExitConnectionsUnconfirmed: route.warnings.includes('buyer_exit_connections_unconfirmed'),
+    entryUnconfirmed: route.warnings.includes('entry_unverified') || route.warnings.includes('precedence_violation'),
     normalModeOffered,
     reconciled,
   };
