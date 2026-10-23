@@ -184,9 +184,14 @@ describe('activation from the environments page', () => {
     const Page = defineComponent({ render: () => [h(RouteCard), h(RouteActionHost)] });
     const m = await mountWith(Page, ctx);
     expect(document.body.querySelector('[data-test="route-cancel"]')?.textContent?.trim()).toBe('取消切换');
+    // 结果要到回滚读回之后才知道：只说尝试恢复，写明无法确认时改选 REJECT（§6.3 第 14 步）
+    expect(document.body.textContent).toContain('取消会尝试恢复原节点并保持 Safari 阻断；无法确认时不恢复，改选 REJECT');
+    expect(document.body.textContent).not.toContain('取消会恢复原节点');
     click(document.body.querySelector('[data-test="route-cancel"]'));
     await flush();
     expect(document.body.textContent).toContain('确定要取消此次切换吗？');
+    expect(document.body.textContent).toContain('服务会尝试恢复切换前的节点选择并保持 Safari 阻断');
+    expect(document.body.textContent).not.toContain('服务会恢复切换前的节点选择');
     expect(document.body.textContent).toContain('不会进入普通模式');
     click(byText('.modal-footer button', '取消切换'));
     await flush();
@@ -196,4 +201,74 @@ describe('activation from the environments page', () => {
     expect(calls.some((c) => c.url === '/api/routing/normal')).toBe(false);
     m.unmount();
   });
+
+  it('the waiting-for-Safari guidance states each operation\'s own timeout outcome: a retest never restores a node or blocks Safari', async () => {
+    const deadline = '2026-10-21T08:02:00.000Z';
+    const probeOp = operation({ kind: 'probe.safari', phase: 'VALIDATING', status: 'waiting', probeKind: 'safari', steps: [{ at: '2026-10-21T08:00:00.000Z', phase: 'VALIDATING', message: '等待在绑定的 Safari 场景中完成出口检测（不切换、不断连）' }] });
+    const switchOp = operation({ id: 'op_2', kind: 'environment.update', phase: 'VERIFY_ONLY', status: 'waiting' });
+    const { ctx } = testContext((call: Call) => {
+      if (call.url === '/api/operations/op_1') return { status: 200, body: probeOp };
+      if (call.url === '/api/operations/op_2') return { status: 200, body: switchOp };
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: '找不到' } } };
+    }, snapshot({ route: route({ phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: 'env_1', activeProxyRevision: 1, awaitingDeadline: deadline }), pendingOperations: [probeOp, switchOp] }));
+    const Page = defineComponent({ render: () => [h(RouteCard), h(RouteActionHost)] });
+    const m = await mountWith(Page, ctx);
+    ctx.viewer.open('op_1', 'US-买家01');
+    await flush();
+    const retest = document.body.querySelector('[data-test="scene-guidance"]')?.textContent ?? '';
+    // 重测超时只结束检测（§6.4）：不承诺恢复原节点、阻断 Safari 或改选 REJECT
+    expect(retest).toContain('超时则本次重新检测失败，路由不变（不切换、不阻断 Safari）');
+    expect(retest).not.toContain('恢复原节点');
+    expect(retest).not.toContain('REJECT');
+    ctx.viewer.close();
+    await flush();
+    // 活动环境发布进入切换后的 VERIFY_ONLY 等待：超时按第 14 步回滚
+    ctx.viewer.open('op_2', 'US-买家01');
+    await flush();
+    expect(document.body.querySelector('[data-test="scene-guidance"]')?.textContent).toContain('超时会尝试恢复原节点并保持 Safari 阻断（无法确认时改选 REJECT 并要求处理）');
+    m.unmount();
+  });
+
+  it('an activation that became a Safari retest (reused active environment, expired probe; kind stays route.activate, probeKind safari) gets the retest timeout and cancel texts, never the switch rollback promise', async () => {
+    const deadline = '2026-10-21T08:02:00.000Z';
+    const reuseOp = operation({
+      kind: 'route.activate',
+      phase: 'VALIDATING',
+      status: 'waiting',
+      probeKind: 'safari',
+      steps: [
+        { at: '2026-10-21T08:00:00.000Z', phase: 'VALIDATING', message: '环境已在使用中，但实测已过期：改为 Safari 重测，不切换' },
+        { at: '2026-10-21T08:00:01.000Z', phase: 'VALIDATING', message: '等待在绑定的 Safari 场景中完成出口检测（不切换、不断连）' },
+      ],
+    });
+    const { ctx, calls } = testContext((call: Call) => {
+      if (call.url === '/api/operations/op_1') return { status: 200, body: reuseOp };
+      if (call.url === '/api/operations/op_1/cancel') return { status: 202, body: accepted };
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: '找不到' } } };
+    }, snapshot({ route: route({ operationId: 'op_1', phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: 'env_1', activeProxyRevision: 1, awaitingDeadline: deadline }), pendingOperations: [reuseOp] }));
+    const Page = defineComponent({ render: () => [h(RouteCard), h(RouteActionHost)] });
+    const m = await mountWith(Page, ctx);
+    // 路由卡：取消只结束检测，路由不变
+    expect(document.body.querySelector('[data-test="route-cancel"]')?.textContent?.trim()).toBe('取消重测');
+    expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).toContain('取消只结束本次检测，路由不变');
+    expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).not.toContain('恢复原节点');
+    ctx.viewer.open('op_1', 'US-买家01');
+    await flush();
+    const guidance = document.body.querySelector('[data-test="scene-guidance"]')?.textContent ?? '';
+    expect(guidance).toContain('超时则本次重新检测失败，路由不变（不切换、不阻断 Safari）');
+    expect(guidance).not.toContain('恢复原节点');
+    expect(guidance).not.toContain('REJECT');
+    expect(document.body.querySelector('[data-test="cancel-operation"]')?.textContent?.trim()).toBe('取消重测');
+    click(document.body.querySelector('[data-test="cancel-operation"]'));
+    await flush();
+    expect(document.body.textContent).toContain('确定要取消这次 Safari 重测吗？');
+    expect(document.body.textContent).toContain('只结束本次检测，路由不变（不切换、不阻断 Safari）');
+    expect(document.body.textContent).not.toContain('确定要取消此次切换吗？');
+    expect(document.body.textContent).not.toContain('服务会尝试恢复切换前的节点选择');
+    click(byText('.modal-footer button', '取消重测'));
+    await flush();
+    expect(calls.some((c) => c.url === '/api/operations/op_1/cancel')).toBe(true);
+    m.unmount();
+  });
 });
+

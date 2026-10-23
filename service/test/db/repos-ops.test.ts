@@ -187,6 +187,35 @@ describe('outbox', () => {
     expect(repos.outbox.claimNext(clock.now())).not.toBeNull();
   });
 
+  test('prefer: entries of earlier operation groups are claimed first, each group still by availableAt and id', () => {
+    const { repos, clock } = makeRepos();
+    const publish = seedOperation(repos, { kind: 'environment.update' });
+    const recovering = seedOperation(repos, { kind: 'environment.update' });
+    const activate = seedOperation(repos, { kind: 'route.activate' });
+    const normal = seedOperation(repos, { kind: 'route.normal' });
+    repos.outbox.enqueue(publish.id, null, T0);
+    repos.outbox.enqueue(normal.id, null, '2026-10-21T00:00:00.500Z');
+    repos.outbox.enqueue(activate.id, null, '2026-10-21T00:00:00.200Z');
+    repos.outbox.enqueue(recovering.id, 'profile_arrived', '2026-10-21T00:00:00.800Z');
+    clock.advance(1_000);
+    const prefer = [[recovering.id], [activate.id, normal.id]];
+    expect(repos.outbox.claimNext(clock.now(), prefer)?.operationId).toBe(recovering.id);
+    expect(repos.outbox.claimNext(clock.now(), prefer)?.operationId).toBe(activate.id);
+    expect(repos.outbox.claimNext(clock.now(), prefer)?.operationId).toBe(normal.id);
+    expect(repos.outbox.claimNext(clock.now(), prefer)?.operationId).toBe(publish.id);
+    // 不指定或只有空组时只按可用时间
+    const { repos: r2, clock: c2 } = makeRepos();
+    const p2 = seedOperation(r2, { kind: 'environment.update' });
+    const n2 = seedOperation(r2, { kind: 'route.normal' });
+    const q2 = seedOperation(r2, { kind: 'route.activate' });
+    r2.outbox.enqueue(p2.id, null, T0);
+    r2.outbox.enqueue(n2.id, null, T0);
+    r2.outbox.enqueue(q2.id, null, T0);
+    expect(r2.outbox.claimNext(c2.now())?.operationId).toBe(p2.id);
+    expect(r2.outbox.claimNext(c2.now(), [[], []])?.operationId).toBe(n2.id);
+    expect(r2.outbox.claimNext(c2.now(), [[], [q2.id]])?.operationId).toBe(q2.id);
+  });
+
   test('releaseClaims returns stale claims to the queue; cancelForOperation ends them', () => {
     const { repos, clock } = makeRepos();
     const op = seedOperation(repos);

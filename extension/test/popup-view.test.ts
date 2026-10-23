@@ -97,7 +97,7 @@ describe('popup states', () => {
   });
 
   it('unbound without another active environment does not offer normal mode', async () => {
-    const { wrapper } = await mountPopup(currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false } }));
+    const { wrapper } = await mountPopup(currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false, reconciled: true } }));
     expect(wrapper.find('[data-test="end-current"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="normal"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="buyer-exit-unconfirmed"]').exists()).toBe(false);
@@ -105,7 +105,7 @@ describe('popup states', () => {
   });
 
   it('unbound, idle normal mode that could not confirm Safari left the buyer exit: shows the warning and offers 进入普通模式 again', async () => {
-    const state = currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true } });
+    const state = currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true, reconciled: true } });
     const { wrapper, calls } = await mountPopup(state, { enterNormalMode: () => accepted('op_n') });
     expect(wrapper.find('[data-test="buyer-exit-unconfirmed"]').text()).toContain(WARNING_TEXT.buyer_exit_connections_unconfirmed);
     await wrapper.find('[data-test="normal"]').trigger('click');
@@ -116,11 +116,11 @@ describe('popup states', () => {
 
 describe('normal mode offered by the server-side flag (§6.5)', () => {
   // 回滚失败记为 NORMAL（阶段 attention、快照保留）：入口看起来是普通模式，Safari 仍可能有经 SFE-ROUTE 的连接
-  const attention = { routeEpoch: 4, entryMode: 'NORMAL' as const, phase: 'attention' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true };
+  const attention = { routeEpoch: 4, entryMode: 'NORMAL' as const, phase: 'attention' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true };
   // 普通模式结束连接失败之后读回也失败：路由记为空闲的普通模式、没有警告，持久标记仍在
-  const markerOnly = { routeEpoch: 5, entryMode: 'NORMAL' as const, phase: 'idle' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true };
+  const markerOnly = { routeEpoch: 5, entryMode: 'NORMAL' as const, phase: 'idle' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true };
   // 第一次激活被取消、没有切换前的环境：停在阻断
-  const blocked = { routeEpoch: 2, entryMode: 'BLOCKED' as const, phase: 'failed' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true };
+  const blocked = { routeEpoch: 2, entryMode: 'BLOCKED' as const, phase: 'failed' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true };
 
   it('bound, NORMAL with phase attention: offers 进入普通模式 and the header does not read as plain 普通模式', async () => {
     const { wrapper, calls } = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: attention }), { enterNormalMode: () => accepted('op_n') });
@@ -154,11 +154,26 @@ describe('normal mode offered by the server-side flag (§6.5)', () => {
 
   it('unbound, idle NORMAL and the server does not offer normal mode: no button, header 普通模式', async () => {
     const { wrapper } = await mountPopup(
-      currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false } }),
+      currentState({ environment: null, route: null, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false, reconciled: true } }),
     );
     expect(wrapper.find('[data-test="normal"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="route-unsettled"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="entry-mode"]').text()).toBe('普通模式');
+  });
+});
+
+describe('route summary read without a completed reconcile (§7.2)', () => {
+  it.each([
+    ['ACTIVE', '托管中'],
+    ['BLOCKED', 'Safari 已阻断'],
+    ['VERIFY_ONLY', '仅允许出口检测'],
+  ] as const)('header does not claim %s while the summary is unreconciled (executor busy or Surge read timed out)', async (mode, claim) => {
+    const summary = { routeEpoch: 7, entryMode: mode, phase: 'active_verified' as const, buyerExitConnectionsUnconfirmed: false, normalModeOffered: true };
+    const unchecked = await mountPopup(currentState({ routeSummary: { ...summary, reconciled: false }, ordersAllowed: false, ordersBlockedReason: '读取 Surge 状态超时' }));
+    expect(unchecked.wrapper.find('[data-test="entry-mode"]').text()).toBe('正在确认入口状态');
+    expect(unchecked.wrapper.find('[data-test="entry-mode"]').text()).not.toContain(claim);
+    const checked = await mountPopup(currentState({ routeSummary: { ...summary, reconciled: true } }));
+    expect(checked.wrapper.find('[data-test="entry-mode"]').text()).toBe(claim);
   });
 });
 
@@ -167,7 +182,7 @@ describe('unidentified profile (e.g. the default profile) still shows the route 
 
   it('buyer-exit warning: shown, with where normal mode can be entered; no action is sent from here', async () => {
     const { wrapper, calls } = await mountPopup(
-      currentState({ ...unidentified, relation: 'none_active', routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true } }),
+      currentState({ ...unidentified, relation: 'none_active', routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true, reconciled: true } }),
     );
     expect(wrapper.find('[data-test="unidentified"] [data-warning="buyer_exit_connections_unconfirmed"]').text()).toBe(WARNING_TEXT.buyer_exit_connections_unconfirmed);
     expect(wrapper.find('[data-test="unidentified-normal-hint"]').text()).toContain('网页后台');
@@ -178,7 +193,7 @@ describe('unidentified profile (e.g. the default profile) still shows the route 
 
   it('another environment in use: says this profile\'s requests use its exit, without naming it', async () => {
     const { wrapper } = await mountPopup(
-      currentState({ ...unidentified, relation: 'other_active', routeSummary: { routeEpoch: 7, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true } }),
+      currentState({ ...unidentified, relation: 'other_active', routeSummary: { routeEpoch: 7, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true } }),
     );
     expect(wrapper.find('[data-test="unidentified-other-active"]').text()).toContain('此场景的请求也会经过它的出口');
     expect(wrapper.find('[data-test="unidentified-normal-hint"]').exists()).toBe(true);
@@ -187,7 +202,7 @@ describe('unidentified profile (e.g. the default profile) still shows the route 
 
   it('route in plain idle normal mode: only the named-profile guidance', async () => {
     const { wrapper } = await mountPopup(
-      currentState({ ...unidentified, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false } }),
+      currentState({ ...unidentified, relation: 'none_active', routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false, reconciled: true } }),
     );
     expect(wrapper.find('[data-test="named-profile-required"]').exists()).toBe(true);
     expect(wrapper.find('[data-test="unidentified-route"]').exists()).toBe(false);
@@ -290,7 +305,7 @@ describe('bound popup', () => {
   });
 
   it('shows the pending banner with 继续验证 and cancel', async () => {
-    const pending = { operation_id: 'op_w', kind: 'activate' as const, deadline: iso(120) };
+    const pending = { operation_id: 'op_w', kind: 'activate' as const, waiting_route: false, deadline: iso(120) };
     const { wrapper, browser, calls } = await mountPopup(currentState({ pendingVerification: pending }), { cancelOperation: () => accepted('op_w') });
     expect(wrapper.find('[data-test="pending-banner"]').text()).toContain('切换到此环境');
     await wrapper.find('[data-test="continue-verify"]').trigger('click');
@@ -298,9 +313,43 @@ describe('bound popup', () => {
     expect(browser.tabs!.create).toHaveBeenCalledWith({ url: 'safari-web-extension://ext-uuid/prepare.html?op=op_w', active: true });
     await wrapper.find('[data-test="cancel-pending"]').trigger('click');
     expect(wrapper.text()).toContain('不会进入普通模式');
+    // 只说尝试恢复：回到阻断无法确认时不恢复，改选 REJECT（§6.3 第 14 步）
+    expect(wrapper.text()).toContain('将尝试恢复切换前的节点选择并保持 Safari 阻断');
+    expect(wrapper.text()).toContain('无法确认时不恢复，改选 REJECT');
     await wrapper.find('[data-test="confirm-cancel"]').trigger('click');
     await flushPromises();
     expect(calls.find((m) => m.type === 'cancelOperation')).toMatchObject({ operation_id: 'op_w' });
+  });
+
+  it('cancel text follows the pending operation\'s phase: an active-environment publish waiting for the scene only ends the wait; once it has switched (VERIFY_ONLY) cancelling rolls back like an activation; a retest only ends the retest', async () => {
+    const waiting = { operation_id: 'op_w', kind: 'apply_new_revision' as const, waiting_route: true, deadline: iso(120) };
+    const w = await mountPopup(currentState({ pendingVerification: waiting }));
+    expect(w.wrapper.find('[data-test="cancel-pending"]').text()).toBe('取消等待');
+    await w.wrapper.find('[data-test="cancel-pending"]').trigger('click');
+    expect(w.wrapper.text()).toContain('新版本保持已部署，当前出口不变，下次打开时再切换。');
+    expect(w.wrapper.text()).not.toContain('将尝试恢复切换前的节点选择');
+    w.wrapper.unmount();
+
+    // 绑定场景已到达：Safari 已阻断、已选择新节点，停在 VERIFY_ONLY——取消按第 14 步回滚，「当前出口不变」不成立
+    const switched = { operation_id: 'op_w', kind: 'apply_new_revision' as const, waiting_route: false, deadline: iso(120) };
+    const s2 = await mountPopup(currentState({ pendingVerification: switched }), { cancelOperation: () => accepted('op_w') });
+    expect(s2.wrapper.find('[data-test="cancel-pending"]').text()).toBe('取消切换');
+    await s2.wrapper.find('[data-test="cancel-pending"]').trigger('click');
+    expect(s2.wrapper.text()).not.toContain('当前出口不变');
+    expect(s2.wrapper.text()).not.toContain('下次打开时再切换');
+    expect(s2.wrapper.text()).toContain('将尝试恢复切换前的节点选择并保持 Safari 阻断');
+    expect(s2.wrapper.text()).toContain('无法确认时不恢复，改选 REJECT');
+    await s2.wrapper.find('[data-test="confirm-cancel"]').trigger('click');
+    await flushPromises();
+    expect(s2.calls.find((m) => m.type === 'cancelOperation')).toMatchObject({ operation_id: 'op_w' });
+    s2.wrapper.unmount();
+
+    const retest = { operation_id: 'op_r', kind: 'probe_safari' as const, waiting_route: false, deadline: iso(120) };
+    const r = await mountPopup(currentState({ pendingVerification: retest }));
+    expect(r.wrapper.find('[data-test="cancel-pending"]').text()).toBe('取消重测');
+    await r.wrapper.find('[data-test="cancel-pending"]').trigger('click');
+    expect(r.wrapper.text()).toContain('将结束本次出口检测，路由不变');
+    expect(r.wrapper.text()).not.toContain('将尝试恢复切换前的节点选择');
   });
 
   it('confirmation dialog shows both options with consequences and resends on choice', async () => {
@@ -350,15 +399,15 @@ describe('bound popup', () => {
   });
 
   it('only offers 进入普通模式 when there is something to undo', async () => {
-    const idle = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false } }));
+    const idle = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 1, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: false, normalModeOffered: false, reconciled: true } }));
     expect(idle.wrapper.find('[data-test="normal"]').exists()).toBe(false);
     expect(idle.wrapper.find('[data-test="warnings"]').exists()).toBe(false);
-    const blocked = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 2, entryMode: 'BLOCKED', phase: 'failed', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true } }));
+    const blocked = await mountPopup(currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 2, entryMode: 'BLOCKED', phase: 'failed', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true } }));
     expect(blocked.wrapper.find('[data-test="normal"]').exists()).toBe(true);
   });
 
   it('idle normal mode that could not confirm Safari left the buyer exit: shows the warning and offers 进入普通模式 again', async () => {
-    const state = currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true } });
+    const state = currentState({ relation: 'none_active', route: null, routeSummary: { routeEpoch: 3, entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true, reconciled: true } });
     const { wrapper, calls } = await mountPopup(state, { enterNormalMode: () => accepted('op_n') });
     expect(wrapper.find('[data-warning="buyer_exit_connections_unconfirmed"]').text()).toBe(WARNING_TEXT.buyer_exit_connections_unconfirmed);
     await wrapper.find('[data-test="normal"]').trigger('click');
@@ -384,7 +433,7 @@ describe('popup polling lifecycle', () => {
   });
 
   it('opening and polling never sends a routing request or opens a page, even with a pending verification', async () => {
-    const pending = { operation_id: 'op_w', kind: 'activate' as const, deadline: null };
+    const pending = { operation_id: 'op_w', kind: 'activate' as const, waiting_route: false, deadline: null };
     const { calls, browser } = await mountPopup(currentState({ pendingVerification: pending, relation: 'other_active', route: null }));
     await vi.advanceTimersByTimeAsync(5000);
     expect(new Set(calls.map((m) => m.type))).toEqual(new Set(['getCurrentState']));

@@ -146,15 +146,16 @@ export function buildRouteView(route: RouteStateRecord, lastSafariProbe: ProbeRe
 
 /**
  * 非当前环境的场景只拿到路由摘要（不含实测、选择、操作 id，警告只有是否需要再次进入普通模式结束 Safari 连接；是否提供
- * 「进入普通模式」由服务端判定后填入）。
+ * 「进入普通模式」与读取之前是否完成过对账由服务端判定后填入）。
  */
-export function buildRouteSummary(route: RouteStateRecord, normalModeOffered: boolean): RouteSummaryView {
+export function buildRouteSummary(route: RouteStateRecord, normalModeOffered: boolean, reconciled: boolean): RouteSummaryView {
   return {
     routeEpoch: route.routeEpoch,
     entryMode: route.entryMode,
     phase: route.phase,
     buyerExitConnectionsUnconfirmed: route.warnings.includes('buyer_exit_connections_unconfirmed'),
     normalModeOffered,
+    reconciled,
   };
 }
 

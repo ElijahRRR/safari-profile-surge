@@ -199,8 +199,16 @@ export interface CurrentStateResponse {
   routeSummary: RouteSummaryView;
   relation: 'this_active' | 'other_active' | 'none_active';
   otherActiveLabel: string | null;
-  /** 当前场景绑定的环境有等待场景到达或实测的路由操作。 */
-  pendingVerification: { operation_id: OperationId; kind: 'activate' | 'apply_new_revision' | 'reverify' | 'probe_safari'; deadline: IsoTime | null } | null;
+  /**
+   * 当前场景绑定的环境有等待场景到达或实测的路由操作。waiting_route：操作停在 WAITING_ROUTE（活动环境的新版本已部署、尚未
+   * 开始切换，取消只结束等待、路由不变）；活动环境发布进入切换之后（VERIFY_ONLY 等待）为 false，取消与激活一样回滚。
+   */
+  pendingVerification: {
+    operation_id: OperationId;
+    kind: 'activate' | 'apply_new_revision' | 'reverify' | 'probe_safari';
+    waiting_route: boolean;
+    deadline: IsoTime | null;
+  } | null;
   /** 仅已识别且未绑定时返回：可关联的未绑定环境。 */
   bindable: BindableEnvironment[];
   activationAvailable: boolean;

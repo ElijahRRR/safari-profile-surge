@@ -37,7 +37,7 @@ import { LIMITS, validateEnvironmentChanges, validateEnvironmentInput } from '..
 import { fingerprint } from '../secrets/pepper.js';
 import type { Engine } from './context.js';
 import { acceptedOf, commitOperation, findDuplicateOperation, findLedger, recordLedger, requestDigest, requireRequestId } from './ledger.js';
-import { confirmationNeeded, needsConfirmationError, routeBusyError, routeOps, supersedeWaiting } from './route-control.js';
+import { confirmationNeeded, needsConfirmationError, routeBusyError, routeOps, supersedeWaiting, waitingEnvironments } from './route-control.js';
 import type { ViewService } from './view-service.js';
 
 export interface AcceptDeps {
@@ -788,7 +788,7 @@ export async function acceptActivate(deps: AcceptDeps, id: string, req: Activate
     return created;
   });
   deps.kick();
-  engine.emit({ operations: [op.id, ...touched], environments: [env.id], route: touched.length > 0 });
+  engine.emit({ operations: [op.id, ...touched], environments: [...new Set([env.id, ...waitingEnvironments(state)])], route: touched.length > 0 });
   return acceptedOf(op, false);
 }
 
@@ -801,11 +801,15 @@ export async function acceptNormal(deps: AcceptDeps, req: NormalModeRequest, act
   if (dup) return acceptedOf(dup, true);
   const policy = oldSessionPolicyOf(req.old_session_policy);
   const confirmed = confirmedIdOf(req.confirmed_environment_id);
+  // 进入普通模式永远可用（docs/ARCHITECTURE.md §5.2、§6.5）；显式请求串行处理、旧请求的结果不能覆盖新请求（方案 1 设计「多环境
+  // 争抢」一行）：路由操作已排队或正在执行时不返回 ROUTE_BUSY，照常受理并排在其后——执行中的激活在第一次写入 Surge 之前、下一次
+  // 放宽入口（VERIFY_ONLY、ACTIVE）或提交之前看到排队的普通模式就停下，把路由交给它（handlers/route.ts yieldToQueuedNormal）；
+  // 回滚、重测与另一次普通模式照常完成。普通模式开始执行时再结束仍在等待的激活与重测。
   const state = routeOps(engine);
-  if (state.busy.length > 0) throw routeBusyError('进入普通模式');
   const route = repos.routeState.get();
   const need = confirmationNeeded(engine, null);
   if (need && (policy === null || confirmed !== route.activeEnvironmentId)) throw needsConfirmationError('进入普通模式', need);
+  const queuedBehind = state.busy.map((o) => o.id);
   const touched: string[] = [];
   const op = repos.tx(() => {
     const created = insertOperation(engine, {
@@ -813,14 +817,22 @@ export async function acceptNormal(deps: AcceptDeps, req: NormalModeRequest, act
       requestId,
       digest,
       actor,
-      payload: { normal: { oldSessionPolicy: policy, expectedActiveEnvironmentId: route.activeEnvironmentId, hadManagedEnvironment: route.activeEnvironmentId !== null } },
-      step: '已受理进入普通模式',
+      payload: {
+        normal: {
+          oldSessionPolicy: policy,
+          expectedActiveEnvironmentId: route.activeEnvironmentId,
+          hadManagedEnvironment: route.activeEnvironmentId !== null,
+          ...(queuedBehind.length > 0 ? { queuedBehind } : {}),
+        },
+      },
+      step: queuedBehind.length > 0 ? '已受理进入普通模式：正在进行的切换或检测停下（或完成）之后立即执行' : '已受理进入普通模式',
     });
     touched.push(...supersedeWaiting(engine, created.id, state));
     return created;
   });
   deps.kick();
-  engine.emit({ operations: [op.id, ...touched], route: touched.length > 0 });
+  // 被结束的等待中激活与重测的目标环境随之改变（切换中、检测中 → 未使用）：一起发布，否则网页后台一直显示它们切换中
+  engine.emit({ operations: [op.id, ...touched], route: touched.length > 0, environments: waitingEnvironments(state) });
   return acceptedOf(op, false);
 }
 

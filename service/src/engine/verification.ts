@@ -83,44 +83,56 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
   const sel = await currentSelection(engine);
   if (sel !== p.nodeName) throw new SfeError('SAFARI_VERIFY_FAILED', '检测失败：SFE-ROUTE 选择已不是目标节点');
 
-  const existing = repos.verificationTests
-    .listForOperation(op.id)
-    .find((t) => t.consumedAt === null && t.profileId === ctx.profileId && t.routeEpoch === route.routeEpoch && Date.parse(t.deadline) > now.getTime());
+  // 读取选择（一次 Surge 调用）期间执行器可能已结束本操作：开始执行的普通模式结束停在等待中的切换与重测（epoch 递增、路由交给
+  // 它），取消、超时或回滚。签发在事务中重读操作与路由，任何一项变化都不签发——不给已结束的操作追加步骤、不在别的操作负责的
+  // 路由上写等待截止时间、不安排计时器（§6.3 并发矩阵：取代使 test_id 失效）。
   const endpoint = engine.verifyEndpoint();
-  if (existing) {
-    return { status: 'ready', test_id: existing.testId, route_epoch: existing.routeEpoch, verify_url: buildVerifyUrl(endpoint, existing.testId), deadline: existing.deadline };
-  }
-  const deadline = p.verifyDeadline ?? new Date(now.getTime() + repos.settings.get('safariVerifyTimeoutSec') * 1000).toISOString();
-  const testId = engine.ids.token(24);
-  const first = p.verifyDeadline === null;
-  repos.tx(() => {
+  const issued = repos.tx(() => {
+    const fresh = repos.operations.get(op.id)!;
+    const fp = payloadOf(fresh).route!;
+    const fr = repos.routeState.get();
+    if (fresh.status !== 'waiting' || (fp.stage !== 'verify_only' && fp.stage !== 'probe_waiting')) throw opError(fresh);
+    if (fresh.routeEpoch !== fr.routeEpoch || fr.routeEpoch !== route.routeEpoch) throw new SfeError('STALE_ROUTE_EPOCH', '检测失败：路由已变化，请重新开始');
+    // 切换的 VERIFY_ONLY 等待由本操作负责路由；重测不写路由，只要求路由仍是使用中且已验证
+    if (fp.stage === 'verify_only' && fr.operationId !== op.id) throw new SfeError('SUPERSEDED', '检测已结束：路由已由其他操作接手');
+    if (fp.stage === 'probe_waiting' && (fr.entryMode !== 'ACTIVE' || fr.phase !== 'active_verified')) return null;
+    const at = engine.now();
+    if (fp.verifyDeadline !== null && Date.parse(fp.verifyDeadline) <= at.getTime()) throw new SfeError('SAFARI_VERIFY_TIMEOUT', 'Safari 实测超时：请重新开始');
+    const existing = repos.verificationTests
+      .listForOperation(op.id)
+      .find((t) => t.consumedAt === null && t.profileId === ctx.profileId && t.routeEpoch === fr.routeEpoch && Date.parse(t.deadline) > at.getTime());
+    if (existing) return { testId: existing.testId, routeEpoch: existing.routeEpoch, deadline: existing.deadline, first: false };
+    const deadline = fp.verifyDeadline ?? new Date(at.getTime() + repos.settings.get('safariVerifyTimeoutSec') * 1000).toISOString();
+    const testId = engine.ids.token(24);
+    const first = fp.verifyDeadline === null;
     repos.verificationTests.insert({
       testId,
       operationId: op.id,
-      environmentId: p.targetEnvironmentId,
+      environmentId: fp.targetEnvironmentId,
       profileId: ctx.profileId,
-      routeEpoch: route.routeEpoch,
-      purpose: p.purpose,
+      routeEpoch: fr.routeEpoch,
+      purpose: fp.purpose,
       deadline,
     });
-    const fresh = repos.operations.get(op.id)!;
     savePayload(engine, fresh, {
       verifyDeadline: deadline,
-      arrivedAt: p.arrivedAt ?? now.toISOString(),
+      arrivedAt: fp.arrivedAt ?? at.toISOString(),
       arrivedProfileId: ctx.profileId,
-      amazonTabsAtVerify: p.amazonTabsAtVerify ?? ctx.amazonTabsOpen,
+      amazonTabsAtVerify: fp.amazonTabsAtVerify ?? ctx.amazonTabsOpen,
     });
     if (first) {
       repos.routeState.update({ awaitingDeadline: deadline });
-      repos.operations.appendStep(op.id, op.phase, ctx.amazonTabsOpen ? '绑定场景已到达（已有 Amazon 标签页：本次打开记为未经启动验证）' : '绑定场景已到达，开始出口检测');
+      repos.operations.appendStep(op.id, fresh.phase, ctx.amazonTabsOpen ? '绑定场景已到达（已有 Amazon 标签页：本次打开记为未经启动验证）' : '绑定场景已到达，开始出口检测');
       repos.outbox.enqueue(op.id, 'verify_timeout', deadline);
     }
+    return { testId, routeEpoch: fr.routeEpoch, deadline, first };
   });
-  if (first) {
+  if (!issued) return { status: 'pending', phase: op.phase, message: '等待路由恢复到使用中状态' };
+  if (issued.first) {
     ctx.kick();
     engine.emit({ operations: [op.id], route: true });
   }
-  return { status: 'ready', test_id: testId, route_epoch: route.routeEpoch, verify_url: buildVerifyUrl(endpoint, testId), deadline };
+  return { status: 'ready', test_id: issued.testId, route_epoch: issued.routeEpoch, verify_url: buildVerifyUrl(endpoint, issued.testId), deadline: issued.deadline };
 }
 
 function parseIso(v: unknown): string | null {

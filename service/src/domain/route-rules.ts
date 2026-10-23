@@ -77,6 +77,14 @@ export interface ControlEvaluation {
   reason: string | null;
 }
 
+/**
+ * 动作前检查（engine/app-service.ts ensureInControl）的结果。checked 为 false：有效期内没有完成过对账（执行器正忙、读取 Surge
+ * 超时或失败），路由记录可能还没有反映 Surge 的变化（例如 Surge 重启之后临时规则已丢弃），ok 一定为 false。
+ */
+export interface PrecheckEvaluation extends ControlEvaluation {
+  checked: boolean;
+}
+
 /** 只按数据库状态判定“受控”（不读 Surge）。 */
 export function evaluateControl(route: RouteStateRecord, probe: ProbeRecord | null, now: Date): ControlEvaluation {
   if (route.activeEnvironmentId === null) return { ok: false, reason: '当前没有使用中的环境' };

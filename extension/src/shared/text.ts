@@ -55,7 +55,7 @@ export const PHASE_TEXT: Record<OperationPhase, string> = {
   ROLLING_BACK: '正在回滚',
   FAILED: '失败',
   SUPERSEDED: '已被新的操作取代',
-  BLOCKED_NEEDS_ATTENTION: 'Safari 保持阻断，需要处理',
+  BLOCKED_NEEDS_ATTENTION: '未能确认，需要处理',
 };
 
 export type BadgeStatus = 'success' | 'warning' | 'error' | 'info';
@@ -106,9 +106,13 @@ export function summaryOffersNormal(summary: RouteSummaryView): boolean {
   );
 }
 
-/** 弹窗顶栏的入口状态：入口记为普通模式、但服务端仍提供「进入普通模式」时不显示成单纯的「普通模式」。 */
+/**
+ * 弹窗顶栏的入口状态：入口记为普通模式、但服务端仍提供「进入普通模式」时不显示成单纯的「普通模式」；读取之前没有完成对账
+ * （reconciled 为 false：执行器正忙或读取 Surge 超时，例如 Surge 刚重启）时不按记录的入口声称托管中、已阻断或只允许检测。
+ */
 export function entryModeHeaderText(summary: RouteSummaryView): string {
   if (summary.entryMode === 'NORMAL' && summaryOffersNormal(summary)) return '普通模式（未确认）';
+  if (summary.reconciled === false && summary.entryMode !== 'NORMAL' && summary.entryMode !== 'UNKNOWN') return '正在确认入口状态';
   return ENTRY_MODE_TEXT[summary.entryMode];
 }
 

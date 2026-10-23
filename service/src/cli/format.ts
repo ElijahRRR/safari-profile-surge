@@ -112,7 +112,7 @@ export const PHASE_TEXT: Record<OperationPhase, string> = {
   ROLLING_BACK: '回滚中',
   FAILED: '失败',
   SUPERSEDED: '已被取代',
-  BLOCKED_NEEDS_ATTENTION: '已阻断，需要处理',
+  BLOCKED_NEEDS_ATTENTION: '未能确认，需要处理',
 };
 
 export const STATUS_TEXT: Record<OperationStatus, string> = {

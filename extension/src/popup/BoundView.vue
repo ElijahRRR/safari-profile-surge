@@ -87,12 +87,19 @@ const primary = computed<'continue' | 'orders' | 'activate'>(() => {
   return 'activate';
 });
 
+// 取消的后果按操作所处的阶段说明（§6.3 第 14 步、§6.4）：活动环境发布只有停在 WAITING_ROUTE（尚未切换）时取消才只结束等待；
+// 进入切换之后（VERIFY_ONLY 等待：Safari 已阻断、已选择新节点）与激活一样回滚；重新检测只结束检测，路由不变
 const cancelText = computed(() =>
-  pending.value?.kind === 'apply_new_revision'
+  pending.value?.waiting_route
     ? '新版本保持已部署，当前出口不变，下次打开时再切换。'
     : pending.value?.kind === 'probe_safari'
-      ? '将结束本次出口检测。'
-      : '将恢复切换前的节点选择并保持 Safari 阻断，之后需要重新核验；不会进入普通模式。',
+      ? '将结束本次出口检测，路由不变（不切换、不阻断 Safari）。'
+      : '将尝试恢复切换前的节点选择并保持 Safari 阻断，之后需要重新核验；无法确认时不恢复，改选 REJECT 拒绝 Safari 经本应用出口的新连接并要求处理。不会进入普通模式。',
+);
+/** 取消按钮按效果命名（与网页后台相同：取消等待、取消重测、取消切换）。 */
+const cancelLabel = computed(() => (pending.value?.waiting_route ? '取消等待' : pending.value?.kind === 'probe_safari' ? '取消重测' : '取消切换'));
+const cancelTitle = computed(() =>
+  pending.value?.waiting_route ? '确定要取消等待场景打开吗？' : pending.value?.kind === 'probe_safari' ? '确定要取消这次重新检测吗？' : '确定要取消这次切换吗？',
 );
 
 async function doCancel() {
@@ -135,7 +142,7 @@ async function doAckWindows() {
       <p v-if="pending.deadline" class="mt-0.5 text-xs text-gray-500 dark:text-dark-400">截止时间 {{ new Date(pending.deadline).toLocaleTimeString('zh-CN') }}</p>
       <div class="mt-3 flex gap-2">
         <button type="button" class="btn btn-primary btn-sm" :disabled="!!s.busy" data-test="continue-verify" @click="c.continueVerification()">继续验证</button>
-        <button type="button" class="btn btn-secondary btn-sm" :disabled="!!s.busy" data-test="cancel-pending" @click="confirmCancel = true">取消切换</button>
+        <button type="button" class="btn btn-secondary btn-sm" :disabled="!!s.busy" data-test="cancel-pending" @click="confirmCancel = true">{{ cancelLabel }}</button>
       </div>
     </div>
 
@@ -232,11 +239,11 @@ async function doAckWindows() {
       </div>
     </div>
 
-    <BaseDialog v-if="confirmCancel" title="确定要取消这次切换吗？" width="narrow" @close="confirmCancel = false">
+    <BaseDialog v-if="confirmCancel" :title="cancelTitle" width="narrow" @close="confirmCancel = false">
       <p>{{ cancelText }}</p>
       <template #footer>
         <button type="button" class="btn btn-secondary btn-sm" @click="confirmCancel = false">取消</button>
-        <button type="button" class="btn btn-danger btn-sm" data-test="confirm-cancel" @click="doCancel">取消切换</button>
+        <button type="button" class="btn btn-danger btn-sm" data-test="confirm-cancel" @click="doCancel">{{ cancelLabel }}</button>
       </template>
     </BaseDialog>
     <BaseDialog v-if="confirmWindows" title="确定已关闭旧窗口吗？" width="narrow" @close="confirmWindows = false">

@@ -1,5 +1,5 @@
 // 路由操作并发矩阵与旧窗口确认（docs/ARCHITECTURE.md §6.1、§6.3 受理、§6.5）。按操作状态判断：
-// queued/running → 新的路由操作返回 ROUTE_BUSY；等待中的激活/重测 → 新的激活或普通模式把它结束为
+// queued/running → 新的激活与重测返回 ROUTE_BUSY，新的普通模式排在其后（永远可用，见 accept.ts acceptNormal）；等待中的激活/重测 → 新的激活或普通模式把它结束为
 // SUPERSEDED（epoch 递增使其 test_id 失效，不回滚）；WAITING_ROUTE → 结束为 READY_FOR_NEXT_OPEN。
 
 import {
@@ -43,7 +43,20 @@ export function routeBusyError(action: string): SfeError {
   return new SfeError('ROUTE_BUSY', `${action}失败：正在切换出口或检测，请稍后再试`);
 }
 
-/** 新的激活或普通模式：在受理事务中结束等待中的路由操作。返回受影响的操作 id。 */
+/**
+ * 将被 supersedeWaiting 结束的等待中路由操作的目标环境：它们的环境视图随之改变（切换中、检测中 → 未使用，发布等待切换 →
+ * 下次打开时切换），调用方随操作一起发布这些环境（网页后台只在 environment.updated 事件中更新环境）。
+ */
+export function waitingEnvironments(state: Pick<RouteOpsState, 'waitingVerification' | 'waitingRoute'>): string[] {
+  const ids = new Set<string>();
+  for (const op of [...state.waitingVerification, ...state.waitingRoute]) {
+    const id = payloadOf(op).route?.targetEnvironmentId ?? op.environmentId;
+    if (id) ids.add(id);
+  }
+  return [...ids];
+}
+
+/** 新的激活或普通模式：在受理事务中结束等待中的路由操作。返回受影响的操作 id（目标环境见 waitingEnvironments）。 */
 export function supersedeWaiting(engine: Engine, newOpId: string, state: RouteOpsState): string[] {
   const { repos } = engine;
   const touched: string[] = [];

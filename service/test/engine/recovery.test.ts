@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME } from '@sfe/contract';
-import { FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
-import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
+import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, type RollbackResult } from '@sfe/contract';
+import { FAKE_CHROME_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
+import { capabilityUnverified } from '../../src/surge/primitives.js';
+import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, envInput, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -11,7 +12,7 @@ afterEach(async () => {
 });
 
 /** 让某个 FakeSurge 原语挂起（模拟进程在调用中途崩溃）。 */
-function hang(name: 'updateExternalResource' | 'selectGroupPolicy' | 'getGroupMembers', when: (...args: string[]) => boolean = () => true): { entered: () => boolean; restore: () => void } {
+function hang(name: 'updateExternalResource' | 'selectGroupPolicy' | 'getGroupMembers' | 'listActiveRequests', when: (...args: string[]) => boolean = () => true): { entered: () => boolean; restore: () => void } {
   const fake = h.fake as unknown as Record<string, (...args: string[]) => Promise<unknown>>;
   const orig = fake[name]!.bind(h.fake);
   let entered = false;
@@ -296,5 +297,160 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
     for (let i = 0; i < 50 && h.store.has('sec_stale0001'); i++) await new Promise((r) => setImmediate(r));
     expect(h.store.has('sec_stale0001')).toBe(false);
     expect(h.repos.secretRefs.get('sec_stale0001')).toBeNull();
+  });
+});
+
+describe('crash recovery with a normal mode accepted behind the interrupted operation (§6.1 claim order)', () => {
+  /** 记录重启之后领取的条目属于哪个操作（照常按执行器给出的优先级领取）。 */
+  function recordClaims(): string[] {
+    const order: string[] = [];
+    const claim = h.repos.outbox.claimNext.bind(h.repos.outbox);
+    h.repos.outbox.claimNext = (now, prefer) => {
+      const row = claim(now, prefer);
+      if (row) order.push(row.operationId);
+      return row;
+    };
+    return order;
+  }
+
+  /**
+   * 使用中环境 A 改代理（发布 P，environment.update）停在 WAITING_ROUTE；绑定场景到达后 P 开始切换，挂在选择新节点上（已递增
+   * epoch、阻断、结束连接；opts.duringRollback：选择新节点失败，挂在回滚恢复切换前的节点上）；其间受理进入普通模式 N（排在 P 之后），
+   * 然后服务崩溃。
+   */
+  async function crashMidPublishSwitchWithQueuedNormal(opts: { duringRollback?: boolean } = {}): Promise<{ envId: string; nodeA: string; P: string; N: string }> {
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeA = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
+    const env = h.repos.environments.get(envId)!;
+    const u = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.20' } } }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(u.operation_id)).toMatchObject({ kind: 'environment.update', phase: 'WAITING_ROUTE' });
+    if (opts.duringRollback) h.fake.failNext('selectGroupPolicy');
+    const stuck = hang('selectGroupPolicy', (_g, p) => p !== 'REJECT' && (!opts.duringRollback || p === nodeA));
+    await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u.operation_id, amazon_tabs_open: false });
+    await until(stuck.entered);
+    expect(h.repos.operations.get(u.operation_id)).toMatchObject({ status: 'running', phase: opts.duringRollback ? 'ROLLING_BACK' : 'SAFARI_BLOCKED' });
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'BLOCKED', operationId: u.operation_id });
+    const n = await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: envId }, WEB);
+    expect(h.repos.operations.get(n.operation_id)).toMatchObject({ status: 'queued', payload: { normal: { queuedBehind: [u.operation_id] } } });
+    stuck.restore();
+    return { envId, nodeA, P: u.operation_id, N: n.operation_id };
+  }
+
+  function expectOriginalRules(N: string): void {
+    expect(h.repos.operations.get(N)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'idle', entryMode: 'NORMAL', activeEnvironmentId: null, operationId: N });
+    // Safari 按 Surge 原规则发出（合成工作配置的 FINAL,DIRECT），不是本应用入口的阻断或 SFE-ROUTE；Chrome 从不命中 Safari 规则
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    expect(safariOutcome(h, FAKE_VERIFY_HOST)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    expect(h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp' }).rule).toBe('FINAL,DIRECT');
+  }
+
+  for (const entryStrategy of ['ruleset_resource', 'temp_rule'] as const) {
+    test(`[${entryStrategy}] crash mid active-environment publish switch with a queued normal mode → the interrupted switch is recovered (rolled back) first, then the normal mode leaves Safari on the original rules`, async () => {
+      h = await createHarness({ entryStrategy });
+      const { nodeA, P, N } = await crashMidPublishSwitchWithQueuedNormal();
+      const order = recordClaims();
+      await h.crash();
+      await h.idle();
+      // 重启前持有执行器的发布先按事实恢复（回滚到切换前的节点并保持阻断），之后才执行排在它之后的普通模式
+      expect(order.indexOf(P)).toBe(0);
+      expect(order.indexOf(N)).toBeGreaterThan(0);
+      const pub = h.repos.operations.get(P)!;
+      expect(pub).toMatchObject({ phase: 'FAILED', status: 'failed' });
+      expect((pub.result as { rollback: RollbackResult }).rollback).toMatchObject({ restoredSelection: nodeA, entryModeAfter: 'BLOCKED' });
+      expect(h.repos.operations.listSteps(P).at(-1)!.message).toContain('已回滚：恢复切换前的节点');
+      expectOriginalRules(N);
+    });
+  }
+
+  test('[ruleset_resource, rule match unavailable] the interrupted switch holds REJECT first (unconfirmed rollback); the normal mode then still ends on the original rules', async () => {
+    h = await createHarness({ entryStrategy: 'ruleset_resource' });
+    const { P, N } = await crashMidPublishSwitchWithQueuedNormal();
+    h.fake.matchRule = async () => {
+      throw capabilityUnverified('matchRule');
+    };
+    const order = recordClaims();
+    await h.crash();
+    await h.idle();
+    expect(order.indexOf(P)).toBe(0);
+    expect(h.repos.operations.get(P)!.phase).toBe('BLOCKED_NEEDS_ATTENTION');
+    expect(h.repos.operations.get(N)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'idle', entryMode: 'NORMAL', activeEnvironmentId: null, operationId: N });
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+  });
+
+  test('crash during the rollback of an active-environment publish switch with a queued normal mode → the rollback is resumed first, then the normal mode', async () => {
+    h = await createHarness();
+    const { nodeA, P, N } = await crashMidPublishSwitchWithQueuedNormal({ duringRollback: true });
+    const order = recordClaims();
+    await h.crash();
+    await h.idle();
+    expect(order.indexOf(P)).toBe(0);
+    expect(h.repos.operations.get(P)!.phase).toBe('FAILED');
+    expect((h.repos.operations.get(P)!.result as { rollback: RollbackResult }).rollback.restoredSelection).toBe(nodeA);
+    expectOriginalRules(N);
+  });
+
+  test('second line of defence: a crash-recovered switch whose route a later operation already took is superseded without touching Surge', async () => {
+    h = await createHarness();
+    const { P, N } = await crashMidPublishSwitchWithQueuedNormal();
+    // 模拟错误的领取顺序（例如升级前的版本）：普通模式先于崩溃恢复中的发布执行并完成
+    const writes = () => ({ select: h.fake.calls.selectGroupPolicy ?? 0, kill: h.fake.calls.killRequest ?? 0, ...entryWrites(h.fake) });
+    let atRecovery: ReturnType<typeof writes> | null = null;
+    const claim = h.repos.outbox.claimNext.bind(h.repos.outbox);
+    h.repos.outbox.claimNext = (now, prefer) => {
+      const row = claim(now, [[N], ...(prefer ?? [])]);
+      if (row?.operationId === P) atRecovery = writes();
+      return row;
+    };
+    await h.crash();
+    await h.idle();
+    const pub = h.repos.operations.get(P)!;
+    expect(pub).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: N });
+    expect(h.repos.operations.listSteps(P).at(-1)!.message).toContain('路由已由之后的操作接手');
+    // 恢复的发布没有再写入 Surge（没有回到阻断、没有改选节点、没有结束连接）
+    expect(atRecovery).not.toBeNull();
+    expect(writes()).toEqual(atRecovery);
+    expectOriginalRules(N);
+  });
+
+  test('crash while a normal mode runs → after the restart it resumes before an operation accepted earlier that is not a route operation', async () => {
+    h = await createHarness();
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const nodeB = h.repos.proxyRevisions.get(b, 1)!.nodeName;
+    let createId: string | null = null;
+    let normalId: string | null = null;
+    // B 的切换选择节点期间：先受理一次环境创建（发布，不是路由操作），再受理普通模式；切换在放宽入口之前把路由交给普通模式
+    const fake = h.fake as unknown as Record<string, (...args: string[]) => Promise<unknown>>;
+    const select = fake.selectGroupPolicy!.bind(h.fake);
+    fake.selectGroupPolicy = async (...args: string[]) => {
+      if (args[1] === nodeB && normalId === null) {
+        createId = (await h.app.createEnvironment({ request_id: rid('create'), environment: envInput('US-Buyer-C', '203.0.113.12') }, WEB)).operation_id;
+        h.clock.advance(1_000);
+        normalId = (await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB)).operation_id;
+      }
+      return select(...args);
+    };
+    // 普通模式结束 Safari 连接时进程退出
+    const stuck = hang('listActiveRequests', () => normalId !== null && h.repos.operations.get(normalId)!.status === 'running');
+    const act = await h.app.activate(b, { request_id: rid('act'), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await until(stuck.entered);
+    fake.selectGroupPolicy = select;
+    stuck.restore();
+    expect(h.repos.operations.get(act.operation_id)).toMatchObject({ phase: 'SUPERSEDED', supersededBy: normalId });
+    expect(h.repos.operations.get(normalId!)!.status).toBe('running');
+    expect(h.repos.operations.get(createId!)!.status).toBe('queued');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'switching', operationId: normalId });
+    const order = recordClaims();
+    await h.crash();
+    await h.idle();
+    // 过渡中的路由（普通模式撤销入口到一半）不因受理更早的发布多停留
+    expect(order[0]).toBe(normalId);
+    expect(order.indexOf(createId!)).toBeGreaterThan(0);
+    expectOriginalRules(normalId!);
+    expect(h.repos.operations.get(createId!)!.status).toBe('succeeded');
   });
 });

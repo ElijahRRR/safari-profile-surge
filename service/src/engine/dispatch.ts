@@ -1,5 +1,6 @@
 // 执行器的分派：按操作种类与恢复原因调用处理器。领取时操作已是 running 说明上一次进程在处理中退出：
-// 进入崩溃恢复（写入前的阶段重新执行；写入已开始的按事实回滚或标为未知），从不重放全部写入。
+// 进入崩溃恢复（写入前的阶段重新执行；写入已开始的按事实回滚或标为未知），从不重放全部写入。处理器的意外异常越过了它自己的
+// 回滚时，本操作负责的过渡中路由先失败即关闭（handlers/route.ts settleAbandonedTransition），再交给执行器记录。
 
 import { isTerminalPhase } from '@sfe/contract';
 import type { OperationRecord, OutboxRecord } from '../db/index.js';
@@ -7,7 +8,7 @@ import { isPublishKind, payloadOf } from '../domain/operations.js';
 import type { Engine } from './context.js';
 import { runDelete, runFrontVerify, runPreflightOp, runUnbind } from './handlers/misc.js';
 import { recoverPublish, runPublish } from './handlers/publish.js';
-import { recoverRoute, resumeRoute, runActivation, runNormal, runProbeSafari } from './handlers/route.js';
+import { recoverRoute, resumeRoute, runActivation, runNormal, runProbeSafari, settleAbandonedTransition } from './handlers/route.js';
 import { runInit, runRemerge } from './maintenance.js';
 
 export interface DispatchHooks {
@@ -18,6 +19,20 @@ export interface DispatchHooks {
 const WRITE_PHASES = new Set(['DEPLOYING', 'RECONCILING', 'ROLLING_BACK']);
 
 export function createDispatcher(engine: Engine, hooks: DispatchHooks) {
+  const inner = createInnerDispatcher(engine, hooks);
+  return async function dispatch(op: OperationRecord, row: OutboxRecord): Promise<void> {
+    try {
+      await inner(op, row);
+    } catch (err) {
+      // 否则执行器只把操作标为失败，过渡中的路由无人负责（Surge 可能仍加载着检测或使用中入口、SFE-ROUTE 选着未验证的节点），
+      // 对账从不写 Surge。本操作不负责过渡中的路由时什么也不做。
+      await settleAbandonedTransition(engine, op.id, err);
+      throw err;
+    }
+  };
+}
+
+function createInnerDispatcher(engine: Engine, hooks: DispatchHooks) {
   return async function dispatch(op: OperationRecord, row: OutboxRecord): Promise<void> {
     if (op.status === 'running') {
       await recover(engine, op);

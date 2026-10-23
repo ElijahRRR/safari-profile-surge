@@ -144,7 +144,7 @@ describe('getCurrentState', () => {
     await bind(h, PROFILE_B, b);
     const other = ((await h.native(PROFILE_B, { type: 'getCurrentState' })) as { data: Record<string, unknown> }).data;
     expect(other.route).toBeNull();
-    expect(other.routeSummary).toEqual({ routeEpoch: 1, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true });
+    expect(other.routeSummary).toEqual({ routeEpoch: 1, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true });
     expect(other.relation).toBe('other_active');
     expect(other.ordersAllowed).toBe(false);
     expect(other.activationAvailable).toBe(true);
@@ -168,7 +168,7 @@ describe('getCurrentState', () => {
       const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: Record<string, unknown> }).data;
       expect(d.relation).toBe('none_active');
       expect(d.route).toBeNull();
-      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true });
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true, reconciled: true });
     }
     const again = await h.native(PROFILE_C, { type: 'enterNormalMode', request_id: rid() });
     expect(again.ok).toBe(true);
@@ -178,6 +178,146 @@ describe('getCurrentState', () => {
     expect(d.routeSummary.buyerExitConnectionsUnconfirmed).toBe(false);
     // 已确认结束、入口经运行时确认：持久标记清除，不再提供普通模式
     expect(d.routeSummary.normalModeOffered).toBe(false);
+  });
+
+  test('the route summary in a response comes from the same read as the full route, after the action precheck has reconciled (Surge restarted while the route was in use)', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'ACTIVE', phase: 'active_verified' });
+    // Surge 重启：临时规则被丢弃，Safari 已按原规则发出；服务在动作前检查的有效期（5 秒，提交 ACTIVE 之后的对账也算）内没有再对账
+    h.fake.restart();
+    h.clock.advance(6_000);
+    const d = ((await h.native(PROFILE_A, { type: 'getCurrentState' })) as {
+      data: { relation: string; ordersAllowed: boolean; route: { entryMode: string; phase: string; normalModeOffered: boolean } | null; routeSummary: { entryMode: string; phase: string; normalModeOffered: boolean } };
+    }).data;
+    const route = h.repos.routeState.get();
+    // 动作前检查已对账（路由不再是使用中且已验证）；摘要（弹窗顶栏按它显示）与完整路由一致，都不再是 ACTIVE/active_verified
+    expect(route.phase).toBe('attention');
+    expect(d.relation).toBe('this_active');
+    expect(d.ordersAllowed).toBe(false);
+    expect(d.route).not.toBeNull();
+    expect({ entryMode: d.routeSummary.entryMode, phase: d.routeSummary.phase }).toEqual({ entryMode: d.route!.entryMode, phase: d.route!.phase });
+    expect(d.routeSummary).toMatchObject({ entryMode: route.entryMode, phase: route.phase, normalModeOffered: true });
+  });
+
+  type StateData = {
+    relation: string;
+    ordersAllowed: boolean;
+    ordersBlockedReason: string | null;
+    route: { entryMode: string; phase: string; warnings: string[] } | null;
+    routeSummary: { entryMode: string; phase: string; reconciled: boolean };
+  };
+  const stateOf = async (profile: string | null) => ((await h.native(profile, { type: 'getCurrentState' })) as { ok: true; data: StateData }).data;
+
+  test('orders are judged on the route read for the same response: a reconcile outside the action precheck that marks the route attention blocks orders at once, inside the precheck window', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.clock.advance(6_000);
+    // 弹窗轮询：动作前检查已对账，允许打开订单页
+    expect((await stateOf(PROFILE_A)).ordersAllowed).toBe(true);
+    // 2 秒后 Surge 重启（临时规则丢弃，Safari 按原规则发出），周期对账（不是动作前检查）先发现
+    h.clock.advance(2_000);
+    h.fake.restart();
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'UNKNOWN' });
+    // 1 秒后的下一次轮询仍在上一次检查的有效期内：不能沿用之前的判定，按这次读到的路由拒绝
+    h.clock.advance(1_000);
+    const d = await stateOf(PROFILE_A);
+    expect(d.route).toMatchObject({ phase: 'attention', entryMode: 'UNKNOWN' });
+    expect(d.ordersAllowed).toBe(false);
+    expect(d.ordersBlockedReason).toBe('路由不在已验证状态');
+    expect(h.fake.simulateRequest({ processPath: '/Applications/Safari.app/Contents/MacOS/Safari', host: 'www.amazon.com', protocol: 'tcp' }).policyName).not.toBe('SFE-ROUTE');
+  });
+
+  test('orders are blocked as soon as the web refresh finds outbound mode changed to direct, inside the precheck window', async () => {
+    h = await createHarness();
+    await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.clock.advance(6_000);
+    expect((await stateOf(PROFILE_A)).ordersAllowed).toBe(true);
+    h.clock.advance(1_000);
+    h.fake.takeover = { ...h.fake.takeover, outboundMode: 'direct' };
+    await h.app.refreshSurge(WEB);
+    h.clock.advance(1_000);
+    const d = await stateOf(PROFILE_A);
+    expect(d.route!.warnings).toContain('outbound_mode_changed');
+    expect(d.ordersAllowed).toBe(false);
+    expect(d.ordersBlockedReason).toBe('路由不在已验证状态');
+  });
+
+  test('when the action precheck cannot finish reconciling (slow Surge after a restart, or the executor busy with another reconcile), the summary is marked unreconciled and orders stay blocked', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.clock.advance(6_000);
+    h.fake.restart();
+    // 重启之后的读取很慢：组选择读取挂起，直到放行
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const orig = h.fake.getGroupSelection.bind(h.fake);
+    h.fake.getGroupSelection = async (name: string) => {
+      await gate;
+      return orig(name);
+    };
+    const pending = h.native(PROFILE_A, { type: 'getCurrentState' });
+    await h.clock.advanceAsync(5_000);
+    const d = ((await pending) as { data: StateData }).data;
+    expect(d.ordersAllowed).toBe(false);
+    expect(d.ordersBlockedReason).toBe('读取 Surge 状态超时');
+    // 摘要仍是对账之前的记录，但标为未对账：弹窗顶栏不按它声称托管中
+    expect(d.routeSummary).toMatchObject({ entryMode: 'ACTIVE', phase: 'active_verified', reconciled: false });
+    // 执行器正忙（后台的动作前对账仍在进行）时，并发的检查共用它，同样未对账
+    const busy = h.native(PROFILE_B, { type: 'getCurrentState' });
+    await h.clock.advanceAsync(5_000);
+    expect(((await busy) as { data: StateData }).data.routeSummary.reconciled).toBe(false);
+    release();
+    h.fake.getGroupSelection = orig;
+    await h.idle();
+    await new Promise((r) => setTimeout(r, 0));
+    const after = await stateOf(PROFILE_A);
+    expect(after.routeSummary).toMatchObject({ entryMode: 'UNKNOWN', phase: 'attention', reconciled: true });
+    expect(after.ordersAllowed).toBe(false);
+
+    // 另一来源占着执行器（周期对账）：检查不能运行，同样标为未对账
+    h.clock.advance(6_000);
+    let releasePeriodic!: () => void;
+    const gatePeriodic = new Promise<void>((r) => (releasePeriodic = r));
+    h.fake.getGroupSelection = async (name: string) => {
+      await gatePeriodic;
+      return orig(name);
+    };
+    const periodic = h.app.runPeriodicReconcile();
+    await new Promise((r) => setTimeout(r, 0));
+    const whileBusy = await stateOf(PROFILE_A);
+    expect(whileBusy.routeSummary.reconciled).toBe(false);
+    expect(whileBusy.ordersBlockedReason).toBe('正在切换出口，请稍后再试');
+    releasePeriodic();
+    h.fake.getGroupSelection = orig;
+    await periodic;
+  });
+
+  test('every profile gets a reconciled summary while the route is managed, not only the active environment\'s profile (Surge restarted)', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    h.clock.advance(6_000);
+    h.fake.restart();
+    for (const profile of [PROFILE_B, PROFILE_C, null]) {
+      const d = await stateOf(profile);
+      expect(d.relation).toBe('other_active');
+      expect(d.route).toBeNull();
+      // 先对账再读取：摘要不再是 ACTIVE/active_verified（弹窗顶栏不显示「托管中」）
+      expect(d.routeSummary).toMatchObject({ entryMode: 'UNKNOWN', phase: 'attention', reconciled: true });
+    }
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'UNKNOWN', phase: 'attention' });
+  });
+
+  test('an idle normal-mode route needs no precheck: getCurrentState does not read Surge and the summary counts as reconciled', async () => {
+    h = await createHarness();
+    const total = () => Object.values(h.fake.calls).reduce((a, b) => a + b, 0);
+    const calls = total();
+    const d = await stateOf(PROFILE_C);
+    expect(d.routeSummary).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', reconciled: true });
+    expect(total()).toBe(calls);
   });
 
   test('reportProfileState is only a hint and never changes routing', async () => {
@@ -340,6 +480,79 @@ describe('requestLoginFill (§6.10)', () => {
     const r = await h.native(PROFILE_A, req(epoch));
     expect((r as unknown as { error: { details: { reason: string } } }).error.details.reason).toBe('control');
     expect(h.repos.routeState.get().warnings).toContain('external_selection_change');
+  });
+
+  /**
+   * 弹窗轮询（另一个请求）开始的动作前对账已读过出站模式、停在之后的 Surge 读取上（listPolicies 挂在闸门上）时，填充请求到达。
+   * 返回 release：放开闸门。
+   */
+  async function precheckInFlight(): Promise<{ popup: Promise<unknown>; release: () => void }> {
+    h.clock.advance(6_000); // 上一次对账已超过 5 秒：getCurrentState 开始新的动作前对账
+    let reached!: () => void;
+    const atListPolicies = new Promise<void>((r) => (reached = r));
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    const orig = h.fake.listPolicies.bind(h.fake);
+    h.fake.listPolicies = async () => {
+      reached();
+      await gate;
+      return orig();
+    };
+    const popup = h.native(PROFILE_A, { type: 'getCurrentState' });
+    await atListPolicies;
+    return {
+      popup,
+      release: () => {
+        h.fake.listPolicies = orig;
+        open();
+      },
+    };
+  }
+
+  test('refused: a precheck that read Surge before the fill request is not reused — the fill waits for it and reconciles again (outbound mode changed in between)', async () => {
+    const { epoch } = await fillSetup();
+    const takeoverReads = () => h.fake.calls.getTakeoverState ?? 0;
+    const { popup, release } = await precheckInFlight();
+    const before = takeoverReads();
+    // 用户把出站模式改为直连，然后填充请求到达（登录页加载时自动请求）
+    h.fake.takeover = { ...h.fake.takeover, outboundMode: 'direct' };
+    const fill = h.native(PROFILE_A, req(epoch));
+    await new Promise((r) => setTimeout(r, 0));
+    release();
+    expect((await popup) as { ok: boolean }).toMatchObject({ ok: true });
+    const r = await fill;
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect((r as unknown as { error: { details: { reason: string } } }).error.details.reason).toBe('control');
+    expect(h.repos.routeState.get().warnings).toContain('outbound_mode_changed');
+    // 填充在弹窗的对账之后另读了一次出站模式
+    expect(takeoverReads() - before).toBeGreaterThanOrEqual(1);
+  });
+
+  test('refused: the same when that precheck already timed out for the popup and is still running', async () => {
+    const { epoch } = await fillSetup();
+    const { popup, release } = await precheckInFlight();
+    await h.clock.advanceAsync(5_000);
+    expect((await popup) as { data: { ordersAllowed: boolean } }).toMatchObject({ data: { ordersAllowed: false } });
+    h.clock.advance(1_000);
+    h.fake.takeover = { ...h.fake.takeover, outboundMode: 'direct' };
+    const fill = h.native(PROFILE_A, req(epoch));
+    await new Promise((r) => setTimeout(r, 0));
+    release();
+    const r = await fill;
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect((r as unknown as { error: { details: { reason: string } } }).error.details.reason).toBe('control');
+  });
+
+  test('a fill arriving while another request\'s precheck runs still succeeds when nothing changed (waits, then reconciles again; never "busy")', async () => {
+    const { epoch } = await fillSetup();
+    const { popup, release } = await precheckInFlight();
+    const before = h.fake.calls.getTakeoverState ?? 0;
+    const fill = h.native(PROFILE_A, req(epoch));
+    await new Promise((r) => setTimeout(r, 0));
+    release();
+    await popup;
+    expect(errCode(await fill)).toBe('OK');
+    expect((h.fake.calls.getTakeoverState ?? 0) - before).toBeGreaterThanOrEqual(1);
   });
 
   test('refused: missing password for the account', async () => {

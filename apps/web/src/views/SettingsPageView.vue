@@ -18,7 +18,7 @@ const settings = computed(() => store.settings.value);
 const entryNormal = computed(() => store.route.value?.entryMode === 'NORMAL');
 
 const TIMEOUTS = [
-  { key: 'profileArrivalTimeoutSec', label: '等待场景打开', hint: '激活后等待目标场景点击扩展图标的最长时间；超时会恢复原节点并保持阻断。' },
+  { key: 'profileArrivalTimeoutSec', label: '等待场景打开', hint: '激活或重新检测后等待目标场景点击扩展图标的最长时间；激活超时会尝试恢复原节点并保持阻断（无法确认时改选 REJECT 并要求处理），重新检测超时只结束本次检测、路由不变。' },
   { key: 'safariVerifyTimeoutSec', label: 'Safari 实测超时', hint: '准备页开始检测后等待提交结果的最长时间。' },
   { key: 'probeTtlSec', label: '实测有效期', hint: '超过后实测显示为「上次结果」，需要重新检测。' },
   { key: 'reconcileIntervalSec', label: '对账间隔', hint: '路由不空闲时只读核对 Surge 状态的间隔。默认 30 秒。' },

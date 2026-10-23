@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'vitest';
 import { SfeError, type ActivateRequest, type RollbackResult } from '@sfe/contract';
+import type { SurgeAdapter } from '../../src/ports.js';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
 import {
   ADMIN,
@@ -11,6 +12,8 @@ import {
   bind,
   createEnv,
   createHarness,
+  entryWrites,
+  envInput,
   rid,
   safariOutcome,
   verify,
@@ -31,6 +34,23 @@ async function expectError(p: Promise<unknown>, code: string): Promise<SfeError>
     return err as SfeError;
   }
   throw new Error(`expected ${code}`);
+}
+
+/** 引擎的 Surge 适配器：调用 name 之前先运行 hook() 返回的函数（为 null 时不做任何事），例如在切换进行中受理普通模式。 */
+function beforeCall(adapter: object, name: string, hook: () => (() => Promise<void>) | null): SurgeAdapter {
+  return new Proxy(adapter, {
+    get(target, prop) {
+      const v = Reflect.get(target, prop, target) as unknown;
+      if (typeof v !== 'function') return v;
+      const fn = v as (...args: unknown[]) => unknown;
+      if (prop !== name) return fn.bind(target);
+      return async (...args: unknown[]) => {
+        const run = hook();
+        if (run) await run();
+        return fn.apply(target, args);
+      };
+    },
+  }) as unknown as SurgeAdapter;
 }
 
 /** A 使用中，B 已部署、已关联（未激活）。 */
@@ -306,14 +326,270 @@ describe('warnings on ACTIVE_VERIFIED', () => {
 });
 
 describe('concurrency matrix', () => {
-  test('queued route operation → ROUTE_BUSY for new activation, normal mode and probe', async () => {
+  test('queued route operation → ROUTE_BUSY for new activation and probe; normal mode is never refused: it is queued behind, the queued activation stops before its first Surge write and the normal mode restores the original rules', async () => {
     h = await createHarness();
     const { a, b } = await twoEnvs();
+    const nodeA = h.repos.routeState.get().selectedNode;
+    const epoch = h.repos.routeState.get().routeEpoch;
     await h.app.executor.stop();
-    await h.app.activate(b, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    const act = await h.app.activate(b, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
     await expectError(h.app.activate(a, { request_id: rid() }, WEB), 'ROUTE_BUSY');
-    await expectError(h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB), 'ROUTE_BUSY');
     await expectError(h.app.probe(a, { request_id: rid(), kind: 'safari' }, WEB), 'ROUTE_BUSY');
+    expect(h.app.views.routeView().normalModeOffered).toBe(true);
+    const n = await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    expect(h.repos.operations.get(n.operation_id)).toMatchObject({ status: 'queued' });
+    expect(h.repos.operations.listSteps(n.operation_id).map((st) => st.message)).toEqual(['已受理进入普通模式：正在进行的切换或检测停下（或完成）之后立即执行']);
+    // 排队的普通模式之后，新的激活仍返回 ROUTE_BUSY
+    await expectError(h.app.activate(a, { request_id: rid() }, WEB), 'ROUTE_BUSY');
+    const selects = h.fake.calls.selectGroupPolicy ?? 0;
+    h.app.executor.start();
+    await h.idle();
+    // 激活在第一次写入 Surge 之前停下（没有递增 epoch、阻断、结束连接或改选 B 的节点），路由交给普通模式
+    expect(h.repos.operations.get(act.operation_id)).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: n.operation_id, routeEpoch: null });
+    const phases = h.repos.operations.listSteps(act.operation_id).map((st) => st.phase);
+    expect(phases).not.toContain('SAFARI_BLOCKED');
+    expect(phases).not.toContain('VERIFY_ONLY');
+    expect(h.repos.operations.listSteps(act.operation_id).at(-1)!.message).toBe(
+      '已被进入普通模式取代：在第一次写入 Surge 之前停下（没有阻断 Safari、没有结束连接、没有改选节点），由普通模式从当前状态进入普通模式',
+    );
+    expect(h.fake.calls.selectGroupPolicy ?? 0).toBe(selects);
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe(nodeA);
+    expect(h.repos.operations.get(n.operation_id)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, activationSnapshot: null, routeEpoch: epoch });
+    expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+  });
+
+  /** Surge 的写入痕迹：入口规则集文件与重新加载、临时规则、SFE-ROUTE 改选、结束连接。 */
+  const surgeWrites = () => ({
+    ...entryWrites(h.fake),
+    tempRules: [...h.fake.tempRules],
+    add: h.fake.calls.addTempRule ?? 0,
+    remove: h.fake.calls.removeTempRule ?? 0,
+    select: h.fake.calls.selectGroupPolicy ?? 0,
+    selection: null as string | null,
+    kill: h.fake.calls.killRequest ?? 0,
+  });
+  const writesNow = async () => ({ ...surgeWrites(), selection: await h.fake.getGroupSelection('SFE-ROUTE') });
+
+  /** 第一次激活（从普通模式出发）：环境已部署、已关联；Safari 有一条按原规则发出的长连接。 */
+  async function firstActivationSetup() {
+    const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    const daily = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    expect(daily.rule).toBe('FINAL,DIRECT');
+    return { env, daily };
+  }
+
+  /** 激活停在第一次写入之前、普通模式完成：两者都没有写入 Surge（从空闲的普通模式出发，普通模式也不需要写入），Safari 按原规则的连接仍在。 */
+  async function expectStoppedBeforeFirstWrite(
+    actId: string,
+    normalId: string,
+    before: Awaited<ReturnType<typeof writesNow>>,
+    epoch: number,
+    dailyId: string,
+    opts: { checksSkipped: boolean },
+  ) {
+    const act = h.repos.operations.get(actId)!;
+    expect(act).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: normalId, routeEpoch: null });
+    expect(h.repos.operations.listSteps(actId).at(-1)!.message).toContain('在第一次写入 Surge 之前停下（没有阻断 Safari、没有结束连接、没有改选节点）');
+    const phases = h.repos.operations.listSteps(actId).map((st) => st.phase);
+    expect(phases).not.toContain('SAFARI_BLOCKED');
+    // 仍在排队时受理：开始执行时就停下，连第 1–3 步的检查（预检）也不做
+    if (opts.checksSkipped) expect(phases).not.toContain('PREFLIGHT_OK');
+    expect(h.repos.operations.get(normalId)!.phase).toBe('NORMAL_RESTORED');
+    expect(await writesNow()).toEqual(before);
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, activationSnapshot: null, routeEpoch: epoch });
+    expect((await h.fake.listActiveRequests()).map((r) => r.id)).toContain(dailyId);
+    expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+  }
+
+  test.each(['ruleset_resource', 'temp_rule'] as const)(
+    'normal mode accepted while the first activation is still queued: the activation stops before touching Surge (no block, no kill of Safari connections on the original rules, no node selected); the normal mode completes (%s)',
+    async (entryStrategy) => {
+      h = await createHarness({ entryStrategy });
+      const { env, daily } = await firstActivationSetup();
+      const before = await writesNow();
+      const epoch = h.repos.routeState.get().routeEpoch;
+      await h.app.executor.stop();
+      const act = await h.app.activate(env, { request_id: rid() }, WEB);
+      const n = await h.app.enterNormal({ request_id: rid() }, WEB);
+      expect(h.repos.operations.get(n.operation_id)!.payload).toMatchObject({ normal: { queuedBehind: [act.operation_id] } });
+      h.app.executor.start();
+      await h.idle();
+      await expectStoppedBeforeFirstWrite(act.operation_id, n.operation_id, before, epoch, daily.id, { checksSkipped: true });
+    },
+  );
+
+  test('normal mode accepted while a crashed activation is re-run by crash recovery: the re-run stops before touching Surge', async () => {
+    h = await createHarness({ dbFile: true });
+    const { env, daily } = await firstActivationSetup();
+    const before = await writesNow();
+    const epoch = h.repos.routeState.get().routeEpoch;
+    await h.app.executor.stop();
+    const act = await h.app.activate(env, { request_id: rid() }, WEB);
+    const n = await h.app.enterNormal({ request_id: rid() }, WEB);
+    // 服务在激活开始检查条件时（第一次写入之前）崩溃：操作停在 running，重启后由崩溃恢复重新执行
+    h.repos.operations.update(act.operation_id, { status: 'running', phase: 'VALIDATING' });
+    await h.crash();
+    await h.idle();
+    await expectStoppedBeforeFirstWrite(act.operation_id, n.operation_id, before, epoch, daily.id, { checksSkipped: true });
+  });
+
+  test('normal mode accepted during the activation\'s pre-write checks (step 2 reads): the activation stops before its blocking step, without any Surge write', async () => {
+    let hook: (() => Promise<void>) | null = null;
+    h = await createHarness({ surge: (fake) => beforeCall(fake, 'getGroupMembers', () => hook) });
+    const { env, daily } = await firstActivationSetup();
+    const before = await writesNow();
+    const epoch = h.repos.routeState.get().routeEpoch;
+    let normalId: string | null = null;
+    hook = async () => {
+      const running = h.repos.operations.listByStatus(['running']).find((o) => o.kind === 'route.activate');
+      if (!running) return;
+      hook = null;
+      normalId = (await h.app.enterNormal({ request_id: rid() }, WEB)).operation_id;
+    };
+    const act = await h.app.activate(env, { request_id: rid() }, WEB);
+    await h.idle();
+    expect(normalId).not.toBeNull();
+    await expectStoppedBeforeFirstWrite(act.operation_id, normalId!, before, epoch, daily.id, { checksSkipped: false });
+  });
+
+  test('normal mode accepted while an active-environment publish switch runs its pre-write checks: the switch stops before blocking Safari; the normal mode completes', async () => {
+    let hook: (() => Promise<void>) | null = null;
+    h = await createHarness({ surge: (fake) => beforeCall(fake, 'getGroupMembers', () => hook) });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const env = h.repos.environments.get(envId)!;
+    const nodeV1 = h.repos.routeState.get().selectedNode;
+    const epoch = h.repos.routeState.get().routeEpoch;
+    const u = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.20' } } }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(u.operation_id)!.phase).toBe('WAITING_ROUTE');
+    const selects = h.fake.calls.selectGroupPolicy ?? 0;
+    let normalId: string | null = null;
+    hook = async () => {
+      if (h.repos.operations.get(u.operation_id)!.status !== 'running') return;
+      hook = null;
+      normalId = (await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: envId }, WEB)).operation_id;
+    };
+    await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: u.operation_id, amazon_tabs_open: false });
+    await h.idle();
+    expect(normalId).not.toBeNull();
+    const op = h.repos.operations.get(u.operation_id)!;
+    // 新版本已部署、未切换：与停在 WAITING_ROUTE 时被普通模式结束一样记为 READY_FOR_NEXT_OPEN（不是被取代的失败）
+    expect(op).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded', supersededBy: normalId, routeEpoch: null, error: null });
+    expect(h.repos.operations.listSteps(u.operation_id).at(-1)!.message).toContain('新版本已部署，未切换：已有进入普通模式的请求');
+    expect(h.repos.environments.get(envId)!.deployedProxyRevision).toBe(2);
+    expect(h.repos.operations.listSteps(u.operation_id).map((st) => st.phase)).not.toContain('SAFARI_BLOCKED');
+    // 没有改选新版本的节点；普通模式不改变 SFE-ROUTE 的选择
+    expect(h.fake.calls.selectGroupPolicy ?? 0).toBe(selects);
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe(nodeV1);
+    expect(h.repos.operations.get(normalId!)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, routeEpoch: epoch });
+    expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+  });
+
+  test('normal mode accepted while the activation selects the node (after blocking): the activation still stops before VERIFY_ONLY with Safari confirmed blocked', async () => {
+    let hook: (() => Promise<void>) | null = null;
+    h = await createHarness({ surge: (fake) => beforeCall(fake, 'selectGroupPolicy', () => hook) });
+    const { a, b } = await twoEnvs();
+    let normalId: string | null = null;
+    hook = async () => {
+      hook = null;
+      normalId = (await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB)).operation_id;
+    };
+    const opId = await startSwitch(b);
+    expect(normalId).not.toBeNull();
+    expect(h.repos.operations.get(opId)).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: normalId });
+    expect(h.repos.operations.listSteps(opId).map((st) => st.phase)).toContain('SAFARI_BLOCKED');
+    expect(h.repos.operations.listSteps(opId).map((st) => st.phase)).not.toContain('VERIFY_ONLY');
+    expect(h.repos.operations.listSteps(opId).at(-1)!.message).toBe(
+      '已被进入普通模式取代：在只开放检测服务（VERIFY_ONLY）之前停下，Safari 保持已确认的阻断，由普通模式撤销本应用入口并结束 Safari 连接',
+    );
+    expect(h.repos.operations.get(normalId!)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, activationSnapshot: null });
+    expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+  });
+
+  test.each(['ruleset_resource', 'temp_rule'] as const)(
+    'normal mode accepted while a passed verification is being checked: the activation does not write ACTIVE or commit, the normal mode runs right after and the earlier environment\'s confirmation still holds (%s)',
+    async (entryStrategy) => {
+      let hook: (() => Promise<void>) | null = null;
+      h = await createHarness({ entryStrategy, surge: (fake) => beforeCall(fake, 'listRecentRequests', () => hook) });
+      const { a, b } = await twoEnvs();
+      const opId = await startSwitch(b);
+      expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
+      let normalId: string | null = null;
+      hook = async () => {
+        hook = null;
+        const op = h.repos.operations.get(opId)!;
+        expect(op.status).toBe('running');
+        normalId = (await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB)).operation_id;
+      };
+      const r = await verify(h, PROFILE_B, opId);
+      expect(r.ok).toBe(true);
+      await h.idle();
+      expect(normalId).not.toBeNull();
+      expect(h.repos.operations.get(opId)).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: normalId });
+      // 没有写入 ACTIVE、没有提交 B：B 没有实测记录，也没有成为使用中的环境
+      expect(h.repos.operations.listSteps(opId).map((st) => st.phase)).not.toContain('ACTIVE_VERIFIED');
+      expect(h.repos.operations.listSteps(opId).at(-1)!.message).toContain('在进入使用中模式（ACTIVE）之前停下，未提交');
+      expect(h.repos.probes.latest(b, 'safari')).toBeNull();
+      expect(h.repos.operations.get(normalId!)!.phase).toBe('NORMAL_RESTORED');
+      expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, activationSnapshot: null });
+      expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+    },
+  );
+
+  test('normal mode accepted while ACTIVE is being written: the activation does not commit; the normal mode undoes the ACTIVE entry (temp_rule)', async () => {
+    let afterCheck = false;
+    let hook: (() => Promise<void>) | null = null;
+    h = await createHarness({
+      entryStrategy: 'temp_rule',
+      surge: (fake) =>
+        beforeCall(beforeCall(fake, 'listRecentRequests', () => (afterCheck = true, null)), 'addTempRule', () => (afterCheck ? hook : null)),
+    });
+    const { a, b } = await twoEnvs();
+    afterCheck = false;
+    const opId = await startSwitch(b);
+    let normalId: string | null = null;
+    hook = async () => {
+      hook = null;
+      normalId = (await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB)).operation_id;
+    };
+    expect((await verify(h, PROFILE_B, opId)).ok).toBe(true);
+    await h.idle();
+    expect(normalId).not.toBeNull();
+    const stopped = h.repos.operations.get(opId)!;
+    expect(stopped).toMatchObject({ phase: 'SUPERSEDED', supersededBy: normalId });
+    expect(h.repos.operations.listSteps(opId).at(-1)!.message).toContain('入口已进入使用中模式（ACTIVE，读回确认），在提交之前停下，未提交');
+    expect(h.repos.probes.latest(b, 'safari')).toBeNull();
+    const n = h.repos.operations.get(normalId!)!;
+    expect(n.phase).toBe('NORMAL_RESTORED');
+    // 普通模式从读回的 ACTIVE 撤销本应用入口
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+    expect(h.fake.tempRules).toEqual([]);
+    expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+  });
+
+  test('normal mode accepted while a Safari re-test is starting: queued, then it ends the waiting re-test (test id invalid) and restores the original rules', async () => {
+    let hook: (() => Promise<void>) | null = null;
+    h = await createHarness({ surge: (fake) => beforeCall(fake, 'getGroupSelection', () => hook) });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    let normalId: string | null = null;
+    hook = async () => {
+      hook = null;
+      normalId = (await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: envId }, WEB)).operation_id;
+    };
+    const probe = await h.app.probe(envId, { request_id: rid(), kind: 'safari' }, WEB);
+    await h.idle();
+    expect(normalId).not.toBeNull();
+    expect(h.repos.operations.get(probe.operation_id)).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: normalId });
+    expect(h.repos.operations.get(normalId!)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+    const begin = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: probe.operation_id, amazon_tabs_open: false });
+    expect(begin).toMatchObject({ ok: false, error: { code: 'SUPERSEDED' } });
   });
 
   test('a waiting activation is SUPERSEDED by a new activation; its test id becomes stale', async () => {
@@ -351,6 +627,70 @@ describe('concurrency matrix', () => {
     expect(rb.restoredSelection).toBe(nodeA);
   });
 
+  test('a verification begun while the selection is being read back, and superseded meanwhile by an accepted normal mode, issues no test id and writes nothing for the superseded switch', async () => {
+    h = await createHarness();
+    const { a, b } = await twoEnvs();
+    const opB = await startSwitch(b);
+    expect(h.repos.operations.get(opB)!.phase).toBe('VERIFY_ONLY');
+    // 准备页到达：签发前重读 SFE-ROUTE 选择（一次 Surge 调用）挂起
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const select = h.fake.getGroupSelection.bind(h.fake);
+    let held = false;
+    h.fake.getGroupSelection = async (group: string) => {
+      if (!held) {
+        held = true;
+        await gate;
+      }
+      return select(group);
+    };
+    const begin = h.native(PROFILE_B, { type: 'beginSafariVerification', operation_id: opB, amazon_tabs_open: false });
+    for (let i = 0; i < 50 && !held; i++) await new Promise((r) => setTimeout(r, 0));
+    expect(held).toBe(true);
+    // 读取期间受理普通模式：取代等待中的切换（epoch 递增，路由交给普通模式）
+    const n = await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    expect(h.repos.operations.get(opB)!.status).toBe('superseded');
+    const steps = h.repos.operations.listSteps(opB).length;
+    release();
+    const r = await begin;
+    await h.idle();
+    expect(r.ok).toBe(false);
+    expect((r as { error: { code: string } }).error.code).toBe('SUPERSEDED');
+    expect(h.repos.verificationTests.listForOperation(opB)).toEqual([]);
+    expect(h.repos.operations.listSteps(opB).length).toBe(steps);
+    expect(h.repos.outbox.pendingForOperation(opB)).toEqual([]);
+    expect(h.repos.operations.get(n.operation_id)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', awaitingDeadline: null });
+  });
+
+  test('a normal mode accepted while an activation runs is executed as soon as the activation hands it the route, before an operation accepted earlier that is not a route operation', async () => {
+    let hook: (() => Promise<void>) | null = null;
+    h = await createHarness({ surge: (fake) => beforeCall(fake, 'selectGroupPolicy', () => hook) });
+    const { a, b } = await twoEnvs();
+    let normalId: string | null = null;
+    let createId: string | null = null;
+    hook = async () => {
+      hook = null;
+      // 切换选择节点期间：先受理一次环境创建（发布，不是路由操作），再受理普通模式
+      createId = (await h.app.createEnvironment({ request_id: rid('create'), environment: envInput('US-Buyer-C', '203.0.113.12') }, WEB)).operation_id;
+      h.clock.advance(1_000);
+      normalId = (await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB)).operation_id;
+    };
+    const mark = h.events.length;
+    const opId = await startSwitch(b);
+    expect(normalId).not.toBeNull();
+    expect(createId).not.toBeNull();
+    expect(h.repos.operations.get(opId)).toMatchObject({ phase: 'SUPERSEDED', supersededBy: normalId });
+    // 执行顺序：普通模式开始执行（running）早于受理更早的发布
+    const started = (id: string) =>
+      h.events.findIndex((e, i) => i >= mark && e.type === 'operation.updated' && (e as { operation: { id: string; status: string } }).operation.id === id && (e as { operation: { status: string } }).operation.status === 'running');
+    expect(started(normalId!)).toBeGreaterThan(-1);
+    expect(started(createId!)).toBeGreaterThan(-1);
+    expect(started(normalId!)).toBeLessThan(started(createId!));
+    expect(h.repos.operations.get(normalId!)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.operations.get(createId!)!.status).toBe('succeeded');
+  });
+
   test('normal mode supersedes a waiting activation', async () => {
     h = await createHarness();
     const { a, b } = await twoEnvs();
@@ -360,6 +700,85 @@ describe('concurrency matrix', () => {
     expect(h.repos.operations.get(first)!.phase).toBe('SUPERSEDED');
     expect(h.repos.operations.get(n.operation_id)!.phase).toBe('NORMAL_RESTORED');
     expect(h.repos.routeState.get().entryMode).toBe('NORMAL');
+  });
+
+  /**
+   * 网页后台只在 environment.updated 事件中更新环境：被普通模式结束（受理时取代、开始执行时取代、执行中让路）的激活，其目标
+   * 环境的最后一个事件必须与服务端当前视图一致，否则网页一直显示它「切换中」、算作使用中（删除与解除关联在本地被拒绝）。
+   */
+  function lastEnvironmentEvent(id: string) {
+    const last = h.events.filter((e) => e.type === 'environment.updated' && e.environment.id === id).at(-1);
+    return last && last.type === 'environment.updated' ? last.environment : null;
+  }
+  function expectEventMatchesView(id: string): void {
+    const ev = lastEnvironmentEvent(id)!;
+    const fresh = h.app.views.environmentView(id)!;
+    expect(fresh.facets.route).toBe('inactive');
+    expect({ route: ev.facets.route, readiness: ev.readiness, lastOp: ev.lastOperation?.phase }).toEqual({
+      route: fresh.facets.route,
+      readiness: fresh.readiness,
+      lastOp: fresh.lastOperation?.phase,
+    });
+  }
+
+  test('a waiting activation superseded when the normal mode is accepted: its environment is re-sent', async () => {
+    h = await createHarness();
+    const { a, b } = await twoEnvs();
+    const opId = await startSwitch(b);
+    expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
+    await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(opId)!.phase).toBe('SUPERSEDED');
+    expectEventMatchesView(b);
+  });
+
+  test('a waiting activation superseded by a new activation of another environment: its environment is re-sent', async () => {
+    h = await createHarness();
+    const { b } = await twoEnvs();
+    const c = (await createEnv(h, 'US-Buyer-C', '203.0.113.12')).environment_id!;
+    await bind(h, PROFILE_C, c);
+    const opB = await startSwitch(b);
+    expect(h.repos.operations.get(opB)!.phase).toBe('VERIFY_ONLY');
+    const opC = await startSwitch(c);
+    expect(h.repos.operations.get(opB)!.phase).toBe('SUPERSEDED');
+    expect(h.repos.operations.get(opC)!.phase).toBe('VERIFY_ONLY');
+    expectEventMatchesView(b);
+  });
+
+  test('an activation that yields to a queued normal mode before writing ACTIVE: its environment is re-sent', async () => {
+    let hook: (() => Promise<void>) | null = null;
+    h = await createHarness({ surge: (fake) => beforeCall(fake, 'listRecentRequests', () => hook) });
+    const { a, b } = await twoEnvs();
+    const opId = await startSwitch(b);
+    expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
+    hook = async () => {
+      hook = null;
+      await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    };
+    expect((await verify(h, PROFILE_B, opId)).ok).toBe(true);
+    await h.idle();
+    expect(h.repos.operations.get(opId)!.phase).toBe('SUPERSEDED');
+    expectEventMatchesView(b);
+  });
+
+  test('an activation that reached its VERIFY_ONLY wait after the normal mode was queued, superseded when the normal mode starts: its environment is re-sent', async () => {
+    let selected = false;
+    let hook: (() => Promise<void>) | null = null;
+    h = await createHarness({
+      entryStrategy: 'temp_rule',
+      surge: (fake) => beforeCall(beforeCall(fake, 'selectGroupPolicy', () => ((selected = true), null)), 'addTempRule', () => (selected ? hook : null)),
+    });
+    const { a, b } = await twoEnvs();
+    selected = false;
+    hook = async () => {
+      hook = null;
+      await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    };
+    const opId = await startSwitch(b);
+    expect(hook).toBeNull();
+    expect(h.repos.operations.listSteps(opId).map((st) => st.phase)).toContain('VERIFY_ONLY');
+    expect(h.repos.operations.get(opId)!.phase).toBe('SUPERSEDED');
+    expectEventMatchesView(b);
   });
 });
 
@@ -495,13 +914,18 @@ describe('active environment proxy change → WAITING_ROUTE', () => {
     expect(op.phase).toBe('WAITING_ROUTE');
     // 等待期间旧版本继续使用、Safari 不被阻断
     expect(safariOutcome(h).leafPolicyName).toBe('SFE-N-E0001-US01-v001');
+    type Pending = { data: { pendingVerification: { kind: string; waiting_route: boolean } } };
     const state = await h.native(PROFILE_A, { type: 'getCurrentState' });
-    expect((state as { data: { pendingVerification: { kind: string } } }).data.pendingVerification.kind).toBe('apply_new_revision');
+    // 停在 WAITING_ROUTE：取消只结束等待（弹窗据此说「当前出口不变，下次打开时再切换」）
+    expect((state as Pending).data.pendingVerification).toMatchObject({ kind: 'apply_new_revision', waiting_route: true });
     const first = await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: opId, amazon_tabs_open: false });
     expect((first as { data: { status: string } }).data.status).toBe('pending');
     await h.idle();
     op = h.repos.operations.get(opId)!;
     expect(op.phase).toBe('VERIFY_ONLY');
+    // 已进入切换（Safari 已阻断、已选择新节点）：取消按第 14 步回滚，不再是「当前出口不变」
+    const switching = await h.native(PROFILE_A, { type: 'getCurrentState' });
+    expect((switching as Pending).data.pendingVerification).toMatchObject({ kind: 'apply_new_revision', waiting_route: false });
     await verify(h, PROFILE_A, opId);
     op = h.repos.operations.get(opId)!;
     expect(op.phase).toBe('ACTIVE_VERIFIED');
@@ -572,6 +996,33 @@ describe('normal mode (§6.5)', () => {
     expect(await h.fake.getCurrentProfile()).toEqual(profileBefore);
     await h.app.acknowledgeWindows({ request_id: rid() }, WEB);
     expect(h.repos.routeState.get().warnings).toEqual([]);
+  });
+
+  test.each(['ruleset_resource', 'temp_rule'] as const)('%s: "I closed the old windows" accepted while a later normal mode runs is not undone by that normal mode\'s completion', async (strategy) => {
+    h = await createHarness({ entryStrategy: strategy });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    // 第一次普通模式选择「不关闭」：留下旧窗口警告；Safari 仍有经买家出口的长连接且结束失败 → 第二次普通模式还要结束它
+    h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    h.fake.failNext('killRequest');
+    await h.app.enterNormal({ request_id: rid(), old_session_policy: 'keep_open_acknowledged', confirmed_environment_id: envId }, WEB);
+    await h.idle();
+    expect(h.repos.routeState.get().warnings).toEqual(expect.arrayContaining(['managed_windows_on_original_rules', 'buyer_exit_connections_unconfirmed']));
+    // 第二次普通模式执行中（它的第一次 Surge 读取）用户点「我已关闭旧窗口」
+    const listRules = h.fake.listRules.bind(h.fake);
+    let acknowledged = false;
+    h.fake.listRules = async () => {
+      if (!acknowledged && h.repos.operations.listByStatus(['running']).some((o) => o.kind === 'route.normal')) {
+        acknowledged = true;
+        await h.app.acknowledgeWindows({ request_id: rid() }, WEB);
+        expect(h.repos.routeState.get().warnings).not.toContain('managed_windows_on_original_rules');
+      }
+      return listRules();
+    };
+    const n = await h.app.enterNormal({ request_id: rid() }, WEB);
+    await h.idle();
+    expect(acknowledged).toBe(true);
+    expect(h.repos.operations.get(n.operation_id)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.routeState.get().warnings).not.toContain('managed_windows_on_original_rules');
   });
 
   test('always available even when capabilities are stale; kills are best-effort and reported', async () => {

@@ -9,7 +9,7 @@ import KeyValueList from './KeyValueList.vue';
 import NoticeBox from './NoticeBox.vue';
 import { formatClock, formatDateTime, formatRelative, formatRevision } from '../lib/format';
 import { ENTRY_MODE_LABELS, OPERATION_KIND_LABELS, OPERATION_PHASE_LABELS, OPERATION_STATUS_LABELS, PROBE_OUTCOME_LABELS, operationStatusDot } from '../lib/labels';
-import { cancelActionLabel, envLabel, isCancellableRouteOperation } from '../lib/environments';
+import { cancelActionLabel, envLabel, isCancellableRouteOperation, isSafariRetest } from '../lib/environments';
 import { useConsole } from '../store/context';
 
 const { api, store, viewer } = useConsole();
@@ -88,9 +88,16 @@ const title = computed(() => {
 const waitingForScene = computed(() => {
   const o = op.value;
   if (!o || o.status !== 'waiting') return false;
-  return o.kind === 'route.activate' || o.kind === 'probe.safari' || o.phase === 'WAITING_ROUTE';
+  // 活动环境发布进入切换后与激活一样停在 VERIFY_ONLY 等待
+  return o.kind === 'route.activate' || o.kind === 'probe.safari' || o.phase === 'WAITING_ROUTE' || o.phase === 'VERIFY_ONLY';
 });
 const deadline = computed(() => (waitingForScene.value ? (store.route.value?.awaitingDeadline ?? null) : null));
+/** 实测超时的后果按操作说明：重新检测（含激活复用时改为的重测）从不切换、阻断或进入普通模式（§6.4），超时只结束检测；切换超时按第 14 步回滚。 */
+const timeoutText = computed(() =>
+  op.value && isSafariRetest(op.value)
+    ? '超时则本次重新检测失败，路由不变（不切换、不阻断 Safari）。'
+    : '超时会尝试恢复原节点并保持 Safari 阻断（无法确认时改选 REJECT 并要求处理）。',
+);
 const cancellable = computed(() => (op.value ? isCancellableRouteOperation(op.value) : false));
 const windowsWarning = computed(() => {
   const o = op.value;
@@ -151,7 +158,7 @@ const rollbackItems = computed(() => {
       </NoticeBox>
       <NoticeBox v-else-if="waitingForScene" tone="info" title="等待 Safari 实测" data-test="scene-guidance">
         在 Safari 切换到场景 {{ sceneName ?? '（未知）' }}，点击扩展图标完成验证。
-        <template v-if="deadline"> 请在 {{ formatClock(deadline) }} 前完成，超时会恢复原节点并保持 Safari 阻断。</template>
+        <template v-if="deadline"> 请在 {{ formatClock(deadline) }} 前完成，{{ timeoutText }}</template>
       </NoticeBox>
 
       <NoticeBox v-if="op.error" tone="danger" :title="op.error.code">{{ op.error.message }}</NoticeBox>

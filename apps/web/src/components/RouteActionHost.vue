@@ -7,7 +7,7 @@ import RouteConfirmDialog from './RouteConfirmDialog.vue';
 import OperationDialog from './OperationDialog.vue';
 import { useConsole } from '../store/context';
 import { newRequestId } from '../lib/request-id';
-import { cancelActionLabel } from '../lib/environments';
+import { cancelActionLabel, isSafariRetest } from '../lib/environments';
 
 const { api, store, toasts, routeActions, viewer } = useConsole();
 
@@ -23,10 +23,11 @@ const cancelText = computed(() => {
   if (op.phase === 'WAITING_ROUTE') {
     return { title, message: '确定要取消等待场景打开吗？', detail: '新版本保持已部署，下次打开该场景时再切换；当前出口不变，不会进入普通模式。' };
   }
-  if (op.kind === 'probe.safari') {
-    return { title, message: '确定要取消这次 Safari 重测吗？', detail: '取消后按服务端规则结束本次检测；不会进入普通模式。' };
+  // 重测（含激活复用时改为的重测）从不切换、阻断或回滚：取消只结束本次检测（§6.4）
+  if (isSafariRetest(op)) {
+    return { title, message: '确定要取消这次 Safari 重测吗？', detail: '只结束本次检测，路由不变（不切换、不阻断 Safari）；不会进入普通模式。' };
   }
-  return { title, message: '确定要取消此次切换吗？', detail: '服务会恢复切换前的节点选择并保持 Safari 阻断，之后需要重新核验；不会进入普通模式。' };
+  return { title, message: '确定要取消此次切换吗？', detail: '服务会尝试恢复切换前的节点选择并保持 Safari 阻断，之后需要重新核验；无法确认时不恢复，改选 REJECT 拒绝 Safari 经本应用出口的新连接并要求处理。不会进入普通模式。' };
 });
 
 async function confirmCancel() {

@@ -116,7 +116,7 @@ export function currentState(overrides: Partial<CurrentStateResponse> = {}): Cur
     profile: { identified: true, profileIdShort: '3fa2c1d0' },
     environment: environment(),
     route: route(),
-    routeSummary: { routeEpoch: 7, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true },
+    routeSummary: { routeEpoch: 7, entryMode: 'ACTIVE', phase: 'active_verified', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true },
     relation: 'this_active',
     otherActiveLabel: null,
     pendingVerification: null,

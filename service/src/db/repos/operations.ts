@@ -208,8 +208,11 @@ const outboxMap = mapper<OutboxRecord>('outbox', {
 export interface OutboxRepo {
   /** 返回新条目 id。 */
   enqueue(operationId: string, reason: string | null, availableAt: Date | string): number;
-  /** 原子领取：一条 UPDATE … RETURNING，最早可用且未领取、未完成的一条；没有则 null。 */
-  claimNext(now: Date | string): OutboxRecord | null;
+  /**
+   * 原子领取：一条 UPDATE … RETURNING，最早可用且未领取、未完成的一条；没有则 null。prefer 为按优先级排列的操作 id 组：属于
+   * 前面一组的条目先于后面的组与其他条目（各组内仍按可用时间与 id 排序；空组忽略）。
+   */
+  claimNext(now: Date | string, prefer?: readonly (readonly string[])[] | null): OutboxRecord | null;
   markDone(id: number, at?: Date | string): boolean;
   get(id: number): OutboxRecord | null;
   /** 未完成的条目（含已领取），按可用时间排序。 */
@@ -229,14 +232,19 @@ export function createOutboxRepo(ctx: RepoContext): OutboxRepo {
     enqueue(operationId, reason, availableAt) {
       return db.run('INSERT INTO outbox (operation_id, resume_reason, available_at) VALUES (?, ?, ?)', [operationId, reason, toIso(availableAt)]).lastInsertRowid;
     },
-    claimNext(now) {
+    claimNext(now, prefer) {
       const t = toIso(now);
+      const groups = (prefer ?? []).filter((g) => g.length > 0);
+      const order =
+        groups.length > 0
+          ? `ORDER BY CASE ${groups.map((g, i) => `WHEN operation_id IN (${g.map(() => '?').join(', ')}) THEN ${i}`).join(' ')} ELSE ${groups.length} END, available_at, id`
+          : 'ORDER BY available_at, id';
       const row = db.get(
         `UPDATE outbox SET claimed_at = ?
-         WHERE id = (SELECT id FROM outbox WHERE done_at IS NULL AND claimed_at IS NULL AND available_at <= ? ORDER BY available_at, id LIMIT 1)
+         WHERE id = (SELECT id FROM outbox WHERE done_at IS NULL AND claimed_at IS NULL AND available_at <= ? ${order} LIMIT 1)
            AND claimed_at IS NULL
          RETURNING *`,
-        [t, t],
+        [t, t, ...groups.flat()],
       );
       return row ? outboxMap.fromRow(row) : null;
     },

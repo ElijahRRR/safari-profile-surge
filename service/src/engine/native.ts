@@ -18,7 +18,7 @@ import {
   type OperationView,
 } from '@sfe/contract';
 import type { Actor } from '../app.js';
-import type { OperationRecord } from '../db/index.js';
+import type { OperationRecord, RouteStateRecord } from '../db/index.js';
 import { labelOf } from '../domain/naming.js';
 import { OPEN_STATUSES, payloadOf } from '../domain/operations.js';
 import { buildRouteSummary } from '../domain/views.js';
@@ -35,7 +35,8 @@ import {
   type AcceptDeps,
 } from './accept.js';
 import type { Engine } from './context.js';
-import type { ControlEvaluation } from '../domain/route-rules.js';
+import type { PrecheckEvaluation } from '../domain/route-rules.js';
+import { controlAfterReconcile } from './reconcile.js';
 import { recordUnidentifiedProfileReport, routeOps } from './route-control.js';
 import { normalModeOffered } from './safari-route-marker.js';
 import { beginVerification, submitVerification } from './verification.js';
@@ -43,8 +44,8 @@ import { beginVerification, submitVerification } from './verification.js';
 type ProfileState = 'unidentified' | 'unbound' | 'bound';
 
 export interface NativeDeps extends AcceptDeps {
-  /** 动作前短超时对账后的“受控”判定；maxAgeMs 内的缓存结果可复用。 */
-  ensureInControl: (opts: { maxAgeMs: number }) => Promise<ControlEvaluation>;
+  /** 动作前短超时对账后的“受控”判定；maxAgeMs 内完成过对账时不再读 Surge（判定按当前路由记录重新计算）。 */
+  ensureInControl: (opts: { maxAgeMs: number }) => Promise<PrecheckEvaluation>;
 }
 
 const FILL_REF_TTL_MS = 60_000;
@@ -172,9 +173,20 @@ function ownRouteOperation(deps: NativeDeps, id: unknown, envId: string): Operat
   return op;
 }
 
+/** 路由需要动作前检查：不是空闲的普通模式（对账同样只在这时比较入口与选择，§6.6）。 */
+function routeNeedsCheck(route: RouteStateRecord): boolean {
+  return route.phase !== 'idle' || route.entryMode !== 'NORMAL' || route.activeEnvironmentId !== null || route.activationSnapshot !== null;
+}
+
 async function currentState(deps: NativeDeps, profileId: string | null, envId: string | null): Promise<CurrentStateResponse> {
   const { engine, views } = deps;
   const { repos } = engine;
+  // 动作前检查（自动打开订单与填充的前提）会先对账，可能改写路由（例如 Surge 重启 → attention、入口 UNKNOWN）：路由不是空闲
+  // 的普通模式时，不论哪个场景（含其他环境的场景与未识别场景，它们的顶栏同样按摘要显示）先做检查，之后再读路由。同一响应中的
+  // 路由摘要、完整路由、环境视图、关系与订单判定都来自检查之后的同一次读取——否则摘要仍是对账之前的 ACTIVE/active_verified，
+  // 顶栏显示「托管中」而 Surge 已不再按本应用入口发出 Safari 请求。检查没有完成对账（执行器正忙、超时）时摘要标为未对账
+  // （reconciled: false），弹窗顶栏不按记录的入口声称托管中或已阻断。
+  const control = routeNeedsCheck(repos.routeState.get()) ? await deps.ensureInControl({ maxAgeMs: 5_000 }) : null;
   const route = repos.routeState.get();
   const active = route.activeEnvironmentId;
   const relation: CurrentStateResponse['relation'] = active === null ? 'none_active' : active === envId ? 'this_active' : 'other_active';
@@ -191,7 +203,7 @@ async function currentState(deps: NativeDeps, profileId: string | null, envId: s
     if (op) {
       const p = payloadOf(op).route!;
       const kind = p.flow === 'probe' ? 'probe_safari' : p.purpose === 'apply_new_revision' ? 'apply_new_revision' : p.purpose === 'reverify' ? 'reverify' : 'activate';
-      pendingVerification = { operation_id: op.id, kind, deadline: p.verifyDeadline ?? p.arrivalDeadline };
+      pendingVerification = { operation_id: op.id, kind, waiting_route: op.phase === 'WAITING_ROUTE', deadline: p.verifyDeadline ?? p.arrivalDeadline };
     }
   }
 
@@ -211,17 +223,24 @@ async function currentState(deps: NativeDeps, profileId: string | null, envId: s
     else activationAvailable = true;
     if (relation !== 'this_active') {
       ordersBlockedReason = relation === 'other_active' ? '其他环境正在使用' : '当前没有使用中的环境';
+    } else if (control === null) {
+      // 检查之前路由是空闲的普通模式（检查期间路由已变化）：本次不允许，下次读取状态时再检查
+      ordersBlockedReason = '路由状态已变化，请重新打开扩展';
+    } else if (!control.checked) {
+      ordersBlockedReason = control.reason;
     } else {
-      const control = await deps.ensureInControl({ maxAgeMs: 5_000 });
-      if (control.ok) ordersAllowed = true;
-      else ordersBlockedReason = control.reason;
+      // 按这次读到的路由重新判定（不读 Surge）：检查返回之后、读取路由之前，对账（周期、刷新、路由操作）或受理可能已改写路由
+      // ——例如对账发现 Surge 重启、出站模式改为直连；不能沿用检查时的判定
+      const fresh = controlAfterReconcile(engine);
+      if (fresh.ok) ordersAllowed = true;
+      else ordersBlockedReason = fresh.reason;
     }
   }
   return {
     profile: { identified: profileId !== null, profileIdShort: shortProfileId(profileId) },
     environment,
     route: relation === 'this_active' ? views.routeView() : null,
-    routeSummary: buildRouteSummary(route, normalModeOffered(engine, route)),
+    routeSummary: buildRouteSummary(route, normalModeOffered(engine, route), control === null || control.checked),
     relation,
     // 未识别场景不返回其他环境名称
     otherActiveLabel: relation === 'other_active' && profileId !== null && activeEnv ? labelOf(activeEnv) : null,
@@ -269,9 +288,11 @@ async function loginFill(deps: NativeDeps, msg: Extract<NativeRequest, { type: '
   if (!account) throw fillDenied('该环境没有配置账号', 'account');
   const control = await deps.ensureInControl({ maxAgeMs: 0 });
   if (!control.ok) throw fillDenied(`路由不受控：${control.reason ?? '状态未知'}`, 'control');
-  // 对账之后再次确认 epoch 与活动环境（对账不会改变它们，但切换可能在此期间完成）
+  // 对账之后再次确认 epoch 与活动环境（对账不会改变它们，但切换可能在此期间完成），并按此刻的路由记录重新判定受控
   const after = repos.routeState.get();
   if (after.routeEpoch !== msg.route_epoch || after.activeEnvironmentId !== env.id) throw fillDenied('路由已变化，请刷新页面后重试', 'epoch');
+  const fresh = controlAfterReconcile(engine);
+  if (!fresh.ok) throw fillDenied(`路由不受控：${fresh.reason ?? '状态未知'}`, 'control');
   const fills: LoginFillServiceResponse['fills'] = [];
   for (const f of fields) {
     if (f === 'identifier') {

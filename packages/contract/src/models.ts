@@ -381,6 +381,12 @@ export interface RouteSummaryView {
   buyerExitConnectionsUnconfirmed: boolean;
   /** 与 RouteStateView.normalModeOffered 相同：任何场景据此提供「进入普通模式」（§6.5）。 */
   normalModeOffered: boolean;
+  /**
+   * 本摘要读取之前的有效期（5 秒）内完成过对账（动作前检查或其他来源），或路由是空闲的普通模式、不需要对账。false：检查没有
+   * 完成对账（执行器正忙、读取 Surge 超时或失败），路由记录可能还没有反映 Surge 的变化（例如 Surge 重启之后临时规则已丢弃）
+   * ——弹窗顶栏不按记录的入口声称托管中、已阻断或只允许检测（§7.2）。
+   */
+  reconciled: boolean;
 }
 
 export interface CapabilityContext {

@@ -7,7 +7,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { ENTRY_RULESET_FILES, type ProtocolCoverage } from '@sfe/contract';
 import { processPathsDigest } from '../../src/engine/capabilities.js';
 import { capabilityUnverified } from '../../src/surge/primitives.js';
-import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
+import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST, FakeSurge } from '../../src/surge/fake.js';
 import { entryRuleSetFileContent, tempRuleText } from '../../src/surge/generate.js';
 import { AGENT, ALL_CAPS, PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, anyContext, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
 
@@ -365,7 +365,7 @@ describe('normal mode is always available (§5.2)', () => {
     for (const profile of [PROFILE_A, PROFILE_B]) {
       const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: { relation: string; routeSummary: Record<string, unknown> } }).data;
       expect(d.relation).toBe('none_active');
-      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'attention', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true });
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'attention', buyerExitConnectionsUnconfirmed: false, normalModeOffered: true, reconciled: true });
     }
     const n = await h.native(PROFILE_B, { type: 'enterNormalMode', request_id: rid() });
     expect(n.ok).toBe(true);
@@ -412,7 +412,7 @@ describe('normal mode is always available (§5.2)', () => {
     for (const profile of [PROFILE_A, PROFILE_B]) {
       const d = ((await h.native(profile, { type: 'getCurrentState' })) as { data: { relation: string; routeSummary: Record<string, unknown> } }).data;
       expect(d.relation).toBe('none_active');
-      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true });
+      expect(d.routeSummary).toEqual({ routeEpoch: expect.any(Number), entryMode: 'NORMAL', phase: 'idle', buyerExitConnectionsUnconfirmed: true, normalModeOffered: true, reconciled: true });
     }
     // 下一次普通模式（未绑定场景发起）结束买家出口上的连接，警告清除、不再提供
     const n = await h.native(PROFILE_B, { type: 'enterNormalMode', request_id: rid() });
@@ -679,12 +679,18 @@ describe('normal mode is always available (§5.2)', () => {
     };
     // 假 Surge 的监视延迟（假时钟 60 秒）高于入口等待上限（40 毫秒）：退路等满上限后按文件内容视为已加载
     h.fake.localWatchLatencyMs = 60_000;
+    // 收紧未经运行时求值确认时普通模式完成前改选 REJECT；这里改选失败（如实报告），SFE-ROUTE 仍选着 A 的节点
+    h.fake.failNext('selectGroupPolicy');
+    const nodeA = h.repos.routeState.get().selectedNode;
     const first = await enterNormal(envId);
     expect(h.repos.operations.get(first)!.phase).toBe('NORMAL_RESTORED');
-    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+    expect(h.repos.operations.get(first)!.result).toMatchObject({ rejectSelected: false });
+    expect(h.repos.operations.listSteps(first).at(-1)!.message).toContain('SFE-ROUTE 未能改选 REJECT（');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, selectedNode: nodeA });
     // Surge 仍加载着写前的 ACTIVE 内容：普通模式之后 Safari 的新长连接经 SFE-ROUTE 发出（买家出口）
     const live = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
     expect(live.policyName).toBe('SFE-ROUTE');
+    expect(live.leafPolicyName).toBe(nodeA);
     expect(h.repos.routeState.get().warnings).toContain('buyer_exit_connections_unconfirmed');
     // 监视赶上之后新请求按原规则；之前的长连接仍在买家出口上
     h.clock.advance(120_000);
@@ -701,6 +707,105 @@ describe('normal mode is always available (§5.2)', () => {
     expect(messages.some((m) => m.includes('之前的 Safari 连接已确认结束'))).toBe(false);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
   });
+
+  test('ruleset_resource without rule match and a watcher slower than the wait: a normal mode whose block is not runtime-confirmed does not end Safari connections on the original rules (Surge may still have the earlier entry loaded), and Safari reconnecting on them is not a kill failure', async () => {
+    h = await createHarness();
+    const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, envId);
+    h.fake.matchRule = async () => {
+      throw capabilityUnverified('matchRule');
+    };
+    h.fake.localWatchLatencyMs = 60_000;
+    // 激活在阻断一步失败（激活方向从不走退路），回滚经退路写入阻断：Surge 仍加载着原来的普通模式，路由不是空闲的普通模式
+    const act = await h.app.activate(envId, { request_id: rid('act') }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(act.operation_id)!.status).toBe('needs_attention');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'UNKNOWN' });
+    // Safari 按原规则的长连接（用户规则 Daily、FINAL）与 Chrome
+    const daily = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'daily.example.test', protocol: 'tcp', longLived: true });
+    expect(daily.policyName).toBe('Daily');
+    const direct = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    expect(direct.rule).toBe('FINAL,DIRECT');
+    const chrome = h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp', longLived: true });
+    const kills = h.fake.calls.killRequest ?? 0;
+    const n = await enterNormal(null);
+    const op = h.repos.operations.get(n)!;
+    expect(op.phase).toBe('NORMAL_RESTORED');
+    // 阻断未经运行时求值确认：不按“入口已阻断”结束配置路径上的全部 Safari 连接；按原规则的连接不在买家出口上，不结束、不记失败
+    expect(h.fake.calls.killRequest ?? 0).toBe(kills);
+    expect((op.result as { killResults: unknown[] }).killResults).toEqual([]);
+    const active = (await h.fake.listActiveRequests()).map((r) => r.id);
+    expect(active).toEqual(expect.arrayContaining([daily.id, direct.id, chrome.id]));
+    const messages = h.repos.operations.listSteps(n).map((st) => st.message);
+    expect(messages.some((m) => m.startsWith('已阻断 Safari 新请求'))).toBe(false);
+    expect(messages).toContain('入口已按计划写入阻断：rule match 读不到或当前 Surge 不支持，入口按结构读回或写入并等待完成，未经运行时求值确认，Surge 可能仍加载着写入之前的入口（Safari 可能仍按原规则发出）；只结束 Safari 可能经买家出口的连接');
+    // 入口未经运行时确认：记录与警告保留，下一次普通模式再结束可能经买家出口的连接
+    expect(h.repos.routeState.get().warnings).toEqual(expect.arrayContaining(['entry_unverified', 'buyer_exit_connections_unconfirmed']));
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+  });
+
+  test('ruleset_resource without rule match and a watcher slower than the wait: while a normal mode\'s block is not runtime-confirmed the route never records BLOCKED (a later failure or activation would take it as confirmed)', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.fake.matchRule = async () => {
+      throw capabilityUnverified('matchRule');
+    };
+    h.fake.localWatchLatencyMs = 60_000;
+    // 结束 Safari 连接时（中间阻断之后、撤销入口之前）记下路由记录的入口模式
+    const seen: string[] = [];
+    const list = h.fake.listActiveRequests.bind(h.fake);
+    h.fake.listActiveRequests = async () => {
+      if (h.repos.operations.listByStatus(['running']).some((o) => o.kind === 'route.normal')) seen.push(h.repos.routeState.get().entryMode);
+      return list();
+    };
+    const n = await enterNormal(envId);
+    expect(h.repos.operations.get(n)!.phase).toBe('NORMAL_RESTORED');
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen).not.toContain('BLOCKED');
+    expect(seen).toContain('UNKNOWN');
+    expect(h.repos.routeState.get().warnings).toEqual(expect.arrayContaining(['entry_unverified', 'buyer_exit_connections_unconfirmed']));
+  });
+
+  test.each([
+    ['A in use (ACTIVE on A\'s exit)', false],
+    ['a switch to B waiting at VERIFY_ONLY (B\'s unverified exit selected)', true],
+  ] as const)(
+    'ruleset_resource without rule match and a watcher slower than the wait, from %s: the normal mode completes but its undo is not runtime-confirmed — SFE-ROUTE is moved to REJECT so Safari never goes out through a buyer exit while Surge still has the earlier entry loaded',
+    async (_label, switching) => {
+      h = await createHarness();
+      const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+      if (switching) {
+        const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+        await bind(h, PROFILE_B, b);
+        const act = await h.app.activate(b, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+        await h.idle();
+        expect(h.repos.operations.get(act.operation_id)!.phase).toBe('VERIFY_ONLY');
+      }
+      const before = h.repos.routeState.get().selectedNode!;
+      h.fake.matchRule = async () => {
+        throw capabilityUnverified('matchRule');
+      };
+      h.fake.localWatchLatencyMs = 60_000;
+      const n = await enterNormal(a);
+      const op = h.repos.operations.get(n)!;
+      expect(op.phase).toBe('NORMAL_RESTORED');
+      expect(op.result).toMatchObject({ rejectSelected: true });
+      expect(h.repos.operations.listSteps(n).at(-1)!.message).toContain('SFE-ROUTE 已改选 REJECT（读回确认）：Surge 加载撤销之前若仍加载着检测或使用中入口');
+      expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null, selectedNode: 'REJECT' });
+      expect(h.repos.routeState.get().warnings).toEqual(expect.arrayContaining(['entry_unverified', 'buyer_exit_connections_unconfirmed']));
+      // Surge 仍加载着撤销之前的入口：经 SFE-ROUTE 的 Safari 请求被拒绝，不经 A 或 B 的出口
+      const v = h.fake.simulateRequest({ processPath: FAKE_SAFARI_PATH, host: FAKE_VERIFY_HOST, protocol: 'tcp' });
+      expect(v.policyName).toBe('SFE-ROUTE');
+      expect(v.leafPolicyName).toBe('REJECT');
+      expect(v.leafPolicyName).not.toBe(before);
+      expect(v.failed).toBe(true);
+      expect(h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp' }).policyName).not.toBe('SFE-ROUTE');
+      // 文件监视加载撤销之后 Safari 按原规则发出
+      h.clock.advance(120_000);
+      expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
+      expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+    },
+  );
 
   test('entry files of the earlier format without a witness: the already-NORMAL step does not claim witness confirmation (ruleset_resource)', async () => {
     h = await createHarness();
@@ -856,5 +961,193 @@ describe('normal mode is always available (§5.2)', () => {
     expect(result.killResults).toEqual([expect.objectContaining({ surgeRequestId: live.id, ok: false })]);
     expect(result.killError.code).toBe('READBACK_MISMATCH');
     expectOriginalRules();
+  });
+});
+
+describe('a failed or unconfirmed normal mode reports only what was read back (§6.5)', () => {
+  test.each(['temp_rule', 'ruleset_resource'] as const)('%s: SFE-ROUTE switched to another buyer\'s node outside the record, then a normal mode whose first write fails: SFE-ROUTE is moved to REJECT (Safari never left on B\'s exit) and the step does not claim it did not fall back', async (strategy) => {
+    h = await createHarness({ entryStrategy: strategy });
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeA = h.repos.routeState.get().selectedNode!;
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.20')).environment_id!;
+    const nodeB = h.repos.proxyRevisions.get(b, 1)!.nodeName;
+    // 用户在 Surge 界面把 SFE-ROUTE 改选 B 的节点：对账只加警告，路由记录的选择仍是 A 的节点
+    await h.fake.selectGroupPolicy('SFE-ROUTE', nodeB);
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get()).toMatchObject({ selectedNode: nodeA, activationSnapshot: null });
+    expect(h.repos.routeState.get().warnings).toContain('external_selection_change');
+    expect(safariOutcome(h, 'www.amazon.com').leafPolicyName).toBe(nodeB);
+    if (strategy === 'temp_rule') h.fake.failNext('addTempRule');
+    else h.fake.failNext('listExternalResources');
+    const n = await enterNormal(a);
+    const op = h.repos.operations.get(n)!;
+    expect(op.status).toBe('failed');
+    expect(op.result).toMatchObject({ rejectSelected: true });
+    const last = h.repos.operations.listSteps(n).at(-1)!.message;
+    expect(last).not.toContain('未回退到其他出口');
+    expect(last).toContain('SFE-ROUTE 已改选 REJECT（读回确认）');
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
+    expect(h.repos.routeState.get().selectedNode).toBe('REJECT');
+    // Safari 不再经 B 的出口发出（经 SFE-ROUTE 被拒绝）；Chrome 不命中本应用规则
+    const after = safariOutcome(h, 'www.amazon.com');
+    expect(after.leafPolicyName).not.toBe(nodeB);
+    expect(after.failed).toBe(true);
+    expect(h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.amazon.com', protocol: 'tcp' }).policyName).not.toBe('SFE-ROUTE');
+  });
+
+  test('a failed normal mode whose selection reads back as the active environment\'s verified exit leaves it (no REJECT) and says so', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const nodeA = h.repos.routeState.get().selectedNode!;
+    h.fake.failNext('addTempRule');
+    const n = await enterNormal(a);
+    expect(h.repos.operations.get(n)!.status).toBe('failed');
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe(nodeA);
+    expect(h.repos.operations.listSteps(n).at(-1)!.message).toContain('SFE-ROUTE 的选择读回就是使用中环境已验证的出口：Safari 停在原来已验证的路由上，未回退到其他出口');
+  });
+
+  test('ruleset_resource without rule match and a watcher slower than the wait: the unconfirmed intermediate block is not recorded under the SAFARI_BLOCKED phase (shown as "Safari 已阻断"), while a confirmed one is', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.fake.matchRule = async () => {
+      throw capabilityUnverified('matchRule');
+    };
+    h.fake.localWatchLatencyMs = 60_000;
+    const seen: string[] = [];
+    const list = h.fake.listActiveRequests.bind(h.fake);
+    h.fake.listActiveRequests = async () => {
+      const normal = h.repos.operations.listByStatus(['running']).find((o) => o.kind === 'route.normal');
+      if (normal) seen.push(normal.phase);
+      return list();
+    };
+    const n = await enterNormal(envId);
+    expect(h.repos.operations.get(n)!.phase).toBe('NORMAL_RESTORED');
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen).not.toContain('SAFARI_BLOCKED');
+    const steps = h.repos.operations.listSteps(n);
+    const block = steps.find((st) => st.message.startsWith('入口已按计划写入阻断'))!;
+    expect(block.phase).not.toBe('SAFARI_BLOCKED');
+    expect(steps.some((st) => st.phase === 'SAFARI_BLOCKED')).toBe(false);
+    // 对照：rule match 可用时中间阻断读回确认，记在 SAFARI_BLOCKED 之下
+    h.fake.matchRule = (FakeSurge.prototype.matchRule as typeof h.fake.matchRule).bind(h.fake);
+    h.fake.localWatchLatencyMs = 0;
+    h.clock.advance(120_000);
+    const { envId: again } = await activeEnv(h, 'US-Buyer-B', '203.0.113.11', PROFILE_B);
+    const n2 = await enterNormal(again);
+    expect(h.repos.operations.get(n2)!.phase).toBe('NORMAL_RESTORED');
+    expect(h.repos.operations.listSteps(n2).find((st) => st.message === '已阻断 Safari 新请求（读回确认）')!.phase).toBe('SAFARI_BLOCKED');
+  });
+
+  test('temp_rule: a module rule ahead of the entry, then the normal mode fails after its intermediate block: the route does not claim a plain block — it carries precedence_violation and entry_unverified', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.fake.setModuleRules([{ text: 'DOMAIN-SUFFIX,www.amazon.com,DIRECT', moduleName: 'user-module' }]);
+    // 结束 Safari 连接之后（中间阻断已写入）撤销入口的第一次写入失败
+    const list = h.fake.listActiveRequests.bind(h.fake);
+    let armed = false;
+    h.fake.listActiveRequests = async () => {
+      if (!armed && h.repos.operations.listByStatus(['running']).some((o) => o.kind === 'route.normal')) {
+        armed = true;
+        h.fake.failNext('removeTempRule');
+      }
+      return list();
+    };
+    const n = await enterNormal(envId);
+    expect(armed).toBe(true);
+    const op = h.repos.operations.get(n)!;
+    expect(op.status).toBe('failed');
+    expect((op.result as { precedenceIssues?: unknown[] }).precedenceIssues?.length).toBeGreaterThan(0);
+    const route = h.repos.routeState.get();
+    expect(route.entryMode).toBe('BLOCKED');
+    expect(route.warnings).toEqual(expect.arrayContaining(['precedence_violation', 'entry_unverified']));
+    // 记录的阻断只是入口位：被模块规则匹配的 Safari 请求按它直连
+    expect(safariOutcome(h, 'www.amazon.com').rule).toBe('DOMAIN-SUFFIX,www.amazon.com,DIRECT');
+    expect(h.app.views.routeView().normalModeOffered).toBe(true);
+  });
+
+  test('temp_rule with rule match failing: the normal mode\'s unconfirmed block and completion say the rules were read back structurally, not that Surge may still have the earlier entry loaded', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.fake.matchRule = async () => {
+      throw capabilityUnverified('matchRule');
+    };
+    const n = await enterNormal(envId);
+    expect(h.repos.operations.get(n)!.phase).toBe('NORMAL_RESTORED');
+    const messages = h.repos.operations.listSteps(n).map((st) => st.message);
+    // temp_rule 没有加载阶段：任何“仍加载着”“加载撤销之前”的说法都不成立（含完成说明中改选 REJECT 的一句）
+    expect(messages.filter((m) => /仍加载着|加载撤销之前|写入之前的入口|写前的入口/.test(m))).toEqual([]);
+    expect(messages.some((m) => m.includes('临时规则已按 Surge 的临时规则列表与有效规则顺序读回'))).toBe(true);
+    const done = messages.at(-1)!;
+    expect(done).toContain('临时规则已按列表与有效规则顺序读回');
+    expect(h.repos.operations.get(n)!.result).toMatchObject({ rejectSelected: true });
+    expect(done).toContain('SFE-ROUTE 已改选 REJECT（读回确认）：临时规则已按 Surge 的临时规则列表与有效规则顺序读回，但 Surge 实际如何匹配 Safari 请求未经 rule match 求值确认');
+  });
+
+  test('temp_rule with rule match failing: the intermediate block\'s udp removal times out after steps accepted only from the temp-rule list — the failed normal mode records UNKNOWN with entry_unverified, not a runtime-confirmed BLOCKED', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    h.fake.matchRule = async () => {
+      throw capabilityUnverified('matchRule');
+    };
+    // ACTIVE → BLOCKED：加入 block（容忍）、移除 active（容忍）、移除 udp——超时且没有生效（规则仍在列表中）
+    const udp = tempRuleText('udp', { processPaths: h.repos.settings.get('safariProcessPaths'), verifyHost: FAKE_VERIFY_HOST });
+    const remove = h.fake.removeTempRule.bind(h.fake);
+    let failed = false;
+    h.fake.removeTempRule = async (rule: string) => {
+      if (!failed && rule === udp) {
+        failed = true;
+        throw new Error('rule temp remove timed out');
+      }
+      return remove(rule);
+    };
+    const n = await enterNormal(envId);
+    expect(failed).toBe(true);
+    const op = h.repos.operations.get(n)!;
+    expect(op.status).toBe('failed');
+    const done = h.repos.operations.listSteps(n).at(-1)!.message;
+    expect(done).not.toContain('最后经运行时求值确认的状态（BLOCKED）');
+    expect(done).toContain('入口状态未知');
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ entryMode: 'UNKNOWN', phase: 'failed' });
+    expect(route.warnings).toContain('entry_unverified');
+  });
+
+  test('temp_rule with rule match failing: a normal mode that took over B\'s VERIFY_ONLY wait wrote an unconfirmed block; its removal then fails — the route is not recorded as a confirmed BLOCKED and SFE-ROUTE moves off B\'s unverified node to REJECT', async () => {
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+    await bind(h, PROFILE_B, b);
+    const act = await h.app.activate(b, { request_id: rid('act'), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(act.operation_id)!.phase).toBe('VERIFY_ONLY');
+    const nodeB = h.repos.proxyRevisions.get(b, 1)!.nodeName;
+    h.fake.matchRule = async () => {
+      throw capabilityUnverified('matchRule');
+    };
+    // 结束 Safari 连接之后（未经确认的中间阻断已写入）撤销入口的第一次移除失败：block 仍在列表中
+    const list = h.fake.listActiveRequests.bind(h.fake);
+    let armed = false;
+    h.fake.listActiveRequests = async () => {
+      if (!armed && h.repos.operations.listByStatus(['running']).some((o) => o.kind === 'route.normal')) {
+        armed = true;
+        h.fake.failNext('removeTempRule');
+      }
+      return list();
+    };
+    const n = await enterNormal(a);
+    expect(armed).toBe(true);
+    expect(h.repos.operations.get(act.operation_id)!.phase).toBe('SUPERSEDED');
+    const op = h.repos.operations.get(n)!;
+    expect(op.status).toBe('failed');
+    const steps = h.repos.operations.listSteps(n).map((st) => st.message);
+    expect(steps.some((m) => m.includes('入口已按计划写入阻断') && m.includes('未经运行时求值确认'))).toBe(true);
+    expect(steps.at(-1)).not.toContain('最后经运行时求值确认的状态（BLOCKED）');
+    expect(steps.at(-1)).not.toContain('未回退到其他出口');
+    const route = h.repos.routeState.get();
+    expect(route).toMatchObject({ entryMode: 'UNKNOWN', phase: 'failed', selectedNode: 'REJECT' });
+    expect(route.warnings).toContain('entry_unverified');
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).not.toBe(nodeB);
+    expect(op.result).toMatchObject({ rejectSelected: true });
   });
 });

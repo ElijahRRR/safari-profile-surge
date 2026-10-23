@@ -107,7 +107,7 @@ export const OPERATION_PHASE_LABELS: Record<OperationPhase, StatusLabel> = {
   ROLLING_BACK: { label: '回滚中', variant: 'warning' },
   FAILED: { label: '失败', variant: 'danger' },
   SUPERSEDED: { label: '已被取代', variant: 'gray' },
-  BLOCKED_NEEDS_ATTENTION: { label: '已阻断，需要处理', variant: 'danger' },
+  BLOCKED_NEEDS_ATTENTION: { label: '未能确认，需要处理', variant: 'danger' },
 };
 
 export const OPERATION_STATUS_LABELS: Record<OperationStatus, StatusLabel> = {

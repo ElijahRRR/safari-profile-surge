@@ -607,6 +607,24 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
     let lastConfirmed: EntryBits | null = fromMode === 'UNKNOWN' ? null : { ...ENTRY_MODE_BITS[fromMode] };
     /** 撤销入口中 rule match 读不到、只按结构读回确认的步骤（证据）。 */
     const unconfirmedSteps: string[] = [];
+    /**
+     * lastConfirmed 经本次切换的运行时求值确认（一步写入后 rule match 读回一致，或没有本应用规则可求值——临时规则列表中没有
+     * 本应用规则即是普通模式）。起点有本应用规则时只按临时规则列表与有效规则顺序读出（fromMode），没有经求值；撤销入口中容忍了
+     * rule match 读不到的步骤之后同样不算。
+     */
+    let backed = start.order !== null && start.order.length === 0;
+    /** 本次切换中 rule match 读不到（某一步或最终读回）。 */
+    let readFailedSeen = false;
+    /**
+     * 记下的位只按结构读回、而本次切换已知 rule match 读不到时（例如撤销入口中容忍了读不到的步骤之后又有一步失败，或起点之后
+     * 的最终读回读不到），抛出的错误带 runtimeConfirmed: false：调用方（route.ts runtimeConfirmedModeFrom）不把这些位当作经运行时
+     * 求值确认的状态——例如不把只按结构读回的阻断记为已确认的 BLOCKED（§6.5）、回滚不跳过回到阻断就恢复切换前的节点（§6.3 第 14 步）。
+     */
+    const unconfirmedFlag = (): Record<string, unknown> => (lastConfirmed !== null && !backed && readFailedSeen ? { runtimeConfirmed: false } : {});
+    const flagged = (e: SfeError): SfeError => {
+      const extra = unconfirmedFlag();
+      return Object.keys(extra).length === 0 ? e : new SfeError(e.code, e.message, { fieldErrors: e.fieldErrors, details: { ...(e.details ?? {}), ...extra }, cause: e.cause ?? e });
+    };
     if ((to === 'VERIFY_ONLY' || to === 'ACTIVE') && hasBlockingIssue(precedenceOf(s))) {
       throw stepFailure('PRECEDENCE_VIOLATION', '切换入口失败：有规则排在入口之前，可能抢先匹配 Safari 流量', lastConfirmed, {
         precedenceIssues: precedenceOf(s),
@@ -662,14 +680,15 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
       }
       const textPresent = after.tempsN.has(textN);
       if (writeError !== null && (st.add ? !textPresent : textPresent)) {
-        // 超时等未知结果：读到的事实表明这一步没有生效，上一确认状态仍然成立。
+        // 超时等未知结果：读到的事实表明这一步没有生效，上一确认状态仍然成立（只按结构读回时如实标明，见 unconfirmedFlag）。
         await deps.ownership.confirm('temp_rule', text, textPresent ? 'present' : 'removed').catch(() => undefined);
-        throw withLastConfirmed(writeError, lastConfirmed, stepInfo);
+        throw flagged(withLastConfirmed(writeError, lastConfirmed, stepInfo));
       }
       const mode = semanticMode(after.order);
       const kindsOk = sameKinds(presentKinds(after), st.kinds);
       const structuralOk = kindsOk && mode !== null && allowed.has(mode);
       const judgement = structuralOk ? await observe(after, precedenceOf(after)) : null;
+      if (judgement?.readFailed === true) readFailedSeen = true;
       // 撤销入口时 rule match 读不到不是停止的理由（结构读回照常，见 runPlan 注释）；对照进程命中从不容忍。
       const toleratedRead = undo && (!st.add || REJECT_KINDS.has(st.kind)) && judgement !== null && judgement.readFailed === true && !judgement.controlHit;
       if (toleratedRead) unconfirmedSteps.push(`${st.kind}${st.add ? '+' : '-'}`);
@@ -689,15 +708,19 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
         await deps.ownership.confirm('temp_rule', text, present ? 'present' : 'removed').catch(() => undefined);
         // 本条规则回到了步骤之前的状态时，上一确认状态仍然成立；否则无法确定（保留的 REJECT 规则：不声称任何已确认状态）。
         const unchanged = st.add ? !present : present;
-        throw stepFailure('READBACK_MISMATCH', '切换入口失败：运行时读回与预期不一致', unchanged ? lastConfirmed : null, {
+        if (!unchanged) lastConfirmed = null;
+        throw stepFailure('READBACK_MISMATCH', '切换入口失败：运行时读回与预期不一致', lastConfirmed, {
           failedStep: { bit: stepInfo.bit, value: st.add, kind: st.kind },
           observedMode: mode ?? 'UNKNOWN',
           ...(keepReject ? { keptRejectRule: true } : {}),
           ...(judgement && !judgement.ok ? { runtime: judgement.evidence, controlHit: judgement.controlHit } : {}),
+          ...unconfirmedFlag(),
         });
       }
       await deps.ownership.confirm('temp_rule', text, st.add ? 'present' : 'removed');
       lastConfirmed = { ...ENTRY_MODE_BITS[mode] };
+      // 容忍的步骤只按结构读回；其余步骤的运行时求值一致（没有本应用规则时无可求值，结构读回即是事实）
+      backed = !toleratedRead;
       s = after;
       onStep?.({ bit: stepInfo.bit, value: st.add, bits: { ...lastConfirmed }, effective: mode });
     }
@@ -710,8 +733,9 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
       judgement = await observe(finalState, precedenceOf(finalState));
       final = readbackOf(finalState, judgement, undo);
     } catch (e) {
-      throw withLastConfirmed(e, lastConfirmed, null);
+      throw flagged(withLastConfirmed(e, lastConfirmed, null));
     }
+    if (judgement?.readFailed === true) readFailedSeen = true;
     if (unconfirmedSteps.length > 0) {
       final.runtimeConfirmed = false;
       final.evidence.push(`撤销入口：这些步骤写入后 rule match 读不到，只按临时规则列表与有效规则顺序确认：${unconfirmedSteps.join('、')}`);
@@ -726,8 +750,9 @@ export function createTempRuleStrategy(deps: TempRuleStrategyDeps): EntryControl
           observedMode: final.mode,
           precedenceIssues: final.precedenceIssues,
           evidence: final.evidence,
-          // 未经运行时确认的读回（EntryReadback.runtimeConfirmed）：普通模式据此不把这一次阻断当作已确认
-          ...(final.runtimeConfirmed === false ? { runtimeConfirmed: false } : {}),
+          // 未经运行时确认的读回（EntryReadback.runtimeConfirmed）：普通模式据此不把这一次阻断当作已确认；记下的位只按结构读回、
+          // 而 rule match 读不到时同样（unconfirmedFlag：例如起点已是目标模式、最终读回读不到）
+          ...(final.runtimeConfirmed === false ? { runtimeConfirmed: false } : unconfirmedFlag()),
         },
       });
     }

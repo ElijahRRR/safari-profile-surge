@@ -287,7 +287,7 @@ describe('other actions', () => {
 
   it('continue verification opens the pending operation', async () => {
     const browser = mockBrowser();
-    const pending = { operation_id: 'op_w', kind: 'apply_new_revision' as const, deadline: null };
+    const pending = { operation_id: 'op_w', kind: 'apply_new_revision' as const, waiting_route: true, deadline: null };
     const { c } = controller({ getCurrentState: () => ok(currentState({ pendingVerification: pending })) }, browser);
     await c.refresh();
     await c.continueVerification();
@@ -295,7 +295,7 @@ describe('other actions', () => {
   });
 
   it('cancel sends cancelOperation for the pending operation', async () => {
-    const pending = { operation_id: 'op_w', kind: 'activate' as const, deadline: null };
+    const pending = { operation_id: 'op_w', kind: 'activate' as const, waiting_route: false, deadline: null };
     const { c, calls } = controller({ getCurrentState: () => ok(currentState({ pendingVerification: pending })), cancelOperation: () => accepted('op_w') });
     await c.refresh();
     await c.cancelPending();

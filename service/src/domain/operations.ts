@@ -74,6 +74,8 @@ export interface NormalPayload {
   oldSessionPolicy: OldSessionPolicy | null;
   expectedActiveEnvironmentId: string | null;
   hadManagedEnvironment: boolean;
+  /** 受理时已排队或正在执行的路由操作（普通模式排在它们之后，§6.3 并发矩阵）；早先的记录没有这一项。 */
+  queuedBehind?: string[];
 }
 
 export interface OperationPayload {

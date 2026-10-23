@@ -171,5 +171,7 @@ describe('environment helpers', () => {
     expect(cancelActionLabel(operation({ kind: 'route.activate', phase: 'VERIFY_ONLY' }))).toBe('取消切换');
     expect(cancelActionLabel(operation({ kind: 'deploy.publish', phase: 'WAITING_ROUTE' }))).toBe('取消等待');
     expect(cancelActionLabel(operation({ kind: 'probe.safari', phase: 'VERIFY_ONLY' }))).toBe('取消重测');
+    // 激活第 1 步复用时改为的重测：操作仍是 route.activate，服务端记 probeKind safari
+    expect(cancelActionLabel(operation({ kind: 'route.activate', phase: 'VALIDATING', probeKind: 'safari' }))).toBe('取消重测');
   });
 });

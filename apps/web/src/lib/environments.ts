@@ -113,12 +113,20 @@ export function isCancellableRouteOperation(op: Pick<OperationView, 'status' | '
 }
 
 /**
+ * 当前环境的 Safari 重测（§6.4：不切换、不阻断、不回滚；超时或取消只结束检测）：重测操作本身，或激活第 1 步复用时改为重测的
+ * 激活（环境已在使用中而实测过期：操作仍是 route.activate，服务端记 probeKind 'safari'）。
+ */
+export function isSafariRetest(op: Pick<OperationView, 'kind' | 'probeKind'>): boolean {
+  return op.kind === 'probe.safari' || op.probeKind === 'safari';
+}
+
+/**
  * 取消等待中路由操作的按钮与确认文案：按效果命名（取消等待、取消重测、取消切换）。
  * 单独的「取消」在设计系统中只表示关闭弹窗、不做操作。
  */
-export function cancelActionLabel(op: Pick<OperationView, 'kind' | 'phase'>): string {
+export function cancelActionLabel(op: Pick<OperationView, 'kind' | 'phase' | 'probeKind'>): string {
   if (op.phase === 'WAITING_ROUTE') return '取消等待';
-  if (op.kind === 'probe.safari') return '取消重测';
+  if (isSafariRetest(op)) return '取消重测';
   return '取消切换';
 }
 

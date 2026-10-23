@@ -54,7 +54,7 @@ import { initCommit, initPreview, remergeCommit, remergePreview } from './mainte
 import { handleNative } from './native.js';
 import { controlAfterReconcile, reconcile, surgeStatus } from './reconcile.js';
 import { createViewService, type ViewService } from './view-service.js';
-import type { ControlEvaluation } from '../domain/route-rules.js';
+import type { PrecheckEvaluation } from '../domain/route-rules.js';
 
 export type { AppServiceDeps } from './context.js';
 
@@ -70,7 +70,7 @@ export interface EngineAppService extends AppService {
   idle(): Promise<void>;
   /** 立即运行一次周期对账（测试用）。 */
   runPeriodicReconcile(): Promise<void>;
-  ensureInControl(opts?: { maxAgeMs?: number }): Promise<ControlEvaluation>;
+  ensureInControl(opts?: { maxAgeMs?: number }): Promise<PrecheckEvaluation>;
 }
 
 function requireWebOrAdmin(actor: Actor, action: string): void {
@@ -106,27 +106,64 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
 
   // ---------- 受控判定（动作前短超时对账） ----------
 
-  let controlCache: { at: number; value: ControlEvaluation } | null = null;
-  async function ensureInControl(opts: { maxAgeMs?: number } = {}): Promise<ControlEvaluation> {
-    const maxAge = opts.maxAgeMs ?? 0;
-    const nowMs = engine.now().getTime();
-    if (controlCache && maxAge > 0 && nowMs - controlCache.at <= maxAge) return controlCache.value;
-    const timeoutMs = deps.precheckTimeoutMs ?? DEFAULT_PRECHECK_TIMEOUT_MS;
-    let cancelTimer: () => void = () => undefined;
-    const timeout = new Promise<ControlEvaluation>((resolve) => {
-      cancelTimer = engine.clock.setTimeout(() => resolve({ ok: false, reason: '读取 Surge 状态超时' }), timeoutMs);
-    });
-    const run = executor
+  type PrecheckOutcome = 'done' | 'busy' | 'failed';
+  /** 进行中（已开始读 Surge）的动作前对账：可复用之前对账的检查共用它（超时之后它仍在后台完成），不因它占着通道而返回“正忙”。 */
+  let precheckRun: Promise<PrecheckOutcome> | null = null;
+  /** 排在进行中的对账之后、尚未开始的一次对账：不复用之前对账的检查（fresh）共用它——它在它们全部到达之后才开始读 Surge。 */
+  let precheckNext: Promise<PrecheckOutcome> | null = null;
+
+  function startPrecheck(): Promise<PrecheckOutcome> {
+    const run: Promise<PrecheckOutcome> = executor
       .tryRunExclusive(async () => {
         await reconcile(engine, 'precheck');
-        return controlAfterReconcile(engine);
+        return 'done' as const;
       })
-      .then((r) => r ?? { ok: false, reason: '正在切换出口，请稍后再试' })
-      .catch(() => ({ ok: false, reason: '读取 Surge 状态失败' }));
-    const value = await Promise.race([run, timeout]);
+      .then((r) => r ?? ('busy' as const))
+      .catch(() => 'failed' as const)
+      .finally(() => {
+        if (precheckRun === run) precheckRun = null;
+      });
+    precheckRun = run;
+    return run;
+  }
+
+  /**
+   * fresh：只接受在本次调用之后才开始读 Surge 的对账（填充等动作前检查不复用之前的对账，§6.6）。进行中的对账可能在调用之前
+   * 就读过出站模式、接管等事实，之后的变化它看不到：等它结束再开始新的一次（失败即关闭：期间执行器开始执行操作 → 正忙）。
+   * 否则共用进行中的对账。
+   */
+  function runPrecheck(fresh: boolean): Promise<PrecheckOutcome> {
+    if (!precheckRun) return startPrecheck();
+    if (!fresh) return precheckRun;
+    precheckNext ??= precheckRun.then(() => {
+      precheckNext = null;
+      // 其间已开始的对账（例如可复用对账的检查在进行中的对账结束后开始的）同样开始于本次调用之后
+      return precheckRun ?? startPrecheck();
+    });
+    return precheckNext;
+  }
+
+  /**
+   * 动作前检查：maxAgeMs 内完成过对账（任何来源：动作前、周期、刷新、提交 ACTIVE 之后的对账，按路由记录的 lastReconciledAt）
+   * 时不再读 Surge；否则在执行器空闲时短超时对账一次。maxAgeMs 为 0（缺省：填充）时不复用任何之前的对账，也不共用调用之前
+   * 已开始读 Surge 的对账（runPrecheck fresh）。判定总是在返回时按当前的路由记录与实测重新计算（controlAfterReconcile，
+   * 不读 Surge），从不复用之前的判定结果——期间的对账、路由操作或受理可能已改写路由。没有完成对账（执行器正忙、超时、失败）
+   * 时 checked 为 false、ok 为 false，结果不缓存。
+   */
+  async function ensureInControl(opts: { maxAgeMs?: number } = {}): Promise<PrecheckEvaluation> {
+    const maxAge = opts.maxAgeMs ?? 0;
+    const last = engine.repos.routeState.get().lastReconciledAt;
+    if (maxAge > 0 && last !== null && engine.now().getTime() - Date.parse(last) <= maxAge) return { ...controlAfterReconcile(engine), checked: true };
+    const timeoutMs = deps.precheckTimeoutMs ?? DEFAULT_PRECHECK_TIMEOUT_MS;
+    let cancelTimer: () => void = () => undefined;
+    const timeout = new Promise<'timeout'>((resolve) => {
+      cancelTimer = engine.clock.setTimeout(() => resolve('timeout'), timeoutMs);
+    });
+    const outcome = await Promise.race([runPrecheck(maxAge === 0), timeout]);
     cancelTimer();
-    controlCache = { at: engine.now().getTime(), value };
-    return value;
+    if (outcome === 'done') return { ...controlAfterReconcile(engine), checked: true };
+    const reason = outcome === 'busy' ? '正在切换出口，请稍后再试' : outcome === 'timeout' ? '读取 Surge 状态超时' : '读取 Surge 状态失败';
+    return { ok: false, reason, checked: false };
   }
 
   // ---------- 周期任务 ----------

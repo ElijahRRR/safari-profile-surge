@@ -1271,7 +1271,49 @@ describe('temp_rule strategy: undo when rule match cannot be read or disagrees',
     const err = (await ctrl.transition('BLOCKED').catch((e: unknown) => e)) as SfeError;
     expect(err.code).toBe('READBACK_MISMATCH');
     expect(err.details!.lastConfirmedBits).toEqual(ENTRY_MODE_BITS.NORMAL);
+    // 起点没有本应用规则：NORMAL 不需要求值，仍按确认报告
+    expect(err.details!.runtimeConfirmed).toBeUndefined();
     expect(fake.tempRules).toEqual([]);
+  });
+
+  test('undo: a later write fails after steps accepted only from the temp-rule list (rule match unreadable) → the error\'s bits are marked not runtime-confirmed', async () => {
+    const udp = normalizeRuleText(tempRuleText('udp', CFG));
+    let failed = false;
+    const { ctrl, fake } = await setupTemp({
+      fakeInsertion: 'head',
+      start: 'ACTIVE',
+      adapter: (f) => {
+        const base = throwingMatch(f, unmapped);
+        return new Proxy(base, {
+          get(target, prop) {
+            if (prop === 'removeTempRule') {
+              return async (rule: string) => {
+                if (!failed && normalizeRuleText(rule) === udp) {
+                  failed = true;
+                  throw new SfeError('SURGE_UNREACHABLE', '连接 Surge 失败：命令超时');
+                }
+                return f.removeTempRule(rule);
+              };
+            }
+            const v: unknown = Reflect.get(target, prop, target);
+            return typeof v === 'function' ? v.bind(target) : v;
+          },
+        }) as unknown as SurgeAdapter;
+      },
+    });
+    const err = (await ctrl.transition('BLOCKED', undefined, { undo: true, towardNormal: true }).catch((e: unknown) => e)) as SfeError;
+    expect(failed).toBe(true);
+    expect(err.code).toBe('SURGE_UNREACHABLE');
+    // 结构上已是阻断（{block, udp}），但加入 block、移除 active 两步只按列表与有效规则顺序确认
+    expect(err.details).toMatchObject({ lastConfirmedBits: ENTRY_MODE_BITS.BLOCKED, runtimeConfirmed: false });
+    expect(observe(fake).mode).toBe('BLOCKED');
+  });
+
+  test('activation (not undo) from a structurally BLOCKED start with rule match unreadable: the final readback fails and the start bits are marked not runtime-confirmed', async () => {
+    const { ctrl } = await setupTemp({ fakeInsertion: 'head', strategyInsertion: 'head', start: 'BLOCKED', adapter: (f) => throwingMatch(f, unmapped) });
+    const err = (await ctrl.transition('BLOCKED').catch((e: unknown) => e)) as SfeError;
+    expect(err.code).toBe('READBACK_MISMATCH');
+    expect(err.details).toMatchObject({ lastConfirmedBits: ENTRY_MODE_BITS.BLOCKED, runtimeConfirmed: false });
   });
 
   for (const insertion of ['head', 'tail'] as const) {
