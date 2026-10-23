@@ -31,7 +31,5 @@
 	</dict>
 	<key>SFEAppGroupIdentifier</key>
 	<string>$(SFE_APP_GROUP_ID)</string>
-	<key>SFEKeychainAccessGroup</key>
-	<string>$(SFE_KEYCHAIN_ACCESS_GROUP)</string>
 </dict>
 </plist>

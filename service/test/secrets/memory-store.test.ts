@@ -14,18 +14,11 @@ describe('MemorySecretStore', () => {
     expect(s.size).toBe(1);
   });
 
-  test('account secrets are not readable through get(), like the real store', async () => {
+  test('account secrets are readable through get(), like the local store (login fill reads them after §6.10 gating)', async () => {
     const s = new MemorySecretStore();
     await s.put('sec_acc', 'login-pw-1', 'account');
-    expect(await s.get('sec_acc')).toBeNull();
-    expect(s.has('sec_acc')).toBe(true);
-    expect(s.unsafeReadAccountForDemo('sec_acc')).toBe('login-pw-1');
-  });
-
-  test('unsafeReadAccountForDemo never returns non-account secrets', async () => {
-    const s = new MemorySecretStore();
-    await s.put('sec_p', 'proxy-pw', 'proxy');
-    expect(s.unsafeReadAccountForDemo('sec_p')).toBeNull();
+    expect(await s.get('sec_acc')).toBe('login-pw-1');
+    expect(s.kindOf('sec_acc')).toBe('account');
   });
 
   test('refs are never overwritten', async () => {
@@ -41,14 +34,14 @@ describe('MemorySecretStore', () => {
 
   test('injected failures carry a reason and never the value', async () => {
     const s = new MemorySecretStore();
-    s.injectFailure('put', 'denied');
+    s.injectFailure('put', 'other');
     const err = await s.put('sec_1', 'value-not-in-error', 'proxy').catch((e: unknown) => e);
-    expect(isSecretStoreFailure(err, 'denied')).toBe(true);
+    expect(isSecretStoreFailure(err, 'other')).toBe(true);
     expect(JSON.stringify({ m: (err as Error).message, d: (err as { details?: unknown }).details })).not.toContain('value-not-in-error');
     await expect(s.put('sec_1', 'v', 'proxy')).resolves.toBeUndefined();
-    s.injectFailure('get', 'locked', 2);
-    await expect(s.get('sec_1')).rejects.toMatchObject({ details: { reason: 'locked' } });
-    await expect(s.get('sec_1')).rejects.toMatchObject({ details: { reason: 'locked' } });
+    s.injectFailure('get', 'not_found', 2);
+    await expect(s.get('sec_1')).rejects.toMatchObject({ details: { reason: 'not_found' } });
+    await expect(s.get('sec_1')).rejects.toMatchObject({ details: { reason: 'not_found' } });
     expect(await s.get('sec_1')).toBe('v');
   });
 

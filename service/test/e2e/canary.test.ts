@@ -101,7 +101,7 @@ test('marker secrets never reach logs, SQLite bytes, events, responses or data f
   for (const o of ops) await h.record(h.app.getOperation(o.id, WEB));
   await h.record(h.app.refreshSurge(WEB));
 
-  // 对照：秘密确实经所有入口进入了钥匙串与 Surge 节点资源（测试本身有效）
+  // 对照：秘密确实经所有入口进入了秘密存储与 Surge 节点资源（测试本身有效）
   expect(h.store.size).toBeGreaterThanOrEqual(10);
   expect(h.repos.environments.list().map((e) => e.displayName).sort()).toEqual(['US-Canary-A', 'US-Canary-Check', 'US-Canary-Csv', 'US-Canary-Json', 'US-Canary-Native']);
   expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).toContain(secret('Pass7'));

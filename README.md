@@ -29,7 +29,7 @@ GitHub 仓库标识使用 `safari-profile-surge`，项目中文名称保留为 `
 | `service` | 本机后台（唯一写入者）：SQLite、Surge 适配层、执行器、HTTP/套接字接口、`sfe` 命令行 |
 | `apps/web` | 网页后台（Vue 3） |
 | `extension` | Safari Web Extension：弹窗、准备页、登录填充 |
-| `apps/macos` | 宿主 App、扩展原生桥、钥匙串助手与 LaunchAgent（XcodeGen 工程，需在 Mac 上编译） |
+| `apps/macos` | 宿主 App、扩展原生桥与 LaunchAgent（XcodeGen 工程，需在 Mac 上编译） |
 | `tools/p0` | P0 能力实测工具与测试服务器 |
 
 ```sh
@@ -50,6 +50,7 @@ npm run demo     # 演示模式：模拟 Surge 与合成数据，不读写真实
 - 已登录直接打开订单页；只在实际登录页按需要填充，不自动提交或处理验证码。
 - 不新增 Amazon MITM，不用通用 WebKit 进程名冒充 Safari 专属归属。
 - 不承诺完整流量防泄漏、指纹隔离或账号关联风险保证。
+- 不使用 macOS 钥匙串（用户决定）：代理凭据与亚马逊账号密码以明文保存在本机后台自己的数据库中，只靠文件权限保护（仅本机这个用户可读）；网页、日志与命令行从不显示。后果与旧版本数据目录的处理见 docs/ARCHITECTURE.md §0 与 docs/INSTALL.md §6、§7。
 
 ## 本次交接范围
 

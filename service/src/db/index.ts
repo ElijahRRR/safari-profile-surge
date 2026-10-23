@@ -1,5 +1,5 @@
 // 数据库入口：打开、迁移、事务与全部仓库。仓库方法都是同步的（node:sqlite 是同步接口）；
-// 跨越 await 的流程（例如写钥匙串）不得放在事务里。
+// 跨越 await 的流程（例如写秘密存储）不得放在事务里。
 
 import type { Clock, IdGenerator, Scrubber } from '../ports.js';
 import { systemClock } from '../util/clock.js';

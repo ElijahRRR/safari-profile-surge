@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { detectLoginForm, newPageMemory, readFormAction, runLoginAssist, type AssistDeps } from '../src/content/fill';
 import type { Panel, PanelContent } from '../src/content/panel';
 import { createPanel } from '../src/content/panel';
+import { createRouter } from '../src/background/router';
+import { createNativeClient } from '../src/shared/native';
+import { PROFILE_STATE, contentSender, currentState, ok } from './fixtures';
 
 const SIGNIN = 'https://www.amazon.com/ap/signin?openid.return_to=x';
 const ACTION = 'https://www.amazon.com/ap/signin';
@@ -292,6 +295,81 @@ describe('runLoginAssist', () => {
     expect(await runLoginAssist(d)).toBe('refused');
     expect(shown[0]?.detail).toContain('路由未受控');
     expect(shown[0]?.detail).toContain('可手动填充');
+  });
+
+  describe('malformed fill replies (the native bridge forwards the service reply unchanged)', () => {
+    // 旧版（钥匙串）服务在替换 App 后仍在运行时的应答：密码项只有 keychainRef/expiresAt，没有 value。
+    const KEYCHAIN_ERA_REPLY = {
+      ok: true,
+      data: {
+        fills: [
+          { field: 'identifier', value: 'buyer01@example.test' },
+          { field: 'password', keychainRef: 'acct_0123456789abcdef', expiresAt: '2026-10-23T08:00:30.000Z' },
+        ],
+      },
+    };
+
+    function expectNothingFilled(shown: PanelContent[]) {
+      expect((document.getElementById('ap_email') as HTMLInputElement).value).toBe('');
+      expect((document.getElementById('ap_password') as HTMLInputElement).value).toBe('');
+      expect(shown).toHaveLength(1);
+      expect(shown[0]?.title).toBe('未自动填充');
+      expect(shown[0]?.tone).toBe('warning');
+      expect(shown[0]?.detail).toContain('格式不符');
+      expect(shown[0]?.detail).toContain('可手动填充');
+      expectNoSubmitOrClick();
+    }
+
+    it('fills nothing (not even the identifier) for a Keychain-era { keychainRef, expiresAt } password entry', async () => {
+      page(BOTH);
+      const { d, shown } = deps({ reply: KEYCHAIN_ERA_REPLY });
+      expect(await runLoginAssist(d)).toBe('refused');
+      expectNothingFilled(shown);
+      expect(d.memory!.filled.size).toBe(0);
+    });
+
+    it('fills nothing for the Keychain-era reply through the real background router and native client', async () => {
+      page(BOTH);
+      const transport = {
+        send: vi.fn(async (env: { message: { type: string } }) => {
+          if (env.message.type === 'getCurrentState') return ok(currentState());
+          if (env.message.type === 'requestLoginFill') return KEYCHAIN_ERA_REPLY;
+          return ok({});
+        }),
+      };
+      const router = createRouter({
+        runtimeId: 'ext-id-1',
+        extensionBaseUrl: 'safari-web-extension://ext-uuid/',
+        native: createNativeClient(transport),
+        collectProfileState: async () => PROFILE_STATE,
+      });
+      const { d, shown } = deps({ sendMessage: (m) => router(m, contentSender(SIGNIN)) });
+      expect(await runLoginAssist(d)).toBe('refused');
+      expect(transport.send.mock.calls.map(([env]) => env.message.type)).toEqual(['getCurrentState', 'requestLoginFill']);
+      expectNothingFilled(shown);
+    });
+
+    it.each([
+      ['a non-string value', [{ field: 'password', value: 12345 }]],
+      ['a null value', [{ field: 'password', value: null }]],
+      ['an empty value', [{ field: 'identifier', value: 'buyer01@example.test' }, { field: 'password', value: '' }]],
+      ['an unknown field', [{ field: 'identifier', value: 'buyer01@example.test' }, { field: 'otp', value: '123456' }]],
+      ['a repeated field', [{ field: 'password', value: SYN_PASSWORD }, { field: 'password', value: 'other-pass' }]],
+      ['a non-object entry', [{ field: 'identifier', value: 'buyer01@example.test' }, 'password']],
+      ['fills that is not an array', { password: SYN_PASSWORD }],
+    ])('fills nothing when the reply has %s', async (_label, fills) => {
+      page(BOTH);
+      const { d, shown } = deps({ reply: { ok: true, data: { fills } } });
+      expect(await runLoginAssist(d)).toBe('refused');
+      expectNothingFilled(shown);
+    });
+
+    it('fills nothing when ok:true carries no data', async () => {
+      page(BOTH);
+      const { d, shown } = deps({ reply: { ok: true } });
+      expect(await runLoginAssist(d)).toBe('refused');
+      expectNothingFilled(shown);
+    });
   });
 
   it('waits briefly for late-rendered fields', async () => {

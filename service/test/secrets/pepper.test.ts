@@ -30,7 +30,7 @@ describe('loadPepper', () => {
     expect(store.calls.filter((c) => c.op === 'put')).toHaveLength(1);
   });
 
-  test('an existing pepper with a missing flag (database rebuilt) is adopted', async () => {
+  test('an existing pepper with a missing flag (crash after the write, before the flag) is adopted', async () => {
     const a = makeRepos();
     const store = new MemorySecretStore();
     const original = await loadPepper(store, a.repos.meta, ids);
@@ -41,11 +41,11 @@ describe('loadPepper', () => {
     expect(b.repos.meta.pepperCreated()).toBe(true);
   });
 
-  test('a locked keychain propagates and creates nothing', async () => {
+  test('a failed read propagates and creates nothing', async () => {
     const { repos } = makeRepos();
     const store = new MemorySecretStore();
-    store.injectFailure('get', 'locked');
-    await expect(loadPepper(store, repos.meta, ids)).rejects.toMatchObject({ code: 'SECRET_STORE_FAILED', details: { reason: 'locked' } });
+    store.injectFailure('get', 'other');
+    await expect(loadPepper(store, repos.meta, ids)).rejects.toMatchObject({ code: 'SECRET_STORE_FAILED', details: { reason: 'other' } });
     expect(store.size).toBe(0);
     expect(repos.meta.pepperCreated()).toBe(false);
   });
@@ -53,8 +53,8 @@ describe('loadPepper', () => {
   test('a failed first write does not set the flag, so a retry may create it', async () => {
     const { repos } = makeRepos();
     const store = new MemorySecretStore();
-    store.injectFailure('put', 'denied');
-    await expect(loadPepper(store, repos.meta, ids)).rejects.toMatchObject({ details: { reason: 'denied' } });
+    store.injectFailure('put', 'other');
+    await expect(loadPepper(store, repos.meta, ids)).rejects.toMatchObject({ details: { reason: 'other' } });
     expect(repos.meta.pepperCreated()).toBe(false);
     await expect(loadPepper(store, repos.meta, ids)).resolves.toHaveLength(32);
   });

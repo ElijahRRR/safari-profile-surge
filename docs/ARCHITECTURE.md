@@ -6,14 +6,25 @@
 
 | 项目 | 决定 | 影响 |
 |---|---|---|
-| 后台语言 | TypeScript + Node（版本固定，随 App 打包，见 §10） | 后台、网页、插件共用 `packages/contract`；Swift 只做宿主 App、原生桥、Keychain 小工具 |
+| 后台语言 | TypeScript + Node（版本固定，随 App 打包，见 §10） | 后台、网页、插件共用 `packages/contract`；Swift 只做宿主 App、原生桥与服务启动器（sfe-service-launcher） |
 | Amazon 站点 | 首版只支持美国站 `www.amazon.com` | 扩展只申请该站点权限；填充只认 `https://www.amazon.com` 顶层登录页 |
 | 跨环境切换（与进入普通模式）时的旧窗口 | 提示手动关闭；也允许选择「不关闭，直接继续」 | 见下方冲突 1 |
 | 签名 | 只有免费 Apple ID | 本机开发签名（Personal Team）；见下方冲突 2 |
+| 秘密的存放（2026-10-23） | 不使用 macOS 钥匙串；代理凭据、亚马逊账号密码等秘密以明文保存在服务自己的数据库中 | 只靠所有者专用的文件权限保护；见下方「秘密的存放」 |
 
 **冲突 1（已按用户选择实现）**：「不关闭旧窗口」与设计「旧环境后台及长连接不能继续错用出口」冲突。切换事务仍结束属于 Safari 的旧连接，但旧环境窗口之后的新请求会经过新环境出口（整个 Safari 同一时刻共用一个出口）；进入普通模式时则会按 Surge 原规则发出（可能直连）。实现：只能在确认弹窗中逐次显式选择，不作为默认值；路由状态持续带 `old_windows_kept_open` 或 `managed_windows_on_original_rules` 警告，网页与插件都显示，永不显示为无警告的绿色。
 
-**冲突 2（待用户确认）**：免费 Apple ID 的 Personal Team 签名是否满足 CLAUDE.md「正式产品需正常打包签名，临时扩展不是长期交付」尚未验证。待测：不开「允许未签名扩展」时扩展能否在 Safari 退出重开、重启、8 天以上、重新构建后保持启用；描述文件/证书有效期与重签频率；App Group 与钥匙串访问组在 Personal Team 下是否可用。对应能力 `extension_install_persistence`、`native_bridge_ipc`、`bridge_keychain_access`。如必须依赖「允许未签名扩展」，交付物视为不满足约束并明确告知，不作为正常安装路径。Apple 文档对这一点没有有利依据，见本节末「Apple 官方文档核对的架构风险」第 1 条。
+**冲突 2（待用户确认）**：免费 Apple ID 的 Personal Team 签名是否满足 CLAUDE.md「正式产品需正常打包签名，临时扩展不是长期交付」尚未验证。待测：不开「允许未签名扩展」时扩展能否在 Safari 退出重开、重启、8 天以上、重新构建后保持启用；描述文件/证书有效期与重签频率；App Group 在 Personal Team 下是否可用。对应能力 `extension_install_persistence`、`native_bridge_ipc`。如必须依赖「允许未签名扩展」，交付物视为不满足约束并明确告知，不作为正常安装路径。Apple 文档对这一点没有有利依据，见本节末「Apple 官方文档核对的架构风险」第 1 条。
+
+**秘密的存放（用户决定，2026-10-23；偏离方案 1 设计第 195–199 行、实时同步设计第 13、22、80 行、固定工作配置设计第 73 行，以及 docs/DEVELOPMENT.md 第 9、35 行“SQLite 与 Keychain”的建议）**：用户问：“为什么要访问我本机的钥匙串？这个项目拿到的ip账号密码，亚马逊账号密码等信息默认保存在自己的一套资料里，不需要从钥匙串中读取”，并在本机加密、明文、主密码三种做法中选择了**明文**。上述 design 行要求账号密码（以及可选的代理密码）放在 Keychain、普通数据库只放引用、不能绕过 Keychain 提示，并把 Keychain 画作凭据的存放处；DEVELOPMENT.md 建议“SQLite 与 Keychain”，并按两者不是同一事务安排秘密的写入顺序。现在的实现：
+
+- 本项目的任何组件（服务、宿主 App、原生桥、扩展、P0 工具）都不读写 macOS 钥匙串，不会出现钥匙串授权提示；App 内没有钥匙串工具，App 与扩展的 entitlements 不声明 `keychain-access-groups`。
+- 代理凭据、亚马逊账号密码与 pepper 以明文保存在服务数据库 `<数据目录>/sfe.sqlite` 的 `secret_values` 表中（`service/src/secrets/local-store.ts`，迁移 2），只靠所有者专用的文件权限保护：数据目录 0700，数据库及其 `-wal`/`-shm`/`-journal` 0600（§2「账号密码的存放」）。其他表仍只存不透明引用与 HMAC 指纹；DEVELOPMENT.md 第 35 行的顺序（先写新秘密，再提交引用它的行，失败清理未被引用的项）照旧保留为四步协议，回收、指纹与 pepper 的规则不变（§4）。
+- 登录填充：服务按 §6.10 把关全部通过后才从 `secret_values` 读出密码，直接放在应答中交给已认证的原生桥，原生桥原样转给扩展（§7.2）；扩展只在内存中短暂持有，从不写入存储。何时允许填充的条件没有任何放宽。
+- 能力 `bridge_keychain_access` 删除（能力共 19 项），`fillAndAutoOpen` 只需要 `native_profile_id` 与 `first_request_and_old_connections`；迁移 2 删除它已有的能力记录与提议。
+- 使用钥匙串的旧版本创建的数据目录在启动时（数据库迁移之前，不改动数据库；宿主 App 合并 `install.json` 时保留旧版本的 `keychainHelperPath`，§10）以 `SECRET_STORE_FAILED` 拒绝（§4），从不读取钥匙串迁移，也从不重新生成曾经存在过的 pepper；需要换用新的数据目录重新初始化并重新导入，旧的钥匙串项由用户按 INSTALL §7 手动删除。
+
+**如实的后果**：任何以同一 macOS 用户身份运行的进程都能直接读取 `sfe.sqlite`，拿到全部代理凭据与亚马逊账号密码的明文，没有任何提示或授权；任何拿到数据目录副本的人（时间机器等备份、迁移到新 Mac、手动复制或同步）同样能读到。旧值什么时候删除取决于种类：被替换或清除的账号密码（以及删除环境时的账号密码）在同一事务中标为 orphaned，下一次清扫（启动时与每小时）删除；被替换的代理用户名/密码属于旧代理版本，只有该版本在发布结算时 retired 之后的清扫才删除——retired 要求它已不在新的节点资源中、不再是已部署、`last_verified`（回滚目标）或使用中的版本、没有被选择、没有进行中的操作引用（§5.4 保留集、`retireStaleRevisions`），部署新版本的那次发布仍保留旧节点，发布停在 WAITING_DEPLOYMENT 时什么都不 retired，所以通常要等该环境用新版本验证通过之后的又一次发布；在此之前旧值留在 `secret_values` 中（通常也在 `sfe-nodes.list` 中），没有期限（INSTALL §6 照此写明）。删除时：数据库开启 `secure_delete`（删除的内容在页内清零），`LocalSecretStore.delete` 删除了值就随即 `wal_checkpoint(TRUNCATE)`（`Db.checkpointTruncate`），此后数据目录的副本中不再有旧值；清扫之前的副本以及文件系统层面的残留（APFS 快照、未覆盖的磁盘块）不在本应用控制之内。持有原生桥传输令牌（同用户可读）的进程可以伪造 `requestLoginFill`，在 §6.10 中服务能核对的条件满足时直接拿到明文账号密码（以前只能拿到一次性钥匙串引用，读取时还要经过钥匙串授权提示）。代理凭据本来就因 Surge 语法以明文写在 `sfe-nodes.list` 中、对同用户进程可读；这次新增的明文位置是账号密码与 pepper。秘密仍不进日志、命令行参数、事件流、HTTP/SSE 响应、CLI 输出、错误信息、操作结果与步骤、诊断或 Git（§2），这些规则保护的是输出渠道，不保护磁盘上的数据。INSTALL §6 与 ACCEPTANCE §4 照此写明。
 
 **待用户决定的产品选项**：`first_request_and_old_connections` 实测不通过时，跨环境切换是否要求（还是仅建议）「保存工作后退出并重开 Safari」。在决定前只建议、不强制，并持续显示限制警告。
 
@@ -41,27 +52,23 @@
 
 1. **签名：Personal Team 能否作为正式交付（冲突 2）。**
    - Apple 写了什么：在 App Store 之外分发扩展的途径是 Developer ID 签名加公证（“you can sign and notarize your extension's app with a Developer ID to distribute it outside the Mac App Store”，https://developer.apple.com/documentation/safariservices/distributing-your-safari-web-extension；Safari 18.4：“Added support for loading Safari Web Extensions that have been Developer ID-signed and notarized.”，https://developer.apple.com/documentation/safari-release-notes/safari-18_4-release-notes）。免费账号：“No cost is associated with this agreement and developers can't distribute apps.”（https://developer.apple.com/help/account/reference/supported-capabilities-macos），也没有 Mac 软件公证（https://developer.apple.com/support/compare-memberships/）；Developer ID 证书 “Required role: Account Holder.”（https://developer.apple.com/support/developer-id/）。没有任何 Apple 页面说 Safari 会长期接受 Personal Team 签名的扩展。
-   - 描述文件：“Unlike Apple’s other platforms, macOS doesn’t require a provisioning profile to run third-party code.” “A Mac app that uses no restricted entitlements doesn’t need a provisioning profile.”（TN3125，https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles）。默认构建只用无限制权限（App 沙盒、`application-groups`、`network.client`），可能根本不依赖 7 天过期的描述文件；备选钥匙串方案的 `keychain-access-groups` 一定要描述文件授权，免费描述文件 “will expire 7 days from issuance”（https://developer.apple.com/help/account/basics/about-your-developer-account）。
+   - 描述文件：“Unlike Apple’s other platforms, macOS doesn’t require a provisioning profile to run third-party code.” “A Mac app that uses no restricted entitlements doesn’t need a provisioning profile.”（TN3125，https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles）。构建只用无限制权限（扩展：App 沙盒、`application-groups`、`network.client`；宿主 App：`application-groups`，不沙盒），可能根本不依赖 7 天过期的描述文件（免费描述文件 “will expire 7 days from issuance”，https://developer.apple.com/help/account/basics/about-your-developer-account）。本项目不使用钥匙串（§0「秘密的存放」），不声明一定要描述文件授权的 `keychain-access-groups`。
    - 由谁决定：`extension_install_persistence`（「允许未签名扩展」关闭；Safari 退出重开、重启、8 天以上、重新构建；App 与扩展是否嵌入描述文件及其有效期）。不通过时没有技术退路：「允许未签名扩展」在退出 Safari 时复位（“The “Allow unsigned extensions” setting for Safari resets when you quit Safari”），临时扩展 “Safari removes temporary extensions after 24 hours or when you quit Safari.”（https://developer.apple.com/documentation/safariservices/running-your-safari-web-extension），两者都不是交付方式；只能由用户决定是否加入付费计划，改用 Developer ID 签名并公证（Safari 18.4 起）。
 
 2. **原生桥依赖 App Group 容器。**
    - Apple 写了什么：macOS 15 起群组容器受保护，标识带 Team ID 前缀即可，但 “This restriction also applies to app extensions, although in that case the system won't prompt the user for consent but will instead just deny the access.”（https://developer.apple.com/documentation/macos-release-notes/macos-15-release-notes）。另一页多了公证条件：“Your app is distributed through the Mac App Store, or notarized.”（https://developer.apple.com/documentation/security/accessing-files-from-the-macos-app-sandbox），免费账号无法满足。两页说法不一。`containerURL` 也不能证明可访问：“In macOS, a URL of the expected form is always returned, even if the app group is invalid”（https://developer.apple.com/documentation/foundation/filemanager/containerurl(forsecurityapplicationgroupidentifier:)）。
    - 由谁决定：`native_bridge_ipc`，以往返成功为准；对扩展来说“没有弹窗”不能证明容器可访问。被拒绝时候选 B（容器内套接字）与候选 C（带群组前缀的 Mach 服务名）依赖同一个群组，换传输解决不了；先记录测量结果再重新设计，不回退到无令牌传输或数据目录之外的路径。
 
-3. **登录填充依赖已过时的钥匙串接口。**
-   - Apple 写了什么：`SecAccessCreate`、`SecTrustedApplicationCreateFromPath` 自 macOS 10.10 标为过时（“SecKeychain is deprecated”，https://developer.apple.com/documentation/security/secaccesscreate(_:_:_:)）；“The file-based keychain is on the road to deprecation. It’s not officially deprecated, but some of the APIs surrounding it are.”（TN3137，https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains）。不在受信任列表中的调用方会触发授权提示而不是直接拒绝：“Otherwise, the system prompts the user for confirmation. The user may choose to Deny, Allow, or Always Allow the access.”（https://developer.apple.com/documentation/security/access-control-lists）。分区列表 “limits access to the item based on an application's code signature”（security(1)）。沙盒 appex 能否按受信任应用列表免提示读取、重签后提示几次、`SecItemAdd` 默认写入的分区列表，Apple 都没有写。
-   - 由谁决定：`bridge_keychain_access`。备选方案需要 `keychain-access-groups`（受限权限，描述文件 7 天），裸命令行工具无法内嵌描述文件，只能由宿主 App 写入。两者都不行时登录填充保持不可用。安全说明已改为“其他进程读取时系统弹窗，用户拒绝才读不到”（§2、INSTALL §6）。
-
-4. **默认场景可能拿不到场景 ID。**
+3. **默认场景可能拿不到场景 ID。**
    - Apple 写了什么：示例代码把没有这个键当作普通浏览（`if let profileIdentifier = userInfo[SFExtensionProfileKey] as? UUID { // Perform profile specific tasks. } else { // Perform normal browsing tasks. }`，https://developer.apple.com/documentation/safariservices/messaging-between-the-app-and-javascript-in-a-safari-web-extension）；WWDC23：“If your extension is active in a profile, there will be a profileIdentifier value for the key SFExtensionProfileKey.”（https://developer.apple.com/videos/play/wwdc2023/10119/）；默认场景的扩展在主「扩展」标签管理，其他场景在「描述文件」（Profiles）标签各自的「扩展」中管理（https://support.apple.com/en-us/105100）。默认场景与无痕浏览有没有这个键、场景 ID 跨重启与重签是否稳定，Apple 没有写。
    - 处理与由谁决定：没有这个键时服务按未识别场景处理（只允许 `getCurrentState` 与 `reportProfileState`），环境只能关联在已命名的场景中。未识别场景的窗口上报计入旧窗口确认（`other_profiles_open`，列为「未识别场景（可能是默认场景）」）：方案 1 要求未配置场景打开时也做冲突处理，默认场景最常见，不能因为拿不到 ID 就不计入。所有未识别场景共用一条上报记录（键 `~unidentified`，不是合法的场景 ID），服务无法区分它们，按失败即关闭合并：有效期（10 分钟）内任一未识别场景上报过有窗口即计入，之后没有窗口的上报不覆盖它；代价是默认场景关闭全部窗口之后，最长到它上一次有窗口的上报过期前，激活仍要求一次旧窗口确认。仍未覆盖：没有启用本扩展、或后台没有送达上报的场景（与已命名场景相同，确认对话框写明只包含已启用扩展并上报过的场景；后台卸载后的上报由 `native_bridge_ipc` 的闹钟唤醒实测）；未识别场景发起普通模式（不受理，弹窗指向网页后台或已命名场景）。`native_profile_id` 的通过条件只要求已命名场景的 ID 互不相同且稳定（或变化已记录），默认场景只记录（有 ID 时也必须与已命名场景不同），以免默认场景没有 ID 时无谓地关闭依赖它的门槛（`fillAndAutoOpen`）。
 
-5. **进程归属与后台安全改进（BSI）。**
+4. **进程归属与后台安全改进（BSI）。**
    - Apple 写了什么：“After Safari has been relaunched, it uses the framework and library content from the new cryptexes. The rest of the operating system remains unaffected and doesn't make use of the new content until the system restarts.”（https://support.apple.com/guide/security/background-security-improvements-sec87fc038c2/web）；“on a Mac, applied content appears on the Preboot volume (through symbolic links in /System/Cryptexes/ )”（https://support.apple.com/guide/deployment/background-security-improvements-dep93ff7ea78/web）。Apple 的设备管理文档把补充构建号与基础构建号分开记录（`SupplementalBuildVersion`，https://developer.apple.com/documentation/devicemanagement/statusdeviceoperatingsystemsupplementalbuildversion），所以 BSI 之后 `sw_vers` 的构建号可能不变。Surge 按哪个进程路径归属 Safari 与 WebKit 的连接，Apple 文档完全没有涉及。
    - 风险：BSI 装上后、系统重启前，只有 Safari 使用新 WebKit，测到的路径看起来像“Safari 专属”，重启后却被所有 WebKit 应用共用；只按 `macosBuild` 记录的能力不会因此过期（已加入补充版本与待重启状态，见下一条）。
    - 由谁决定：`safari_process_attribution`。所需测量：在没有待重启的 BSI 时测归属（BSI 装上后、重启前测得的路径不作为证据）；每次 BSI 后与系统重启后重新测，记录 `sw_vers` 的完整输出与 Surge 记录的进程路径（同一文件可能以 `/Applications`、`/System/Cryptexes` 或 `/System/Volumes/Preboot/Cryptexes` 下的不同路径出现）。能力上下文含 BSI 补充版本 `macosVersionExtra`（`sw_vers -productVersionExtra`，空输出记为 `none`；设备管理文档的补充版本示例为 `a`，https://developer.apple.com/documentation/devicemanagement/statusdeviceoperatingsystemsupplementalextraversion）与待重启状态 `macosRestartPending`（暂存位置 `/System/Volumes/Preboot/Cryptexes/Incoming` 是否存在；Apple 只写到 “applying the Incoming Cryptex”，没有写路径，这是测试 Mac 上的观察，TODO(P0) 按 P0-RUNBOOK §1.6 核对）。`safari_process_attribution`、`safari_udp_quic_handling`、`first_request_and_old_connections` 依赖这两个字段：待重启或无法确认时一律待验证（激活前与对账按当前值判定，失败即关闭；网页说明需要重启 Mac），补充版本变化即过期；P0 的 attribution 在待重启时记为不完整，提议被拒绝。暂存位置不存在不能证明没有待重启的 BSI（核对之前测试者仍按上述条件人工核对）；`sw_vers -productVersionExtra` 在安装时还是重启后变化也未写明。通用 WebKit 路径从不当作 Safari 专属（`GENERIC_WEBKIT_PREFIXES`；暂存位置与 App 子路径 Apple 没有写明，实测前不据推断改动该列表）。
 
-6. **随系统版本变化的行为（文档提示与 P0 记录）。**
+5. **随系统版本变化的行为（文档提示与 P0 记录）。**
    - Safari 17.6 才修复后台页约 30 秒后停止响应，最低版本因此为 Safari 17.6（上方「最低系统」）。
    - Safari 18.4：“Fixed CORS for Web Extension pages to respect granted per-site permissions.”（https://developer.apple.com/documentation/safari-release-notes/safari-18_4-release-notes）；准备页请求检测服务 `api.ipify.org`、`api64.ipify.org` 是否需要用户另外授权，由 P0 实测。
    - 网站授权自 Safari 17 起在所有场景共用（“In Safari 17 and later, when you grant access to an extension for a specific web site, that grants the extension access to the site across all profiles, private browsing, and browsing without a profile.”，https://developer.apple.com/documentation/safariservices/managing-safari-web-extension-permissions），扩展的开关仍按场景分开（“By default, extensions are turned off for each new profile.”，https://support.apple.com/en-us/105100）。
@@ -76,7 +83,7 @@ packages/easyquick  EasyQuick UI 设计系统：token、组件样式（bundle �
 service             本机管理服务（唯一写入者）与 sfe CLI
 apps/web            本机网页后台（Vue 3 + EasyQuick UI）
 extension           Safari Web Extension（MV3）：后台、弹窗、准备页、登录页内容脚本
-apps/macos          Swift：宿主 App、原生桥、sfe-keychain（XcodeGen 工程）
+apps/macos          Swift：宿主 App、原生桥、sfe-service-launcher（XcodeGen 工程）
 tools/p0            P0 能力门槛实测工具与操作手册（输出写到仓库外；复用同一受限 SurgeAdapter，不切换配置、不重载全部、不 flush，写前快照并打印精确回退）
 docs                架构、安装/卸载/回退、P0 手册、验收报告模板
 ```
@@ -85,11 +92,11 @@ docs                架构、安装/卸载/回退、P0 手册、验收报告模�
 
 ```
 Safari 扩展（后台/弹窗/准备页）──sendNativeMessage──▶ 原生桥 SafariWebExtensionHandler（签名 App Extension，沙盒）
-   ▲ 内容脚本只经后台发 requestLoginFill            │ 补充 SFExtensionProfileKey；以传输令牌做双向 HMAC 握手（令牌不上线路）；解析钥匙串引用
+   ▲ 内容脚本只经后台发 requestLoginFill            │ 补充 SFExtensionProfileKey；以传输令牌做双向 HMAC 握手（令牌不上线路）；应答原样交给扩展
                                                       ▼ 候选传输（P0: native_bridge_ipc 决定）
                                          sfe-service（Node，随 App 打包，SMAppService LaunchAgent）
-网页（127.0.0.1:61847，Bearer 令牌）──HTTP + 事件流──▶ │ ──▶ SQLite（数据目录 0700）
-sfe CLI / GPT ──agent.sock（受限）──────────────────▶ │ ──▶ sfe-keychain（stdin JSON，只写账号密码，可读代理凭据）
+网页（127.0.0.1:61847，Bearer 令牌）──HTTP + 事件流──▶ │ ──▶ SQLite（数据目录 0700、文件 0600；secret_values 表以明文保存秘密）
+sfe CLI / GPT ──agent.sock（受限）──────────────────▶ │
 宿主 App ──maintenance.sock（维护）─────────────────▶ │ ──▶ Surge（固定的 CLI/HTTP 原语，只读回环 API）
 ```
 
@@ -99,9 +106,9 @@ sfe CLI / GPT ──agent.sock（受限）────────────�
 
 - 同一用户的本机进程是信任边界。能连 maintenance.sock 的进程可以拿到网页登录码；agent.sock 是给 GPT/导入工具的最小权限通道，不是对抗恶意同用户进程的安全边界。两个套接字都是 0600、位于 0700 数据目录。
 - 网页不用 Cookie：浏览器对 127.0.0.1 的不同端口共享 Cookie，其他本机网页服务会收到它。改为一次性登录码换取会话令牌，令牌存放在该源的 localStorage（按端口隔离），每个 `/api` 请求带 `Authorization: Bearer`。
-- 原生桥消息里的 `profileId` 只有在原生桥证明持有令牌（§7.2 握手）时才被采信；抢占回环端口的其他系统用户既拿不到令牌，也拿不到场景 ID 或消息。令牌对同用户进程可读，所以伪造桥消息的进程可以做 agent 能做的事，并且能拿到明文登录账号与一次性钥匙串引用（比 agent 多）。**买家密码不经 Node 返回**：服务只发钥匙串引用，由签名的原生桥自己读钥匙串。其他进程拿到引用后读取该项时，系统会弹出钥匙串授权提示（macOS 10.13.1 起要求输入钥匙串密码），只有用户拒绝时才读不到；用户选「允许」或「始终允许」后就能读到（Apple：“If so, the system grants access. Otherwise, the system prompts the user for confirmation. The user may choose to Deny, Allow, or Always Allow the access.”，https://developer.apple.com/documentation/security/access-control-lists；“the system … always prompts for the keychain password when asking the user whether to add an app to the list of trusted apps.”，https://developer.apple.com/documentation/security/secaclcreatewithsimplecontents(_:_:_:_:_:)）。所以这道防线依赖用户拒绝陌生程序的请求，INSTALL §6 写明了这一点。
-- **账号密码的存放**（`bridge_keychain_access` 决定）：首选方案——由 App 内的 sfe-keychain 写入登录钥匙串（文件型），条目的访问控制只信任 sfe-keychain 与扩展（SecAccess 受信任应用列表）；sfe-keychain 对账号密码只支持写入与删除。备选方案——数据保护钥匙串 + 共享访问组，由带描述文件的签名组件写入，仅当 `extension_install_persistence` 证明免费描述文件不会失效时采用。两者都不行时登录填充保持不可用，并在 INSTALL/ACCEPTANCE 中写明。钥匙串调用有超时（30 秒，等待用户授权提示），超时或拒绝进入可恢复状态（秘密不提交、操作失败可重试），从不把未写入的引用标为可用。
-- **含秘密的位置**（完整清单）：钥匙串；sfe-keychain 的 stdin/stdout；`sfe-nodes.list`（Surge 语法要求明文代理凭据）；工作配置与原配置备份（含用户自己节点的凭据、http-api 密钥、MITM 证书口令）；`<数据目录>/tmp` 下的 `--check` 候选副本（用后即删）。不进 SQLite、日志、命令行参数、事件流、HTTP 列表接口、Git。代理凭据因此对同用户进程可读（资源文件本来就是明文），文档如实说明。
+- 原生桥消息里的 `profileId` 只有在原生桥证明持有令牌（§7.2 握手）时才被采信；抢占回环端口的其他系统用户既拿不到令牌，也拿不到场景 ID 或消息。令牌对同用户进程可读，所以伪造桥消息的进程可以做 agent 能做的事，并且能拿到明文登录账号（比 agent 多）；它伪造的 `requestLoginFill` 只要满足 §6.10 中服务能独立核对的条件（`fillAndAutoOpen` 门槛、环境开启填充、所报场景关联的正是活动环境、路由“受控”）就能直接拿到明文账号密码：页面地址、是否顶层框架、表单目标、`route_epoch` 与场景 ID 都由桥消息提供，伪造者可以照填（已绑定的场景 ID 同用户进程也能从数据库读到）。这没有比直接读文件多暴露什么：同用户进程本来就能直接读取 `sfe.sqlite`（下一条）；令牌防的是其他系统用户与抢占端口者，不防同用户进程（§0「秘密的存放」、INSTALL §6）。
+- **账号密码的存放**（用户决定，§0「秘密的存放」）：与代理凭据、pepper 一样，以明文保存在服务数据库 `<数据目录>/sfe.sqlite` 的 `secret_values` 表中（`secrets/local-store.ts` 的 `LocalSecretStore`），不使用钥匙串，因此没有钥匙串授权提示，也没有钥匙串超时或用户拒绝带来的可恢复状态。保护只有文件权限：数据目录 0700（启动时 `ensurePrivateDirSync` 新建或收紧）；数据库文件以 O_NOFOLLOW 打开或新建为 0600，不是普通文件或不属于当前用户时拒绝打开；`-wal`/`-shm`/`-journal` 在打开之前与启用 WAL 之后各核对一次（`db/db.ts` 的 `preparePrivateSidecars`：已存在的收紧为 0600，符号链接、非普通文件或不属于当前用户时拒绝打开）。同一用户的任何进程、数据目录的任何副本（时间机器等备份）都能读到明文。写入失败时秘密不提交、操作失败可重试，从不把未写入的引用标为可用（§4）。秘密存储的错误统一为 `SECRET_STORE_FAILED`，`details.reason` 为 `not_found`、`legacy_keychain_data` 或 `other`；消息与 details 不含引用、值或 SQL 文本。
+- **含秘密的位置**（完整清单）：`<数据目录>/sfe.sqlite` 的 `secret_values` 表及数据库的 `-wal`/`-shm`（明文：代理凭据、账号密码、pepper；删除的值由 `secure_delete` 与删除后的 `wal_checkpoint(TRUNCATE)` 清除，§0）；`sfe-nodes.list`（Surge 语法要求明文代理凭据）；工作配置与原配置备份（含用户自己节点的凭据、http-api 密钥、MITM 证书口令）；`<数据目录>/tmp` 下的 `--check` 候选副本（用后即删）；登录填充时服务经原生桥交给扩展的应答（只在内存中传递）。不进 SQLite 的其他表、日志、命令行参数、事件流、HTTP/SSE 响应、CLI 输出、错误信息、操作结果与步骤、诊断、Git。代理凭据与账号密码因此对同用户进程可读，文档如实说明（INSTALL §6）。
 
 ## 3. 服务内部模块（service/src）
 
@@ -110,7 +117,7 @@ sfe CLI / GPT ──agent.sock（受限）────────────�
 | `config.ts` | 数据目录（默认 `~/Library/Application Support/SafariProfileSurge`，数据目录在 Git 工作树内时拒绝启动）、套接字与端口、Surge CLI 路径（只来自 0600 安装配置）、演示模式 |
 | `util/` | `clock`（含测试时钟）、`ids`（≥128 位令牌）、`scrubber`（按值脱敏 + Surge 行规则）、`logger`（只写脱敏 JSON 行，不记请求体）、`keyed-digest`（HMAC）、`secure-files`（O_EXCL 0600 原子写、0700 目录、临时文件清扫） |
 | `db/` | `node:sqlite` 打开、迁移、事务（BEGIN IMMEDIATE + 保存点）、每张表的仓库与记录类型 |
-| `secrets/` | `SecretStore`（钥匙串 / 测试内存实现）、`SecretRefManager`（四步协议、引用计数回收）、pepper 与 HMAC 指纹 |
+| `secrets/` | `SecretStore`（`LocalSecretStore`：服务数据库的 `secret_values` 表，明文；测试与演示用内存实现）、`SecretRefManager`（四步协议、引用计数回收）、pepper 与 HMAC 指纹、旧版（钥匙串）数据目录的启动检测 |
 | `domain/` | 输入校验、节点行变化判定、命名分配、差异、视图组装 |
 | `importer/` | CSV/XLSX/JSON 解析为 `ImportRecord`（不执行公式/宏/外链），映射与行级校验 |
 | `surge/` | 原语接口实现（CLI/HTTP/Fake）、配置解析与受管理段合并、节点资源与入口规则生成、入口策略、能力门槛、请求核对、连接结束、配置脱敏 |
@@ -118,7 +125,7 @@ sfe CLI / GPT ──agent.sock（受限）────────────�
 | `http/` | 回环 HTTP、令牌认证、Host/Origin 检查、路由、事件流、静态文件、登录交换页 |
 | `ipc/` | NDJSON 帧；原生桥服务（按 P0 定案的传输）；agent/maintenance 套接字 |
 | `cli/` | `sfe` 命令行（秘密只从 stdin 读） |
-| `main.ts` | 组装与启动：版本断言 → 迁移 → 读 Surge 事实对账 → 恢复未完成操作 → 开始执行器 → 开放 HTTP/IPC |
+| `main.ts` | 组装与启动：版本断言 → 旧版（钥匙串）数据目录检查（迁移之前，§4）→ 迁移 → 读 Surge 事实对账 → 恢复未完成操作 → 开始执行器 → 开放 HTTP/IPC |
 
 依赖通过 `service/src/ports.ts` 注入；测试用 `FakeSurge`、内存秘密存储与可控时钟。
 
@@ -138,15 +145,17 @@ sfe CLI / GPT ──agent.sock（受限）────────────�
 - `capabilities`（状态、验证上下文、逐协议覆盖、所确认的提议 `proposal_id`）、`capability_proposals`（P0 工具/agent/维护通道提交的证据摘要，待网页确认）。
 - `backups`（源与备份路径、各文件摘要、可读的运行开关：增强模式、系统代理、出站模式、自动重载、HTTP API）。
 - `settings`、`meta`、`secret_refs`（`owner_kind`、`owner_id`、状态）、`web_sessions`（令牌哈希、绝对与空闲过期）、`login_codes`（哈希、60 秒、单次）。
+- `secret_values`（迁移 2）：`ref` 主键、`kind`（`proxy`/`account`/`system`，CHECK 约束）、明文 `value`、`created_at`。代理凭据与账号密码的行有对应的 `secret_refs`；系统秘密（`sfe.pepper`）没有引用行。同一迁移删除已移除能力 `bridge_keychain_access` 在 `capabilities` 与 `capability_proposals` 中的行，旧数据目录的视图与门槛计算因此不受影响。保存过秘密的旧版（钥匙串）数据目录在这一迁移之前就被拒绝（见下文），迁移只作用于从未保存过秘密的第 1 版数据库。
 
 **秘密生命周期**：
 
-1. 小事务插入 `secret_refs(ref, pending, owner)`；2. 写钥匙串（新 ref，从不覆盖）；3. 主事务写引用该 ref 的行、标 committed、写 operation + outbox；4. 失败则删除该项与 pending 行；启动及周期清扫超过 10 分钟的 pending。
+1. 小事务插入 `secret_refs(ref, pending, owner)`；2. 写秘密存储（`secret_values` 插入新行；ref 已存在即失败，从不覆盖；这一写单独提交，不在任何事务内）；3. 主事务写引用该 ref 的行、标 committed、写 operation + outbox；4. 失败则删除该项与 pending 行；启动及周期清扫超过 10 分钟的 pending。秘密值与引用现在在同一个数据库文件中，但仍按这四步分开提交（第 3 步的主事务在第 2 步之后、可能隔着其他 await 才开始），失败清理与回收的语义因此不变。
 - `keep` 语义：新代理版本沿用旧 ref；回收按引用判断——只有没有任何非 retired 的版本行、账号行或设置行引用它时才删除。
 - 账号密码替换或清除：在提交新状态的同一事务中把旧 ref 标为 orphaned，之后删除。
 - 删除环境：其版本全部 retired 后删除其秘密。
 - 回收在启动时和每小时执行一次：删除已 orphaned 且没有任何引用的项、超过 10 分钟的 pending 项。
-- pepper 存在钥匙串中；读不到时 fail closed（停止导入与发布，`SECRET_STORE_FAILED`），从不静默重新生成。
+- pepper 是 `secret_values` 中的系统秘密 `sfe.pepper`（明文，32 字节随机数的 base64url）。只在从未创建过时生成，写入成功后才记 `meta.pepper_created`；标志已记录却读不到时 fail closed（停止导入与发布，`SECRET_STORE_FAILED`，`details.reason = not_found`），从不静默重新生成——否则旧指纹全部失效，变化检测会把未改的凭据当成已改。
+- **旧版（钥匙串）数据目录**：使用钥匙串的旧版本创建的数据目录有已提交的 `secret_refs` 和/或 `pepper_created` 标志，值却都在钥匙串里。服务启动时（非演示模式；在数据库迁移之前，也在加载 pepper、清扫引用、开放任何监听之前）由 `assertNoLegacyKeychainData` 检测两种情形：`pepper_created` 已记录而 `secret_values` 中没有 `sfe.pepper`；有 `committed` 引用在 `secret_values` 中没有值（`pending` 与 `orphaned` 不算）。第 1 版数据库还没有 `secret_values` 表，记录过的 pepper 与全部 `committed` 引用都算缺失；还没有任何表的新数据库不是旧版。检测到即记一条 `secrets.legacy_keychain_data` 日志（`pepperMissing`、缺失数量与完整的中文说明 `message`，不含引用：LaunchAgent 下 stderr 被 launchd 丢弃，日志是用户唯一能看到说明的地方）、关闭数据库与日志，以 `SECRET_STORE_FAILED` 拒绝启动（`details.reason = legacy_keychain_data`、`pepperMissing`、`missingCommittedRefs`；消息与 details 不含引用）。中文说明要求换用新的数据目录重新初始化并重新导入，旧的钥匙串项按 INSTALL §7 用 `security delete-generic-password` 手动删除。检测在迁移之前执行，拒绝时数据库原样保留（仍是第 1 版结构，`bridge_keychain_access` 的记录与提议都在）；宿主 App 合并 `install.json` 时也保留旧版本写入的 `keychainHelperPath`（§10），所以装回旧版本仍能打开这个数据目录、进入普通模式——装回后由 launchd 重新启动的旧服务可能在旧 App 打开之前就读取 `install.json`，缺少这个字段时旧服务没有钥匙串工具，读不到 pepper，连普通模式也进不了，而后台服务只在启动时读取 `install.json`。新数据目录没有旧的能力记录、工作配置与 `managed_objects`，所以完整步骤（服务已无法启动时由用户手动撤销旧入口、删除旧工作配置文件、重新确认能力）写在 INSTALL §7。服务从不读取钥匙串迁移，也从不在标志表明 pepper 曾经存在时重新生成它。
 - **不存储或发出任何基于含秘密内容的无密钥哈希**：资源文件、配置、请求、导入批次的摘要一律用 pepper 派生密钥的 HMAC；视图与事件只给配置代数，不给摘要。
 
 ## 5. Surge 适配层
@@ -159,7 +168,7 @@ sfe CLI / GPT ──agent.sock（受限）────────────�
 - `reloadProfile` 不在 `SurgeAdapter` 上，只存在于单独的 `MaintenanceSurge` 端口，只注入维护处理器（init/remerge），发布、路由、回滚、恢复处理器拿不到它；它从不是刷新失败的兜底。
 - 每个原语固定到一种实现（CLI 或 HTTP），由 P0 原语清单决定并写入配置；`CompositeSurgeAdapter` 不动态选择。能力记录里的 `adapterMechanism` 与配置不一致时视为待验证。
 - CLI：`execFile(cliPath, argv)`，不经 shell；`cliPath` 只来自安装配置，必须解析到已安装的 Surge.app 内且通过 `codesign --verify`（记录的 Team ID）；argv 只有路径、资源 key、组名、节点名、规则文本。
-- 子进程（surge-cli、codesign、sw_vers、defaults、open，运行实例读取的 ps、plutil、lsof，以及 P0 的 ps 等）一律经 `util/exec-fixed.ts`：只执行绝对路径的固定程序，不经 shell，启动后立即关闭 stdin（sfe-keychain 例外：写入一行请求后关闭）。不带命令运行时 `surge-cli` 进入交互模式（随包技能：“If no command is provided, it enters interactive mode.”；历史上 6.5.0 遇到无法识别的 `--version` 也是如此），stdin 不关闭时只能等到超时，被误报为无法连接。CLI 每个命令的 argv 都有子命令（只有 `--check` 是单独的选项），不使用没有写入文档的 `--version`；版本用 6.8.0 起的 `version` 命令。6.10 不带 `--raw` 时客户端拒绝不认识的命令（“Unknown command”），按 `SURGE_COMMAND_FAILED`（`details.reason = unsupported_command`）处理，失败即关闭。
+- 子进程（surge-cli、codesign、sw_vers、defaults、open，运行实例读取的 ps、plutil、lsof，以及 P0 的 ps 等）一律经 `util/exec-fixed.ts`：只执行绝对路径的固定程序，不经 shell，启动后立即关闭 stdin；服务中没有其他启动子进程的路径，也从不调用 `/usr/bin/security` 或任何钥匙串工具（`service/test/util/exec-fixed.test.ts` 检查）。不带命令运行时 `surge-cli` 进入交互模式（随包技能：“If no command is provided, it enters interactive mode.”；历史上 6.5.0 遇到无法识别的 `--version` 也是如此），stdin 不关闭时只能等到超时，被误报为无法连接。CLI 每个命令的 argv 都有子命令（只有 `--check` 是单独的选项），不使用没有写入文档的 `--version`；版本用 6.8.0 起的 `version` 命令。6.10 不带 `--raw` 时客户端拒绝不认识的命令（“Unknown command”），按 `SURGE_COMMAND_FAILED`（`details.reason = unsupported_command`）处理，失败即关闭。
 - 输出（stdout 或 stderr）中出现交互模式提示时，先于退出码、超时、无法连接文字等一切分类，也先于解析，按 `SURGE_COMMAND_FAILED`（`details.reason = interactive_mode`）处理：退出 0 不算成功（`--check` 不算通过，写命令不算已写入），错误信息不回显输出（其中的 `Connected to 127.0.0.1` 不是版本或结果）。P0 `inventory` 的 `--help` 输出若是该提示（匹配提示且不含原语表中任何命令词），命令词按空处理、给出警告并保留原文；帮助正文中提到交互模式但列出了命令时仍按帮助解析。
 - 退出 0（或 `--check` 的非零结果）时，stderr 出现无法连接文字（not running、isn't running、connection refused、could not connect、controller connection timed out / was closed、connection interrupted、Surge CLI is not connected 等，取自 6.10 包内 surge-cli 的文字），或 stdout 不是 JSON 且出现这些文字，同样先于解析按 `SURGE_UNREACHABLE` 处理：空输出不会被当作“没有临时规则”，`--check` 不算通过，写命令不算已写入。JSON 结果中的名称或规则含这些词不受影响。6.8.0 起“Command errors are now written to standard error and produce a non-zero exit status.”；Surge 未运行时的实际输出与退出码待测试 Mac 记录（P0-RUNBOOK V7）。
 - HTTP：只连回环；密钥在运行时从工作配置 `[General] http-api` 读取（不落库）；该行绑定到非回环地址时拒绝使用 HTTP 并告警。若 P0 表明必需 HTTP 而工作配置没有，`maintenance.init` 以受管理的 `[General]` 段（`http-api = <随机密钥>@127.0.0.1:<端口>`，关闭 TLS 与网页仪表盘）加入，并经用户确认。
@@ -175,13 +184,13 @@ sfe CLI / GPT ──agent.sock（受限）────────────�
 | 激活与活动环境切换 | native_bridge_ipc、external_node_underlying_proxy、safari_process_attribution、runtime_entry_modes、entry_rules_after_restart、safari_udp_quic_handling、fixed_profile_no_switch；ruleset_resource 策略另需 auto_reload_atomic_replace（规则集文件经 Surge 文件监视重新读取，由该策略下的 runtime_entry_modes 证明；从不调用 update） |
 | 结束 Safari 旧连接 | safari_process_attribution（普通模式下不满足时尽力而为并报告结果） |
 | 场景绑定 | native_bridge_ipc（native_profile_id 未通过时绑定状态为 bound_unverified_id） |
-| 登录填充、自动打开订单 | native_profile_id、first_request_and_old_connections、bridge_keychain_access，且路由“受控”（§6.6） |
+| 登录填充、自动打开订单 | native_profile_id、first_request_and_old_connections，且路由“受控”（§6.6）；账号密码保存在服务数据库中，不依赖钥匙串（§0「秘密的存放」） |
 | 独立预检 | independent_node_preflight（不通过：预检记为 inconclusive，不借当前选择组测试） |
 | 维护写工作配置与重载 | auto_reload_atomic_replace，且 same_profile_reload_impact 已测量（`CAPABILITY_MEASURED_GATES`：supported 或带影响记录的 unsupported）；入口必须是 NORMAL |
 
 - **进入普通模式永远可用**：它只依赖入口写入原语与运行时读回，不受 safari_process_attribution 等状态影响（让用户在能力失效后仍能撤销本应用的入口）。优先级问题只阻止 VERIFY_ONLY/ACTIVE，不阻止经 BLOCKED 到 NORMAL；结束 Safari 连接失败（含列不出活动请求、严格核对时仍有连接）只记录并报告，不中止；本应用拥有但被外部修改、无法识别或缺失的入口规则集文件按 §5.5 改写。
 - **通过条件**：`CAPABILITY_CRITERIA`（contract/phases.ts）是网页能力页与 P0 手册共用的唯一文字来源。safari_process_attribution 与 safari_udp_quic_handling 的提议必须带逐协议覆盖（`ProtocolCoverage`）；确认 supported 时，`GATING_COVERAGE_ITEMS` 每项都必须是 pass 或写明 limitation；DNS、WebRTC、系统服务只作记录与展示。
-- **验证上下文**：每条能力记录保存 Surge 版本与构建、macOS 构建与补充版本（后台安全改进，`macosVersionExtra`）、后台安全改进待重启状态（`macosRestartPending`）、Safari 版本、入口策略、进程路径摘要、工作配置身份、自动重载设置、接管方式、签名身份、原语实现（只记录该能力依赖的原语，见 `CAPABILITY_PRIMITIVES`，以规范 JSON 比较）；`CAPABILITY_CONTEXT_DEPS` 声明每项依赖哪些字段。比较规则：记录为 `any` 匹配任何当前值；当前值读不到（null）时只匹配记录的 null 或 `any`，否则过期原因为该字段名；其余字段必须相等。例外：Surge 版本与构建（`NEVER_NULL_FIELDS`）只在记录与当前都是格式正确的同一具体值时匹配——任一侧为 null 都不匹配（读不到当前版本时记录的 null 或 `any` 也不匹配，记录为 null 时读到的版本也不匹配）；记录为 `any` 或格式不对（早于提议校验经维护通道提议并确认的旧记录、旧解析器的 `127.0.0.1`）时读到的版本也不匹配，否则升级后能力不会过期。读不到运行中 Surge 的版本即依赖版本的能力全部待验证（失败即关闭），进入普通模式不受影响。例外二：`macosRestartPending` 没有 `any`，只在记录与当前都是 `no` 时匹配（`yes`、`unknown`、null 与旧记录缺少该字段都不匹配），见 §0 第 5 条。提议校验：依赖版本或构建的能力，提议的上下文必须带格式正确的具体值（版本 `^\d{1,3}\.\d{1,3}(\.\d{1,3})?$`、构建 `^\d{1,10}$`），null、`any` 或其他值（例如旧解析器从 CLI 交互模式输出中取到的 `127.0.0.1`）以 `EVIDENCE_REQUIRED` 拒绝；P0 `propose` 在发送前同样拒绝；网页确认已有的提议时服务端按同一规则再查一次（`EVIDENCE_REQUIRED`；提议的上下文不会再变，这条提议标为已驳回、不再显示在待确认列表中，设置与能力记录不变），网页的「确认」按钮同样禁用并说明原因；同一能力的新提议被接受时，该能力较早的、按这条规则永远不能确认的待确认提议一并标为已驳回（能确认的较早提议保留）。依赖 `macosRestartPending` 的能力另要求它为 `no`、`macosVersionExtra` 为读到的具体值（不是 null 或 `any`）：提交、确认（早于该规则、没有这两个字段的提议同样驳回）、P0 与网页同一规则（`hostContextErrors`）。已有的这类能力记录（版本为 null、`any` 或格式不对）无需迁移：无论当前版本能否读到都显示为待验证、过期原因为 surgeVersion/surgeBuild，网页说明为“验证记录缺少……需要重测”。当前值来源：`sw_vers` 构建号与 `-productVersionExtra`（与 P0 同一解析：空输出为 `none`，不认识的输出为 null）、后台安全改进暂存位置的 lstat（存在为 `yes`，不存在为 `no`，其他错误为 null）、Safari.app 的 Info.plist、宿主 App 上报的签名身份、Surge 版本与构建（运行中的 Surge 实例，且与 `surge-cli --raw version` 交叉核对一致、不低于 6.10.0（12500）、Controller 协议 ≥ 22，见下面的“运行中 Surge 的版本”与 §0；读到的值不符合上面的格式也按 null）、`getTakeoverState`、`getAutoReloadSetting`、设置中的策略与进程路径、`mechanism()`。任一依赖字段不匹配 → 有效状态为待验证（`staleReasons` 列出原因）。
+- **验证上下文**：每条能力记录保存 Surge 版本与构建、macOS 构建与补充版本（后台安全改进，`macosVersionExtra`）、后台安全改进待重启状态（`macosRestartPending`）、Safari 版本、入口策略、进程路径摘要、工作配置身份、自动重载设置、接管方式、签名身份、原语实现（只记录该能力依赖的原语，见 `CAPABILITY_PRIMITIVES`，以规范 JSON 比较）；`CAPABILITY_CONTEXT_DEPS` 声明每项依赖哪些字段。比较规则：记录为 `any` 匹配任何当前值；当前值读不到（null）时只匹配记录的 null 或 `any`，否则过期原因为该字段名；其余字段必须相等。例外：Surge 版本与构建（`NEVER_NULL_FIELDS`）只在记录与当前都是格式正确的同一具体值时匹配——任一侧为 null 都不匹配（读不到当前版本时记录的 null 或 `any` 也不匹配，记录为 null 时读到的版本也不匹配）；记录为 `any` 或格式不对（早于提议校验经维护通道提议并确认的旧记录、旧解析器的 `127.0.0.1`）时读到的版本也不匹配，否则升级后能力不会过期。读不到运行中 Surge 的版本即依赖版本的能力全部待验证（失败即关闭），进入普通模式不受影响。例外二：`macosRestartPending` 没有 `any`，只在记录与当前都是 `no` 时匹配（`yes`、`unknown`、null 与旧记录缺少该字段都不匹配），见 §0.1 第 4 条。提议校验：依赖版本或构建的能力，提议的上下文必须带格式正确的具体值（版本 `^\d{1,3}\.\d{1,3}(\.\d{1,3})?$`、构建 `^\d{1,10}$`），null、`any` 或其他值（例如旧解析器从 CLI 交互模式输出中取到的 `127.0.0.1`）以 `EVIDENCE_REQUIRED` 拒绝；P0 `propose` 在发送前同样拒绝；网页确认已有的提议时服务端按同一规则再查一次（`EVIDENCE_REQUIRED`；提议的上下文不会再变，这条提议标为已驳回、不再显示在待确认列表中，设置与能力记录不变），网页的「确认」按钮同样禁用并说明原因；同一能力的新提议被接受时，该能力较早的、按这条规则永远不能确认的待确认提议一并标为已驳回（能确认的较早提议保留）。依赖 `macosRestartPending` 的能力另要求它为 `no`、`macosVersionExtra` 为读到的具体值（不是 null 或 `any`）：提交、确认（早于该规则、没有这两个字段的提议同样驳回）、P0 与网页同一规则（`hostContextErrors`）。已有的这类能力记录（版本为 null、`any` 或格式不对）无需迁移：无论当前版本能否读到都显示为待验证、过期原因为 surgeVersion/surgeBuild，网页说明为“验证记录缺少……需要重测”。当前值来源：`sw_vers` 构建号与 `-productVersionExtra`（与 P0 同一解析：空输出为 `none`，不认识的输出为 null）、后台安全改进暂存位置的 lstat（存在为 `yes`，不存在为 `no`，其他错误为 null）、Safari.app 的 Info.plist、宿主 App 上报的签名身份、Surge 版本与构建（运行中的 Surge 实例，且与 `surge-cli --raw version` 交叉核对一致、不低于 6.10.0（12500）、Controller 协议 ≥ 22，见下面的“运行中 Surge 的版本”与 §0；读到的值不符合上面的格式也按 null）、`getTakeoverState`、`getAutoReloadSetting`、设置中的策略与进程路径、`mechanism()`。任一依赖字段不匹配 → 有效状态为待验证（`staleReasons` 列出原因）。
 - **运行中 Surge 的版本**（`surge/running-instance.ts`，服务与 P0 共用 `createDefaultSurgeInstanceReader`，同一常量、同一 `stat`（bigint）与同一执行方式）：证明磁盘上的包就是运行中的那一份；`surge-cli --raw version`（Mac 6.8.0+：“Show Surge, Core, Controller protocol, operating-system, and device versions.”）只作交叉核对（`crossCheckSurgeVersion`，见 §0“最低 Surge”），不单独作为版本来源，HTTP API 不用于版本（`/v1/metrics` 的 `surge_build_info` 只在 P0 V9 记录）。只在 macOS 上运行，只执行固定的 `/bin/ps`、`/usr/bin/plutil`、`/usr/sbin/lsof`、`/usr/bin/codesign`，不经 shell，stdin 关闭；只读，从不写 Surge 或它的文件。规则依次为：① `ps -ww -axo pid=,uid=,lstart=,comm=`（环境固定为 `LC_ALL=C LANG=C TZ=UTC` 与固定 PATH；`comm` 是进程自己提供的 argv[0]，不是内核给出的可执行文件路径，ps(1)：“a process is entitled to destroy this information”，所以这一步只产生候选，由 ⑥ 的 lsof txt inode 与路径核对确认）中只取当前用户、可执行文件为 `<包>.app/Contents/MacOS/<程序>`、包的真实路径等于 `/Applications/Surge.app` 真实路径的进程（root 特权助手、`Contents/Applications/surge-cli`、包内嵌套的登录项、其他用户的 Surge、其他位置的副本与 Setapp 版都排除；路径含 `/AppTranslocation/` 单列原因）；② 先读 Info.plist 的 `CFBundleExecutable`，只保留程序名与之相同的进程，再要求恰好一个（零个为 `not_running`/`bundle_mismatch`/`translocated`，多个为 `multiple_instances`；其他位置的 Surge.app 同时在当前用户下运行也是 `multiple_instances`；运行中的 `/Applications/Surge.app` 已被移走或指向别处为 `running_image_mismatch`）；③ `lstart` 严格按 `%a %b %e %H:%M:%S %Y`（UTC，日空格补齐，星期须与日期一致）解析为整秒 S，否则 `start_time_unparseable`；④ 先以 bigint stat Info.plist 与主程序，再用 `plutil -extract <键> raw -o -` 读取（不用 `defaults`，避免 cfprefsd 缓存）：`CFBundleIdentifier` 必须在 `SURGE_BUNDLE_IDS`（初始 `com.nssurge.surge-mac`，TODO(P0)：测试 Mac V2 确认后定稿），版本与构建必须符合上面的格式；⑤ 两个文件的 ctime 与 birthtime 都必须已知且严格早于 S（同一秒按已修改处理；解包、`ditto`、`cp -p` 会保留旧 mtime，所以不看 mtime；包目录本身不检查，系统在启动时可能写扩展属性），否则 `modified_after_start`；⑥ `lsof -nP -a -p <pid> -d txt -F in` 中必须有一项与磁盘上的主程序 inode 相同且路径相同（或为其真实路径），否则 `running_image_mismatch`（`mv` 整包替换时 ctime 不变，靠这一条发现），lsof 失败为 `running_image_unverifiable`；⑦ `codesign --verify --strict <包>`（复用 `codesignArgs`；服务的 Team ID 与 CLI 路径校验一致为未知，P0 的 `--surge-team-id` 只会更严），否则 `signature_invalid`；⑧ 再 stat 一次，dev、ino、size、mtime、ctime、birthtime 必须完全相同，否则 `changed_during_read`。以 pid、S 与两次 stat 结果为键缓存包信息与签名结论（失败不缓存）；ps、stat、lsof 每次都执行；同时到来的读取共用一次进行中的读取。读取在执行器通道上进行（对账、刷新、动作前检查都经 `readBasicFacts`），所以服务的 codesign 超时为 15 秒（`SERVICE_CODESIGN_TIMEOUT_MS`，P0 为 60 秒以记录真实耗时），引擎对每次读取另设 8 秒总时限（`SERVICE_INSTANCE_READ_BUDGET_MS`，即引擎的 `DEFAULT_INSTANCE_READ_BUDGET_MS`），超过即按 `read_failed`（版本为 null；读取本身继续完成并更新缓存，它失败时另记 `surge.version_read_late` 与原因代码，例如 codesign 超时的 `signature_invalid`），排队的操作（包括进入普通模式）不会被一次慢的读取长时间拖住。P0 按同一时限核对自己的读取（`serviceLimitsExceeded`/`serviceInstanceResult`）：签名一步达到 15 秒，或缓存命中后每次仍要执行的步骤（包信息与签名以外的全部规则）合计达到 8 秒，服务就读不到这个版本——P0 的能力上下文与 inventory 中版本为 null，`instance` 提示并退出 3，`propose` 拒绝依赖版本的能力。结果是 `{pid, startedAt, bundlePath, bundleId, version, build}` 或带原因的失败，失败原因有中文说明（`RUNNING_INSTANCE_FAILURE_TEXT`）。`HostInfo.surgeInstance()` 缺省为 `not_darwin`（非 macOS）或 `unavailable`；`main.ts` 的 `macHost` 持有一个常驻读取器（为了缓存），演示模式与引擎测试夹具用 `FakeSurge.runningInstance()`。`readBasicFacts` 在可达性检测成功后读取它：版本与构建一起接受或一起为 null，失败原因记在内部的 `SurgeFacts.versionIssue`（不进入契约视图），提示「无法确认运行中的 Surge 版本（原因）：依赖 Surge 版本的能力按待验证处理」。运行实例可读且不低于最低版本后，`readVersion` 调用 `getVersion`（install.json 必须把它映射为 cli；没有映射即 `cli_version_unreadable`）与运行实例交叉核对，三者都通过才记录版本、构建号与 Controller 协议。P0 的 `measureContext` 与 `inventory`（证据 `inventory/surge-instance.json`、`inventory/surge-version.json`）用同一读取器与同一交叉核对，`instance` 命令单独读取并保存逐条证据（低于最低版本时退出 3）；磁盘上 Surge.app 的版本（`defaults read`）只作旁证，与运行实例不一致时提示。这些规则在测试 Mac 上通过 P0-RUNBOOK §1.5 的 V1–V10 之前，不据读到的版本确认依赖版本的能力。
 - **可达性**：不经 `getVersion`（版本只决定版本，从不决定可达性）。引擎创建时按 `mechanism()` 在 `LIVENESS_PRIMITIVES`（listExternalResources、getCurrentProfile、listPolicies，按此顺序）中静态选定第一个映射到 CLI 或 HTTP 的只读原语（只有 CLI 时是 `--raw external-resource list`；只配置 HTTP API 时是 getCurrentProfile 或 listPolicies；不含 listTempRules：`--raw dump temp-rule` 的空输出就是“没有临时规则”，不能证明连接，只映射了它时没有检测原语），之后不按成败换用另一个原语或另一种实现。`readBasicFacts` 只在这一次读取解析成功时判为可达，其余一律不可达（失败即关闭），且不再读取其他事实：没有可用原语或其实现不存在（CLI 未通过签名校验、HTTP API 不是只监听回环地址）→「无法连接 Surge：尚未配置可用的命令行工具或 HTTP API」；`SURGE_UNREACHABLE` →「无法连接 Surge」；命令失败、交互模式提示、输出无法识别、HTTP 401 等 →「无法确认 Surge 连接：只读检测失败或输出无法识别」。没有“其他错误按可达处理”的分支。版本与构建与可达性无关：读不到或格式不对时为 null（依赖版本的能力按上面的规则待验证），Surge 仍可达，提示「无法确认运行中的 Surge 版本（原因）：依赖 Surge 版本的能力按待验证处理」。状态提示按优先级只取一条：无法连接 > 当前配置不是工作配置 > 版本无法确认 > 工作配置目录位置无法确认。检测与版本的结论只在变化时记日志（`surge.liveness_failed`/`surge.liveness_restored`、`surge.version_unknown`/`surge.version_known`，只含原语名与原因代码，不含 Surge 输出）。每次读取事实多一次只读调用。不可达时发布、激活、初始化以 `SURGE_UNREACHABLE` 拒绝，托管状态下对账附加 `surge_unreachable`（§6.6）；进入普通模式不看可达性，不受影响。
 - **证据与确认**：`supported`/`unsupported` 只能由网页会话确认一个提议（`capability_proposals`）。提议由 tools/p0、agent 或维护通道提交（网页只确认、不提议），必须带上下文、脱敏摘要与原始证据摘要；safari_process_attribution 的提议必须带进程完整路径（绝对路径、存在、无通配、非裸进程名、非系统通用 WebKit 框架路径，且证据显示 Chrome 与其他 WebKit 应用不命中）；runtime_entry_modes 的提议必须带所验证的入口策略。**进程路径与入口策略的唯一来源是已确认的提议**（设置接口不能改）；确认新的路径或策略会让依赖它们的能力回到待验证，入口不是 NORMAL 时拒绝确认。之后改用 ruleset_resource 还需要 `maintenance.remerge` 写入四条 RULE-SET。
@@ -329,7 +338,7 @@ SFE-N-E0001-US01-v003 = socks5, 203.0.113.10, 1080, username=<u>, password=<p>, 
 
 ### 6.7 删除、解除绑定与清理
 
-正在使用或正在验证的环境：删除/解除绑定返回 409 `ENVIRONMENT_ACTIVE`（请先进入普通模式；没有请求内确认），从不隐式改路由。否则作为排队操作执行：解除绑定只删映射（从不删除 Safari 场景、Cookie 或登录资料）；删除还设置 `deleted_at`、版本标为 superseded、删除账号密码钥匙串项。入口为 NORMAL 且 SFE-ROUTE 仍选着该环境的节点时，执行器先把选择改为 REJECT 并读回（此时 Safari 不经 SFE-ROUTE，安全），使节点满足移除条件。节点移除由之后的发布（同一发布门槛）在满足 §5.4 移除条件时合批完成；代理秘密在版本 retired 后回收。
+正在使用或正在验证的环境：删除/解除绑定返回 409 `ENVIRONMENT_ACTIVE`（请先进入普通模式；没有请求内确认），从不隐式改路由。否则作为排队操作执行：解除绑定只删映射（从不删除 Safari 场景、Cookie 或登录资料）；删除还设置 `deleted_at`、版本标为 superseded（已不在节点资源中的直接 retired）、账号密码的引用在同一事务中标为 orphaned，由回收（启动时与每小时）从 `secret_values` 删除。入口为 NORMAL 且 SFE-ROUTE 仍选着该环境的节点时，执行器先把选择改为 REJECT 并读回（此时 Safari 不经 SFE-ROUTE，安全），使节点满足移除条件。节点移除由之后的发布（同一发布门槛）在满足 §5.4 移除条件时合批完成；代理秘密在版本 retired 后回收。
 
 ### 6.8 前置代理
 
@@ -342,7 +351,7 @@ SFE-N-E0001-US01-v003 = socks5, 203.0.113.10, 1080, username=<u>, password=<p>, 
 ### 6.10 订单页与登录填充
 
 - 「打开或定位订单页」只在当前场景是活动环境且路由“受控”时可用；带 `launch_unverified`/`launch_order_unverified` 时可用但显示警告。否则按钮执行受控入口（激活）并在新的空白标签页打开准备页；从不在 NORMAL 或实测前导航到 Amazon。已登录直接显示订单页，不进入登录流程。已绑定场景不是活动环境却有 Amazon 标签页时，弹窗显示「本场景的 Amazon 页面未经启动验证，正按当前路由规则发送请求」。
-- 填充：内容脚本只在顶层框架的登录页、页面实际出现对应字段时请求；后台用 `sender` 填 `top_url`/`frame_is_top`（Safari 没有提供 `sender.id`、`sender.frameId` 或 `sender.tab.url` 时直接拒绝，不采用内容脚本自报的值），用一次新的 `getCurrentState` 填 `route_epoch`；服务要求登录页分类、表单目标同源 HTTPS、环境开启填充、请求场景绑定的正是活动环境、路由“受控”、`route_epoch` 一致、账号属于该环境，以及 `fillAndAutoOpen` 门槛；返回页面实际出现的每个字段（账号直接给值，密码给一次性钥匙串引用）。内容脚本在写入前重读 `form.action`，变化即丢弃；每页每字段最多一次；从不提交、不处理验证码或二次验证；字段识别失败时先经后台 `checkLoginFill` 确认本场景适用填充（已绑定、该站点登录页、开启填充、是活动环境；只回答是否适用，不取值），适用才显示「可手动填充」，未绑定、未识别、未开启填充或无法确认时页面上不显示任何东西；不猜提交按钮；提供「返回订单」按钮（只导航一次）。
+- 填充：内容脚本只在顶层框架的登录页、页面实际出现对应字段时请求；后台用 `sender` 填 `top_url`/`frame_is_top`（Safari 没有提供 `sender.id`、`sender.frameId` 或 `sender.tab.url` 时直接拒绝，不采用内容脚本自报的值），用一次新的 `getCurrentState` 填 `route_epoch`；服务要求登录页分类、表单目标同源 HTTPS、环境开启填充、请求场景绑定的正是活动环境、路由“受控”、`route_epoch` 一致、账号属于该环境，以及 `fillAndAutoOpen` 门槛；返回页面实际出现的每个字段，账号标识与密码都直接给值（`LoginFillServiceResponse` 就是 `LoginFillResponse`：`{ fills: [{ field, value }] }`）。密码只在上述检查全部通过后才从 `secret_values` 读出，读出即登记到脱敏器；读取跨越了 await，返回之前再确认一次 `route_epoch` 与活动环境，变化即以 `FILL_NOT_ALLOWED`（`reason = epoch`）拒绝、不返回任何值；任何一项检查未通过都不读取密码。值不存在时为 `SECRET_STORE_FAILED`（`not_found`，消息不含引用）。日志只记字段名。原生桥把应答原样交给扩展（§7.2），后台只在内存中转交内容脚本，从不写入 `storage` 或打印。原生桥不再检查应答形状，所以内容脚本在写入任何值之前逐项检查：每一项都必须是 `{ field: 'identifier' | 'password', value: 非空字符串 }`，字段不重复；任何一项不符就整个拒绝、一个字段也不填，页面显示「本机服务的填充应答格式不符（可能仍在运行旧版本的后台服务）」与手动填充提示（`extension/src/content/fill.ts`）。这覆盖替换 App 后旧版（钥匙串）服务仍在运行的情形：它的密码项只有 `keychainRef`/`expiresAt`，没有 `value`，原生桥与服务的协议版本、握手与令牌都没有变化，不检查就会把 `undefined` 当作文字 "undefined" 写进密码框。内容脚本在写入前重读 `form.action`，变化即丢弃；每页每字段最多一次；从不提交、不处理验证码或二次验证；字段识别失败时先经后台 `checkLoginFill` 确认本场景适用填充（已绑定、该站点登录页、开启填充、是活动环境；只回答是否适用，不取值），适用才显示「可手动填充」，未绑定、未识别、未开启填充或无法确认时页面上不显示任何东西；不猜提交按钮；提供「返回订单」按钮（只导航一次）。
 - 页面登录身份首版始终为「未核对」；修改账号后显示「配置账号已更换，网页登录状态未核对」，由用户确认后清除。
 
 ### 6.11 服务停止
@@ -362,7 +371,7 @@ SFE-N-E0001-US01-v003 = socks5, 203.0.113.10, 1080, username=<u>, password=<p>, 
 
 ### 7.2 原生桥（插件）
 
-见 `contract/native.ts`。服务按 `NATIVE_PERMISSIONS` 矩阵强制：未识别场景（原生桥没有拿到 `SFExtensionProfileKey`；默认场景可能就是这样，见 §0「Apple 官方文档核对的架构风险」第 4 条）只允许 `getCurrentState`（不返回其他环境名称，但照常返回路由关系与摘要，弹窗据此显示状态）与 `reportProfileState`（记入所有未识别场景共用的一条记录，只用于旧窗口确认的「其他场景有打开的窗口」）；针对环境的请求携带 `environment_id`，与场景绑定比对不一致 → `BINDING_MISMATCH`（在版本检查与创建操作之前）；`getOperation` 只返回自己环境或自己发起的操作，否则 `NOT_FOUND`；非活动环境的场景只拿到路由摘要（不含实测、选择、操作 id；警告只有 `buyerExitConnectionsUnconfirmed`——路由带 `buyer_exit_connections_unconfirmed` 时为 true，路由即使已是空闲的普通模式，弹窗也显示该警告并提供「进入普通模式」；另有服务端判定的 `normalModeOffered`，弹窗按它提供「进入普通模式」，§6.5）。路由不是空闲的普通模式时，`getCurrentState` 不论来自哪个场景（含其他环境的场景与未识别场景，它们的弹窗顶栏同样按摘要显示）都先做动作前检查，再读路由：有效期（5 秒）内完成过对账（任何来源：动作前、周期、刷新、提交 ACTIVE 之后的对账，按路由记录的 `lastReconciledAt`）时不再读 Surge，否则在执行器空闲时短超时对账一次（可能改写路由，例如 Surge 重启之后；并发的检查共用进行中的那一次）。同一响应中的路由摘要、完整路由、环境视图、关系与订单判定都来自检查之后的同一次读取：`ordersAllowed` 按这次读到的路由与实测重新判定“受控”（§6.6，不读 Surge），从不沿用检查时或之前的判定——检查之后周期对账、刷新或路由操作可能已把路由标为 attention。检查没有完成对账（执行器正忙、读取 Surge 超时或失败；这些结果不缓存）时 `ordersAllowed` 为 false，路由摘要 `reconciled: false`，弹窗顶栏显示「正在确认入口状态」，不按记录的入口声称托管中、已阻断或只允许检测。路由是空闲的普通模式时不检查、不读 Surge（`reconciled: true`）。扩展从不在启动、窗口/标签页创建、焦点或心跳事件中发送激活或普通模式请求，只在用户点击时发送；`reportProfileState` 在弹窗打开、窗口与标签页创建/关闭时由后台发送（未识别场景同样发送），超过 10 分钟的上报不再计入“有打开的窗口”；只作提示，从不改变路由。帧格式 NDJSON，单条 ≤256 KiB。
+见 `contract/native.ts`。服务按 `NATIVE_PERMISSIONS` 矩阵强制：未识别场景（原生桥没有拿到 `SFExtensionProfileKey`；默认场景可能就是这样，见 §0「Apple 官方文档核对的架构风险」第 3 条）只允许 `getCurrentState`（不返回其他环境名称，但照常返回路由关系与摘要，弹窗据此显示状态）与 `reportProfileState`（记入所有未识别场景共用的一条记录，只用于旧窗口确认的「其他场景有打开的窗口」）；针对环境的请求携带 `environment_id`，与场景绑定比对不一致 → `BINDING_MISMATCH`（在版本检查与创建操作之前）；`getOperation` 只返回自己环境或自己发起的操作，否则 `NOT_FOUND`；非活动环境的场景只拿到路由摘要（不含实测、选择、操作 id；警告只有 `buyerExitConnectionsUnconfirmed`——路由带 `buyer_exit_connections_unconfirmed` 时为 true，路由即使已是空闲的普通模式，弹窗也显示该警告并提供「进入普通模式」；另有服务端判定的 `normalModeOffered`，弹窗按它提供「进入普通模式」，§6.5）。路由不是空闲的普通模式时，`getCurrentState` 不论来自哪个场景（含其他环境的场景与未识别场景，它们的弹窗顶栏同样按摘要显示）都先做动作前检查，再读路由：有效期（5 秒）内完成过对账（任何来源：动作前、周期、刷新、提交 ACTIVE 之后的对账，按路由记录的 `lastReconciledAt`）时不再读 Surge，否则在执行器空闲时短超时对账一次（可能改写路由，例如 Surge 重启之后；并发的检查共用进行中的那一次）。同一响应中的路由摘要、完整路由、环境视图、关系与订单判定都来自检查之后的同一次读取：`ordersAllowed` 按这次读到的路由与实测重新判定“受控”（§6.6，不读 Surge），从不沿用检查时或之前的判定——检查之后周期对账、刷新或路由操作可能已把路由标为 attention。检查没有完成对账（执行器正忙、读取 Surge 超时或失败；这些结果不缓存）时 `ordersAllowed` 为 false，路由摘要 `reconciled: false`，弹窗顶栏显示「正在确认入口状态」，不按记录的入口声称托管中、已阻断或只允许检测。路由是空闲的普通模式时不检查、不读 Surge（`reconciled: true`）。扩展从不在启动、窗口/标签页创建、焦点或心跳事件中发送激活或普通模式请求，只在用户点击时发送；`reportProfileState` 在弹窗打开、窗口与标签页创建/关闭时由后台发送（未识别场景同样发送），超过 10 分钟的上报不再计入“有打开的窗口”；只作提示，从不改变路由。帧格式 NDJSON，单条 ≤256 KiB。
 
 原生桥 ↔ 服务的一个连接（`BridgeHello` / `BridgeChallenge` / `BridgeRequest`，实现见 `service/src/ipc/bridge-server.ts` 与 `apps/macos/Shared/BridgeHandshake.swift`）。传输令牌从不上线路，HMAC 密钥是令牌的 UTF-8 字节，随机数 32 字节，证明为小写十六进制：
 
@@ -372,6 +381,8 @@ SFE-N-E0001-US01-v003 = socks5, 203.0.113.10, 1080, username=<u>, password=<p>, 
 4. 服务用 `timingSafeEqual` 验证 `clientProof`，再按原规则校验信封（版本、场景 ID、`bridgeVersion` 为可见 ASCII 且不含空格，原生桥发送 `<短版本>+<构建号>`，例如 `0.1.0+1`；消息类型）并回复一行 `NativeResponse` 后关闭。
 
 握手（从连接建立到收完 request）限时 3 秒；hello 格式不对、服务随机数与客户端随机数相同、request 证明不符（含重放旧连接的 request、同一连接再发 hello）、超时，一律直接断开，不说明是哪一项不符，日志只记阶段。
+
+原生桥对所有类型的应答都原样交给扩展，不改写（`apps/macos/Shared/BridgeForwarder.swift`；扩展的 `ExtensionResponseMap` 就是 `NativeResponseMap`）。`requestLoginFill` 的应答 `LoginFillServiceResponse` 与扩展收到的 `LoginFillResponse` 是同一类型（`{ fills: [{ field: 'identifier' | 'password', value }] }`，没有钥匙串引用或有效期字段），其中的账号密码由服务按 §6.10 读出；原生桥不读取、不缓存、不记录它，日志只有消息类型与结果码。应答形状由内容脚本在写入页面前检查（§6.10），形状不符时一个字段也不填。服务的原生桥日志同样不记应答内容。
 
 ### 7.3 本机套接字（CLI/GPT/宿主 App）
 
@@ -399,8 +410,9 @@ Vue 3 + Vite + vue-router（hash 路由）。样式只用 EasyQuick UI（`@sfe/e
 XcodeGen `project.yml`；目标：
 
 - **SafariProfileSurge.app**（宿主，菜单栏）：打开管理后台（maintenance.sock 申请登录码，`NSWorkspace` 打开）；「打开环境」及每环境入口（受控入口，调用激活）；服务状态；以 `SMAppService` 注册内置的 LaunchAgent（App 内打包固定版本的 Node 与服务脚本，同团队签名；Node 是 Mach-O，放在 `Contents/Helpers/node`，服务脚本与网页放在 `Contents/Resources/service/`，按 Apple「Placing content in a bundle」：“Resources are everything that’s not code.”）；生成并分发原生桥传输令牌（写入前检查 App Group 容器能否打开，写入后读回）；打开 Safari 扩展设置；检测扩展未启用或原生桥不可达并提示（系统拒绝访问 App Group 容器与找不到配置分开提示）。
-- **Extension**（App Extension）：`SafariWebExtensionHandler` 读取 `SFExtensionProfileKey`，以令牌与服务做双向 HMAC 握手后转发（服务不能证明持有令牌时不发送请求内容），10 秒超时；收到密码钥匙串引用时自己读取（访问组），替换成值后交给扩展；不记录消息内容（去掉模板里的 os_log）。
-- **sfe-keychain**（命令行工具，打包在 App 内）：stdin 一条 JSON（set/get/delete），用登录钥匙串；账号密码只支持 set/delete；错误区分「用户拒绝」「钥匙串不允许交互」（`errSecInteractionNotAllowed`，Apple 只定义为 “Interaction with the Security Server is not allowed.”：可能已锁定，也可能无法显示授权提示；线路值沿用 `locked`）「访问控制不匹配」。
+- **Extension**（App Extension）：`SafariWebExtensionHandler` 读取 `SFExtensionProfileKey`，以令牌与服务做双向 HMAC 握手后转发（服务不能证明持有令牌时不发送请求内容），10 秒超时；服务的应答原样交给扩展（包括含账号密码的登录填充应答，不读取、不改写、不缓存，§7.2）；不记录消息或应答内容（去掉模板里的 os_log）。
+- **sfe-service-launcher**（命令行工具，`Contents/Helpers/`）：LaunchAgent 的 BundleProgram，按自身位置找到打包的 `node` 与 `service.mjs` 后 `execv`。
+- 不使用钥匙串（§0「秘密的存放」）：App 内没有钥匙串工具，App 与扩展的 entitlements 只含 App 沙盒设置、`application-groups` 与（扩展的）`network.client`，不声明 `keychain-access-groups`。宿主 App 合并 `install.json` 时从不删除字段，旧版本写入的 `keychainHelperPath` 原样保留（本版本的服务读取时忽略它；它只是路径，不是秘密）：装回旧版本（INSTALL §7 第 1 步）时，launchd 重新启动的旧服务可能在打开旧 App 之前就读取 `install.json`，没有这个字段就没有钥匙串工具、进不了普通模式。新建的 `install.json` 不写这个字段。构建脚本删除旧构建留在 `Contents/Helpers` 中的 `sfe-keychain`。
 
 服务启动时断言 Node 版本等于打包版本且 `node:sqlite` 所需接口存在，只过滤 sqlite 的 ExperimentalWarning。
 
@@ -410,7 +422,7 @@ XcodeGen `project.yml`；目标：
 
 ## 12. 测试与验收边界
 
-- 离线（本仓库可跑）：契约与纯函数、命名、序列化/注入防护、导入、入口切换规划（穷举不变量）、发布/激活/回滚/对账/恢复编排（FakeSurge，含故障注入与“无全局操作”调用计数断言）、秘密引用“保留后旧版本退役”回归测试、HTTP 认证与 Host/Origin、IPC 权限矩阵、秘密金丝雀测试（标记秘密经所有入口进入后扫描日志、SQLite、事件流、响应）、网页组件、扩展逻辑。`npm run check` 另运行仓库秘密扫描（私钥、密码形状、真实 IP）与测试夹具检查（只允许 RFC 5737/3849 文档地址、回环地址、`example.test`/`.invalid`）。
-- 只能在测试 Mac 上验证：全部 P0 能力、Swift 编译与签名、钥匙串、真实 Surge 读回、Safari 实测出口、Chrome 对照、连接连续性、统一日志扫描（`log show`）。见 `docs/P0-RUNBOOK.md`。
+- 离线（本仓库可跑）：契约与纯函数、命名、序列化/注入防护、导入、入口切换规划（穷举不变量）、发布/激活/回滚/对账/恢复编排（FakeSurge，含故障注入与“无全局操作”调用计数断言）、秘密引用“保留后旧版本退役”回归测试、本机秘密存储（`LocalSecretStore`：不覆盖、任何种类可读、错误不含 SQL 文本或值、umask 0 下数据目录 0700 与数据库及 `-wal`/`-shm` 0600、旧版（钥匙串）数据目录启动即拒绝）、登录填充只在把关通过后读取并返回密码、HTTP 认证与 Host/Origin、IPC 权限矩阵、秘密金丝雀测试（标记秘密经所有入口进入后扫描日志、SQLite、事件流、响应；该测试用内存秘密存储，所以 SQLite 的扫描证明的是 `secret_values` 之外的表不含秘密）、网页组件、扩展逻辑。`npm run check` 另运行仓库秘密扫描（私钥、密码形状、真实 IP）与测试夹具检查（只允许 RFC 5737/3849 文档地址、回环地址、`example.test`/`.invalid`）。
+- 只能在测试 Mac 上验证：全部 P0 能力、Swift 编译与签名、APFS 上 SQLite `-wal`/`-shm` 的实际权限、经签名原生桥与 Safari 的端到端登录填充、真实 Surge 读回、Safari 实测出口、Chrome 对照、连接连续性、统一日志扫描（`log show`）。见 `docs/P0-RUNBOOK.md`。
 
 离线测试通过不代表网络验收通过；验收报告模板见 `docs/ACCEPTANCE.md`，未测项写「未验证」。

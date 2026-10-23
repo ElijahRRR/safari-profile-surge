@@ -96,11 +96,9 @@ describe('checklists', () => {
     expect(item?.question).toContain('roundtrip');
   });
 
-  it('keychain errors item records the reason each side actually gets instead of assuming locked → locked', () => {
-    const item = CHECKLISTS.bridge_keychain_access!.items.find((i) => i.id === 'errors');
-    expect(item?.question).toContain('sfe-keychain');
-    expect(item?.question).toContain('备注');
-    expect(item?.question).not.toContain('分类正确');
+  it('no keychain checklist: secrets live in the service data directory, never in the Keychain (user decision)', () => {
+    expect(Object.keys(CHECKLISTS)).not.toContain('bridge_keychain_access');
+    expect(JSON.stringify(CHECKLISTS)).not.toMatch(/钥匙串|keychain/i);
   });
 
   it('native bridge checklist records the macOS 26 quit prompt for background tasks (Apple: users are prompted to allow or not allow)', () => {
@@ -140,9 +138,9 @@ describe('checklists', () => {
     expect(parseAnswer('否')).toBe('n');
     expect(parseAnswer('')).toBeNull();
     expect(parseAnswer(null)).toBeNull();
-    const list = CHECKLISTS.bridge_keychain_access!;
-    const checks = checklistChecks(list, { write: { answer: 'y', note: '' }, read_no_prompt: { answer: 'n', note: '每次都提示' } });
-    expect(checks.map((c) => c.ok)).toEqual([true, false, null, null]);
+    const list = CHECKLISTS.native_profile_id!;
+    const checks = checklistChecks(list, { distinct: { answer: 'y', note: '' }, default_profile: { answer: 'n', note: '与已命名场景相同' } });
+    expect(checks.map((c) => c.ok)).toEqual([true, false, null, null, null]);
     expect(verdictOf(checks)).toBe('fail');
     const all = checklistChecks(list, Object.fromEntries(list.items.map((i) => [i.id, { answer: 'y' as const, note: '' }])));
     expect(verdictOf(all)).toBe('pass');

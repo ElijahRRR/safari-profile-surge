@@ -44,7 +44,7 @@ export function findDuplicateOperation(engine: Engine, requestId: string, digest
 }
 
 /**
- * 在主事务内再核对一次幂等后创建操作。受理在首次核对与主事务之间有 await（钥匙串写入、预览重算）时，
+ * 在主事务内再核对一次幂等后创建操作。受理在首次核对与主事务之间有 await（秘密写入、预览重算）时，
  * 并发的同一请求可能已先提交：此时返回原操作（duplicate: true），摘要不同仍为 409，不会撞 request_id
  * 唯一约束或误报版本冲突。create 在同一事务内同步执行。
  */

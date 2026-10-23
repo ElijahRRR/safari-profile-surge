@@ -1,5 +1,6 @@
 // 服务配置（docs/ARCHITECTURE.md §3、§10、§11）。数据目录、套接字、端口，以及只来自 0600 安装配置
-// （<数据目录>/install.json）的 Surge CLI 路径、钥匙串工具路径与原语实现清单。
+// （<数据目录>/install.json）的 Surge CLI 路径与原语实现清单。秘密保存在数据目录的数据库中，不使用钥匙串：
+// 旧版安装配置中的 keychainHelperPath 字段被忽略（不报错）。
 // 演示模式使用新建的临时数据目录，从不读取安装配置，也就拿不到真实 Surge 路径。
 
 import { closeSync, constants as fsConstants, fstatSync, mkdtempSync, openSync, readFileSync } from 'node:fs';
@@ -69,7 +70,6 @@ export interface ServiceConfig {
   installConfigPath: string;
   /** 只来自 0600 安装配置；其他情况为 null。 */
   surgeCliPath: string | null;
-  keychainHelperPath: string | null;
   nodeVersionPin: string | null;
   adapterMechanism: Record<SurgePrimitive, PrimitiveMechanism>;
   /** 安装配置被忽略或部分字段无效的原因（简体中文，不含配置内容）。 */
@@ -152,7 +152,6 @@ function defaultMechanisms(): Record<SurgePrimitive, PrimitiveMechanism> {
 
 interface InstallConfig {
   surgeCliPath: string | null;
-  keychainHelperPath: string | null;
   nodeVersionPin: string | null;
   adapterMechanism: Record<SurgePrimitive, PrimitiveMechanism>;
   bridge: { transport: 'tcp'; port: number } | { transport: 'unix'; path: string } | null;
@@ -162,7 +161,7 @@ interface InstallConfig {
 }
 
 function emptyInstallConfig(issues: string[] = []): InstallConfig {
-  return { surgeCliPath: null, keychainHelperPath: null, nodeVersionPin: null, adapterMechanism: defaultMechanisms(), bridge: null, httpPort: null, webRoot: null, issues };
+  return { surgeCliPath: null, nodeVersionPin: null, adapterMechanism: defaultMechanisms(), bridge: null, httpPort: null, webRoot: null, issues };
 }
 
 // eslint-disable-next-line no-control-regex
@@ -215,7 +214,7 @@ export function readInstallConfig(path: string): InstallConfig {
   const cfg = emptyInstallConfig();
   const issues = cfg.issues;
   cfg.surgeCliPath = absolutePathField(obj, 'surgeCliPath', issues);
-  cfg.keychainHelperPath = absolutePathField(obj, 'keychainHelperPath', issues);
+  // keychainHelperPath（旧版的钥匙串工具路径）不再使用：不读取、不报错
   cfg.webRoot = absolutePathField(obj, 'webRoot', issues);
   if (obj.nodeVersionPin !== undefined && obj.nodeVersionPin !== null) {
     if (typeof obj.nodeVersionPin === 'string' && /^v?\d+\.\d+\.\d+$/.test(obj.nodeVersionPin)) cfg.nodeVersionPin = obj.nodeVersionPin;
@@ -312,7 +311,6 @@ export function loadConfig(opts: LoadConfigOptions): ServiceConfig {
     extensionHarnessRoot: args.demo ? args.extensionHarnessRoot : null,
     installConfigPath,
     surgeCliPath: install.surgeCliPath,
-    keychainHelperPath: install.keychainHelperPath,
     nodeVersionPin: install.nodeVersionPin,
     adapterMechanism: install.adapterMechanism,
     installConfigIssues: install.issues,

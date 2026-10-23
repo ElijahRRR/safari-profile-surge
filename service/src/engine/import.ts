@@ -167,7 +167,7 @@ const PROXY_CREDENTIAL_MAX = 128;
 
 /**
  * 解析后立即登记各行秘密（逐行校验之前）。只登记不超过字段上限的值：更长的值必然被逐行校验拒绝、
- * 从不进入钥匙串，登记它们只会无界占用脱敏器内存。先收集再一次登记。
+ * 从不写入秘密存储，登记它们只会无界占用脱敏器内存。先收集再一次登记。
  */
 function registerRowSecrets(engine: Engine, rows: readonly ParsedImportRow[]): void {
   const values = new Set<string>();
@@ -257,7 +257,7 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
   }
   if (fieldErrors.length > 0) throw new SfeError('VALIDATION_FAILED', '导入失败：逐行决定不正确', { fieldErrors });
 
-  // 写钥匙串（主事务之外）
+  // 写秘密存储（主事务之外）
   const batchId = engine.ids.next('batch');
   const secrets = new Map<number, RowSecrets>();
   const created: string[] = [];
@@ -292,7 +292,7 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
   let routeChanged = false;
   let committed: { op: OperationRecord; duplicate: boolean };
   try {
-    // 幂等在主事务内再核对一次：并发的同一请求可能在写钥匙串期间已提交
+    // 幂等在主事务内再核对一次：并发的同一请求可能在写秘密存储期间已提交
     committed = commitOperation(engine, requestId, digest, () => {
       const batch = insertOperation(engine, {
         kind: 'import.batch',
@@ -365,7 +365,7 @@ export async function importCommit(deps: AcceptDeps, req: ImportCommitRequest, a
     for (const ref of created) await engine.secrets.discard(ref).catch(() => false);
     throw err;
   }
-  // 未被使用的钥匙串项（版本冲突的行；并发的同一请求已先提交时为全部）
+  // 未被使用的秘密项（版本冲突的行；并发的同一请求已先提交时为全部）
   for (const ref of created) {
     if (!repos.secretRefs.isReferenced(ref)) await engine.secrets.discard(ref).catch(() => false);
   }

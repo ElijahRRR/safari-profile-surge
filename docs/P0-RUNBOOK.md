@@ -12,7 +12,7 @@ P0 证明或否定 `CAPABILITY_KEYS` 中的每一项能力，并把结论以“�
 
 - 只使用**空白 Safari 测试场景、测试域名（`*.p0.example.test` 与固定的检测服务主机）和本机测试代理**。从不导入买家账号、买家代理凭据或真实订单页。
 - 工具**从不**调用 switch-profile / profile switch、reload、restart-engine、更新全部外部资源、flush 临时规则（`rule temp flush`、`flush-temp-rule`）、managed-profile update、module、set，也从不开关增强模式、系统代理或出站模式（feature set、mode set、global-policy set），从不停止 Surge。每条 surge-cli 命令都必须完全符合服务的 argv 允许清单（`service/src/surge/cli-commands.ts` 的 `CLI_ARGV_ALLOWLIST`）。需要切换配置、重启 Surge 或重载配置的步骤都由你在 Surge 菜单中手动完成；**不要为了测试运行 `restart-engine`**。
-- 本地文件（测试节点资源、入口与 canary 规则集）写入后**不靠 `external-resource update` 生效**（HTTP API 文档，Mac 6.10.0+：“Download remote external resources immediately. … Local resources are skipped.”）：工具有界轮询，等待 Surge 自动重新读取（规则集文档：“Local files are watched and reloaded automatically when they change.”；本地 policy-path 是否被监视没有写入文档，由 3.12 测量）。update 只对本工具测试资源的单个 key 调用，只为记录它对本地资源报告什么，从不当作刷新。
+- 本地文件（测试节点资源、入口与 canary 规则集）写入后**不靠 `external-resource update` 生效**（HTTP API 文档，Mac 6.10.0+：“Download remote external resources immediately. … Local resources are skipped.”）：工具有界轮询，等待 Surge 自动重新读取（规则集文档：“Local files are watched and reloaded automatically when they change.”；本地 policy-path 是否被监视没有写入文档，由 3.11 测量）。update 只对本工具测试资源的单个 key 调用，只为记录它对本地资源报告什么，从不当作刷新。
 - 写入之前工具先打印快照与**精确回退**，等你输入 `yes`（或显式加 `--yes`）才执行。
 - 原始输出只写到仓库外的限权目录（默认 `~/Library/Application Support/SafariProfileSurge/p0/<运行编号>/`，目录 0700、文件 0600）；终端与提议只含脱敏摘要。不要把原始证据复制到仓库、聊天或工单中。
 - 工具只能“提议”能力结论；“确认”只能在网页后台完成。
@@ -54,7 +54,7 @@ npx tsx tools/p0/src/cli.ts help
 | 2 | 测试服务 | 另开终端 `test-servers`，全程保持运行 | — |
 | 3 | 测试配置 | `make-test-profile`，然后**手动**在 Surge 中切到「SFE-P0-测试」，再 `inventory --run <编号> --profile <测试配置>` | — |
 | 4 | 进程归属 | `attribution` | safari_process_attribution |
-| 5 | 扩展与原生桥 | 构建安装（见 docs/INSTALL.md）后 `checklist` 四项 | native_bridge_ipc、native_profile_id、extension_install_persistence、bridge_keychain_access |
+| 5 | 扩展与原生桥 | 构建安装（见 docs/INSTALL.md）后 `checklist` 三项 | native_bridge_ipc、native_profile_id、extension_install_persistence |
 | 6 | 入口模式 | `entry --strategy …` | runtime_entry_modes、safari_udp_quic_handling |
 | 7 | 本地文件重新读取与连续性 | 一个终端 `continuity`，另一个 `refresh`（自动重载开、关各一次；不调用 update，测量 Surge 的自动重新读取） | auto_reload_atomic_replace、targeted_resource_refresh、policy_path_reread、fixed_profile_no_switch、connection_continuity |
 | 8 | 前置链路与凭据字符 | `chain`、`charset` | external_node_underlying_proxy；凭据字符白名单 |
@@ -85,7 +85,7 @@ npx tsx tools/p0/src/cli.ts help
 |---|---|
 | `echo.p0.example.test:<回显端口>` | 测试页、回显、长连接流、WebSocket（只能经本机测试出口访问） |
 | `chain.p0.example.test` | 测试规则把它交给 SFE-ROUTE，工具用它验证所选节点 |
-| `c<N>.canary.p0.example.test` | 规则集 canary：测量本地规则集的文件监视（见 3.10） |
+| `c<N>.canary.p0.example.test` | 规则集 canary：测量本地规则集的文件监视（见 3.9） |
 | `p<N>.pcanary.p0.example.test` | 配置 canary：重载检测（见 §1.4） |
 | `api.ipify.org`、`api64.ipify.org` | 固定的检测服务（与扩展相同） |
 | `api6.ipify.org` | 只有 IPv6 的检测主机 |
@@ -110,7 +110,7 @@ npx tsx tools/p0/src/cli.ts help
 
 ARCHITECTURE 要求记录“P0 定义的未重载信号”。Surge 6.10 上工具使用五个信号，任何一个变化即判定发生了重载或重启：
 
-1. **配置 canary**：原子替换测试配置（主配置）中的配置 canary 行（只改编号），之后经 Surge 代理请求 `p<N>.pcanary.p0.example.test`。按新内容命中（经 P0-Canary）说明 Surge 重新读取了主配置，即发生了配置重载（6.9.0 起 reload 只应用差异，同样会读取这一行）。规则集 canary 不再用作重载检测：本地规则集文件本来就会被 Surge 的文件监视重新读取（3.10 测量它）。
+1. **配置 canary**：原子替换测试配置（主配置）中的配置 canary 行（只改编号），之后经 Surge 代理请求 `p<N>.pcanary.p0.example.test`。按新内容命中（经 P0-Canary）说明 Surge 重新读取了主配置，即发生了配置重载（6.9.0 起 reload 只应用差异，同样会读取这一行）。规则集 canary 不再用作重载检测：本地规则集文件本来就会被 Surge 的文件监视重新读取（3.9 测量它）。
 2. **引擎运行时长**（`getRuntimeInfo`：`--raw dump performance` 的 uptime，或 `/v1/metrics` 的 `surge_uptime_seconds`）变小：引擎重启。`restart-engine` 或 6.9.0 起需要时自动升级的 reload（“Automatically performs a full engine restart if a change requires one.”）都会这样；进程本身不变，所以第 3 条看不到。
 3. **Surge 进程启动时间**（`ps -o lstart`）变化：Surge 退出重开。
 4. **本工具之外的临时规则减少**：引擎重启与退出都会清空临时规则（帮助：“discarded when Surge stops”）；reload 保留它们（“Unaffected connections, caches and temporary rules are preserved.”）。
@@ -179,14 +179,14 @@ kill "$SELFTEST_PID"
 下列各项在代码中标为 TODO(P0)，实测之前一律按失败处理（读不到即不可用、不确定即不通过）。逐项记录实际结果（原始输出只在运行目录），交给开发者收紧解析或调整门槛；不要为了得到结果而运行允许清单之外的命令。
 
 - `--raw` 的键名：`version`（版本与构建号的键名）、`status`（`profile` 是否带 `.conf`、`profile-path`）、`feature get enhanced-mode|system-proxy`、`mode get`、`policy-group get SFE-ROUTE` 与 `policy-group list`（policy-path 中的成员是否出现在 list 中）、`dump performance`（uptime 的单位）、`dump temp-rule`（空与非空）、`dump active` / `dump recent`（请求 id、进程路径、策略、规则字段）、`rule match`（`rule`、`policy` 的键名）、`external-resource list`（`local`、`updating`、`fromModule`、`error`）。inventory 的 `values` 与调用记录给出能否解析；原始输出用 V8 的方法手动查看。
-- `external-resource update <本地资源 key>` 的输出与退出码（文档：本地资源被跳过；6.10 包内文字有 “No remote external resource needed updating.”）：3.10 与 3.12 记录。
-- 本地规则集被文件监视重新读取的延迟，以及它是否只重新读取该规则集（不是整份配置重载、不是引擎重启、其他应用连接不受影响）：3.10。
-- 本地 policy-path 文件是否被监视（不调用 update 时 SFE-ROUTE 成员是否变化、选择是否保留、连接是否受影响）：3.12。没有被监视时新节点保持“已保存，待部署”，不实现回环地址的远端资源替代方案。
-- 多条临时规则之间的先后（帮助只写 “Add a temporary rule with the highest priority”）、`rule match` 是否包含临时规则、命中规则集时 `rule` 是 RULE-SET 行还是子规则、“final policy” 是组名还是组内选择：3.7。
-- 含空格的进程路径作为单个 argv 元素能否被 `rule match process-path=` 与 `rule temp add` 完整接受：3.7（`--process-path` 用实际的 Safari 路径）。
-- 哪个请求字段是 `kill <connection-id>` 的 id：3.7 的结束连接记录。
+- `external-resource update <本地资源 key>` 的输出与退出码（文档：本地资源被跳过；6.10 包内文字有 “No remote external resource needed updating.”）：3.9 与 3.11 记录。
+- 本地规则集被文件监视重新读取的延迟，以及它是否只重新读取该规则集（不是整份配置重载、不是引擎重启、其他应用连接不受影响）：3.9。
+- 本地 policy-path 文件是否被监视（不调用 update 时 SFE-ROUTE 成员是否变化、选择是否保留、连接是否受影响）：3.11。没有被监视时新节点保持“已保存，待部署”，不实现回环地址的远端资源替代方案。
+- 多条临时规则之间的先后（帮助只写 “Add a temporary rule with the highest priority”）、`rule match` 是否包含临时规则、命中规则集时 `rule` 是 RULE-SET 行还是子规则、“final policy” 是组名还是组内选择：3.6。
+- 含空格的进程路径作为单个 argv 元素能否被 `rule match process-path=` 与 `rule temp add` 完整接受：3.6（`--process-path` 用实际的 Safari 路径）。
+- 哪个请求字段是 `kill <connection-id>` 的 id：3.6 的结束连接记录。
 - `--check` 对无效配置的退出码：make-test-profile 的 `--check` 记录；可另用一份故意写错的合成配置手动核对。
-- 6.9.0 起哪些改动会让 reload 升级为完整引擎重启：3.15 只记录本次是否升级，不据一次结果推断规则。
+- 6.9.0 起哪些改动会让 reload 升级为完整引擎重启：3.14 只记录本次是否升级，不据一次结果推断规则。
 - 后台安全改进的识别（服务与 P0 同一规则，见 `service/src/engine/capabilities.ts`）：先记录 `man sw_vers` 中 `-productVersionExtra` 的原文；再在**没有安装**、**已安装未重启**（Safari 已重开）、**重启后**三种状态下各记录一次 `/usr/bin/sw_vers`（完整输出）、`/usr/bin/sw_vers -productVersionExtra`（输出与退出码，没有安装时是否为空）、`ls -ld /System/Volumes/Preboot/Cryptexes/Incoming`（是否存在、普通用户能否读取），以及 inventory 的两行结果。`Incoming` 这个暂存位置是测试 Mac 上的观察，Apple 没有写明路径（只写到 “applying the Incoming Cryptex”）。没有待重启时它也存在 → 依赖进程归属的三项（归属、UDP/QUIC、首请求与旧连接）会一直待验证，交给开发者改判断方法；装上后不出现 → 工具发现不了待重启，测试者继续按 §1.1 人工核对，同样交给开发者。补充版本在安装时还是重启后才变化，以及 Safari 进程路径在三种状态下是否不同（`/Applications/...`、`/System/Cryptexes/...` 或 `/System/Volumes/Preboot/Cryptexes/...`），一并记录。移除后台安全改进同样要重启才完成，有条件时也按三种状态记录一次。
 
 ## 2. 通用回退
@@ -279,7 +279,7 @@ kill "$SELFTEST_PID"
   - 包内布局与嵌套代码签名：`codesign --verify --deep --strict --verbose=2 /Applications/SafariProfileSurge.app` 退出 0；`codesign -dv /Applications/SafariProfileSurge.app/Contents/Helpers/node` 显示标识 `com.sfe.node` 与 App 相同的 TeamIdentifier；`find /Applications/SafariProfileSurge.app/Contents/Resources -type f -exec file {} + | grep -c Mach-O` 为 0（Node 按 Apple「Placing content in a bundle」放在 `Contents/Helpers`：“Resources are everything that’s not code.”）。结果写进 `validity` 项备注。
   - `ls -l /Applications/SafariProfileSurge.app/Contents/embedded.provisionprofile /Applications/SafariProfileSurge.app/Contents/PlugIns/SafariProfileSurgeExtension.appex/Contents/embedded.provisionprofile`：记录哪一个存在。
   - 存在时：`security cms -D -i <该文件> -o "$TMPDIR/sfe-profile.plist" && plutil -p "$TMPDIR/sfe-profile.plist" | grep -E 'CreationDate|ExpirationDate'`，记录两个日期后 `rm "$TMPDIR/sfe-profile.plist"`（描述文件含设备与证书信息，不保存、不提交）。
-  - 背景：TN3125 写明 “Unlike Apple’s other platforms, macOS doesn’t require a provisioning profile to run third-party code.” “A Mac app that uses no restricted entitlements doesn’t need a provisioning profile.”（https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles）；免费团队的描述文件 “will expire 7 days from issuance”（https://developer.apple.com/help/account/basics/about-your-developer-account）。Xcode 自动签名是否仍嵌入描述文件、它过期后 App 能否启动、扩展是否保持启用、原生桥是否可用，Apple 都没有写；8 天以上的检查要覆盖嵌入的描述文件过期之后。备选钥匙串方案的 `keychain-access-groups` 一定要描述文件授权，不受本项结论豁免。
+  - 背景：TN3125 写明 “Unlike Apple’s other platforms, macOS doesn’t require a provisioning profile to run third-party code.” “A Mac app that uses no restricted entitlements doesn’t need a provisioning profile.”（https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles）；免费团队的描述文件 “will expire 7 days from issuance”（https://developer.apple.com/help/account/basics/about-your-developer-account）。Xcode 自动签名是否仍嵌入描述文件、它过期后 App 能否启动、扩展是否保持启用、原生桥是否可用，Apple 都没有写；8 天以上的检查要覆盖嵌入的描述文件过期之后。本应用不使用钥匙串，签名中不应出现 `keychain-access-groups`；出现时如实记录。
 
   然后 `checklist extension_install_persistence`。
 - **通过条件**：不开启“允许未签名扩展”，扩展在 Safari 退出重开、重启、8 天以上与重新构建后仍保持启用；证书有效期、App 与扩展是否嵌入描述文件及其有效期已记录。
@@ -287,23 +287,12 @@ kill "$SELFTEST_PID"
 - **证据**：`results/extension_install_persistence.json`；日期；签名身份。
 - **回退**：无。
 
-### 3.6 bridge_keychain_access（原生桥读取钥匙串）
-
-- **用途**：登录填充时由签名的原生桥自己读取账号密码，服务从不返回密码。
-- **前置条件**：同 3.3。只用合成测试值（例如 `example-test-value`），不使用真实账号。
-- **步骤**：用 sfe-keychain 写入一个合成账号密码项 → 在测试场景触发一次读取（开发构建的测试入口）→ 记录是否出现提示；重新构建/重签后重复并记录提示次数；锁定钥匙串、拒绝授权时检查错误分类（denied / locked），并分别记录扩展（登录填充，弹窗中的说明）与 sfe-keychain（服务调用）实际得到哪个 reason。`locked` 来自 `errSecInteractionNotAllowed`，Apple 只定义为 “Interaction with the Security Server is not allowed.”（https://developer.apple.com/documentation/security/errsecinteractionnotallowed），需要用户认证而不允许显示界面时也返回它，所以界面显示为「钥匙串需要用户交互但当前不允许（可能已锁定，或无法显示授权提示）」；钥匙串锁定时是弹出解锁提示还是直接返回这个码，以本项记录为准，之后再决定是否拆分 reason。`checklist bridge_keychain_access`。
-- **安全说明的核对（只记录，写进 `errors` 项备注）**：受信任应用列表之外的进程读取时，Apple 写明系统会询问用户，而不是直接拒绝：“Otherwise, the system prompts the user for confirmation. The user may choose to Deny, Allow, or Always Allow the access.”（https://developer.apple.com/documentation/security/access-control-lists）。在终端运行 `security find-generic-password -s com.sfe.account -w`：应出现钥匙串授权提示（macOS 10.13.1 起要求输入钥匙串密码），选「拒绝」并记录提示与命令的结果。**不要选「允许」或「始终允许」**（后者会把 `security` 永久加入该项的受信任列表）。`SecItemAdd` 默认写入什么分区列表、同团队扩展能否通过，Apple 没有写（security(1) 只说分区列表 “limits access to the item based on an application's code signature”），以本项读取结果为准。
-- **通过条件**：签名的原生桥能读取由指定写入方写入的账号密码钥匙串项，无额外提示；重建/重签后的提示次数已记录。
-- **失败处理**：首选方案与备选方案（数据保护钥匙串 + 共享访问组）都不行时，登录填充保持不可用，并在 INSTALL/ACCEPTANCE 中写明。
-- **证据**：`results/bridge_keychain_access.json`；提示次数；签名身份。
-- **回退**：在「钥匙串访问」中删除合成测试项（名称以 SafariProfileSurge 开头、服务 `com.sfe.account`）。
-
-### 3.7 runtime_entry_modes（运行时入口四种模式）
+### 3.6 runtime_entry_modes（运行时入口四种模式）
 
 - **用途**：NORMAL / BLOCKED / VERIFY_ONLY / ACTIVE 四种模式在不重载配置、不重启引擎的前提下精确生效，切换中没有放行窗口；Chrome 从不被 Safari 规则命中。
 - **前置条件**：3.2 已得到候选路径（或用 `--process-path` 指定）；测试配置；test-servers；Safari 测试场景打开 `http://echo.p0.example.test:<端口>/app/safari`（轮询页），Chrome 打开 `…/app/chrome`；建议同时在另一个终端运行 `continuity`。
 - **策略选择**：
-  - `ruleset_resource`：四个规则集文件。每一步由服务策略按摘要原子替换一个文件，**不调用 `external-resource update`**（本地资源被跳过），在限定时间内（缺省 5 秒、每 0.2 秒）等待 Surge 的文件监视重新读取；每个文件带一条每次写入都不同的见证规则（`AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-<位>-<编号>.invalid))`，关闭的位的占位规则同样限定这个不存在的合成进程：DOMAIN 规则按主机名匹配任何进程，不限定时 Chrome 请求这一主机会经 SFE-ROUTE），用 `rule match … process-path=/var/empty/sfe-entry-witness` 确认 Surge 加载的正是这一版，再核对规则顺序与 Safari/Chrome 探测（Chrome 另探测各文件的见证主机与占位主机，必须不命中入口规则或 SFE-ROUTE）。等不到时按“结果未知”处理：放宽的一步能确认 Surge 仍是旧内容时把文件写回；收紧的一步保留新内容（监视赶上后加载的是更严格的内容）；入口记为未确认、不继续放宽。需要 `--auto-reload-condition`：服务规则是“读取当前自动重载设置并与能力记录的条件比较，读不到或不一致即拒绝”。读不到设置时只有 `any` 能通过，而 `any` 只有在 3.10 中自动重载开、关两种设置都通过时才可以提议。
+  - `ruleset_resource`：四个规则集文件。每一步由服务策略按摘要原子替换一个文件，**不调用 `external-resource update`**（本地资源被跳过），在限定时间内（缺省 5 秒、每 0.2 秒）等待 Surge 的文件监视重新读取；每个文件带一条每次写入都不同的见证规则（`AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-<位>-<编号>.invalid))`，关闭的位的占位规则同样限定这个不存在的合成进程：DOMAIN 规则按主机名匹配任何进程，不限定时 Chrome 请求这一主机会经 SFE-ROUTE），用 `rule match … process-path=/var/empty/sfe-entry-witness` 确认 Surge 加载的正是这一版，再核对规则顺序与 Safari/Chrome 探测（Chrome 另探测各文件的见证主机与占位主机，必须不命中入口规则或 SFE-ROUTE）。等不到时按“结果未知”处理：放宽的一步能确认 Surge 仍是旧内容时把文件写回；收紧的一步保留新内容（监视赶上后加载的是更严格的内容）；入口记为未确认、不继续放宽。需要 `--auto-reload-condition`：服务规则是“读取当前自动重载设置并与能力记录的条件比较，读不到或不一致即拒绝”。读不到设置时只有 `any` 能通过，而 `any` 只有在 3.9 中自动重载开、关两种设置都通过时才可以提议。
   - `temp_rule`：五种条件互不相交的临时规则（`rule temp add <rule>` / `rule temp remove <rule>`，Mac 6.9.0+，协议 ≥20；ARCHITECTURE §5.5），每种模式只取决于存在哪些规则，与先后无关；拒绝↔路由翻转的那一步不论 Surge 把新规则放在哪里，结果都只能是起点、终点、BLOCKED 或 VERIFY_ONLY。帮助只写 “Add a temporary rule with the highest priority”，多条临时规则之间的先后没有写入文档：主序列总会先测量新临时规则插在前还是后（添加并删除两条永不命中的 `DOMAIN,p0-insert-N.invalid,REJECT`；其他情况用 `--probe-insertion` 单独要求测量），结果记入运行状态与 runtime_entry_modes 的检查项（预期为插在最前）。
     - 探测同时正向确认 `listTempRules`：添加后的临时规则列表必须列出两条探测规则才算确认（记入运行状态）。temp_rule 主序列与 `--precedence-test temp` 总会先运行这一探测（不需要 `--probe-insertion`），本次没有确认就在入口写入前停止（前置条件不满足）或不注入；`entry --strategy temp_rule --to <NORMAL 以外>` 在运行状态中没有确认时先探测，仍没有确认就拒绝；临时规则同步与 `rollback` 只在确认后才把列表中没有的规则判为已删除。没有确认的原因分开报告：
       - “没有列出刚添加的探测规则（有效规则中能看到它们）：该原语映射不可用”：只有这一种记为不可用。此后 `entry --strategy temp_rule --to NORMAL` 也拒绝（无法读回，改用 `rollback --execute`）。把 `dump temp-rule` 的输出交给开发者核对后再重测；之后的探测确认成功会覆盖这一结论。
@@ -317,7 +306,7 @@ kill "$SELFTEST_PID"
      - `--precedence-test module`：按提示在 Surge「模块」中安装并启用测试配置目录下的 `SFE-P0-precedence.sgmodule`，同样必须被拒绝；之后按提示停用并移除模块。
   2. 主序列：`entry --strategy ruleset_resource --auto-reload-condition <on|off|any> --precedence-test temp,module`，另一次用 `entry --strategy temp_rule --precedence-test temp,module`。工具先把 SFE-ROUTE 选为测试节点 A、布置配置 canary（§1.4），然后依次切换 BLOCKED → VERIFY_ONLY → ACTIVE → NORMAL，每步写入后运行时读回，每个模式停留 `--dwell` 秒（默认 20）。
   3. rule match 矩阵：每个模式读回确认后，工具对每个 Safari 进程路径与对照进程路径（同一运行目录中 3.2 测得的 Chrome 路径，没有时为 Chrome 的标准路径），分别以检测主机与 `echo.p0.example.test`、`protocol=TCP|UDP|QUIC` 调用 `rule match`（只求值，不建立连接）：Safari 的结果必须符合该模式（QUIC 与 UDP 同类：“`PROTOCOL,UDP` also matches QUIC and STUN connections.”；拒绝或经 SFE-ROUTE 时命中的必须是本应用入口规则，NORMAL 时不能命中本应用入口规则）；对照进程从不命中本应用入口规则，最终策略从不是 SFE-ROUTE 或本应用节点。服务的入口策略在每一步之后也用同样的探测读回。
-  4. BLOCKED 之后工具按候选路径结束 Safari 的连接（逐条记录，不影响其他应用）；VERIFY_ONLY 时 Safari 页面中回显应失败、检测服务应成功；ACTIVE 时回显应经过 p0-a，并按提示在 Safari 打开 `https://cloudflare-quic.com/cdn-cgi/trace` 刷新 3 次、输入 `http=` 的值。入口运行不询问扩展弹窗的「重新检测」：它在 P0 中由服务执行（不经过 Safari 入口），BLOCKED 与 VERIFY_ONLY 下显示相同，不能证明扩展页面请求的处理；扩展页面请求的覆盖见 3.8。
+  4. BLOCKED 之后工具按候选路径结束 Safari 的连接（逐条记录，不影响其他应用）；VERIFY_ONLY 时 Safari 页面中回显应失败、检测服务应成功；ACTIVE 时回显应经过 p0-a，并按提示在 Safari 打开 `https://cloudflare-quic.com/cdn-cgi/trace` 刷新 3 次、输入 `http=` 的值。入口运行不询问扩展弹窗的「重新检测」：它在 P0 中由服务执行（不经过 Safari 入口），BLOCKED 与 VERIFY_ONLY 下显示相同，不能证明扩展页面请求的处理；扩展页面请求的覆盖见 3.7。
   5. 结束后工具读取 Surge 最近请求，把每条 Safari 请求映射到当时生效的入口位组合，检查有没有超出该状态允许的结果（放行窗口）。
 - **通过条件**：所选策略下四种模式精确生效，运行时读回包括 rule match：Safari 的 TCP、UDP、QUIC 对检测主机与其他主机都得到该模式预期的结果，Chrome 从不命中本应用入口规则或 SFE-ROUTE；每次切换不发生配置重载或引擎重启，其他应用长连接与新请求不受影响；中间状态无放行窗口；本应用入口优先于启用的模块 DIRECT 规则与用户临时规则；AND/NOT 组合（进程、协议、域名）的入口规则在该机制中可用；temp_rule 时新临时规则的插入位置已实测；ruleset_resource 时规则集文件原子替换后不调用 external-resource update，由 Surge 的文件监视在限定时间内重新读取并经见证规则读回。
 - **判定细节**：检查项包括四种模式精确生效（读回）、Surge 记录中没有放行窗口、Safari 测试页在各模式下的表现、Chrome 测试页不受影响、其他应用长连接与新请求不受影响（流或 WebSocket 重置、WebSocket 重连失败、短请求失败都算影响）、没有配置重载或引擎重启（§1.4；配置 canary 不可用时为“不完整”）、rule match 矩阵（Safari 的 TCP/UDP/QUIC 符合各模式；Chrome 从不命中；任一读取失败为“不完整”，不符为“不通过”）、AND(进程,域名) 与 AND(进程,UDP) 规则实际命中（Surge 请求记录）、temp_rule 时插入位置已测得、优先于临时规则与模块 DIRECT 规则。任何一项没有数据时结论为“不完整”。
@@ -325,11 +314,11 @@ kill "$SELFTEST_PID"
 - **证据**：`entry/<策略>-<时间>.json`（步骤时间线、每个模式的读回与证据、rule match 矩阵与对照路径、Surge 请求中 Safari 与测试主机的记录、配置 canary 与重载/重启信号、结束连接结果、H3 观察）、`entry/old-connections-evidence.json`、`servers/page.jsonl`、`servers/exit.jsonl`、`actions.jsonl`、`results/runtime_entry_modes.json`。期望节点为 SFE-N-P0-A；配置身份为测试配置；对照应用为 Chrome。
 - **回退**：`entry --strategy <策略> --to NORMAL`；`rollback --execute`。
 
-### 3.8 safari_udp_quic_handling（Safari UDP/QUIC 处理）
+### 3.7 safari_udp_quic_handling（Safari UDP/QUIC 处理）
 
 - **用途**：SOCKS5 链不支持 UDP；Safari 的 QUIC 必须被拒绝并回落 TCP，从不直连。
-- **前置条件**：同 3.7。全局 `udp-policy-not-supported-behaviour` 只读取记录，不修改。
-- **步骤**：与 3.7 的主序列同一次运行：VERIFY_ONLY 与 ACTIVE 期间的 Safari UDP 记录必须全部被 udp 规则拒绝；ACTIVE 下 H3 测试页显示 `http=http/2`（回落 TCP），对应的 TCP 请求经 SFE-ROUTE。逐协议覆盖全部来自测量：
+- **前置条件**：同 3.6。全局 `udp-policy-not-supported-behaviour` 只读取记录，不修改。
+- **步骤**：与 3.6 的主序列同一次运行：VERIFY_ONLY 与 ACTIVE 期间的 Safari UDP 记录必须全部被 udp 规则拒绝；ACTIVE 下 H3 测试页显示 `http=http/2`（回落 TCP），对应的 TCP 请求经 SFE-ROUTE。逐协议覆盖全部来自测量：
   - http3_quic、http2：本次运行中 Safari 的 UDP 记录与 H3 测试主机回落的 TCP 记录（只接受直接测量）；
   - ipv4、http1：VERIFY_ONLY 下检测请求经 SFE-ROUTE；测试页回显在各模式下符合预期；
   - ipv6：Safari 轮询页每 5 轮请求一次 `api6.ipify.org`，Surge 中的记录在 BLOCKED/VERIFY_ONLY 下必须被拒绝、ACTIVE 下必须经 SFE-ROUTE；NORMAL 下 IPv6 检测也全部失败时记为 limitation（测试网络没有 IPv6）；
@@ -338,20 +327,20 @@ kill "$SELFTEST_PID"
   - 本次运行中没有直接观察到的非 UDP 项，只有当同一运行目录中有**同一进程路径、结论为“通过”**的 safari_process_attribution（3.2）且该项为 pass/limitation 时，记为 limitation 并注明“由 safari_process_attribution 覆盖”；否则为 not_tested 并写明缺什么，提议 supported 会被拒绝。
 - **通过条件**：VERIFY_ONLY 与 ACTIVE 下 Safari 的 UDP/QUIC（H3 测试主机）被拒绝且从不直连，页面回落 TCP 经 SFE-ROUTE，出口一致。
 - **失败处理**：UDP 有任何一条未被拒绝或被直连，记录不支持，激活门槛保持关闭。Safari 没有发起 QUIC 时写成“未测”，换一个支持 H3 的测试主机（`--h3-host`）重测。其他门槛项为 not_tested 时按备注补测（保持轮询页打开，或先完成 3.2，包括扩展步骤），不手工改写覆盖。
-- **证据**：同 3.7；逐协议覆盖写在 `results/safari_udp_quic_handling.json`。
-- **回退**：同 3.7。
+- **证据**：同 3.6；逐协议覆盖写在 `results/safari_udp_quic_handling.json`。
+- **回退**：同 3.6。
 
-### 3.9 entry_rules_after_restart（Surge 重启后入口规则生命周期）
+### 3.8 entry_rules_after_restart（Surge 重启后入口规则生命周期）
 
 - **用途**：Surge 重启后临时规则消失（帮助：“Temporary rules … are discarded when Surge stops.”；`restart-engine` 同样清空）；控制器必须在一个对账周期内发现，而不是继续显示 ACTIVE。只重启引擎时进程启动时间不变，服务按引擎运行时长回落识别。
-- **前置条件**：3.7 通过。
+- **前置条件**：3.6 通过。
 - **步骤**：`entry --strategy <策略> --auto-reload-condition … --restart-test`。主序列结束后工具再次进入 ACTIVE，按提示在 Surge 菜单中退出 Surge 并重新打开，等待接管恢复后回车；工具立即读回入口并记录临时规则、规则集去留、进程启动时间与引擎运行时长，再回到 NORMAL。**不要用 `restart-engine` 代替**（它不在允许清单中，且会关闭全部连接）。
 - **通过条件**：Surge 重启（退出重开；只重启引擎时按引擎运行时长回落识别）后入口规则的去留已记录，且控制器在一个对账周期内检测到丢失（入口记为 UNKNOWN 并暂停填充与自动打开）。
 - **失败处理**：规则丢失但读回仍为 ACTIVE 时记录不通过（控制器会误报受控）；产品的对账逻辑必须修正后重测。
 - **证据**：`entry/<策略>-<时间>.json` 中的 `restart`（进程启动时间是否变化、引擎运行时长是否回落）、`results/entry_rules_after_restart.json`。
-- **回退**：同 3.7；如重启后无法回到 NORMAL，按 §2 处理。
+- **回退**：同 3.6；如重启后无法回到 NORMAL，按 §2 处理。
 
-### 3.10 auto_reload_atomic_replace（自动重载与原子替换行为）
+### 3.9 auto_reload_atomic_replace（自动重载与原子替换行为）
 
 - **用途**：写入被引用的本地文件之前，必须知道 Surge 会怎样重新读取它：6.10 的本地规则集由文件监视自动重新读取（规则集文档：“Local files are watched and reloaded automatically when they change.”），这一读取必须只涉及该文件——不是整份配置重载，不是引擎重启，不影响其他应用的连接。另记录主配置被原子替换后是否触发重载（维护写入用）。
 - **前置条件**：测试配置；test-servers；在 Surge 设置中查看当前「自动重载」开关（工具读不到时由你声明）；`matchRule` 有可用实现时用 `rule match` 读回（否则改用实际请求，较慢）。
@@ -366,10 +355,10 @@ kill "$SELFTEST_PID"
 - **证据**：`results/auto_reload_atomic_replace.json`（声明的设置值、延迟、update 的结果分类）、`results/history/`、`snapshots/`、`refresh/traffic-*.json`、`surge-calls.jsonl`（rule match 轮询）。
 - **回退**：把自动重载开关恢复为测试前的值（手动）；配置 canary 行与 canary 规则集只影响测试主机；测试节点资源由命令自动恢复。
 
-### 3.11 targeted_resource_refresh（节点资源定向重新读取）
+### 3.10 targeted_resource_refresh（节点资源定向重新读取）
 
 - **用途**：新增节点只让本应用的节点资源被重新读取：不调用 update（本地资源被跳过）、不重载、不更新全部，其他资源与其他应用不受影响，读回完整。
-- **前置条件**：同 3.10；建议另一个终端运行 `continuity`。
+- **前置条件**：同 3.9；建议另一个终端运行 `continuity`。
 - **步骤**：`refresh --auto-reload off`。阶段 C：测试节点资源加入 SFE-N-P0-C → 原子替换 → **不调用 update**，有界轮询 SFE-ROUTE 成员（每 0.5 秒，至多 `--wait` 秒）直到与清单完全相等 → 读回组成员、选择、资源状态（`local`、`fromModule`、错误、是否正在更新）、节点详情；比较其他外部资源的更新时间与错误状态与 §1.4 的信号。时限内没有重新读取时，工具只对该 key 调用一次 update 并记录 Surge 报告什么、成员是否随之变化——与文档不符时写明，但**从不算通过**。
 - **通过条件**：本应用节点资源（本地 policy-path 文件）原子替换后不调用 external-resource update（本地资源被跳过），经固定原语能读回组成员、资源错误与选择；只有该资源变化，其他外部资源不受影响，不发生整份配置重载或引擎重启；执行器从不写入它无法读回的内容。
 - **判定细节**：“恰好一个 key 指向测试节点资源，且是来自配置的本地资源”要求 Surge 报告 `local: true`、`fromModule` 为空（没有 `local` 字段时为“不完整”）。节点详情读不到时读回级别为 partial。“资源没有错误”按读回成员 1 秒后的状态判定，备注记录写入前、读回成员后与 1 秒后的资源状态（正常 / 正在更新 / 未就绪 / 有错误；Surge 报告 `ready` 不为 true 时记为未就绪，不算健康）。配置 canary 不可用时“没有发生整份配置重载”为“不完整”。
@@ -377,28 +366,28 @@ kill "$SELFTEST_PID"
 - **证据**：`results/targeted_resource_refresh.json`、`snapshots/refresh-before-*.json`、`surge-calls.jsonl`（每次调用的原语与耗时）、`actions.jsonl`。
 - **回退**：命令结束时写回只含 A、B 的资源并等待重新读取、恢复原选择；失败时按打印的回退处理。
 
-### 3.12 policy_path_reread（本地 policy-path 重新读取）
+### 3.11 policy_path_reread（本地 policy-path 重新读取）
 
 - **用途**：本地 policy-path 文件是否会被 Surge 自动重新读取没有写入文档（策略组文档只说 “Remote resources are cached on disk and re-downloaded periodically.”，`update-interval` “Only meaningful when the path is a URL.”）。这是发布的前提：没有自动重新读取，新节点只能停在待部署。
-- **前置条件**：同 3.11。
+- **前置条件**：同 3.10。
 - **步骤**：同一次 `refresh`：阶段 C 测得不调用 update 时成员是否在时限内与清单相等及其延迟；之后选择新节点 C 并经 `chain.p0.example.test` 请求，回显必须看到 p0-c；阶段 D（可用 `--skip-removal-fallback` 跳过）选中 C 后从资源移除、等待重新读取，选择必须回落到首成员 REJECT，不能落到其他节点。时限内没有重新读取时，阶段 C 之后的检查记为未测。
 - **通过条件**：本地 policy-path 文件原子替换后不调用 external-resource update，Surge 在限定时间内自动重新读取（延迟已记录）：新增成员可选且实际生效，旧成员与选择保留，选中节点被移除时回落到首成员 REJECT。
 - **判定细节**：只有“不调用 update 时自动重新读取”能通过；调用 update 后成员才变化（与文档 “Local resources are skipped.” 不符）只作记录，结论仍为“不通过”。延迟会用于调整服务发布的等待（`resourceReloadWait`，缺省 10 秒）。
 - **失败处理**：记录不支持；发布门槛保持关闭，新版本停在 WAITING_DEPLOYMENT，已部署的节点不受影响。
 - **证据**：`results/policy_path_reread.json`（延迟、轮询次数、update 的结果分类）、`servers/echo.jsonl`（经过的测试节点）。
-- **回退**：同 3.11。
+- **回退**：同 3.10。
 
-### 3.13 fixed_profile_no_switch（固定配置日常不切换）
+### 3.12 fixed_profile_no_switch（固定配置日常不切换）
 
 - **用途**：日常在环境之间切换只改 SFE-ROUTE 选择，不切配置、不重载、不重启引擎。
-- **前置条件**：同 3.10；Chrome 打开 `…/app/chrome` 轮询页。
+- **前置条件**：同 3.9；Chrome 打开 `…/app/chrome` 轮询页。
 - **步骤**：同一次 `refresh` 的阶段 B：SFE-ROUTE 依次选择 A、B、A（`policy-group set SFE-ROUTE <节点>`），读回选择、经过的节点、当前配置名与 §1.4 的重载/重启信号；同时检查工具自身的长连接/短请求与 Chrome 测试页上报。
 - **通过条件**：切换 SFE-ROUTE 选择时工作配置身份不变、不发生配置重载或引擎重启、Chrome 长连接与新请求不受影响。
 - **失败处理**：不能以多配置切换替代；记录不支持，激活门槛保持关闭。
 - **证据**：`results/fixed_profile_no_switch.json`、`servers/page.jsonl`（Chrome）。
-- **回退**：同 3.11。
+- **回退**：同 3.10。
 
-### 3.14 connection_continuity（其他应用连接连续性）
+### 3.13 connection_continuity（其他应用连接连续性）
 
 - **用途**：发布节点资源期间，其他应用（Chrome 与本工具模拟的应用）的长连接保持、新请求正常、出口不变。
 - **前置条件**：测试配置；test-servers。
@@ -412,7 +401,7 @@ kill "$SELFTEST_PID"
 - **证据**：`continuity/<时间>.json`（样本、标记、逐时段统计：成功率、延迟、最大间隔、重置、经过的节点）、`results/connection_continuity.json`。
 - **回退**：只读（本命令不写 Surge）。
 
-### 3.15 same_profile_reload_impact（同一配置维护重载影响）
+### 3.14 same_profile_reload_impact（同一配置维护重载影响）
 
 - **用途**：维护流程（remerge）可能需要重载同一配置；用户需要知道影响后选择时间。
 - **前置条件**：测试配置；test-servers；入口为 NORMAL。
@@ -426,17 +415,17 @@ kill "$SELFTEST_PID"
 - **证据**：`continuity/<时间>.json`、`results/same_profile_reload_impact.json`（重置数、失败数、恢复时间、接管与出站模式前后、是否升级为完整引擎重启）。
 - **回退**：无写入；确认接管与出站模式未变。
 
-### 3.16 external_node_underlying_proxy（外部节点前置链路）
+### 3.15 external_node_underlying_proxy（外部节点前置链路）
 
 - **用途**：外部资源中的节点必须经主配置中的前置；前置不可达或缺失时失败而不是直连。
 - **前置条件**：测试配置；test-servers；入口为 NORMAL。
-- **步骤**：`chain [--reload-wait 10]`。工具在测试资源中加入 SFE-N-P0-DEAD（前置端口无服务）与 SFE-N-P0-MISSING（前置名不存在），不调用 update，等待 Surge 自动重新读取（DEAD 出现在成员中为准；3.12 未通过时结论为“不完整”，不重载补救），然后依次选择 A、DEAD、MISSING，各经 `chain.p0.example.test` 请求一次。正面证据：前置服务记录 CONNECT 到出口服务、出口服务判定连接来自前置、回显看到 p0-a；DEAD 与 MISSING 不能到达出口，也不能出现 DIRECT 记录。
+- **步骤**：`chain [--reload-wait 10]`。工具在测试资源中加入 SFE-N-P0-DEAD（前置端口无服务）与 SFE-N-P0-MISSING（前置名不存在），不调用 update，等待 Surge 自动重新读取（DEAD 出现在成员中为准；3.11 未通过时结论为“不完整”，不重载补救），然后依次选择 A、DEAD、MISSING，各经 `chain.p0.example.test` 请求一次。正面证据：前置服务记录 CONNECT 到出口服务、出口服务判定连接来自前置、回显看到 p0-a；DEAD 与 MISSING 不能到达出口，也不能出现 DIRECT 记录。
 - **通过条件**：外部资源中的节点经 underlying-proxy 引用主配置前置时确实经过前置；前置不可达时连接失败而非直连；前置名缺失时节点被跳过或失败而非直连。
 - **失败处理**：记录不支持，发布与激活门槛保持关闭。
 - **证据**：`servers/front.jsonl`、`servers/exit.jsonl`、`results/external_node_underlying_proxy.json`。
 - **回退**：命令自动恢复测试资源与选择。
 
-### 3.17 independent_node_preflight（候选节点独立预检）
+### 3.16 independent_node_preflight（候选节点独立预检）
 
 - **用途**：非活动环境的新节点能否不改变当前选择就做连通性测试。
 - **前置条件**：测试配置；test-servers；`testPolicy` 有可用实现。
@@ -446,10 +435,10 @@ kill "$SELFTEST_PID"
 - **证据**：`servers/echo.jsonl`、`results/independent_node_preflight.json`。
 - **回退**：命令恢复原选择。
 
-### 3.18 first_request_and_old_connections（首请求与旧连接处理）
+### 3.17 first_request_and_old_connections（首请求与旧连接处理）
 
 - **用途**：受控入口下首个业务请求已走新出口；旧环境的长连接、后台请求、恢复的标签页与扩展休眠场景不会继续用旧出口。
-- **前置条件**：3.7 已运行（工具记录了结束 Safari 连接的结果）；扩展与宿主 App 已安装；测试环境只用测试节点。
+- **前置条件**：3.6 已运行（工具记录了结束 Safari 连接的结果）；扩展与宿主 App 已安装；测试环境只用测试节点。
 - **步骤**：
   1. 受控入口：在菜单「打开环境」（或 `sfe env open <测试环境>`）发起，观察测试页第一个请求经过的节点（回显 `via`）。
   2. 旧长连接：切换时 Safari 测试页的 WebSocket 必须被结束，之后的消息经过新节点。
@@ -462,7 +451,7 @@ kill "$SELFTEST_PID"
 - **证据**：`entry/old-connections-evidence.json`、`servers/page.jsonl`、`results/first_request_and_old_connections.json`。
 - **回退**：在网页后台或插件中进入普通模式。
 
-### 3.19 open_profile_by_id（按场景 ID 打开 Safari，只记录）
+### 3.18 open_profile_by_id（按场景 ID 打开 Safari，只记录）
 
 - **用途**：受控入口能否直接打开指定场景；不通过时界面给出「在 Safari 切换到场景 <名称>，点击扩展图标」的引导，不称一键完成。
 - **步骤**：查阅当期 Safari/macOS 的公开文档与 API，记录是否存在受支持的方式；不使用私有数据库或界面自动化。`checklist open_profile_by_id`。
@@ -471,16 +460,16 @@ kill "$SELFTEST_PID"
 - **证据**：`results/open_profile_by_id.json`。
 - **回退**：无。
 
-### 3.20 profile_batch_create（批量创建 Safari 场景，只记录）
+### 3.19 profile_batch_create（批量创建 Safari 场景，只记录）
 
 - **用途**：关联向导能否批量创建场景；不通过时向导逐个引导用户在 Safari 官方界面创建并启用扩展。
-- **步骤**：同 3.19，并记录官方界面逐个创建与启用扩展的步骤。`checklist profile_batch_create`。
+- **步骤**：同 3.18，并记录官方界面逐个创建与启用扩展的步骤。`checklist profile_batch_create`。
 - **通过条件**：存在可用的公开方式批量创建 Safari 场景。
 - **失败处理**：只记录。
 - **证据**：`results/profile_batch_create.json`。
 - **回退**：删除测试中创建的空白场景（在 Safari 设置中手动删除）。
 
-### 3.21 凭据字符（不是能力项，决定 UNSAFE_CREDENTIAL_CHARS 的范围）
+### 3.20 凭据字符（不是能力项，决定 UNSAFE_CREDENTIAL_CHARS 的范围）
 
 - **用途**：代理用户名/密码目前只允许 `[A-Za-z0-9._~-]`；其他字符逐类证明安全后才放宽 `SURGE_SAFE_CREDENTIAL_RE`。
 - **步骤**：`charset`（可用 `--classes comma,hash` 只测部分类别；`--reload-wait` 调整等待）。每类一个合成节点，用户名与密码的开头、中间、结尾都含该类字符，另加正常节点 C 作为“已重新读取”的见证；工具 `--check`，不调用 update、等待 Surge 自动重新读取（C 出现在成员中为准），逐个选择并经 SFE-ROUTE 请求，出口服务比较收到的值（只记录长度与判定）。时限内没有重新读取时所有类别记为未测试（不当作“被 Surge 跳过”）。入口必须是 NORMAL。
@@ -493,7 +482,7 @@ kill "$SELFTEST_PID"
 1. inventory 先读顶层 `--help`，再逐条读取 `help dump`、`help rule temp`、`help rule match`、`help external-resource`、`help version`、`help status`、`help policy-group`、`help feature`、`help mode`、`help kill`（6.9.0 起顶层帮助只列命令组，手册：“`help <command>` for the detailed usage of one command or command family”），原文存 `inventory/surge-cli-help.txt` 与 `inventory/surge-cli-help/`，取词的并集（`--check/-c` 这样的写法按 `--check` 识别）。不可用的一条（交互模式提示、Unknown command、非零退出或没有输出）不并入并给出警告；顶层帮助是交互模式提示时不读逐条帮助、不探测任何 CLI 原语。
 2. inventory 打印建议的映射：读原语取实测可用的实现（CLI 优先；`getVersion` 必须是 cli，才能与运行实例交叉核对），主动原语（组选择、结束请求、外部资源更新、临时规则增删、策略测试）取“帮助中有对应命令”或“模块 B 已实现且回环 HTTP API 可用”的实现，**未经测试命令证明前不能当作已通过**。外部资源更新只用于记录本地资源被跳过，从不作为发布或入口的刷新机制。`reloadProfile` 不由 P0 设置。
 3. CLI 只执行签名校验通过的 `surge-cli`，只执行帮助中出现的命令，且每条 argv 必须完全符合 `CLI_ARGV_ALLOWLIST`：读命令带 `--raw`；写命令只有 `policy-group set SFE-ROUTE <节点>`（不能是 auto）、`kill <数字 id>`（单个连接，“Terminate an active connection.”）、`external-resource update <单个 key>`（不能是 all）、`rule temp add|remove <规则>`，不带 `--raw` 以保留客户端命令校验。switch-profile、profile switch、reload、restart-engine、mode set、global-policy set、feature set、module、set、stop、managed-profile update、rule temp flush、flush-temp-rule、update all 等全局动作都不可达。
-4. 读原语的 JSON 输出（`--raw`）只接受已知结构：非 JSON、未知外层结构、任何一项缺少可识别字段（规则文本、资源 key 与位置、请求 id、策略名称）时读取直接失败，从不读成空列表或跳过该项；只有空白输出被当作“没有临时规则”。空白输出因此仍可能掩盖仍存在的规则，所以 `listTempRules: cli` 还需要 entry 的插入探测正向确认（见 3.7；inventory 在建议的映射说明中标出）后，才会被当作“规则已不存在”的证据。
+4. 读原语的 JSON 输出（`--raw`）只接受已知结构：非 JSON、未知外层结构、任何一项缺少可识别字段（规则文本、资源 key 与位置、请求 id、策略名称）时读取直接失败，从不读成空列表或跳过该项；只有空白输出被当作“没有临时规则”。空白输出因此仍可能掩盖仍存在的规则，所以 `listTempRules: cli` 还需要 entry 的插入探测正向确认（见 3.6；inventory 在建议的映射说明中标出）后，才会被当作“规则已不存在”的证据。
 5. 某个原语显示 `not_in_help` 时，把 `inventory/surge-cli-help-relevant.txt` 与 `inventory/surge-cli-help/` 中的相关原文交给开发者核对服务的 CLI 原语表（命令以 6.10 文档为准），**不要**手动改用帮助中的其他动词或用 `--raw` 绕过客户端命令校验。
 6. 各测试命令通过后，把映射写入数据目录的 `install.json` 的 `adapterMechanism` 字段（文件保持 0600；宿主 App 从不覆盖该字段）。映射变化会让依赖相应原语的能力回到待验证。
 

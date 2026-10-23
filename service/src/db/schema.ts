@@ -293,4 +293,19 @@ export const MIGRATIONS: readonly string[] = [
     used_at TEXT
   );
   `,
+  /* 2 */ `
+  -- 秘密值（用户决定：不使用钥匙串）：代理凭据、账号密码与系统秘密（pepper）以明文保存在本数据库中，
+  -- 只靠所有者专用的文件权限保护（数据目录 0700，数据库及其 -wal/-shm 0600）。引用见 secret_refs；
+  -- 系统秘密（sfe.*）没有引用行。
+  CREATE TABLE secret_values (
+    ref TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('proxy','account','system')),
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+
+  -- 能力项 bridge_keychain_access（原生桥读取钥匙串）已随钥匙串一起移除：旧的能力记录与提议不再有意义
+  DELETE FROM capabilities WHERE key = 'bridge_keychain_access';
+  DELETE FROM capability_proposals WHERE key = 'bridge_keychain_access';
+  `,
 ];

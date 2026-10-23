@@ -20,7 +20,7 @@ fail() {
 REPO_ROOT="$(cd "${SRCROOT}/../.." && pwd)"
 SERVICE_DIST="${REPO_ROOT}/service/dist"
 RESOURCES_DEST="${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
-# 与 project.yml 中 sfe-keychain、sfe-service-launcher 的 copy 目标（wrapper 下的 Contents/Helpers）相同
+# 与 project.yml 中 sfe-service-launcher 的 copy 目标（wrapper 下的 Contents/Helpers）相同
 HELPERS_DEST="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
 NODE_DEST="${HELPERS_DEST}/node"
 
@@ -54,8 +54,9 @@ done
 
 mkdir -p "$RESOURCES_DEST" "$HELPERS_DEST"
 # 旧构建把 node 放在 Resources：增量构建时一并删除，Resources 中不留任何 Mach-O。
-# 只删除本脚本负责的路径；Helpers 中的 sfe-keychain、sfe-service-launcher 由 Xcode 复制，不动。
-rm -rf "${RESOURCES_DEST}/service" "${RESOURCES_DEST}/node" "$NODE_DEST"
+# 旧构建还会在 Helpers 中留下已删除的钥匙串工具 sfe-keychain（本项目不再使用钥匙串）：一并删除。
+# 只删除本脚本负责的路径；Helpers 中的 sfe-service-launcher 由 Xcode 复制，不动。
+rm -rf "${RESOURCES_DEST}/service" "${RESOURCES_DEST}/node" "$NODE_DEST" "${HELPERS_DEST}/sfe-keychain"
 /usr/bin/ditto "$SERVICE_DIST" "${RESOURCES_DEST}/service"
 /usr/bin/ditto "$node_bin" "$NODE_DEST"
 chmod 0755 "$NODE_DEST"

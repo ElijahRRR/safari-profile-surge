@@ -51,7 +51,7 @@ describe('import: expected exit IP of the active environment', () => {
 });
 
 describe('import: concurrent retries of the same commit', () => {
-  test('two identical commits in flight → the same result, one batch, no stray keychain items', async () => {
+  test('two identical commits in flight → the same result, one batch, no stray secret items', async () => {
     h = await createHarness();
     const req = csv([',US-New-1,socks5,203.0.113.20,1080,synthuser1,synthpass1,,US,,,acct-pw-1,,,']);
     const preview = await h.app.importPreview(req, WEB);

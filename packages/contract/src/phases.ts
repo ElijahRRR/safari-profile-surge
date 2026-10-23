@@ -150,7 +150,6 @@ export const CAPABILITY_KEYS = [
   'safari_process_attribution',
   'native_profile_id',
   'native_bridge_ipc',
-  'bridge_keychain_access',
   'extension_install_persistence',
   'fixed_profile_no_switch',
   'runtime_entry_modes',
@@ -175,7 +174,6 @@ export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
   safari_process_attribution: 'Safari 精确进程归属',
   native_profile_id: '原生场景 ID 稳定性',
   native_bridge_ipc: '扩展与本机服务通信',
-  bridge_keychain_access: '原生桥读取钥匙串',
   extension_install_persistence: '扩展签名与启用持久性',
   fixed_profile_no_switch: '固定配置日常不切换',
   runtime_entry_modes: '运行时入口四种模式',
@@ -221,7 +219,6 @@ export const CAPABILITY_CONTEXT_DEPS: Record<CapabilityKey, readonly CapabilityC
   safari_process_attribution: ['macosBuild', 'macosVersionExtra', 'macosRestartPending', 'safariVersion', 'processPathsDigest', 'surgeVersion', 'surgeBuild', 'takeoverMode'],
   native_profile_id: ['macosBuild', 'safariVersion', 'signingIdentity'],
   native_bridge_ipc: ['macosBuild', 'safariVersion', 'signingIdentity'],
-  bridge_keychain_access: ['macosBuild', 'signingIdentity'],
   extension_install_persistence: ['macosBuild', 'safariVersion', 'signingIdentity'],
   fixed_profile_no_switch: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism'],
   runtime_entry_modes: ['surgeVersion', 'surgeBuild', 'entryStrategy', 'processPathsDigest', 'autoReload', 'adapterMechanism', 'takeoverMode'],
@@ -277,8 +274,8 @@ export const CAPABILITY_GATES = {
   killSafariConnections: ['safari_process_attribution'],
   /** 场景绑定需要能收到原生桥消息。 */
   bind: ['native_bridge_ipc'],
-  /** 登录页填充与自动打开订单（P4：绑定、出口和启动顺序均可验证后）。 */
-  fillAndAutoOpen: ['native_profile_id', 'first_request_and_old_connections', 'bridge_keychain_access'],
+  /** 登录页填充与自动打开订单（P4：绑定、出口和启动顺序均可验证后）。账号密码保存在本机后台资料中，不依赖钥匙串。 */
+  fillAndAutoOpen: ['native_profile_id', 'first_request_and_old_connections'],
   preflight: ['independent_node_preflight'],
   /** 维护流程写入工作配置并重载同一配置（另需 CAPABILITY_MEASURED_GATES.maintenanceWrite）。 */
   maintenanceWrite: ['auto_reload_atomic_replace'],
@@ -318,7 +315,6 @@ export const CAPABILITY_CRITERIA: Record<CapabilityKey, string> = {
     '每个已命名场景都提供 SFExtensionProfileKey 且互不相同，Safari 退出重开、扩展重装、App 重签后保持不变或变化行为已记录；默认场景是否提供已记录（不提供时按未识别场景处理、不能关联；提供时也与各已命名场景不同）。',
   native_bridge_ipc:
     '扩展经原生桥与服务往返成功；Safari 重开、重启、服务重启、服务升级后仍成功；后台脚本休眠后被唤醒仍能完成往返；无 TCC 提示；macOS 26 或更高时，退出 App 出现的后台任务提示与选「允许」「不允许」后服务的状态已记录。',
-  bridge_keychain_access: '签名的原生桥能读取由指定写入方写入的账号密码钥匙串项，无额外提示；重建/重签后的提示次数已记录。',
   extension_install_persistence: '不开启“允许未签名扩展”，扩展在 Safari 退出重开、重启、8 天以上与重新构建后仍保持启用；证书有效期、App 与扩展是否嵌入描述文件及其有效期已记录。',
   fixed_profile_no_switch: '切换 SFE-ROUTE 选择时工作配置身份不变、不发生配置重载或引擎重启、Chrome 长连接与新请求不受影响。',
   runtime_entry_modes:

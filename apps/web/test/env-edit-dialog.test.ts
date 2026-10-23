@@ -82,6 +82,12 @@ describe('EnvironmentEditDialog (edit)', () => {
     });
   });
 
+  it('says where the account password is kept: the local service data, in plain text, owner-only (no Keychain)', async () => {
+    await open('edit');
+    expect(secret('账号密码').textContent).toContain('保存在本机后台的资料中（明文，仅本机用户可读）；网页与日志从不显示。');
+    expect(document.body.textContent).not.toContain('钥匙串');
+  });
+
   it('sends replace with the typed value only when 替换 is chosen', async () => {
     await open('edit');
     await chooseAction('代理密码', 'replace');

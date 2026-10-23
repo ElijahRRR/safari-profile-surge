@@ -1,25 +1,24 @@
-// 钥匙串错误：统一为 SECRET_STORE_FAILED，details.reason 区分原因；消息与 details 从不包含秘密值。
+// 秘密存储错误：统一为 SECRET_STORE_FAILED，details.reason 区分原因；消息与 details 从不包含秘密值。
+// 秘密保存在本机后台资料（服务数据库）中，不使用钥匙串（用户决定，见 docs/ARCHITECTURE.md §0）。
 
 import { SfeError } from '@sfe/contract';
 
-export type SecretStoreFailureReason = 'denied' | 'locked' | 'acl' | 'not_found' | 'timeout' | 'other';
+/**
+ * not_found：找不到该项；legacy_keychain_data：数据目录由使用钥匙串的旧版本创建，本机资料中没有对应的值
+ * （从不读取钥匙串迁移）；other：其他读写错误。
+ */
+export type SecretStoreFailureReason = 'not_found' | 'legacy_keychain_data' | 'other';
 
 const ACTION: Record<'put' | 'get' | 'delete', string> = {
-  put: '写入钥匙串失败',
-  get: '读取钥匙串失败',
-  delete: '删除钥匙串项失败',
+  put: '保存秘密失败',
+  get: '读取秘密失败',
+  delete: '删除秘密失败',
 };
 
 const REASON: Record<SecretStoreFailureReason, string> = {
-  denied: '用户拒绝了访问',
-  // errSecInteractionNotAllowed：Apple 只定义为 “Interaction with the Security Server is not allowed.”；需要用户认证而又
-  // 不允许显示界面时也返回它（kSecUseAuthenticationUIFail）。从 LaunchAgent 调用 sfe-keychain 时可能无法显示授权提示，
-  // 所以不一定是钥匙串已锁定。线路值沿用 locked；文字与 apps/macos/Shared/KeychainStatus.swift 的 displayText 一致。
-  locked: '钥匙串需要用户交互但当前不允许（可能已锁定，或无法显示授权提示）',
-  acl: '访问控制不匹配',
-  not_found: '找不到该项',
-  timeout: '等待钥匙串授权超时，可重试',
-  other: '钥匙串工具返回错误',
+  not_found: '本机后台资料中找不到该项',
+  legacy_keychain_data: '数据目录由使用钥匙串的旧版本创建，本机后台资料中没有对应的值',
+  other: '本机后台资料读写出错',
 };
 
 export function secretStoreError(op: 'put' | 'get' | 'delete', reason: SecretStoreFailureReason, message?: string): SfeError {

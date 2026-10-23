@@ -16,6 +16,14 @@ import {
   httpStatusFor,
   SAFARI_MINIMUM_VERSION,
   safariBelowMinimum,
+  CAPABILITY_CONTEXT_DEPS,
+  CAPABILITY_CRITERIA,
+  CAPABILITY_GATES,
+  CAPABILITY_KEYS,
+  CAPABILITY_LABELS,
+  type LoginFillResponse,
+  type LoginFillServiceResponse,
+  type NativeResponseMap,
 } from '../src/index.js';
 
 describe('naming', () => {
@@ -103,5 +111,25 @@ describe('safari minimum version', () => {
     for (const v of ['17.0', '17.5', '17.5.1', '16.6', '17']) expect(safariBelowMinimum(v)).toBe(true);
     for (const v of ['17.6', '17.6.0', '17.6.1', '17.10', '18.0', '18.0.1', '26.0', ' 18.4 ']) expect(safariBelowMinimum(v)).toBe(false);
     for (const v of [null, '', 'unknown', 'demo', '17.x', '18.0 (20619.1.26)', '-17.0']) expect(safariBelowMinimum(v)).toBeNull();
+  });
+});
+
+describe('no Keychain (user decision: secrets stay in the service data directory)', () => {
+  test('the capability list has no keychain gate; fill and auto-open need only the profile id and first-request checks', () => {
+    expect(CAPABILITY_KEYS).toHaveLength(19);
+    expect(CAPABILITY_KEYS as readonly string[]).not.toContain('bridge_keychain_access');
+    for (const table of [CAPABILITY_LABELS, CAPABILITY_CONTEXT_DEPS, CAPABILITY_CRITERIA]) expect(Object.keys(table).sort()).toEqual([...CAPABILITY_KEYS].sort());
+    expect([...CAPABILITY_GATES.fillAndAutoOpen]).toEqual(['native_profile_id', 'first_request_and_old_connections']);
+    expect(JSON.stringify({ CAPABILITY_LABELS, CAPABILITY_CRITERIA })).not.toMatch(/钥匙串|keychain/i);
+  });
+
+  test('the login fill response is the same shape for the bridge and the extension: values only', () => {
+    const service: LoginFillServiceResponse = { fills: [{ field: 'identifier', value: 'buyer01@example.test' }, { field: 'password', value: 'synth-pw' }] };
+    const extension: LoginFillResponse = service;
+    const mapped: NativeResponseMap['requestLoginFill'] = extension;
+    expect(mapped.fills.map((f) => Object.keys(f).sort())).toEqual([
+      ['field', 'value'],
+      ['field', 'value'],
+    ]);
   });
 });

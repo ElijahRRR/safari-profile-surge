@@ -8,7 +8,5 @@ SFE_NODE_VERSION =
 
 #include? "../Local.xcconfig"
 
-// App Group 与钥匙串访问组。entitlements 中写 $(TeamIdentifierPrefix)sfe 与 $(AppIdentifierPrefix)com.sfe.shared，
-// Info.plist 中写下面两个值供代码读取；两者都应展开为 <Team ID>.sfe 与 <Team ID>.com.sfe.shared。
+// App Group。entitlements 中写 $(TeamIdentifierPrefix)sfe，Info.plist 中写下面的值供代码读取；两者都应展开为 <Team ID>.sfe。
 SFE_APP_GROUP_ID = $(DEVELOPMENT_TEAM).sfe
-SFE_KEYCHAIN_ACCESS_GROUP = $(DEVELOPMENT_TEAM).com.sfe.shared

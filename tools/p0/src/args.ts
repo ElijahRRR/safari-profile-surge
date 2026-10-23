@@ -146,7 +146,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   {
     name: 'checklist',
-    summary: '人工检查清单（原生桥、场景 ID、钥匙串、签名持久性、首请求与旧连接、重载影响、批量创建/按 ID 打开）',
+    summary: '人工检查清单（原生桥、场景 ID、签名持久性、首请求与旧连接、重载影响、批量创建/按 ID 打开）',
     usage: 'checklist <能力> [--signing-identity <Team ID>] [--app-path /Applications/SafariProfileSurge.app]',
     positionals: { min: 1, max: 1 },
     flags: { 'signing-identity': { kind: 'string' }, 'app-path': { kind: 'string' } },

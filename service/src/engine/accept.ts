@@ -68,7 +68,7 @@ function secretFieldValue(field: unknown): string | null {
 /**
  * 请求中的秘密值立即登记到脱敏器（日志、错误、步骤都不会回显）。登记在校验之前进行，因此只看已知的秘密
  * 位置：新建的 environment、修改的 changes 下的代理用户名/密码与账号密码，每个请求至多 3 个值；只登记不超过
- * 字段上限的值（更长的值必然被校验拒绝、从不进入钥匙串）。不遍历请求中的任意键：被拒绝的请求无法借此
+ * 字段上限的值（更长的值必然被校验拒绝、从不写入秘密存储）。不遍历请求中的任意键：被拒绝的请求无法借此
  * 往脱敏器里塞入大量值（登记表另有容量上限）。
  */
 export function registerRequestSecrets(engine: Engine, req: unknown): void {
@@ -262,7 +262,7 @@ export async function acceptCreate(deps: AcceptDeps, req: CreateEnvironmentReque
   void keys;
   let committed: { op: OperationRecord; duplicate: boolean };
   try {
-    // 幂等在主事务内再核对一次：并发的同一请求可能在写钥匙串期间已提交
+    // 幂等在主事务内再核对一次：并发的同一请求可能在写秘密存储期间已提交
     committed = commitOperation(engine, requestId, digest, () => {
       if (opts.bindProfileId) {
         if (engine.repos.profileBindings.byProfile(opts.bindProfileId)) throw new SfeError('PROFILE_ALREADY_BOUND', '新建并关联失败：当前场景已关联其他环境');
@@ -419,7 +419,7 @@ export async function acceptUpdate(deps: AcceptDeps, id: string, req: UpdateEnvi
   };
   const proxyPlan = plan();
 
-  // 需要新钥匙串项的秘密：值与当前指纹不同的替换
+  // 需要写入新秘密项的值：值与当前指纹不同的替换
   const items: Array<{ key: string; value: string; kind: 'proxy' | 'account' }> = [];
   const curRev = env.desiredProxyRevision !== null ? repos.proxyRevisions.get(env.id, env.desiredProxyRevision) : null;
   const account = repos.accounts.get(env.id);
@@ -434,7 +434,7 @@ export async function acceptUpdate(deps: AcceptDeps, id: string, req: UpdateEnvi
   let committed: { op: OperationRecord; duplicate: boolean };
   const routeChanged = { value: false };
   try {
-    // 幂等在主事务内、版本检查之前再核对一次：并发的同一请求可能在写钥匙串期间已提交（否则会误报版本冲突）
+    // 幂等在主事务内、版本检查之前再核对一次：并发的同一请求可能在写秘密存储期间已提交（否则会误报版本冲突）
     committed = commitOperation(engine, requestId, digest, () => {
       env = getEnvironment(engine, id, '保存');
       if (env.revision !== expected) throw revisionConflict(engine, env, expected, requestedState());

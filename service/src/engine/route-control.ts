@@ -90,7 +90,7 @@ export const OLD_SESSION_LIMITATION =
   '首请求与旧连接处理尚未通过实测：旧环境的长连接与后台请求可能继续一段时间，建议保存工作后退出并重开 Safari 再切换';
 
 /**
- * 未识别场景（原生桥拿不到 SFExtensionProfileKey；默认场景可能就是这样，docs/ARCHITECTURE.md §0.1 第 4 条）的上报记录键。
+ * 未识别场景（原生桥拿不到 SFExtensionProfileKey；默认场景可能就是这样，docs/ARCHITECTURE.md §0.1 第 3 条）的上报记录键。
  * 不是合法的场景 ID（原生桥只接受 [A-Za-z0-9-]{8,64}），不会与已识别场景的记录冲突，也不会被绑定。
  */
 export const UNIDENTIFIED_PROFILE_REPORT_KEY = '~unidentified';

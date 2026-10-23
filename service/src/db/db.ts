@@ -1,8 +1,10 @@
 // node:sqlite 封装（docs/ARCHITECTURE.md §4、§10）：外键开启、5 秒忙等、文件库用 WAL；
-// 数据库文件新建为 0600；迁移按 meta.schema_version 增量执行；事务 BEGIN IMMEDIATE，嵌套用 SAVEPOINT。
+// 数据库文件新建为 0600，-wal/-shm/-journal 打开前后都确认为 0600（数据库以明文保存代理凭据与账号密码，只靠
+// 所有者专用的文件权限保护）；secure_delete 开启，删除的内容在页内清零（明文秘密删除后不留在空闲空间中）；
+// 迁移按 meta.schema_version 增量执行；事务 BEGIN IMMEDIATE，嵌套用 SAVEPOINT。
 // node:sqlite 仍标为实验特性：只过滤它自己的 ExperimentalWarning，其他警告照常输出。
 
-import { closeSync, constants as fsConstants, fchmodSync, fstatSync, openSync } from 'node:fs';
+import { chmodSync, closeSync, constants as fsConstants, fchmodSync, fstatSync, lstatSync, openSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import type { DatabaseSync, SQLInputValue, StatementSync } from 'node:sqlite';
 import { SfeError } from '@sfe/contract';
@@ -69,6 +71,11 @@ export interface Db {
    */
   tx<T>(fn: () => T): T;
   inTransaction(): boolean;
+  /**
+   * 把 WAL 全部写回数据库文件并把 -wal 截断为 0 字节（PRAGMA wal_checkpoint(TRUNCATE)），清除旧帧中的内容副本
+   * （例如刚删除的明文秘密）。事务中不执行；有其他读者时可能只完成一部分。返回是否完整完成。
+   */
+  checkpointTruncate(): boolean;
   close(): void;
 }
 
@@ -100,17 +107,54 @@ function preparePrivateFile(path: string): void {
   }
 }
 
+/** SQLite 在数据库旁边创建的文件：WAL 模式的 -wal/-shm，以及回滚日志 -journal。 */
+export const SQLITE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const;
+
+/**
+ * 已存在的旁路文件收紧为 0600；拒绝符号链接、非普通文件与不属于当前用户的文件。SQLite 按数据库文件的权限新建它们
+ * （数据库为 0600 时也是 0600），这里在打开前收紧旧文件、打开后再确认一次。
+ */
+export function preparePrivateSidecars(path: string): void {
+  for (const suffix of SQLITE_SIDECAR_SUFFIXES) {
+    const p = `${path}${suffix}`;
+    let st;
+    try {
+      st = lstatSync(p);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw err;
+    }
+    if (st.isSymbolicLink() || !st.isFile()) throw new SfeError('UNSAFE_LOCATION', '打开数据库失败：数据库旁路文件不是普通文件');
+    const uid = process.getuid?.();
+    if (uid !== undefined && st.uid !== uid) throw new SfeError('UNSAFE_LOCATION', '打开数据库失败：数据库旁路文件不属于当前用户');
+    if ((st.mode & 0o077) !== 0) chmodSync(p, 0o600);
+  }
+}
+
 export function openDatabase(path: string | ':memory:'): Db {
   const { DatabaseSync } = loadSqlite();
   const isMemory = path === ':memory:';
-  if (!isMemory) preparePrivateFile(path);
+  if (!isMemory) {
+    preparePrivateFile(path);
+    preparePrivateSidecars(path);
+  }
   const raw = new DatabaseSync(path, { enableForeignKeyConstraints: true });
   raw.exec('PRAGMA foreign_keys = ON');
   raw.exec('PRAGMA busy_timeout = 5000');
+  // 删除或改写的内容用零覆盖（node 内置 SQLite 缺省关闭）：被删除的明文秘密不留在数据库文件的空闲页中。
+  // WAL 中旧帧的副本由删除秘密后的 checkpoint 清除（checkpointTruncate）
+  raw.exec('PRAGMA secure_delete = ON');
   if (!isMemory) {
     raw.exec('PRAGMA journal_mode = WAL');
     // 路由与操作状态必须在提交后可靠落盘
     raw.exec('PRAGMA synchronous = FULL');
+    // WAL 模式下 -wal/-shm 已创建：再确认一次权限
+    try {
+      preparePrivateSidecars(path);
+    } catch (err) {
+      raw.close();
+      throw err;
+    }
   }
   raw.exec('PRAGMA trusted_schema = OFF');
 
@@ -211,6 +255,13 @@ export function openDatabase(path: string | ':memory:'): Db {
     },
     inTransaction(): boolean {
       return depth > 0;
+    },
+    checkpointTruncate(): boolean {
+      if (closed) throw new Error('database is closed');
+      if (depth > 0 || raw.isTransaction) return false;
+      if (isMemory) return true;
+      const row = raw.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy?: number } | undefined;
+      return Number(row?.busy ?? 1) === 0;
     },
     close(): void {
       if (closed) return;

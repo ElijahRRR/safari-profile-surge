@@ -1,22 +1,14 @@
 import Foundation
 
-/// App 包内的固定位置。命令行工具（sfe-keychain、sfe-service-launcher）与打包的 node 位于 Contents/Helpers，
+/// App 包内的固定位置。命令行工具 sfe-service-launcher 与打包的 node 位于 Contents/Helpers，
 /// 按自身位置推算其他组件，从不依赖当前目录或环境变量。
 enum BundleLayout {
-    static let extensionBundleName = "SafariProfileSurgeExtension.appex"
-
     /// .../SafariProfileSurge.app/Contents/Helpers/<工具> → .../SafariProfileSurge.app/Contents
     static func contentsDirectory(forHelperExecutable executable: URL) -> URL? {
         let helpers = executable.deletingLastPathComponent()
         let contents = helpers.deletingLastPathComponent()
         guard helpers.lastPathComponent == "Helpers", contents.lastPathComponent == "Contents" else { return nil }
         return contents
-    }
-
-    static func extensionBundle(forHelperExecutable executable: URL) -> URL? {
-        contentsDirectory(forHelperExecutable: executable)?
-            .appendingPathComponent("PlugIns", isDirectory: true)
-            .appendingPathComponent(extensionBundleName, isDirectory: true)
     }
 
     /// LaunchAgent 实际运行的命令：Contents/Helpers/node Contents/Resources/service/service.mjs（绝对路径）。

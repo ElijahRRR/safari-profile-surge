@@ -1,7 +1,8 @@
 // 原生桥消息（docs/ARCHITECTURE.md §7.2、contract/native.ts）。场景身份只来自原生桥（令牌已由 ipc 层校验），
 // 从不采信消息体中的身份字段。按 NATIVE_PERMISSIONS 矩阵与绑定关系授权：携带 environment_id 的请求先与场景绑定
 // 比对（BINDING_MISMATCH，在版本检查与创建操作之前）；未识别场景只能读取状态（看不到其他环境名称）与上报窗口（只用于旧窗口确认）；
-// 非活动环境的场景只拿到路由摘要。登录填充按 §6.10 逐项把关，密码只返回钥匙串引用，从不在 Node 中读取。
+// 非活动环境的场景只拿到路由摘要。登录填充按 §6.10 逐项把关，全部通过后才从本机后台资料读出账号密码（登记到脱敏器）
+// 交给已认证的原生桥，原生桥原样转给扩展；任何一项未通过都不读取、不返回值。
 
 import {
   CAPABILITY_GATES,
@@ -47,8 +48,6 @@ export interface NativeDeps extends AcceptDeps {
   /** 动作前短超时对账后的“受控”判定；maxAgeMs 内完成过对账时不再读 Surge（判定按当前路由记录重新计算）。 */
   ensureInControl: (opts: { maxAgeMs: number }) => Promise<PrecheckEvaluation>;
 }
-
-const FILL_REF_TTL_MS = 60_000;
 
 function fillDenied(message: string, reason: string, extra: Record<string, unknown> = {}): SfeError {
   return new SfeError('FILL_NOT_ALLOWED', `填充失败：${message}`, { details: { reason, ...extra } });
@@ -259,7 +258,10 @@ async function currentState(deps: NativeDeps, profileId: string | null, envId: s
   };
 }
 
-/** §6.10：逐项把关；账号标识直接给值，密码只给一次性有效期的钥匙串引用。 */
+/**
+ * §6.10：逐项把关；全部通过后读出账号标识与密码直接给值（密码从本机后台资料读出，立即登记到脱敏器；
+ * 日志只记字段名）。读取之后再次确认 epoch 与活动环境，期间变化则不返回任何值。
+ */
 async function loginFill(deps: NativeDeps, msg: Extract<NativeRequest, { type: 'requestLoginFill' }>, envId: string): Promise<LoginFillServiceResponse> {
   const { engine } = deps;
   const { repos } = engine;
@@ -300,9 +302,20 @@ async function loginFill(deps: NativeDeps, msg: Extract<NativeRequest, { type: '
       fills.push({ field: 'identifier', value: account.loginIdentifier });
     } else {
       if (!account.passwordRef) throw fillDenied('没有配置登录密码', 'password');
-      fills.push({ field: 'password', keychainRef: account.passwordRef, expiresAt: new Date(engine.now().getTime() + FILL_REF_TTL_MS).toISOString() });
+      fills.push({ field: 'password', value: await readAccountPassword(engine, account.passwordRef) });
     }
   }
+  // 读取跨越了 await：返回之前再确认一次，路由在此期间变化则不交出任何值
+  const final = repos.routeState.get();
+  if (final.routeEpoch !== msg.route_epoch || final.activeEnvironmentId !== env.id) throw fillDenied('路由已变化，请刷新页面后重试', 'epoch');
   engine.log('info', 'login_fill.allowed', { environmentId: env.id, fields });
   return { fills };
+}
+
+/** 从本机后台资料读出账号密码并登记到脱敏器；读不到时失败（错误中不含引用或值）。 */
+async function readAccountPassword(engine: Engine, ref: string): Promise<string> {
+  const value = await engine.store.get(ref);
+  if (value === null) throw new SfeError('SECRET_STORE_FAILED', '填充失败：本机后台资料中找不到登录密码', { details: { reason: 'not_found' } });
+  engine.scrubber.register(value);
+  return value;
 }
