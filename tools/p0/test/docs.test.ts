@@ -122,7 +122,7 @@ describe('docs/P0-RUNBOOK.md', () => {
     expect(text).toContain('SFE-P0-测试');
   });
 
-  it('native sections measure what Apple leaves open: default-profile ID, embedded provisioning profile, macOS 26 quit prompt, keychain prompt', () => {
+  it('native sections measure what Apple leaves open: default-profile ID, embedded provisioning profile, macOS 26 quit prompt', () => {
     const section = (key: string) => {
       const start = text.indexOf(` ${key}（`);
       return text.slice(start, text.indexOf('\n### ', start));
@@ -138,9 +138,6 @@ describe('docs/P0-RUNBOOK.md', () => {
     const bridge = section('native_bridge_ipc');
     expect(bridge).toContain('`quit_prompt`');
     expect(bridge).toContain('sfltool dumpbtm');
-    const keychain = section('bridge_keychain_access');
-    expect(keychain).toContain('security find-generic-password -s com.sfe.account -w');
-    expect(keychain).toContain('不要选「允许」或「始终允许」');
     // ps 的 comm 是 argv[0]，V1 只作候选
     const v1 = text.split('\n').find((l) => l.startsWith('| V1 |'))!;
     expect(v1).toContain('argv[0]');
@@ -186,11 +183,13 @@ describe('docs/ACCEPTANCE.md', () => {
   });
 
   it('lists the known limitations', () => {
-    for (const s of ['免费 Apple ID 签名', '接管与出站模式可读性', '页面登录身份', '不关闭，直接继续', '最低 Surge 版本', '维护重载']) expect(text).toContain(s);
+    for (const s of ['免费 Apple ID 签名', '接管与出站模式可读性', '页面登录身份', '不关闭，直接继续', '最低 Surge 版本', '维护重载', '秘密以明文保存（不使用钥匙串）']) expect(text).toContain(s);
+    // 用户决定（2026-10-23）不使用钥匙串：不再声称钥匙串保护
+    expect(text).not.toContain('钥匙串的保护范围');
   });
 
   it('records the 6.10 version cross-check and the measured watcher behaviour in the environment table', () => {
-    for (const row of ['| 版本交叉核对（surge-cli --raw version 一致、Controller 协议 ≥ 22） | 未验证 |', '| 本地 policy-path 是否被自动重新读取及延迟（3.12 实测） | 未验证 |', '| 新临时规则的插入位置（entry 插入探测） | 未验证 |']) {
+    for (const row of ['| 版本交叉核对（surge-cli --raw version 一致、Controller 协议 ≥ 22） | 未验证 |', '| 本地 policy-path 是否被自动重新读取及延迟（3.11 实测） | 未验证 |', '| 新临时规则的插入位置（entry 插入探测） | 未验证 |']) {
       expect(text).toContain(row);
     }
   });
@@ -207,6 +206,30 @@ describe('docs/ARCHITECTURE.md §0', () => {
     // 契约措辞已改写：不再说“待文档步骤改写”
     expect(s0).not.toContain('待文档步骤改写');
     expect(text).not.toContain('6.5 没有版本命令');
+  });
+
+  it('records the no-keychain, plain-text secrets decision with the user question, the overridden design lines and the honest consequence', () => {
+    expect(s0).toContain('**秘密的存放（用户决定，2026-10-23；偏离方案 1 设计第 195–199 行、实时同步设计第 13、22、80 行、固定工作配置设计第 73 行，以及 docs/DEVELOPMENT.md 第 9、35 行');
+    expect(s0).toContain('为什么要访问我本机的钥匙串？这个项目拿到的ip账号密码，亚马逊账号密码等信息默认保存在自己的一套资料里，不需要从钥匙串中读取');
+    expect(s0).toContain('任何以同一 macOS 用户身份运行的进程都能直接读取 `sfe.sqlite`');
+    expect(s0).toContain('时间机器');
+    expect(s0).not.toContain('**登录填充依赖已过时的钥匙串接口。**');
+  });
+
+  it('deleted secrets are zeroed (secure_delete + WAL truncation), and legacy data dirs are refused before migrating', () => {
+    expect(text).not.toContain('服务没有开启 SQLite 的 `secure_delete`');
+    expect(text).not.toContain('被删除的旧值可能留在空闲页或 WAL 中');
+    expect(s0).toContain('`wal_checkpoint(TRUNCATE)`');
+    expect(text).not.toContain('检测在迁移之后执行');
+    expect(text).toContain('检测在迁移之前执行，拒绝时数据库原样保留');
+    expect(text).toContain('完整的中文说明 `message`');
+  });
+
+  it('does not promise that replaced proxy credentials leave secret_values at the next sweep (they wait for the old revision to retire)', () => {
+    expect(s0).not.toContain('被替换、清除或回收的旧值在清扫（启动时与每小时）时删除');
+    expect(s0).toContain('被替换或清除的账号密码（以及删除环境时的账号密码）在同一事务中标为 orphaned，下一次清扫（启动时与每小时）删除');
+    expect(s0).toContain('只有该版本在发布结算时 retired 之后的清扫才删除');
+    expect(s0).toContain('部署新版本的那次发布仍保留旧节点');
   });
 
   it('records the normal-mode conflict when rule match is unavailable instead of claiming normal mode is unaffected', () => {
@@ -280,13 +303,78 @@ describe('docs/INSTALL.md', () => {
     expect(text).toContain('登录项与扩展');
   });
 
-  it('does not overstate the keychain ACL or the 7-day profile (Apple: untrusted callers get a prompt; TN3125: no profile needed without restricted entitlements)', () => {
+  it('does not overstate keychain protection or the 7-day profile (TN3125: no profile needed without restricted entitlements)', () => {
     expect(text).not.toContain('拿到引用也读不到');
     expect(text).not.toContain('但读不到账号密码');
-    expect(text).toContain('The user may choose to Deny, Allow, or Always Allow the access.');
-    expect(text).toContain('只有你拒绝时才读不到');
     expect(text).toContain('A Mac app that uses no restricted entitlements doesn’t need a provisioning profile.');
     expect(text).not.toContain('过期前需要在 Xcode 中重新构建运行');
+  });
+
+  it('states plain-text secrets honestly and explains the legacy keychain data directory (user decision 2026-10-23)', () => {
+    expect(text).toContain('**本应用不使用 macOS 钥匙串**');
+    expect(text).toContain('**`<数据目录>/sfe.sqlite`（及 `-wal`/`-shm`）：全部代理凭据、亚马逊账号密码与 pepper 的明文。**');
+    expect(text).not.toContain('账号密码只存在钥匙串');
+    expect(text).not.toContain('一次性钥匙串引用');
+    const legacy = text.slice(text.indexOf('## 7. 从使用钥匙串的旧版本升级'));
+    expect(legacy.length).toBeGreaterThan(0);
+    expect(legacy).toContain('legacy_keychain_data');
+    expect(legacy).toContain('while security delete-generic-password -s "$s" >/dev/null; do :; done');
+    expect(legacy).toContain('for s in com.sfe.proxy com.sfe.account com.sfe.system; do');
+    // 手动撤销旧临时规则时逐条移除，从不建议 flush（会清掉用户自己的临时规则）
+    expect(legacy).toContain('不要用 `rule temp flush`');
+  });
+
+  it('legacy upgrade: the refusal leaves the data dir to the old version, the log carries the message, and the App is quit before the move', () => {
+    const legacy = text.slice(text.indexOf('## 7. 从使用钥匙串的旧版本升级'));
+    expect(legacy).not.toContain('之后装回旧版本也打不开这个数据目录');
+    expect(legacy).toContain('检查在数据库迁移之前进行，拒绝时数据库原样保留');
+    expect(legacy).toContain('`message` 字段是完整的中文说明');
+    // 新版本 App 改写 install.json，但保留旧服务需要的 keychainHelperPath；装回旧版本后先打开旧 App，停止过的服务重新注册
+    expect(legacy).not.toContain('拒绝时数据目录原样保留');
+    expect(legacy).toContain('但保留旧版本的钥匙串工具路径 `keychainHelperPath`');
+    expect(legacy).toContain('**打开一次旧版本 App**');
+    expect(legacy).toContain('已经在新版本中「停止后台服务」时在旧版本菜单中「注册后台服务」');
+    // App 只在启动时准备数据目录：改名前退出、之后重新打开（打开仍在运行的 App 什么也不创建）
+    expect(legacy).toContain('再选菜单「退出」**退出 App**');
+    expect(legacy).toContain('重新打开 App（第 4 步已退出，这是一次新的启动');
+  });
+
+  it('the host App keeps the old keychainHelperPath in install.json (rollback to the Keychain version needs it)', () => {
+    const install = text.slice(text.indexOf('## 2. 安装'), text.indexOf('## 3.'));
+    expect(text).not.toContain('`keychainHelperPath` 在合并时删除');
+    expect(install).toContain('合并从不删除字段：旧版本写入的钥匙串工具路径 `keychainHelperPath` 原样保留');
+    const arch = read('ARCHITECTURE.md');
+    expect(arch).not.toContain('时删除旧版本写入的 `keychainHelperPath`');
+    expect(arch).toContain('宿主 App 合并 `install.json` 时从不删除字段，旧版本写入的 `keychainHelperPath` 原样保留');
+    expect(arch).not.toContain('（数据库迁移之前，不改动数据目录）');
+    const macReadme = readFileSync(new URL('../../../apps/macos/README.md', import.meta.url), 'utf8');
+    expect(macReadme).not.toContain('在合并时删除');
+    expect(macReadme).not.toContain('含删除旧版本留下的 `keychainHelperPath`');
+    expect(macReadme).toContain('保留旧版本留下的 `keychainHelperPath`');
+  });
+
+  it('describes how deleted secrets are removed from disk instead of denying secure_delete', () => {
+    expect(text).not.toContain('服务没有开启 SQLite 的 `secure_delete`');
+    expect(text).toContain('数据库开启了 SQLite 的 `secure_delete`');
+    expect(text).toContain('每删除一个值就把 `-wal` 写回数据库并截断为 0 字节');
+  });
+
+  it('§6 separates account passwords (next sweep) from proxy credentials (only after the old revision retires)', () => {
+    expect(text).not.toContain('修改、清除或删除环境后，旧值在下一次清理时');
+    expect(text).toContain('**账号密码**：修改、清除密码或删除环境后，旧值在下一次清理时（服务启动时与之后每小时）删除。');
+    expect(text).toContain('**代理用户名与密码**：旧值属于旧的代理版本，要等这个版本“退役”（retired）之后的下一次清理才删除。');
+    expect(text).toContain('部署新版本的那次发布仍保留旧节点');
+    expect(text).toContain('旧值一直留在 `secret_values` 中，通常也仍在 `sfe-nodes.list` 中，没有期限');
+  });
+
+  it('§7 stops the old service before the App is replaced and reuses old P0 runs with --raw-dir', () => {
+    const legacy = text.slice(text.indexOf('## 7. 从使用钥匙串的旧版本升级'));
+    // 替换 App 不重启已在运行的旧服务：先停止，否则旧服务继续应答新扩展
+    expect(legacy).toContain('**然后先在旧版本的菜单中「停止后台服务」，再安装新版本 App**');
+    expect(legacy).toContain('本机服务的填充应答格式不符');
+    // 第 4 步把 p0/ 一起改名：propose 默认找不到旧运行，要指向旧的证据目录
+    expect(legacy).toContain('--raw-dir "$HOME/Library/Application Support/SafariProfileSurge.keychain-old/p0"');
+    expect(legacy).toContain('`propose` 会重新测量当前上下文，与测量时不一致');
   });
 });
 
@@ -301,7 +389,6 @@ describe('docs/ARCHITECTURE.md §0.1 and apps/macos/README.md (Apple documentati
     for (const [title, measurement, url] of [
       ['**签名：Personal Team 能否作为正式交付', '`extension_install_persistence`', 'https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles'],
       ['**原生桥依赖 App Group 容器。**', '`native_bridge_ipc`', 'https://developer.apple.com/documentation/macos-release-notes/macos-15-release-notes'],
-      ['**登录填充依赖已过时的钥匙串接口。**', '`bridge_keychain_access`', 'https://developer.apple.com/documentation/security/access-control-lists'],
       ['**默认场景可能拿不到场景 ID。**', '`native_profile_id`', 'https://developer.apple.com/documentation/safariservices/messaging-between-the-app-and-javascript-in-a-safari-web-extension'],
       ['**进程归属与后台安全改进（BSI）。**', '`safari_process_attribution`', 'https://support.apple.com/guide/security/background-security-improvements-sec87fc038c2/web'],
     ] as const) {
@@ -322,7 +409,6 @@ describe('docs/ARCHITECTURE.md §0.1 and apps/macos/README.md (Apple documentati
     expect(macReadme).not.toContain('不能替用户给未来的场景自动授权');
     expect(macReadme).not.toContain('（开发菜单）');
     expect(macReadme).not.toContain('各场景（含默认场景）');
-    expect(macReadme).toContain('limits access to the item based on an application\'s code signature');
     expect(macReadme).toContain('Safari 17.6 或更高');
     expect(macReadme).toContain('**只需一次**');
   });

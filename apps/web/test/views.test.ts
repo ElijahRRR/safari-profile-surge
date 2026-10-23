@@ -116,6 +116,8 @@ describe('environments page', () => {
     click(byText('[role="menuitem"]', '删除'));
     await flush();
     expect(document.body.textContent).toContain('确定要删除环境 US-买家01 · E0001 吗？');
+    expect(document.body.textContent).toContain('账号密码从本机后台资料中删除');
+    expect(document.body.textContent).not.toContain('钥匙串');
     click(document.body.querySelector('.modal-footer [data-test="confirm"]'));
     await flush();
     expect(calls.find((c) => c.method === 'DELETE')?.body).toEqual({ request_id: expect.stringMatching(/^web-/), expected_revision: 3 });

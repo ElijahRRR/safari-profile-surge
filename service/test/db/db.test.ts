@@ -4,8 +4,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'vitest';
+import { CAPABILITY_CONTEXT_FIELDS, CAPABILITY_KEYS, type CapabilityContext } from '@sfe/contract';
 import { isSqliteExperimentalWarning, openDatabase } from '../../src/db/db.js';
+import { createRepositories } from '../../src/db/index.js';
 import { MIGRATIONS } from '../../src/db/schema.js';
+import { computeCapabilityViews } from '../../src/surge/capability-gate.js';
 
 const fresh = () => mkdtempSync(join(tmpdir(), 'sfe-db-'));
 
@@ -221,4 +224,60 @@ describe('sqlite ExperimentalWarning filter', () => {
     expect(res.stderr).toContain('canary-warning-for-test');
     expect(res.stderr).not.toMatch(/SQLite is an experimental/);
   }, 30_000);
+});
+
+describe('migration 2: local secret values, bridge_keychain_access removed', () => {
+  /** 只执行到第 1 版（旧版钥匙串数据库的结构）。 */
+  function v1Database(path: string | ':memory:' = ':memory:') {
+    const db = openDatabase(path);
+    db.exec(MIGRATIONS[0]!);
+    db.run("INSERT INTO meta(key, value) VALUES('schema_version', '1')");
+    return db;
+  }
+  const ctx = Object.fromEntries(CAPABILITY_CONTEXT_FIELDS.map((f) => [f, null])) as unknown as CapabilityContext;
+
+  test('creates secret_values and drops bridge_keychain_access records and proposals; other rows stay', () => {
+    const db = v1Database();
+    const at = '2026-10-21T00:00:00.000Z';
+    for (const key of ['bridge_keychain_access', 'native_bridge_ipc']) {
+      db.run('INSERT INTO capabilities(key, status, context, verified_at, note) VALUES(?, ?, ?, ?, ?)', [key, 'supported', JSON.stringify(ctx), at, 'old']);
+      db.run(
+        `INSERT INTO capability_proposals(id, key, proposed_status, context, summary, evidence_digest, submitted_by, submitted_at)
+         VALUES(?, ?, 'supported', ?, 'summary', 'sha256:00000000', 'agent', ?)`,
+        [`prop_${key}`, key, JSON.stringify(ctx), at],
+      );
+    }
+    db.run("INSERT INTO meta(key, value) VALUES('pepper_created', '1')");
+    expect(db.migrate()).toEqual({ from: 1, to: MIGRATIONS.length });
+    expect(db.all<{ key: string }>('SELECT key FROM capabilities').map((r) => r.key)).toEqual(['native_bridge_ipc']);
+    expect(db.all<{ key: string }>('SELECT key FROM capability_proposals').map((r) => r.key)).toEqual(['native_bridge_ipc']);
+    expect(db.all('SELECT * FROM secret_values')).toEqual([]);
+    // 迁移本身不改 pepper 标志：旧版数据目录由启动时的检查拒绝（secrets/local-store.ts）
+    expect(db.get<{ value: string }>("SELECT value FROM meta WHERE key = 'pepper_created'")?.value).toBe('1');
+    // 视图与门槛不受影响：只按现有能力项计算
+    const repos = createRepositories(db);
+    const views = computeCapabilityViews(repos.capabilities.list(), ctx);
+    expect(views.map((v) => v.key)).toEqual([...CAPABILITY_KEYS]);
+    expect(views.some((v) => (v.key as string) === 'bridge_keychain_access')).toBe(false);
+    expect(repos.proposals.list({ pending: true }).map((p) => p.key)).toEqual(['native_bridge_ipc']);
+    db.close();
+  });
+
+  test('secret_values enforces the kind set and unique refs', () => {
+    const db = openDatabase(':memory:');
+    db.migrate();
+    const at = '2026-10-21T00:00:00.000Z';
+    db.run('INSERT INTO secret_values(ref, kind, value, created_at) VALUES(?, ?, ?, ?)', ['sec_1', 'proxy', 'v', at]);
+    expect(() => db.run('INSERT INTO secret_values(ref, kind, value, created_at) VALUES(?, ?, ?, ?)', ['sec_1', 'proxy', 'w', at])).toThrow();
+    expect(() => db.run('INSERT INTO secret_values(ref, kind, value, created_at) VALUES(?, ?, ?, ?)', ['sec_2', 'keychain', 'w', at])).toThrow();
+    db.close();
+  });
+
+  test('refuses a symlinked -wal next to the database', () => {
+    const dir = fresh();
+    const path = join(dir, 'sfe.sqlite');
+    writeFileSync(join(dir, 'elsewhere'), '');
+    symlinkSync(join(dir, 'elsewhere'), `${path}-wal`);
+    expect(() => openDatabase(path)).toThrow(expect.objectContaining({ code: 'UNSAFE_LOCATION' }));
+  });
 });

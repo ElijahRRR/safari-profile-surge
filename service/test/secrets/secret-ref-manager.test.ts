@@ -33,7 +33,7 @@ describe('createSecret / markCommitted', () => {
     const store: SecretStore = {
       put: async (ref) => {
         seen.push(t.repos.secretRefs.get(ref)?.state ?? 'missing');
-        // 写钥匙串时不在任何事务中
+        // 写秘密存储时不在任何事务中
         seen.push(String(t.db.inTransaction()));
       },
       get: async () => null,
@@ -63,9 +63,9 @@ describe('createSecret / markCommitted', () => {
   test('store failure removes the pending row and propagates the error (recoverable, nothing committed)', async () => {
     const store = new MemorySecretStore();
     const { repos, mgr } = setup(store);
-    store.injectFailure('put', 'timeout');
+    store.injectFailure('put', 'other');
     const err = await mgr.createSecret('never-stored', 'account', { kind: 'account', id: 'env_1' }).catch((e: unknown) => e);
-    expect(err).toMatchObject({ code: 'SECRET_STORE_FAILED', details: { reason: 'timeout' } });
+    expect(err).toMatchObject({ code: 'SECRET_STORE_FAILED', details: { reason: 'other' } });
     expect(repos.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM secret_refs')?.n).toBe(0);
     expect(store.size).toBe(0);
   });
@@ -75,13 +75,13 @@ describe('createSecret / markCommitted', () => {
     const store: SecretStore = {
       put: async (ref, value, kind) => {
         await inner.put(ref, value, kind);
-        throw secretStoreError('put', 'timeout');
+        throw secretStoreError('put', 'other');
       },
       get: (ref) => inner.get(ref),
       delete: (ref) => inner.delete(ref),
     };
     const { repos, mgr } = setup(store);
-    await expect(mgr.createSecret('landed', 'proxy', { kind: 'environment', id: 'e' })).rejects.toMatchObject({ details: { reason: 'timeout' } });
+    await expect(mgr.createSecret('landed', 'proxy', { kind: 'environment', id: 'e' })).rejects.toMatchObject({ details: { reason: 'other' } });
     expect(inner.size).toBe(0);
     expect(repos.secretRefs.listStalePending(new Date('2100-01-01'))).toEqual([]);
   });
@@ -89,9 +89,9 @@ describe('createSecret / markCommitted', () => {
   test('if cleanup also fails, the pending row stays for the sweeper', async () => {
     const store = new MemorySecretStore();
     const { repos, mgr, clock } = setup(store);
-    store.injectFailure('put', 'locked');
-    store.injectFailure('delete', 'locked');
-    await expect(mgr.createSecret('v', 'proxy', { kind: 'environment', id: 'e' })).rejects.toMatchObject({ details: { reason: 'locked' } });
+    store.injectFailure('put', 'other');
+    store.injectFailure('delete', 'other');
+    await expect(mgr.createSecret('v', 'proxy', { kind: 'environment', id: 'e' })).rejects.toMatchObject({ details: { reason: 'other' } });
     const pending = repos.secretRefs.listStalePending(new Date('2100-01-01'));
     expect(pending).toHaveLength(1);
     clock.advance(TEN_MIN + 1);
@@ -193,8 +193,8 @@ describe('reference-counted reclamation', () => {
     expect(res.deleted).toEqual([oldRef]);
     expect(store.has(oldRef)).toBe(false);
     expect(store.has(newRef)).toBe(true);
-    // 账号密码服务端读不到
-    expect(await store.get(newRef)).toBeNull();
+    // 账号密码保存在本机后台资料中，服务可以读出（登录填充按 §6.10 把关后使用）
+    expect(await store.get(newRef)).toBe('login-new');
   });
 
   test('account password clear: orphaned and reclaimed', async () => {
@@ -246,7 +246,7 @@ describe('reference-counted reclamation', () => {
     const { repos, mgr } = setup(store);
     const ref = await mgr.createSecret('v', 'proxy', { kind: 'environment', id: 'e' });
     repos.tx(() => mgr.orphan(ref));
-    store.injectFailure('delete', 'locked');
+    store.injectFailure('delete', 'other');
     expect(await mgr.sweep()).toEqual({ deleted: [], kept: [], failed: [ref] });
     expect(repos.secretRefs.get(ref)?.state).toBe('orphaned');
     expect((await mgr.sweep()).deleted).toEqual([ref]);
@@ -285,7 +285,7 @@ describe('discard', () => {
     const store = new MemorySecretStore();
     const { repos, mgr } = setup(store);
     const ref = await mgr.createSecret('v', 'proxy', { kind: 'environment', id: 'e' });
-    store.injectFailure('delete', 'denied');
+    store.injectFailure('delete', 'other');
     expect(await mgr.discard(ref)).toBe(false);
     expect(repos.secretRefs.get(ref)?.state).toBe('orphaned');
     expect((await mgr.sweep()).deleted).toEqual([ref]);

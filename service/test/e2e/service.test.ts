@@ -1,15 +1,20 @@
 // 组装根（main.ts）：演示模式完整启动（FakeSurge、合成数据、HTTP、agent/maintenance 套接字），
-// 以及非演示模式在没有 Surge 工具时也能启动且不宣称任何能力。停止服务从不写 Surge。
+// 以及非演示模式在没有 Surge 工具时也能启动且不宣称任何能力；秘密保存在本机数据库中，使用钥匙串的旧版数据目录
+// 在启动时（迁移之前，不改动数据库）fail closed，中文说明写进 service.log。停止服务从不写 Surge。
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, test } from 'vitest';
-import { ROUTE_GROUP_NAME } from '@sfe/contract';
+import { CAPABILITY_KEYS, ROUTE_GROUP_NAME } from '@sfe/contract';
 import type { Actor } from '../../src/app.js';
+import { openDatabase, openRepositories } from '../../src/db/index.js';
+import { MIGRATIONS } from '../../src/db/schema.js';
+import { LEGACY_KEYCHAIN_DATA_MESSAGE } from '../../src/secrets/local-store.js';
+import { PEPPER_REF } from '../../src/secrets/pepper.js';
 import { DEMO_CAPABILITY_NOTE, DEMO_PROFILES } from '../../src/demo/index.js';
 import { startService, type RunningService } from '../../src/main.js';
 import type { FakeSurge } from '../../src/surge/fake.js';
@@ -162,7 +167,33 @@ describe('startService (production wiring, no Surge tools installed)', () => {
     expect(snap.surge).toMatchObject({ version: null, build: null });
     const caps = await svc.app.listCapabilities();
     expect(caps.some((c) => c.effectiveStatus === 'supported')).toBe(false);
+    expect(caps.map((c) => c.key)).toEqual([...CAPABILITY_KEYS]);
     expect((statSync(join(dataDir, 'sfe.sqlite')).mode & 0o077) === 0).toBe(true);
+    // 秘密保存在本机数据库中（不使用钥匙串）：pepper 是 system 秘密；数据目录 0700，数据库旁路文件 0600
+    expect(svc.repos.db.get<{ kind: string }>('SELECT kind FROM secret_values WHERE ref = ?', [PEPPER_REF])?.kind).toBe('system');
+    expect(svc.repos.meta.pepperCreated()).toBe(true);
+    expect(statSync(dataDir).mode & 0o777).toBe(0o700);
+    for (const s of ['-wal', '-shm']) {
+      const f = join(dataDir, `sfe.sqlite${s}`);
+      if (existsSync(f)) expect(statSync(f).mode & 0o077, f).toBe(0);
+    }
+    // 重启后沿用同一个 pepper（数据目录不是旧版钥匙串数据目录）
+    const pepper = svc.repos.db.get<{ value: string }>('SELECT value FROM secret_values WHERE ref = ?', [PEPPER_REF])!.value;
+    await svc.stop();
+    svc = await startService({ argv: ['--data-dir', dataDir, '--http-port', '0'], env: {}, platform: process.platform, homedir: home, cwd: home, bridge: false });
+    expect(svc.repos.db.get<{ value: string }>('SELECT value FROM secret_values WHERE ref = ?', [PEPPER_REF])?.value).toBe(pepper);
+  });
+
+  test('an install.json written by the Keychain version (keychainHelperPath) still starts', async () => {
+    const home = tempDir('sfe-home-');
+    const dataDir = join(home, 'data');
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const install = join(dataDir, 'install.json');
+    writeFileSync(install, JSON.stringify({ keychainHelperPath: '/Applications/SafariProfileSurge.app/Contents/MacOS/sfe-keychain' }));
+    chmodSync(install, 0o600);
+    svc = await startService({ argv: ['--data-dir', dataDir, '--http-port', '0'], env: {}, platform: process.platform, homedir: home, cwd: home, bridge: false });
+    expect(svc.config.installConfigIssues).toEqual([]);
+    expect(svc.repos.meta.pepperCreated()).toBe(true);
   });
 
   test('refuses a data directory inside a Git work tree', async () => {
@@ -170,5 +201,86 @@ describe('startService (production wiring, no Surge tools installed)', () => {
     await expect(
       startService({ argv: ['--data-dir', join(process.cwd(), 'service', '.sfe-data-test'), '--http-port', '0'], env: {}, platform: process.platform, homedir: home, cwd: home, bridge: false }),
     ).rejects.toMatchObject({ code: 'UNSAFE_LOCATION' });
+  });
+});
+
+describe('startService with a data directory created by the Keychain version', () => {
+  const start = (home: string, dataDir: string) =>
+    startService({ argv: ['--data-dir', dataDir, '--http-port', '0'], env: {}, platform: process.platform, homedir: home, cwd: home, bridge: false });
+
+  test('pepper flag without a local pepper: fails closed with SECRET_STORE_FAILED and never regenerates the pepper', async () => {
+    const home = tempDir('sfe-home-');
+    const dataDir = join(home, 'data');
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    // 旧版：pepper 在钥匙串中，数据库只有“曾经创建过”的标志
+    const old = openRepositories(join(dataDir, 'sfe.sqlite'));
+    old.meta.markPepperCreated();
+    old.db.close();
+    const err = await start(home, dataDir).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: 'SECRET_STORE_FAILED', details: { reason: 'legacy_keychain_data', pepperMissing: true, missingCommittedRefs: 0 } });
+    expect((err as Error).message).toContain('docs/INSTALL.md');
+    const after = openRepositories(join(dataDir, 'sfe.sqlite'));
+    expect(after.db.all('SELECT ref FROM secret_values')).toEqual([]);
+    expect(after.meta.pepperCreated()).toBe(true);
+    after.db.close();
+    // launchd 丢弃 stderr：日志中这一条带完整的中文说明（不含引用或值）
+    const line = readFileSync(join(dataDir, 'service.log'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((e) => e.msg === 'secrets.legacy_keychain_data');
+    expect(line).toMatchObject({ level: 'error', pepperMissing: true, missingCommittedRefs: 0, message: LEGACY_KEYCHAIN_DATA_MESSAGE });
+    expect(LEGACY_KEYCHAIN_DATA_MESSAGE).toContain('钥匙串');
+  });
+
+  test('schema 1 database from the Keychain version: refused before migrating, so the old version can still open it', async () => {
+    const home = tempDir('sfe-home-');
+    const dataDir = join(home, 'data');
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const path = join(dataDir, 'sfe.sqlite');
+    // 旧版本的数据库：第 1 版结构、pepper 标志、已提交的引用、bridge_keychain_access 的能力记录与提议
+    const db = openDatabase(path);
+    db.exec(MIGRATIONS[0]!);
+    db.run("INSERT INTO meta(key, value) VALUES('schema_version', '1')");
+    db.run("INSERT INTO meta(key, value) VALUES('pepper_created', '1')");
+    db.run(
+      "INSERT INTO secret_refs(ref, kind, owner_kind, owner_id, state, created_at) VALUES('sec_keychain_era_0001', 'proxy', 'environment', 'env_old', 'committed', '2026-10-01T00:00:00.000Z')",
+    );
+    db.run("INSERT INTO capabilities(key, status, context, verified_at, note) VALUES('bridge_keychain_access', 'supported', '{}', '2026-10-01T00:00:00.000Z', 'old')");
+    db.run(
+      `INSERT INTO capability_proposals(id, key, proposed_status, context, summary, evidence_digest, submitted_by, submitted_at)
+       VALUES('prop_kc_old', 'bridge_keychain_access', 'supported', '{}', 'summary', 'sha256:00000000', 'agent', '2026-10-01T00:00:00.000Z')`,
+    );
+    db.close();
+    const err = await start(home, dataDir).catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: 'SECRET_STORE_FAILED', details: { reason: 'legacy_keychain_data', pepperMissing: true, missingCommittedRefs: 1 } });
+    expect(JSON.stringify(err)).not.toContain('sec_keychain_era_0001');
+    // 拒绝时数据库原封不动：仍是第 1 版（旧版本的 migrate() 只接受不高于 1 的版本），没有迁移 2 的表，旧记录都在
+    const raw = openDatabase(path);
+    expect(raw.schemaVersion()).toBe(1);
+    expect(raw.get("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'secret_values'")).toBeUndefined();
+    expect(raw.all('SELECT key FROM capabilities')).toEqual([{ key: 'bridge_keychain_access' }]);
+    expect(raw.all('SELECT id FROM capability_proposals')).toEqual([{ id: 'prop_kc_old' }]);
+    // 没有清扫、没有生成 pepper
+    expect(raw.all('SELECT ref, state FROM secret_refs')).toEqual([{ ref: 'sec_keychain_era_0001', state: 'committed' }]);
+    expect(raw.get<{ value: string }>("SELECT value FROM meta WHERE key = 'pepper_created'")?.value).toBe('1');
+    raw.close();
+    const log = readFileSync(join(dataDir, 'service.log'), 'utf8');
+    expect(log).toContain('secrets.legacy_keychain_data');
+    expect(log).not.toContain('sec_keychain_era_0001');
+  });
+
+  test('a schema 1 database that never stored a secret is migrated and starts', async () => {
+    const home = tempDir('sfe-home-');
+    const dataDir = join(home, 'data');
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const db = openDatabase(join(dataDir, 'sfe.sqlite'));
+    db.exec(MIGRATIONS[0]!);
+    db.run("INSERT INTO meta(key, value) VALUES('schema_version', '1')");
+    db.close();
+    svc = await start(home, dataDir);
+    expect(svc.repos.db.schemaVersion()).toBe(MIGRATIONS.length);
+    expect(svc.repos.meta.pepperCreated()).toBe(true);
+    expect(svc.repos.db.get('SELECT 1 AS ok FROM secret_values WHERE ref = ?', [PEPPER_REF])).toBeDefined();
   });
 });

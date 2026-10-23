@@ -57,8 +57,8 @@ describe('execFixed', () => {
 });
 
 describe('child processes in service/src', () => {
-  // 所有外部程序都经 execFixed（stdin 关闭）；唯一例外是 sfe-keychain，它在 stdin 上写一行请求后立即关闭。
-  test('only exec-fixed.ts and the keychain helper import node:child_process', () => {
+  // 所有外部程序都经 execFixed（stdin 关闭）；秘密保存在服务数据库中，不再调用任何钥匙串工具。
+  test('only exec-fixed.ts imports node:child_process', () => {
     const root = fileURLToPath(new URL('../../src/', import.meta.url));
     const found: string[] = [];
     const walk = (dir: string): void => {
@@ -69,7 +69,21 @@ describe('child processes in service/src', () => {
       }
     };
     walk(root);
-    expect(found.sort()).toEqual(['secrets/keychain-helper-store.ts', 'util/exec-fixed.ts']);
-    expect(readFileSync(join(root, 'secrets/keychain-helper-store.ts'), 'utf8')).toMatch(/child\.stdin\?\.end\(/);
+    expect(found.sort()).toEqual(['util/exec-fixed.ts']);
+  });
+
+  // 用户决定：不使用钥匙串。服务从不调用 security 命令或钥匙串工具（旧版数据目录只给出手动删除的说明文字）。
+  test('no service source runs the security tool or a keychain helper', () => {
+    const root = fileURLToPath(new URL('../../src/', import.meta.url));
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const name of readdirSync(dir)) {
+        const p = join(dir, name);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (p.endsWith('.ts') && /\/usr\/bin\/security|sfe-keychain|find-generic-password|SecItem/.test(readFileSync(p, 'utf8'))) offenders.push(relative(root, p));
+      }
+    };
+    walk(root);
+    expect(offenders).toEqual([]);
   });
 });

@@ -1,4 +1,4 @@
-// 节点资源的生成（docs/ARCHITECTURE.md §5.4）：按清单读取钥匙串中的代理凭据（读到即登记到脱敏器），
+// 节点资源的生成（docs/ARCHITECTURE.md §5.4）：按清单读取本机秘密资料中的代理凭据（读到即登记到脱敏器），
 // 经受控序列化生成每一行。生成错误按条目返回，调用方决定排除该条目还是整体失败。
 
 import { SfeError, type ApiErrorBody } from '@sfe/contract';
@@ -28,7 +28,7 @@ async function readSecret(engine: Engine, ref: string | null): Promise<string | 
   if (ref === null) return null;
   const value = await engine.store.get(ref);
   if (value === null) {
-    throw new SfeError('SECRET_STORE_FAILED', '读取代理凭据失败：钥匙串中找不到该项', { details: { reason: 'not_found' } });
+    throw new SfeError('SECRET_STORE_FAILED', '读取代理凭据失败：本机后台资料中找不到该项', { details: { reason: 'not_found' } });
   }
   engine.scrubber.register(value);
   return value;

@@ -268,20 +268,40 @@ describe('requestLoginFill (§6.10)', () => {
       ...patch,
     }) as NativeRequest;
 
-  test('success: identifier as value, password only as keychain reference; Node never reads the account password', async () => {
+  /** 账号密码引用被读取的次数（只在 §6.10 全部通过之后读取）。 */
+  const passwordReads = (envId: string) => {
+    const ref = h.repos.accounts.get(envId)!.passwordRef!;
+    return h.store.calls.filter((c) => c.op === 'get' && c.ref === ref).length;
+  };
+
+  test('success: identifier and password are returned as values read from the local store; logs never contain them', async () => {
     const { envId, epoch } = await fillSetup();
-    const getsBefore = h.store.calls.filter((c) => c.op === 'get').length;
+    expect(passwordReads(envId)).toBe(0);
     const r = await h.native(PROFILE_A, req(epoch));
     expect(errCode(r)).toBe('OK');
     const fills = (r as { data: { fills: Array<Record<string, string>> } }).data.fills;
-    const ref = h.repos.accounts.get(envId)!.passwordRef!;
+    // 与原生桥交给扩展的应答完全相同：只有 field 与 value，没有引用或有效期
     expect(fills).toEqual([
       { field: 'identifier', value: 'buyer01@example.test' },
-      { field: 'password', keychainRef: ref, expiresAt: expect.any(String) },
+      { field: 'password', value: 'synth-account-pw' },
     ]);
-    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
-    expect(h.store.calls.filter((c) => c.op === 'get' && c.ref === ref)).toHaveLength(0);
-    expect(h.store.calls.filter((c) => c.op === 'get').length).toBe(getsBefore);
+    expect(passwordReads(envId)).toBe(1);
+    // 读到的密码已登记到脱敏器：之后任何日志、错误或步骤中出现都会被遮盖
+    expect(h.app.engine.scrubber.scrub('x synth-account-pw y')).not.toContain('synth-account-pw');
+    h.app.engine.log('warn', 'test.echo', { message: 'leak synth-account-pw' });
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('login_fill.allowed');
+    expect(logs).not.toContain('synth-account-pw');
+    expect(logs).not.toContain('buyer01@example.test');
+  });
+
+  test('success: only the requested fields are read and returned', async () => {
+    const { envId, epoch } = await fillSetup();
+    const r = await h.native(PROFILE_A, req(epoch, { fields: ['identifier'] }));
+    expect((r as { data: { fills: unknown[] } }).data.fills).toEqual([{ field: 'identifier', value: 'buyer01@example.test' }]);
+    expect(passwordReads(envId)).toBe(0);
+    const pw = await h.native(PROFILE_A, req(epoch, { fields: ['password', 'password'] }));
+    expect((pw as { data: { fills: unknown[] } }).data.fills).toEqual([{ field: 'password', value: 'synth-account-pw' }]);
   });
 
   test.each([
@@ -294,11 +314,14 @@ describe('requestLoginFill (§6.10)', () => {
     ['form action http', { form_action: 'http://www.amazon.com/ap/signin' }, 'form_action'],
     ['stale epoch', { route_epoch: -1 }, 'epoch'],
     ['no fields', { fields: [] }, 'fields'],
-  ])('refused: %s', async (_name, patch, reason) => {
-    const { epoch } = await fillSetup();
+  ])('refused: %s — nothing is read or returned', async (_name, patch, reason) => {
+    const { envId, epoch } = await fillSetup();
     const r = await h.native(PROFILE_A, req(epoch, patch));
     expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
     expect((r as unknown as { error: { details: { reason: string } } }).error.details.reason).toBe(reason);
+    expect(passwordReads(envId)).toBe(0);
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
+    expect(JSON.stringify(r)).not.toContain('buyer01@example.test');
   });
 
   test('refused: auto fill disabled for the environment', async () => {
@@ -309,11 +332,39 @@ describe('requestLoginFill (§6.10)', () => {
     expect((r as unknown as { error: { details: { reason: string } } }).error.details.reason).toBe('disabled');
   });
 
-  test('refused: fill capability gate missing', async () => {
-    const { epoch } = await fillSetup();
-    h.revoke(['bridge_keychain_access']);
+  test.each([['native_profile_id'], ['first_request_and_old_connections']] as const)('refused: fill capability gate missing (%s); no keychain capability exists', async (key) => {
+    const { envId, epoch } = await fillSetup();
+    h.revoke([key]);
     const r = await h.native(PROFILE_A, req(epoch));
-    expect((r as unknown as { error: { details: { reason: string } } }).error.details.reason).toBe('capability');
+    const error = (r as unknown as { error: { details: { reason: string; missing: string[] } } }).error;
+    expect(error.details.reason).toBe('capability');
+    expect(error.details.missing).toEqual([key]);
+    expect(passwordReads(envId)).toBe(0);
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
+  });
+
+  test('the password value missing from the local store → SECRET_STORE_FAILED, nothing returned', async () => {
+    const { envId, epoch } = await fillSetup();
+    await h.store.delete(h.repos.accounts.get(envId)!.passwordRef!);
+    const r = await h.native(PROFILE_A, req(epoch));
+    expect(errCode(r)).toBe('SECRET_STORE_FAILED');
+    expect(JSON.stringify(r)).not.toContain('buyer01@example.test');
+    expect(JSON.stringify(r)).not.toContain(h.repos.accounts.get(envId)!.passwordRef!);
+  });
+
+  test('the route changing while the password is read → refused (epoch), no value returned', async () => {
+    const { envId, epoch } = await fillSetup();
+    const ref = h.repos.accounts.get(envId)!.passwordRef!;
+    const original = h.store.get.bind(h.store);
+    h.store.get = async (r: string) => {
+      const value = await original(r);
+      if (r === ref) h.repos.tx(() => h.repos.routeState.update({ routeEpoch: epoch + 1 }));
+      return value;
+    };
+    const r = await h.native(PROFILE_A, req(epoch));
+    expect(errCode(r)).toBe('FILL_NOT_ALLOWED');
+    expect((r as unknown as { error: { details: { reason: string } } }).error.details.reason).toBe('epoch');
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
   });
 
   test('refused: requesting profile is not bound to the active environment', async () => {
@@ -324,14 +375,17 @@ describe('requestLoginFill (§6.10)', () => {
     await h.app.updateEnvironment(b, { request_id: rid(), expected_revision: env.revision, changes: { autoFillLogin: true, account: { loginIdentifier: 'buyer02@example.test' } } }, WEB);
     const r = await h.native(PROFILE_B, req(epoch));
     expect((r as unknown as { error: { details: { reason: string } } }).error.details.reason).toBe('not_active');
-    void envId;
+    expect(passwordReads(envId)).toBe(0);
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
   });
 
   test('refused: route not in control (probe expired, external change)', async () => {
-    const { epoch } = await fillSetup();
+    const { envId, epoch } = await fillSetup();
     h.clock.advance(901_000);
     const r = await h.native(PROFILE_A, req(epoch));
     expect((r as unknown as { error: { details: { reason: string } } }).error.details.reason).toBe('control');
+    expect(passwordReads(envId)).toBe(0);
+    expect(JSON.stringify(r)).not.toContain('synth-account-pw');
   });
 
   test('refused: selection changed externally (precheck reconcile)', async () => {

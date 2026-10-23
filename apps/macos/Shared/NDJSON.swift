@@ -1,7 +1,7 @@
 import Foundation
 
 /// NDJSON 帧：一连接一请求、一行应答。只取第一行；上限按字节计，不含换行与行尾的 \r。
-/// 原生桥（TCP）、维护套接字与 sfe-keychain 的 stdin 共用这一份切分逻辑。
+/// 原生桥（TCP）与维护套接字共用这一份切分逻辑。
 struct LineBuffer {
     enum Outcome: Equatable {
         /// 还没有读到换行。

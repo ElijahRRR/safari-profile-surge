@@ -146,7 +146,7 @@ const confirmText = computed(() => {
       return {
         title: '删除环境',
         message: `确定要删除环境 ${label} 吗？`,
-        detail: '删除后其节点在下次发布时移除，账号密码从钥匙串删除；Safari 场景、Cookie 与登录资料保留。',
+        detail: '删除后其节点在下次发布时移除，账号密码从本机后台资料中删除；Safari 场景、Cookie 与登录资料保留。',
         button: '删除',
         variant: 'danger' as const,
       };

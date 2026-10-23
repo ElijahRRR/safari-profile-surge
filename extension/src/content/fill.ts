@@ -2,6 +2,7 @@
 // - 只在该站点 HTTPS 登录页（不含 /ap/mfa）运行；只识别表单内可见的账号与密码字段；
 // - 只向后台发送 { type, form_action, fields }，顶层地址、框架与路由序号由后台填写；
 // - 未识别到字段时先向后台确认本场景适用填充（checkLoginFill），不适用或无法确认时不显示任何东西；
+// - 应答逐项检查形状（字段名、非空字符串值、不重复），任何一项不符就一个字段也不填；
 // - 写入每个值前重读 form.action，变化即丢弃；每页每字段最多填一次；
 // - 从不提交、不点击、不处理验证码或二次验证；从不保存或打印填充值。
 
@@ -153,11 +154,34 @@ function waitForDetection(doc: Document, timeoutMs: number): Promise<Detection> 
   });
 }
 
+// 原生桥原样转发服务的应答，不再检查形状，所以在写入页面之前由这里检查。
+const MALFORMED_FILL_MESSAGE = '本机服务的填充应答格式不符（可能仍在运行旧版本的后台服务）：请在 App 菜单中「停止后台服务」再「注册后台服务」后重试';
+
+/**
+ * 每一项都必须是 { field: 'identifier' | 'password', value: 非空字符串 }，且字段不重复；任何一项不符就整个拒绝，
+ * 一个字段也不填。例如旧版（钥匙串）服务的密码项只有 keychainRef 而没有 value，不能把 undefined 写成文字 "undefined"。
+ */
+function wellFormedFills(fills: unknown): fills is LoginFillResponse['fills'] {
+  if (!Array.isArray(fills)) return false;
+  const seen = new Set<FillField>();
+  for (const item of fills as unknown[]) {
+    if (typeof item !== 'object' || item === null) return false;
+    const { field, value } = item as { field?: unknown; value?: unknown };
+    if (field !== 'identifier' && field !== 'password') return false;
+    if (seen.has(field)) return false;
+    seen.add(field);
+    if (typeof value !== 'string' || value.length === 0) return false;
+  }
+  return true;
+}
+
 function parseReply(reply: unknown): { ok: true; data: LoginFillResponse } | { ok: false; message: string; reason: string | null } {
   if (typeof reply === 'object' && reply !== null) {
     const r = reply as { ok?: unknown; data?: unknown; error?: { message?: unknown; details?: { reason?: unknown } } };
-    if (r.ok === true && typeof r.data === 'object' && r.data !== null && Array.isArray((r.data as LoginFillResponse).fills)) {
-      return { ok: true, data: r.data as LoginFillResponse };
+    if (r.ok === true) {
+      const fills = typeof r.data === 'object' && r.data !== null ? (r.data as { fills?: unknown }).fills : undefined;
+      if (wellFormedFills(fills)) return { ok: true, data: { fills } };
+      return { ok: false, message: MALFORMED_FILL_MESSAGE, reason: 'malformed_reply' };
     }
     if (r.ok === false) {
       const message = typeof r.error?.message === 'string' ? r.error.message : '登录填充失败';

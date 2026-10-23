@@ -1,7 +1,7 @@
 // 秘密引用的四步协议与回收（docs/ARCHITECTURE.md §4）：
-// 1. 小事务插入 pending 引用；2. 写钥匙串（新引用，从不覆盖）；3. 调用方主事务写引用该 ref 的行并
-//    markCommitted；4. 失败则删除钥匙串项与 pending 行。回收只按“是否仍被引用”判断，宁可晚删不可错删。
-// createSecret/discard/sweep 会 await 钥匙串，不得在事务内调用；markCommitted/orphan 必须在调用方事务内调用。
+// 1. 小事务插入 pending 引用；2. 写秘密存储（新引用，从不覆盖）；3. 调用方主事务写引用该 ref 的行并
+//    markCommitted；4. 失败则删除秘密项与 pending 行。回收只按“是否仍被引用”判断，宁可晚删不可错删。
+// createSecret/discard/sweep 会 await 秘密存储，不得在事务内调用；markCommitted/orphan 必须在调用方事务内调用。
 
 import { SfeError } from '@sfe/contract';
 import type { Clock, IdGenerator, SecretStore } from '../ports.js';
@@ -17,11 +17,11 @@ export interface SecretOwner {
 }
 
 export interface SweepResult {
-  /** 钥匙串项与引用行都已删除。 */
+  /** 秘密项与引用行都已删除。 */
   deleted: string[];
   /** 仍被引用，保留（并恢复为 committed）。 */
   kept: string[];
-  /** 钥匙串删除失败，保留引用行等待下次清扫。 */
+  /** 秘密项删除失败，保留引用行等待下次清扫。 */
   failed: string[];
 }
 
@@ -34,8 +34,8 @@ export class SecretRefManager {
   ) {}
 
   /**
-   * 第 1、2 步：先在独立小事务中登记 pending 引用，再写钥匙串。写入失败时尝试删除钥匙串项
-   * （超时等情况下工具可能已写入），删除成功才删除 pending 行；删除也失败则留给清扫重试。
+   * 第 1、2 步：先在独立小事务中登记 pending 引用，再写秘密存储。写入失败时尝试删除秘密项
+   * （写入结果未知时可能已写入），删除成功才删除 pending 行；删除也失败则留给清扫重试。
    * 返回的引用在调用方 markCommitted 之前不可用。
    */
   async createSecret(value: string, kind: SecretKind, owner: SecretOwner): Promise<string> {
@@ -58,7 +58,7 @@ export class SecretRefManager {
     try {
       await this.store.delete(ref);
     } catch {
-      // 钥匙串项可能残留：保留 pending 行，由清扫在超时后重试删除
+      // 秘密项可能残留：保留 pending 行，由清扫在超时后重试删除
       return;
     }
     this.repos.tx(() => {
@@ -91,7 +91,7 @@ export class SecretRefManager {
 
   /**
    * 丢弃一个尚未被使用的引用（例如 createSecret 之后主事务失败）。仍被引用时拒绝。
-   * 钥匙串删除失败时把引用标为 orphaned 留给清扫，返回 false；不抛错。
+   * 秘密项删除失败时把引用标为 orphaned 留给清扫，返回 false；不抛错。
    */
   async discard(ref: string): Promise<boolean> {
     if (this.repos.db.inTransaction()) throw new Error('discard must not be called inside a database transaction');
@@ -138,7 +138,7 @@ export class SecretRefManager {
         result.failed.push(cand.ref);
         continue;
       }
-      // 删除钥匙串后再次确认未被引用；期间如被引用（不应发生）则保留行，以便追查
+      // 删除秘密项后再次确认未被引用；期间如被引用（不应发生）则保留行，以便追查
       const removed = this.repos.tx(() => {
         if (this.repos.secretRefs.isReferenced(cand.ref)) return false;
         return this.repos.secretRefs.delete(cand.ref);

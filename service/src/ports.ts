@@ -37,10 +37,10 @@ export interface Scrubber {
 
 // ---------- 秘密 ----------
 
-/** 钥匙串抽象。ref 是不透明引用（sec_…），从不复用；值只在内存中短暂存在。 */
+/** 秘密存储（本机后台资料，见 secrets/local-store.ts；不使用钥匙串）。ref 是不透明引用（sec_…），从不复用。 */
 export interface SecretStore {
   put(ref: string, value: string, kind: 'proxy' | 'account' | 'system'): Promise<void>;
-  /** 账号密码（kind=account）不提供读取：由签名的原生桥自行读取钥匙串。 */
+  /** 任何种类都可读取（账号密码只在登录填充按 §6.10 把关通过后读出）；读到的值由调用方登记到脱敏器。 */
   get(ref: string): Promise<string | null>;
   delete(ref: string): Promise<void>;
 }

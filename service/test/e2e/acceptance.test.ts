@@ -272,7 +272,7 @@ describe('sync design §11 acceptance (offline equivalents)', () => {
     await h.app.refreshSurge(WEB);
     const caps = await h.app.listCapabilities();
     // 依赖 Surge 的能力全部失效；只依赖 Safari/macOS 的能力（扩展、原生桥）不受 Surge 版本影响
-    const safariOnly = new Set(['native_profile_id', 'native_bridge_ipc', 'bridge_keychain_access', 'extension_install_persistence', 'open_profile_by_id', 'profile_batch_create']);
+    const safariOnly = new Set(['native_profile_id', 'native_bridge_ipc', 'extension_install_persistence', 'open_profile_by_id', 'profile_batch_create']);
     for (const c of caps) {
       if (safariOnly.has(c.key)) expect(c.effectiveStatus, c.key).toBe('supported');
       else expect(c.effectiveStatus, c.key).not.toBe('supported');

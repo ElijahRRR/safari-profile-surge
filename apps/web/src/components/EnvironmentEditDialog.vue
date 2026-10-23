@@ -214,7 +214,7 @@ function submit() {
             :mode="mode"
             :configured="env?.account.hasPassword ?? false"
             :error="err('account.password')"
-            hint="保存到钥匙串；网页与日志从不显示。"
+            hint="保存在本机后台的资料中（明文，仅本机用户可读）；网页与日志从不显示。"
           />
         </div>
       </section>

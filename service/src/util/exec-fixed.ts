@@ -2,7 +2,6 @@
 // 启动后立即关闭 stdin。本项目调用的外部程序（surge-cli、codesign、sw_vers、defaults、ps、open 等）都不从
 // stdin 读取输入；stdin 保持打开时，进入交互模式的程序（6.5 的 surge-cli 遇到无法识别的参数）会一直等到
 // 超时被结束，被误报为“命令超时 / 无法连接”。关闭后它读到 EOF 立即退出。见 docs/ARCHITECTURE.md §5.1。
-// 需要经 stdin 传请求的 sfe-keychain 不走这里（secrets/keychain-helper-store.ts 写入一行后同样立即关闭）。
 
 import { execFile, type ChildProcess, type ExecFileException } from 'node:child_process';
 import { isAbsolute } from 'node:path';

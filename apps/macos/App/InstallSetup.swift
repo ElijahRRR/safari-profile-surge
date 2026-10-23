@@ -14,10 +14,6 @@ enum InstallPaths {
         dataDirectory.appendingPathComponent("maintenance.sock").path
     }
 
-    static var keychainHelper: URL {
-        Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/sfe-keychain", isDirectory: false)
-    }
-
     static var webRoot: URL {
         Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/service/web", isDirectory: true)
     }
@@ -120,7 +116,6 @@ enum InstallSetup {
         let fileManager = FileManager.default
         let fields = InstallConfig.Fields(
             surgeCliPath: fileManager.isExecutableFile(atPath: InstallConfig.defaultSurgeCLIPath) ? InstallConfig.defaultSurgeCLIPath : nil,
-            keychainHelperPath: InstallPaths.keychainHelper.path,
             nodeVersionPin: bundle.object(forInfoDictionaryKey: "SFENodeVersion") as? String,
             bridgePort: bridgePort,
             webRoot: fileManager.fileExists(atPath: InstallPaths.webRoot.path) ? InstallPaths.webRoot.path : nil

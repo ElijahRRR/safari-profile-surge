@@ -55,8 +55,8 @@ enum Fixtures {
     static let token = String(repeating: "A", count: 42) + "Q"
     static let profileUUID = UUID(uuidString: "0F1E2D3C-4B5A-6978-8796-A5B4C3D2E1F0")!
     static let profileId = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    /// 合成的账号密码（不是真实密码）。
     static let syntheticSecret = "synthetic-secret-1"
-    static let accountRef = "acct:env-0001:r1"
 }
 
 /// 与 service/test/ipc/bridge-server.test.ts 共用的握手已知答案（Node 与 openssl 独立算出）：

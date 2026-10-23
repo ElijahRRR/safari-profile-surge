@@ -584,6 +584,12 @@ describe('create form secrets', () => {
     storage.restore();
   });
 
+  it('says the login password is kept by the local service, not in the extension (no Keychain)', async () => {
+    const { wrapper } = await mountCreate();
+    expect(wrapper.text()).toContain('保存在本机后台，不在扩展中保存。');
+    expect(wrapper.text()).not.toContain('钥匙串');
+  });
+
   it('requires an explicit site and a valid port before sending', async () => {
     const { wrapper, calls } = await mountCreate();
     await wrapper.find('[data-test="create-name"]').setValue('US-买家05');

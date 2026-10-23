@@ -1,7 +1,7 @@
 // 导入入口：解码 → 解析为表格或记录 → 表头映射 → 逐行规范化与校验 → 文件内重复检查。
 // 整个文件不可读或不安全时抛 SfeError('IMPORT_REJECTED')（422）；请求形状不对抛 BAD_REQUEST；
 // 表头问题放在 fileErrors（此时不返回任何行）；行内问题放在各行 normalized.errors。
-// 返回的 record 含秘密明文（引擎写钥匙串需要）：调用方不得记录日志或原样返回给客户端。
+// 返回的 record 含秘密明文（引擎写秘密存储需要）：调用方不得记录日志或原样返回给客户端。
 
 import { SfeError, isSiteCode, type FieldError, type ImportFormat, type ImportRecord, type SiteCode } from '@sfe/contract';
 import { mapHeader, type ImportField } from './columns.js';

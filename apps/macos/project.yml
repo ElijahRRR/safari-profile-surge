@@ -59,12 +59,6 @@ targets:
       - target: SafariProfileSurgeExtension
         embed: true
         codeSign: true
-      - target: sfe-keychain
-        embed: true
-        codeSign: true
-        copy:
-          destination: wrapper
-          subpath: Contents/Helpers
       - target: sfe-service-launcher
         embed: true
         codeSign: true
@@ -97,37 +91,15 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.sfe.SafariProfileSurge.Extension
         INFOPLIST_FILE: Config/Extension-Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        # 默认（首选的登录钥匙串方案）不声明 keychain-access-groups：它是受限权限，会让扩展依赖描述文件
-        # （免费 Personal Team 约 7 天过期）。
+        # 只用无限制权限（App 沙盒、application-groups、network.client）；本项目不使用钥匙串，不声明 keychain-access-groups
         CODE_SIGN_ENTITLEMENTS: Config/Extension.entitlements
         ENABLE_APP_SANDBOX: YES
         SKIP_INSTALL: YES
-        # 打开备选钥匙串方案（数据保护钥匙串 + 共享访问组）时两项必须同时改（embed-extension-resources.sh 会检查）：
-        #   SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) SFE_DATA_PROTECTION_KEYCHAIN
-        #   CODE_SIGN_ENTITLEMENTS: Config/Extension-DataProtection.entitlements
     postBuildScripts:
       - name: Embed web extension resources
         path: Scripts/embed-extension-resources.sh
         shell: /bin/sh
         basedOnDependencyAnalysis: false
-
-  sfe-keychain:
-    type: tool
-    platform: macOS
-    sources:
-      - path: KeychainTool
-      - path: CommandLineSupport
-      - path: Shared/KeychainStatus.swift
-      - path: Shared/NDJSON.swift
-    settings:
-      groups: [signing]
-      base:
-        PRODUCT_NAME: sfe-keychain
-        PRODUCT_BUNDLE_IDENTIFIER: com.sfe.keychain
-        # 把 Info.plist 嵌入二进制，签名标识为 com.sfe.keychain（钥匙串受信任应用列表按签名识别）
-        GENERATE_INFOPLIST_FILE: YES
-        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
-        SKIP_INSTALL: YES
 
   sfe-service-launcher:
     type: tool
@@ -144,7 +116,7 @@ targets:
         CREATE_INFOPLIST_SECTION_IN_BINARY: YES
         SKIP_INSTALL: YES
 
-  # 纯 Swift 逻辑测试（不需要宿主 App、网络或真实钥匙串）：直接编译被测源文件。
+  # 纯 Swift 逻辑测试（不需要宿主 App 或网络）：直接编译被测源文件。
   SafariProfileSurgeTests:
     type: bundle.unit-test
     platform: macOS
@@ -155,8 +127,6 @@ targets:
       - path: Shared/BridgeHandshake.swift
       - path: Shared/BridgeConfig.swift
       - path: Shared/BridgeForwarder.swift
-      - path: Shared/KeychainStatus.swift
-      - path: KeychainTool/KeychainToolCore.swift
       - path: CommandLineSupport/BundleLayout.swift
       - path: App/AdminProtocol.swift
       - path: App/InstallConfig.swift

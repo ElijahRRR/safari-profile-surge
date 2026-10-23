@@ -1,4 +1,4 @@
-// 人工检查清单：原生桥、场景 ID、钥匙串、签名持久性、首请求与旧连接，以及只作记录的批量创建/按 ID 打开。
+// 人工检查清单：原生桥、场景 ID、签名持久性、首请求与旧连接，以及只作记录的批量创建/按 ID 打开。
 // 由自动测试命令测量的能力不走清单。答案：y 通过、n 不通过、空 未完成。
 
 import type { CapabilityKey } from '@sfe/contract';
@@ -68,18 +68,6 @@ export const CHECKLISTS: Partial<Record<CapabilityKey, Checklist>> = {
         id: 'quit_prompt',
         question:
           'macOS 26 或更高：后台服务运行中退出 App 时的后台任务提示原文、选「允许」后往返仍成功、选「不允许」后服务与登录项状态的变化已记录在备注中（更早的系统备注写「不适用」）？',
-      },
-    ],
-  },
-  bridge_keychain_access: {
-    title: '原生桥读取钥匙串',
-    items: [
-      { id: 'write', question: 'sfe-keychain 写入合成测试账号密码项成功？' },
-      { id: 'read_no_prompt', question: '签名的原生桥读取该项没有额外提示？' },
-      { id: 'resign_prompts', question: '重新构建/重签后的提示次数已记录在备注中？' },
-      {
-        id: 'errors',
-        question: '钥匙串锁定、用户拒绝时，扩展（登录填充）与 sfe-keychain（服务调用）分别得到的 reason 已记录在备注中？',
       },
     ],
   },

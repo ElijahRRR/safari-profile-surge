@@ -1,6 +1,6 @@
 // 并发的同一请求（客户端重试）：幂等核对在主事务内进行，后到的请求返回原操作（duplicate: true），
-// 不报版本冲突、不撞 request_id 唯一约束，也不留下钥匙串项（§6.1）。
-// 提交前有异步步骤（文件读取、钥匙串写入），哪个调用先提交并不确定：断言与顺序无关。
+// 不报版本冲突、不撞 request_id 唯一约束，也不留下秘密项（§6.1）。
+// 提交前有异步步骤（文件读取、秘密写入），哪个调用先提交并不确定：断言与顺序无关。
 import { afterEach, describe, expect, test } from 'vitest';
 import type { Accepted } from '@sfe/contract';
 import { WEB, createEnv, createHarness, envInput, rid, type Harness } from './harness.js';
@@ -36,7 +36,7 @@ describe('concurrent retries with the same request_id', () => {
     await h.idle();
     expect(h.repos.environments.get(envId)!.revision).toBe(env.revision + 1);
     expect(h.repos.proxyRevisions.maxRevision(envId)).toBe(2);
-    // 后到请求写入的钥匙串项被丢弃：不留下未引用的秘密
+    // 后到请求写入的秘密项被丢弃：不留下未引用的秘密
     expect(h.repos.secretRefs.listStalePending(FAR_FUTURE)).toEqual([]);
   });
 

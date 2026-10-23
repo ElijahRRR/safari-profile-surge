@@ -321,7 +321,9 @@ describe('capabilities page', () => {
   it('shows pass criteria for every capability and disables 确认 with the reason when coverage is incomplete', async () => {
     const { ctx } = testContext(() => ({ status: 404 }), snapshot({ capabilityProposals: [proposal({ protocolCoverage: { ...coverage('pass'), ipv6: { result: 'not_tested', note: null } } })] }));
     const m = await mountWith(CapabilitiesView, ctx, {}, '/capabilities');
-    expect(document.body.querySelectorAll('[data-test="criteria"]')).toHaveLength(20);
+    expect(document.body.querySelectorAll('[data-test="criteria"]')).toHaveLength(19);
+    // 不使用钥匙串：没有「原生桥读取钥匙串」这一项
+    expect(document.body.textContent).not.toContain('钥匙串');
     const confirm = document.body.querySelector<HTMLButtonElement>('[data-test="confirm-proposal"]')!;
     expect(confirm.disabled).toBe(true);
     expect(document.body.querySelector('[data-test="confirm-block"]')?.textContent).toContain('逐协议覆盖不完整');

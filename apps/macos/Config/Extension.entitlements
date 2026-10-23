@@ -11,7 +11,5 @@
 	<array>
 		<string>$(TeamIdentifierPrefix)sfe</string>
 	</array>
-	<!-- 首选的登录钥匙串方案不需要 keychain-access-groups（受限权限，需要描述文件）。备选方案
-	     （SFE_DATA_PROTECTION_KEYCHAIN）改用 Extension-DataProtection.entitlements，见 project.yml 与 README。 -->
 </dict>
 </plist>

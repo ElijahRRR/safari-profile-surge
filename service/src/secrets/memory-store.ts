@@ -1,4 +1,4 @@
-// 内存秘密存储：测试与演示模式使用，行为与钥匙串实现一致（账号密码不可读取、引用不覆盖）。
+// 内存秘密存储：测试与演示模式使用，行为与本机实现（local-store.ts）一致（任何种类都可读取、引用不覆盖）。
 
 import type { SecretStore } from '../ports.js';
 import type { SecretKind } from '../db/repos/secret-refs.js';
@@ -30,23 +30,13 @@ export class MemorySecretStore implements SecretStore {
   async get(ref: string): Promise<string | null> {
     this.calls.push({ op: 'get', ref });
     this.maybeFail('get');
-    const item = this.items.get(ref);
-    if (!item) return null;
-    // 与真实实现一致：账号密码只由签名的原生桥读取，服务读不到
-    if (item.kind === 'account') return null;
-    return item.value;
+    return this.items.get(ref)?.value ?? null;
   }
 
   async delete(ref: string): Promise<void> {
     this.calls.push({ op: 'delete', ref });
     this.maybeFail('delete');
     this.items.delete(ref);
-  }
-
-  /** 只供演示模式的原生桥模拟读取账号密码；生产代码不得调用。 */
-  unsafeReadAccountForDemo(ref: string): string | null {
-    const item = this.items.get(ref);
-    return item && item.kind === 'account' ? item.value : null;
   }
 
   has(ref: string): boolean {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'vitest';
-import { SfeError } from '@sfe/contract';
+import { CAPABILITY_KEYS, SfeError } from '@sfe/contract';
 import { ADMIN, AGENT, PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, envInput, rid, type Harness } from './harness.js';
 
 let h: Harness;
@@ -21,7 +21,7 @@ async function expectError(p: Promise<unknown>, code: string): Promise<SfeError>
 const surgeWrites = () => ({ update: h.fake.calls.updateExternalResource ?? 0, select: h.fake.calls.selectGroupPolicy ?? 0, reload: h.fake.calls.reloadProfile ?? 0 });
 
 describe('create', () => {
-  test('validation failure → 422, no operation, nothing written to the keychain', async () => {
+  test('validation failure → 422, no operation, nothing written to the secret store', async () => {
     h = await createHarness();
     const ops = h.repos.operations.listRecent(100).length;
     const err = await expectError(
@@ -46,7 +46,7 @@ describe('create', () => {
     expect(h.repos.proxyRevisions.get(a.environment_id!, 1)!.frontProxyId).toBe(h.frontId);
   });
 
-  test('secrets go to the keychain only; the database stores refs and keyed fingerprints', async () => {
+  test('secrets go to the secret store only; environment rows store refs and keyed fingerprints', async () => {
     h = await createHarness();
     const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10', { username: 'synthuser01', password: 'synthpass01', accountPassword: 'acct-secret-01' });
     const rev = h.repos.proxyRevisions.get(a.environment_id!, 1)!;
@@ -55,16 +55,17 @@ describe('create', () => {
     expect(h.repos.secretRefs.get(rev.passwordRef!)!.state).toBe('committed');
     const acc = h.repos.accounts.get(a.environment_id!)!;
     expect(h.store.kindOf(acc.passwordRef!)).toBe('account');
-    // 账号密码 Node 读不到
-    expect(await h.store.get(acc.passwordRef!)).toBeNull();
+    // 账号密码保存在本机后台资料中（不使用钥匙串），只在登录填充把关通过后读出
+    expect(await h.store.get(acc.passwordRef!)).toBe('acct-secret-01');
+    expect(await h.store.get(rev.passwordRef!)).toBe('synthpass01');
   });
 
-  test('keychain failure (timeout) is recoverable: no operation, no pending ref left, retry succeeds', async () => {
+  test('secret store failure is recoverable: no operation, no pending ref left, retry succeeds', async () => {
     h = await createHarness();
-    h.store.injectFailure('put', 'timeout');
+    h.store.injectFailure('put', 'other');
     const req = { request_id: rid(), environment: envInput('US-Buyer-01', '203.0.113.10', { password: 'synthpass01' }) };
     const err = await expectError(h.app.createEnvironment(req, WEB), 'SECRET_STORE_FAILED');
-    expect(err.details).toMatchObject({ reason: 'timeout' });
+    expect(err.details).toMatchObject({ reason: 'other' });
     expect(h.repos.operations.byRequestId(req.request_id)).toBeNull();
     expect(h.repos.secretRefs.listStalePending(new Date('2100-01-01'))).toEqual([]);
     const ok = await h.app.createEnvironment(req, WEB);
@@ -254,7 +255,9 @@ describe('roles and masking', () => {
     const snap = await h.app.snapshot(WEB);
     expect(snap.demoMode).toBe(false);
     expect(snap.sequence).toBe(h.app.events.currentSequence());
-    expect(snap.capabilities).toHaveLength(20);
+    expect(snap.capabilities).toHaveLength(CAPABILITY_KEYS.length);
+    expect(snap.capabilities).toHaveLength(19);
+    expect(snap.capabilities.map((c) => c.key)).not.toContain('bridge_keychain_access');
     expect(snap.settings.workingProfilePath).toBe(h.profilePath);
   });
 

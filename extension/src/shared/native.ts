@@ -4,7 +4,6 @@
 import {
   NATIVE_PROTOCOL_VERSION,
   type ApiErrorBody,
-  type LoginFillResponse,
   type NativeEnvelope,
   type NativeRequest,
   type NativeRequestType,
@@ -12,8 +11,11 @@ import {
   type NativeResponseMap,
 } from '@sfe/contract';
 
-/** 扩展看到的应答：requestLoginFill 由原生桥解析钥匙串引用后给值。 */
-export type ExtensionResponseMap = Omit<NativeResponseMap, 'requestLoginFill'> & { requestLoginFill: LoginFillResponse };
+/**
+ * 扩展看到的应答：与服务的应答相同（原生桥原样转发，不改写，也不检查形状）。requestLoginFill 的值由服务从本机后台资料读出，
+ * 扩展只在内存中短暂持有、填入页面，从不写入存储；内容脚本写入页面之前逐项检查形状（content/fill.ts）。
+ */
+export type ExtensionResponseMap = NativeResponseMap;
 
 export type RequestOf<K extends NativeRequestType> = Extract<NativeRequest, { type: K }>;
 

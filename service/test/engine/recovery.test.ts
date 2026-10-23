@@ -287,7 +287,7 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
 
   test('startup sweep removes stale pending secret refs left by a crash', async () => {
     h = await createHarness({ dbFile: true });
-    // 崩溃发生在“钥匙串已写入、主事务未提交”之间
+    // 崩溃发生在“秘密已写入、主事务未提交”之间
     h.repos.tx(() => h.repos.secretRefs.insertPending({ ref: 'sec_stale0001', kind: 'proxy', ownerKind: 'proxy_revision', ownerId: 'env_x', createdAt: h.clock.now().toISOString() }));
     await h.store.put('sec_stale0001', 'synth-stale-value', 'proxy');
     h.clock.advance(11 * 60 * 1000);

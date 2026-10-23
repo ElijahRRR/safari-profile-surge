@@ -10,7 +10,6 @@ enum NativeBridge {
     static let loopbackHost = "127.0.0.1"
     /// 与 service/src/config.ts 的 DEFAULT_BRIDGE_PORT 一致。
     static let defaultPort: UInt16 = 61848
-    static let loginFillType = "requestLoginFill"
 
     /// 只用于日志：与 NativeRequestType 一致的已知类型。未知类型在日志中记为 unknown，不记录原文。
     static let knownMessageTypes: Set<String> = [
@@ -147,64 +146,6 @@ enum NativeBridge {
         }
         return "unknown"
     }
-
-    // MARK: 登录填充
-
-    /// 把服务的 LoginFillServiceResponse（密码只给钥匙串引用）改写为交给扩展的 LoginFillResponse
-    /// （`{ field, value }`）。服务的失败应答原样透传。任一密码读取失败则整体失败，不返回部分结果。
-    static func rewriteLoginFill(
-        _ response: [String: Any],
-        now: Date,
-        readPassword: (String) -> Result<String, KeychainFailureReason>
-    ) -> Result<[String: Any], NativeFailure> {
-        guard JSONLine.bool(response["ok"]) == true else { return .success(response) }
-        guard let data = response["data"] as? [String: Any],
-              let entries = data["fills"] as? [Any],
-              entries.count <= 4
-        else {
-            return .failure(.malformedFill)
-        }
-        var seen = Set<String>()
-        var fills: [[String: Any]] = []
-        for raw in entries {
-            guard let entry = raw as? [String: Any], let field = entry["field"] as? String, !seen.contains(field) else {
-                return .failure(.malformedFill)
-            }
-            seen.insert(field)
-            switch field {
-            case "identifier":
-                guard let value = entry["value"] as? String, entry["keychainRef"] == nil else { return .failure(.malformedFill) }
-                fills.append(["field": field, "value": value])
-            case "password":
-                // 密码从不由服务直接给值：出现 value 即视为格式错误
-                guard entry["value"] == nil,
-                      let ref = entry["keychainRef"] as? String, KeychainRef.isValid(ref),
-                      let expiresText = entry["expiresAt"] as? String, let expiresAt = parseISODate(expiresText)
-                else {
-                    return .failure(.malformedFill)
-                }
-                guard expiresAt > now else { return .failure(.fillRefExpired) }
-                switch readPassword(ref) {
-                case .success(let value):
-                    fills.append(["field": field, "value": value])
-                case .failure(let reason):
-                    return .failure(.keychainRead(reason))
-                }
-            default:
-                return .failure(.malformedFill)
-            }
-        }
-        return .success(["ok": true, "data": ["fills": fills] as [String: Any]])
-    }
-
-    static func parseISODate(_ text: String) -> Date? {
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFraction.date(from: text) { return date }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: text)
-    }
 }
 
 /// 传输层失败（不含任何消息内容）。
@@ -218,7 +159,7 @@ enum BridgeTransportError: Error, Equatable {
     case handshakeFailed
 }
 
-/// 原生桥自己产生的错误应答。消息为简体中文，从不包含令牌、消息内容或钥匙串值。
+/// 原生桥自己产生的错误应答。消息为简体中文，从不包含令牌、消息内容、应答内容或密码。
 struct NativeFailure: Error, Equatable {
     let code: String
     let message: String
@@ -259,14 +200,8 @@ struct NativeFailure: Error, Equatable {
         )
     }
     static let malformedResponse = NativeFailure(code: "SURGE_UNREACHABLE", message: "无法连接本机服务：应答格式不正确", reason: "malformed")
-    static let malformedFill = NativeFailure(code: "FILL_NOT_ALLOWED", message: "登录填充失败：本机服务应答格式不正确", reason: "malformed")
-    static let fillRefExpired = NativeFailure(code: "FILL_NOT_ALLOWED", message: "登录填充失败：钥匙串引用已过期，请重新填充", reason: "expired")
 
     static let nonceUnavailable = NativeFailure(code: "INTERNAL", message: "处理请求失败：无法生成随机数")
-
-    static func keychainRead(_ reason: KeychainFailureReason) -> NativeFailure {
-        NativeFailure(code: "FILL_NOT_ALLOWED", message: "无法读取钥匙串中的登录密码：\(reason.displayText)", reason: reason.rawValue)
-    }
 
     static func unreachable(_ error: BridgeTransportError) -> NativeFailure {
         switch error {

@@ -1,4 +1,4 @@
-// 环境、代理版本、账号。秘密只以钥匙串引用（*_ref）与 HMAC 指纹（*_fp）出现。
+// 环境、代理版本、账号。秘密只以引用（*_ref，值在 secret_values 表，见 secrets/local-store.ts）与 HMAC 指纹（*_fp）出现。
 
 import type { SiteCode } from '@sfe/contract';
 import { col, mapper, nowIso, placeholders, type InsertOf, type RepoContext } from './common.js';

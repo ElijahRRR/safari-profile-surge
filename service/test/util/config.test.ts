@@ -64,7 +64,6 @@ describe('data directory defaults', () => {
       webRoot: null,
       extensionHarnessRoot: null,
       surgeCliPath: null,
-      keychainHelperPath: null,
       nodeVersionPin: null,
       installConfigIssues: [],
       bridge: { transport: 'tcp', host: '127.0.0.1', port: DEFAULT_BRIDGE_PORT, tokenFile: join(c.dataDir, 'bridge.token') },
@@ -148,12 +147,11 @@ describe('unsafe locations', () => {
 describe('install.json', () => {
   const dataDirOf = (o: LoadConfigOptions) => join(o.homedir, 'data');
 
-  test('reads Surge CLI, keychain helper, node pin, mechanisms, bridge and http port from a 0600 file', () => {
+  test('reads Surge CLI, node pin, mechanisms, bridge and http port from a 0600 file', () => {
     const o = base();
     const dataDir = dataDirOf(o);
     writeInstall(dataDir, {
       surgeCliPath: '/Applications/Surge.app/Contents/Applications/surge-cli',
-      keychainHelperPath: '/Applications/SafariProfileSurge.app/Contents/MacOS/sfe-keychain',
       nodeVersionPin: 'v22.22.0',
       adapterMechanism: { selectGroupPolicy: 'http', updateExternalResource: 'cli', reloadProfile: 'cli', bogus: 'cli', listRules: 'shell' },
       bridge: { transport: 'tcp', port: 61900 },
@@ -162,7 +160,6 @@ describe('install.json', () => {
     });
     const c = loadConfig({ ...o, argv: ['--data-dir', dataDir] });
     expect(c.surgeCliPath).toBe('/Applications/Surge.app/Contents/Applications/surge-cli');
-    expect(c.keychainHelperPath).toBe('/Applications/SafariProfileSurge.app/Contents/MacOS/sfe-keychain');
     expect(c.nodeVersionPin).toBe('v22.22.0');
     expect(c.adapterMechanism.selectGroupPolicy).toBe('http');
     expect(c.adapterMechanism.updateExternalResource).toBe('cli');
@@ -249,14 +246,40 @@ describe('install.json', () => {
   test('ignores relative paths and malformed fields individually', () => {
     const o = base();
     const dataDir = dataDirOf(o);
-    writeInstall(dataDir, { surgeCliPath: 'surge-cli', keychainHelperPath: '/ok/helper', nodeVersionPin: '22', httpPort: 'x', bridge: { transport: 'pipe' } });
+    writeInstall(dataDir, { surgeCliPath: 'surge-cli', nodeVersionPin: '22', httpPort: 'x', bridge: { transport: 'pipe' } });
     const c = loadConfig({ ...o, argv: ['--data-dir', dataDir] });
     expect(c.surgeCliPath).toBeNull();
-    expect(c.keychainHelperPath).toBe('/ok/helper');
     expect(c.nodeVersionPin).toBeNull();
     expect(c.httpPort).toBe(61847);
     expect(c.bridge.transport).toBe('tcp');
     expect(c.installConfigIssues).toHaveLength(4);
+  });
+
+  test('an install.json written by the Keychain version (keychainHelperPath) still loads: the field is ignored without an issue', () => {
+    const o = base();
+    const dataDir = dataDirOf(o);
+    for (const helper of ['/Applications/SafariProfileSurge.app/Contents/MacOS/sfe-keychain', 'relative/sfe-keychain', 42, null]) {
+      writeInstall(dataDir, { surgeCliPath: '/Applications/Surge.app/Contents/Applications/surge-cli', keychainHelperPath: helper, httpPort: 61999 });
+      const c = loadConfig({ ...o, argv: ['--data-dir', dataDir] });
+      expect(c.surgeCliPath).toBe('/Applications/Surge.app/Contents/Applications/surge-cli');
+      expect(c.httpPort).toBe(61999);
+      expect(c.installConfigIssues).toEqual([]);
+      expect(c).not.toHaveProperty('keychainHelperPath');
+      expect(readInstallConfig(c.installConfigPath)).not.toHaveProperty('keychainHelperPath');
+    }
+  });
+
+  // 回退（INSTALL §7 第 1 步）：装回旧版本后，launchd 重新启动的旧服务可能在打开旧 App 之前就读取 install.json，
+  // 没有 keychainHelperPath 就没有钥匙串工具、进不了普通模式。所以宿主 App 合并时从不删除字段（这里没有 Swift 工具链，
+  // 只能核对源码；行为由 apps/macos/Tests/InstallConfigTests.swift testLegacyKeychainHelperPathIsPreserved 覆盖）。
+  test('the macOS host app never deletes install.json fields on merge (keeps the old version\'s keychainHelperPath for rollback)', () => {
+    const swift = readFileSync(fileURLToPath(new URL('../../../apps/macos/App/InstallConfig.swift', import.meta.url)), 'utf8');
+    const body = /static func merged\(existing:[\s\S]*?\n {4}\}\n/.exec(swift)?.[0];
+    expect(body).toBeDefined();
+    expect(body).not.toMatch(/removeValue|removeAll|\]\s*=\s*nil|keychainHelperPath/);
+    expect(swift).not.toMatch(/obsoleteKeys/);
+    // 新建的配置也不写这个字段（只保留已有的值）
+    expect(swift).not.toMatch(/config\["keychainHelperPath"\]\s*=/);
   });
 
   test('unix bridge transport with a valid path', () => {

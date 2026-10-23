@@ -13,7 +13,7 @@ export interface MetaRepo {
   bumpConfigurationGeneration(): number;
   eventSequence(): number;
   setEventSequence(n: number): void;
-  /** 钥匙串中的 pepper 是否曾经创建过：为 true 而读不到时必须 fail closed，不能重新生成。 */
+  /** 本机秘密资料中的 pepper 是否曾经创建过：为 true 而读不到时必须 fail closed，不能重新生成。 */
   pepperCreated(): boolean;
   markPepperCreated(): void;
   schemaVersion(): number;

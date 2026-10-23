@@ -215,15 +215,16 @@ export type BeginVerificationResponse =
   | { status: 'ready'; test_id: string; route_epoch: number; verify_url: string; deadline: IsoTime }
   | { status: 'not_needed'; message: string };
 
-/** 服务对原生桥的填充应答：账号标识直接给值；密码只给钥匙串引用，由签名的原生桥自行读取。 */
-export interface LoginFillServiceResponse {
-  fills: Array<{ field: 'identifier'; value: string } | { field: 'password'; keychainRef: string; expiresAt: IsoTime }>;
-}
-
-/** 原生桥交给扩展的填充值（原生桥解析钥匙串引用后）。扩展只在内存中短暂持有。 */
+/**
+ * 登录填充的值：服务按 §6.10 把关通过后，从本机后台资料读出账号标识与密码直接给值；原生桥原样转给扩展，
+ * 不改写。扩展只在内存中短暂持有，从不写入存储。
+ */
 export interface LoginFillResponse {
   fills: Array<{ field: 'identifier' | 'password'; value: string }>;
 }
+
+/** 服务对原生桥的填充应答：与原生桥交给扩展的应答完全相同。 */
+export type LoginFillServiceResponse = LoginFillResponse;
 
 export interface NativeResponseMap {
   getCurrentState: CurrentStateResponse;

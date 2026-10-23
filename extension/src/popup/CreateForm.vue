@@ -164,7 +164,7 @@ onBeforeUnmount(wipeSecrets);
         <label class="input-label">登录密码</label>
         <input v-model="secrets.accountPassword" class="input" type="password" autocomplete="off" data-test="create-account-password" />
         <p v-if="fieldError(errors, 'account.password')" class="input-error-text mt-1.5">{{ fieldError(errors, 'account.password') }}</p>
-        <p v-else class="input-hint mt-1.5">保存到钥匙串，不在扩展中保存。</p>
+        <p v-else class="input-hint mt-1.5">保存在本机后台，不在扩展中保存。</p>
       </div>
       <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300">
         <input v-model="form.autoOpenOrders" type="checkbox" class="h-4 w-4 rounded" data-test="create-auto-open" />

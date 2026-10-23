@@ -1,4 +1,5 @@
-// sfe-service 组装根（docs/ARCHITECTURE.md §3、§10、§11）：版本断言 → 配置 → 迁移 → 日志与脱敏 → 秘密存储 →
+// sfe-service 组装根（docs/ARCHITECTURE.md §3、§10、§11）：版本断言 → 配置 → 日志与脱敏 → 旧版数据目录检查（使用钥匙串的
+// 旧版数据目录在迁移之前 fail closed，不改动数据库）→ 迁移 → 秘密存储（本机数据库，不使用钥匙串）→
 // Surge 适配（按原语固定实现；演示模式为 FakeSurge）→ AppService 启动（对账、恢复、执行器）→ HTTP、原生桥、
 // agent/maintenance 套接字。收到 SIGINT/SIGTERM 时只关闭监听与执行器，从不改变 Surge 的入口或选择。
 
@@ -10,7 +11,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SfeError } from '@sfe/contract';
 import { loadConfig, type ServiceConfig } from './config.js';
-import { openRepositories, type Repositories } from './db/index.js';
+import { createRepositories, openDatabase, type Repositories } from './db/index.js';
 import { createAppService, type EngineAppService } from './engine/app-service.js';
 import { STAGED_CRYPTEX_PATH, pathPresence, restartPendingFrom, versionExtraFromSwVers } from './engine/capabilities.js';
 import type { HostInfo } from './engine/context.js';
@@ -21,9 +22,7 @@ import { createAdminServer, type AdminServerHandle } from './ipc/admin-server.js
 import { createBridgeServer, type BridgeServerHandle } from './ipc/bridge-server.js';
 import { createBridgeTokenSource, readBridgeTokenFile } from './ipc/bridge-token.js';
 import type { Logger, MaintenanceSurge, SecretStore, SurgeAdapter } from './ports.js';
-import { KeychainHelperStore } from './secrets/keychain-helper-store.js';
-import { MemorySecretStore } from './secrets/memory-store.js';
-import { secretStoreError } from './secrets/errors.js';
+import { LEGACY_KEYCHAIN_DATA_MESSAGE, LocalSecretStore, assertNoLegacyKeychainData } from './secrets/local-store.js';
 import { createCliAdapter, defaultCodesignRunner, verifyCliPath } from './surge/cli-adapter.js';
 import { createCompositeAdapter } from './surge/composite.js';
 import { createHttpAdapter, parseHttpApiLine } from './surge/http-adapter.js';
@@ -73,20 +72,6 @@ export function assertRuntime(pin: string | null, version = process.version): vo
   }
   const [major, minor] = version.replace(/^v/, '').split('.').map(Number);
   if ((major ?? 0) < 22 || ((major ?? 0) === 22 && (minor ?? 0) < 13)) throw new SfeError('INTERNAL', '启动失败：需要 Node 22.13 或更新版本（node:sqlite）');
-}
-
-function unavailableStore(): SecretStore {
-  return {
-    put: async () => {
-      throw secretStoreError('put', 'other', '没有配置钥匙串工具');
-    },
-    get: async () => {
-      throw secretStoreError('get', 'other', '没有配置钥匙串工具');
-    },
-    delete: async () => {
-      throw secretStoreError('delete', 'other', '没有配置钥匙串工具');
-    },
-  };
 }
 
 const unavailableMaintenance: MaintenanceSurge = {
@@ -210,7 +195,28 @@ async function startServiceHeld(opts: StartOptions): Promise<RunningService> {
   for (const issue of config.installConfigIssues) logger.log('warn', 'config.install_issue', { issue });
   const ids = createIdGenerator();
   const clock = systemClock;
-  const repos = openRepositories(config.databasePath, { clock, ids, scrubber });
+  const db = openDatabase(config.databasePath);
+  if (!config.demo) {
+    // 旧版（钥匙串）数据目录：在迁移之前拒绝启动，拒绝时数据库保持旧版本的结构（装回旧版本仍能打开它、进入普通模式；
+    // 旧服务需要的 install.json keychainHelperPath 由宿主 App 合并时保留）；
+    // 也在加载 pepper、清扫引用或接受任何请求之前。从不读取钥匙串迁移。launchd 丢弃 stderr，所以中文说明也写进日志
+    try {
+      assertNoLegacyKeychainData(db);
+    } catch (err) {
+      if (err instanceof SfeError && err.details?.reason === 'legacy_keychain_data') {
+        logger.log('error', 'secrets.legacy_keychain_data', {
+          pepperMissing: err.details.pepperMissing === true,
+          missingCommittedRefs: err.details.missingCommittedRefs ?? null,
+          message: LEGACY_KEYCHAIN_DATA_MESSAGE,
+        });
+      }
+      db.close();
+      sink.close();
+      throw err;
+    }
+  }
+  db.migrate();
+  const repos = createRepositories(db, { clock, ids, scrubber });
 
   let store: SecretStore;
   let surge: SurgeAdapter;
@@ -224,9 +230,7 @@ async function startServiceHeld(opts: StartOptions): Promise<RunningService> {
     const pepper = await loadPepper(store, repos.meta, ids);
     await prepareDemoState(repos, demoSurge, pepper);
   } else {
-    store = config.keychainHelperPath
-      ? new KeychainHelperStore({ helperPath: config.keychainHelperPath, kindOf: (ref) => repos.secretRefs.get(ref)?.kind ?? null })
-      : unavailableStore();
+    store = new LocalSecretStore({ db: repos.db, clock, scrubber });
     surge = await buildRealSurge(config, repos, logger, (s) => scrubber.scrub(s));
   }
 

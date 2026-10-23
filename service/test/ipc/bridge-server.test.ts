@@ -329,7 +329,7 @@ describe('bridge server (tcp)', () => {
 
   test('other errors → INTERNAL without details', async () => {
     const app = createStubApp();
-    app.throwOn('handleNative', new Error('keychain item CANARY-kc-991 locked'));
+    app.throwOn('handleNative', new Error('secret store CANARY-kc-991 failed'));
     const { endpoint, logger } = await startTcp({ app });
     const res = await respond(endpoint);
     expect(res).toEqual({ ok: false, error: { code: 'INTERNAL', message: '服务内部错误' } });
@@ -339,13 +339,19 @@ describe('bridge server (tcp)', () => {
 
   test('never logs message contents, the token, the profile id, nonces or proofs', async () => {
     const { app, endpoint, logger } = await startTcp();
-    app.respond('handleNative', { ok: true, data: { fills: [{ field: 'identifier', value: 'buyer01@example.test' }] } });
+    // 登录填充的应答带账号密码的值（服务从本机后台资料读出）：原样交给原生桥，从不写入日志
+    const fills = [
+      { field: 'identifier', value: 'buyer01@example.test' },
+      { field: 'password', value: 'synth-CANARY-fill-pw' },
+    ];
+    app.respond('handleNative', { ok: true, data: { fills } });
     const ok = await call(endpoint, {
       payload: payloadOf({
-        message: { type: 'requestLoginFill', top_url: 'https://www.amazon.com/ap/signin?CANARY-URL', frame_is_top: true, form_action: null, fields: ['identifier'], route_epoch: 3 },
+        message: { type: 'requestLoginFill', top_url: 'https://www.amazon.com/ap/signin?CANARY-URL', frame_is_top: true, form_action: null, fields: ['identifier', 'password'], route_epoch: 3 },
       }),
     });
     if (ok.kind !== 'response') throw new Error('handshake failed');
+    expect(JSON.stringify(ok)).toContain('synth-CANARY-fill-pw');
     await call(endpoint, { request: (req) => ({ ...req, clientProof: 'f'.repeat(64), payload: payloadOf({ message: { type: 'getCurrentState', note: 'CANARY-forged' } }) }) });
     await call(endpoint, { token: 'wrong-token-CANARY-000000000000000' });
     await exchangeRaw(endpoint, 'GET /CANARY-PATH HTTP/1.1\r\n\r\n');

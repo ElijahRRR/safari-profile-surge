@@ -3,7 +3,6 @@ import XCTest
 final class InstallConfigTests: XCTestCase {
     private let fields = InstallConfig.Fields(
         surgeCliPath: "/Applications/Surge.app/Contents/Applications/surge-cli",
-        keychainHelperPath: "/Applications/SafariProfileSurge.app/Contents/Helpers/sfe-keychain",
         nodeVersionPin: "22.13.1",
         bridgePort: 61848,
         webRoot: "/Applications/SafariProfileSurge.app/Contents/Resources/service/web"
@@ -12,7 +11,9 @@ final class InstallConfigTests: XCTestCase {
     func testFreshConfigHasAllPrimitivesUnavailable() {
         let config = InstallConfig.merged(existing: nil, fields: fields)
         let mechanisms = config["adapterMechanism"] as? [String: String]
-        XCTAssertEqual(mechanisms?.count, 22)
+        // 与 InstallConfig.primitives 一一对应（该列表由 service/test/util/config.test.ts 与 ALL_SURGE_PRIMITIVES 交叉核对），不另写数字
+        XCTAssertEqual(mechanisms?.count, InstallConfig.primitives.count)
+        XCTAssertEqual(mechanisms.map { Set($0.keys) }, Set(InstallConfig.primitives))
         XCTAssertEqual(Set(mechanisms.map { Array($0.values) } ?? []), ["unavailable"])
         XCTAssertEqual(mechanisms?["reloadProfile"], "unavailable")
         XCTAssertEqual(mechanisms?["selectGroupPolicy"], "unavailable")
@@ -21,7 +22,7 @@ final class InstallConfigTests: XCTestCase {
     func testFreshConfigFields() {
         let config = InstallConfig.merged(existing: nil, fields: fields)
         XCTAssertEqual(config["surgeCliPath"] as? String, fields.surgeCliPath)
-        XCTAssertEqual(config["keychainHelperPath"] as? String, fields.keychainHelperPath)
+        XCTAssertNil(config["keychainHelperPath"])
         XCTAssertEqual(config["nodeVersionPin"] as? String, "22.13.1")
         XCTAssertEqual(config["webRoot"] as? String, fields.webRoot)
         let bridge = config["bridge"] as? [String: Any]
@@ -45,11 +46,28 @@ final class InstallConfigTests: XCTestCase {
     }
 
     func testUnknownKeysArePreservedAndOwnedKeysUpdated() {
-        let existing: [String: Any] = ["httpPort": 61900, "keychainHelperPath": "/old/path", "bridge": ["transport": "tcp", "port": 1] as [String: Any]]
+        let existing: [String: Any] = ["httpPort": 61900, "nodeVersionPin": "22.12.0", "bridge": ["transport": "tcp", "port": 1] as [String: Any]]
         let config = InstallConfig.merged(existing: existing, fields: fields)
         XCTAssertEqual(config["httpPort"] as? Int, 61900)
-        XCTAssertEqual(config["keychainHelperPath"] as? String, fields.keychainHelperPath)
+        XCTAssertEqual(config["nodeVersionPin"] as? String, "22.13.1")
         XCTAssertEqual((config["bridge"] as? [String: Any])?["port"] as? Int, 61848)
+    }
+
+    func testLegacyKeychainHelperPathIsPreserved() {
+        // 旧版本（钥匙串方案）写入的 sfe-keychain 路径：新版本不使用它（服务读取时忽略），但合并时原样保留——
+        // 装回旧版本时，launchd 重新启动的旧服务可能在打开旧 App 之前就读取 install.json，缺少它就没有钥匙串工具（INSTALL §7 第 1 步）
+        let helper = "/Applications/SafariProfileSurge.app/Contents/Helpers/sfe-keychain"
+        let existing: [String: Any] = [
+            "httpPort": 61900,
+            "keychainHelperPath": helper,
+            "adapterMechanism": ["selectGroupPolicy": "cli"],
+        ]
+        let config = InstallConfig.merged(existing: existing, fields: fields)
+        XCTAssertEqual(config["keychainHelperPath"] as? String, helper)
+        XCTAssertEqual(config["httpPort"] as? Int, 61900)
+        XCTAssertEqual(config["adapterMechanism"] as? [String: String], ["selectGroupPolicy": "cli"])
+        // 再次合并（每次启动 App）仍保留
+        XCTAssertEqual(InstallConfig.merged(existing: config, fields: fields)["keychainHelperPath"] as? String, helper)
     }
 
     func testInvalidNodePinIsNotWritten() {
