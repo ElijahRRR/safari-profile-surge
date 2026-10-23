@@ -40,7 +40,12 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
   const route = repos.routeState.get();
   try {
     if (route.entryMode === 'NORMAL') {
-      const sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
+      // 初始化前允许删除仅保存在本机的草稿。CLI 对不存在的组会报错而非返回 null；
+      // 只在没有工作配置、没有已部署版本且运行时确认组不存在时跳过选择查询。
+      const localOnly = engine.profileFiles() === null && env.deployedProxyRevision === null
+        && revisions.every((r) => r.state === 'desired');
+      const groupAbsent = localOnly && !(await engine.surge.listPolicies()).groups.includes(ROUTE_GROUP_NAME);
+      const sel = groupAbsent ? null : await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
       if (sel !== null && names.has(sel)) {
         await engine.surge.selectGroupPolicy(ROUTE_GROUP_NAME, 'REJECT');
         const after = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
@@ -57,6 +62,9 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
   // 仍在节点资源中的版本留给之后的发布移除；不在资源中的版本立即 retired 并回收秘密
   const files = engine.profileFiles();
   const inResource = new Set(resourceNodeNames(files ? await files.read(NODE_RESOURCE_FILE).catch(() => null) : null));
+  // 仅终结该环境自己的挂起编辑；批量发布可能还包含其他环境，不能整批取消。
+  const obsolete = repos.operations.listByStatus(['parked'], { kinds: ['environment.create', 'environment.update'] })
+    .filter((pending) => pending.environmentId === env.id);
   repos.tx(() => {
     for (const r of revisions) {
       if (r.state === 'retired') continue;
@@ -71,10 +79,15 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
     repos.accounts.delete(env.id);
     repos.profileBindings.deleteByEnvironment(env.id);
     repos.environments.update(env.id, { deletedAt: engine.nowIso(), revision: env.revision + 1 });
+    for (const pending of obsolete) {
+      repos.outbox.cancelForOperation(pending.id);
+      repos.operations.update(pending.id, { status: 'superseded', phase: 'SUPERSEDED', supersededBy: op.id, error: null });
+      repos.operations.appendStep(pending.id, 'SUPERSEDED', '环境已删除，取消尚未完成的环境发布');
+    }
     repos.operations.update(op.id, { phase: 'COMPLETED', status: 'succeeded', resultRevision: env.revision + 1 });
     repos.operations.appendStep(op.id, 'COMPLETED', '环境已删除：映射与账号已清除，节点将在之后的发布中移除；Safari 场景、Cookie 与登录资料未改动');
   });
-  engine.emit({ operations: [op.id], deletedEnvironments: [env.id], fronts: true, route: true });
+  engine.emit({ operations: [op.id, ...obsolete.map((pending) => pending.id)], deletedEnvironments: [env.id], fronts: true, route: true });
 }
 
 export async function runUnbind(engine: Engine, op: OperationRecord): Promise<void> {
