@@ -598,6 +598,52 @@ describe('normal mode (§6.5)', () => {
 });
 
 describe('delete / unbind (§6.7)', () => {
+  const uninitializedProfile = '[Proxy]\nFront-A = socks5, 192.0.2.10, 1080\n[Proxy Group]\nDaily = select, Front-A, DIRECT\n[Rule]\nFINAL,DIRECT\n';
+
+  test('uninitialized draft deletion needs no route group or network writes and supersedes only its parked publish', async () => {
+    h = await createHarness({ sourceProfile: uninitializedProfile, capabilities: [] });
+    const a = await createEnv(h, 'Draft-A', '203.0.113.10');
+    const b = await createEnv(h, 'Draft-B', '203.0.113.11');
+    expect(h.repos.operations.get(a.operation_id)!.status).toBe('parked');
+    // Real CLI throws for an absent group; the fake normally returns null.
+    h.fake.failNext('getGroupSelection', new SfeError('SURGE_COMMAND_FAILED', 'Policy group does not exist.'));
+    const before = { ...h.fake.calls };
+    const env = h.repos.environments.get(a.environment_id!)!;
+    const d = await h.app.deleteEnvironment(env.id, { request_id: rid(), expected_revision: env.revision }, ADMIN);
+    await h.idle();
+    expect(h.repos.operations.get(d.operation_id)!.status).toBe('succeeded');
+    expect(h.repos.environments.get(env.id)!.deletedAt).not.toBeNull();
+    expect(h.repos.proxyRevisions.listByEnvironment(env.id).every((r) => r.state === 'retired')).toBe(true);
+    expect(h.repos.operations.get(a.operation_id)).toMatchObject({ status: 'superseded', supersededBy: d.operation_id, error: null });
+    expect(h.repos.operations.get(b.operation_id)!.status).toBe('parked');
+    for (const name of ['getGroupSelection', 'selectGroupPolicy', 'updateExternalResource', 'reloadProfile', 'killRequest', 'addTempRule', 'removeTempRule']) {
+      expect(h.fake.calls[name] ?? 0).toBe(before[name] ?? 0);
+    }
+  });
+
+  test('draft deletion fails closed if runtime policy inventory cannot be read', async () => {
+    h = await createHarness({ sourceProfile: uninitializedProfile, capabilities: [] });
+    const a = await createEnv(h, 'Draft', '203.0.113.10');
+    h.fake.failNext('listPolicies');
+    const env = h.repos.environments.get(a.environment_id!)!;
+    const d = await h.app.deleteEnvironment(env.id, { request_id: rid(), expected_revision: env.revision }, ADMIN);
+    await h.idle();
+    expect(h.repos.operations.get(d.operation_id)!.status).toBe('failed');
+    expect(h.repos.environments.get(env.id)!.deletedAt).toBeNull();
+    expect(h.repos.operations.get(a.operation_id)!.status).toBe('parked');
+  });
+
+  test('existing route group query errors are not treated as an absent group', async () => {
+    h = await createHarness({ sourceProfile: uninitializedProfile + '[Proxy Group]\nSFE-ROUTE = select, REJECT\n', capabilities: [] });
+    const a = await createEnv(h, 'Draft', '203.0.113.10');
+    h.fake.failNext('getGroupSelection');
+    const env = h.repos.environments.get(a.environment_id!)!;
+    const d = await h.app.deleteEnvironment(env.id, { request_id: rid(), expected_revision: env.revision }, ADMIN);
+    await h.idle();
+    expect(h.repos.operations.get(d.operation_id)!.status).toBe('failed');
+    expect(h.repos.environments.get(env.id)!.deletedAt).toBeNull();
+  });
+
   test('active environment: ENVIRONMENT_ACTIVE, no request-level confirmation', async () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
