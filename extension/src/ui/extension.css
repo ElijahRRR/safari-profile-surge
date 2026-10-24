@@ -1,0 +1,14 @@
+/* 扩展页面补充样式：只做 EasyQuick 没有的页面尺寸约束，颜色与组件样式全部来自设计系统。 */
+body.sfe-popup {
+  width: 380px;
+  min-width: 380px;
+  min-height: 0;
+}
+
+body.sfe-prepare {
+  min-height: 100vh;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+}

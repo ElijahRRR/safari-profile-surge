@@ -1,0 +1,19 @@
+{
+  "name": "@sfe/easyquick",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tokens.css": "./src/tokens.css",
+    "./easyquick.css": "./src/easyquick.css",
+    "./app.css": "./src/app.css",
+    "./tailwind.preset.cjs": "./tailwind.preset.cjs"
+  },
+  "scripts": {
+    "typecheck": "vue-tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "vue": "3.5.43"
+  }
+}
