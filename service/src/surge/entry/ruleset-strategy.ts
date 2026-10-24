@@ -2,8 +2,8 @@
 // 文档：本地规则集“Local files are watched and reloaded automatically when they change.”（规则集文档）；外部资源更新
 // “Local resources are skipped.”（HTTP API 文档，Mac 6.10.0+）——所以从不对本地入口文件调用 updateExternalResource，
 // 也从不把它当作刷新。每一步：读取自动重载设置并与实测条件比对 → 确认 Surge 中恰好一个资源指向该文件 → 比较并替换地
-// 原子写入单个文件（带新的见证标记，期望上次摘要）→ 在有限时间内轮询 `rule match <见证主机>`，直到 Surge 已加载这一版
-// 内容 → 有效规则顺序与 Safari/对照探测读回 → 确认归属，才进行下一步。超时按未知处理（不声称更宽松的状态）。
+// 原子写入单个文件（带新的见证标记，期望上次摘要）→ 在有限时间内轮询 `rule match <文档地址> process-path=<见证路径>`，
+// 直到 Surge 已加载这一版内容 → 有效规则顺序与 Safari/对照探测读回 → 确认归属，才进行下一步。超时按未知处理（不声称更宽松的状态）。
 // 从不重载配置、更新全部或 flush。见 docs/ARCHITECTURE.md §5.5。
 
 import { randomBytes } from 'node:crypto';
@@ -12,9 +12,10 @@ import { fileURLToPath } from 'node:url';
 import {
   ENTRY_MODE_BITS,
   ENTRY_PLACEHOLDER_RULE,
+  ENTRY_PROBE_IPV4,
   ENTRY_RULESET_FILES,
-  ENTRY_WITNESS_PROCESS_PATH,
   LEGACY_ENTRY_PLACEHOLDER_RULE,
+  PREVIOUS_ENTRY_PLACEHOLDER_RULE,
   ROUTE_GROUP_NAME,
   SfeError,
   type EntryBits,
@@ -28,7 +29,7 @@ import {
   ENTRY_BIT_POLICY,
   entryRuleSetFileContent,
   entryRules,
-  entryWitnessHost,
+  entryWitnessProcessPath,
   entryWitnessRule,
   parseEntryRuleSetFile,
   type EntryBit,
@@ -69,28 +70,22 @@ const BIT_OUTCOME: Record<EntryBit, Outcome> = { udp: 'reject', verify: 'route',
 export const DEFAULT_RULESET_WATCH = { timeoutMs: 5000, pollMs: 200 } as const;
 
 /**
- * 见证探测用的合成进程路径（contract 的 ENTRY_WITNESS_PROCESS_PATH）：不存在的可执行文件，见证规则与占位规则都限定它，
- * 所以只有见证探测命中，Safari、Chrome 与其他应用的真实请求都不会（DOMAIN 规则按主机名匹配、不做 DNS 查询，`.invalid`
- * 不解析并不能挡住真实请求，见 generate.ts）。排在入口之前、能命中它的规则会让见证一直读不到（超时，失败即关闭）。
- */
-export const WITNESS_PROBE_PROCESS_PATH = ENTRY_WITNESS_PROCESS_PATH;
-
-/**
  * 入口段不完整、重复或顺序不对时（ruleset_order）撤销入口走向普通模式以外的方向停止的说明：写明恢复路径（先进入普通模式，它把
  * 入口规则集文件改写为占位规则，再在维护中重新合并恢复受管理段）。
  */
 const DAMAGED_SEGMENT_MESSAGE = '切换入口失败：本应用入口的 RULE-SET 不在有效规则中、重复或顺序不对（工作配置被外部修改），请先进入普通模式，再在维护中重新合并';
 
-/** 关闭的位的占位规则（规范化）：当前格式与旧格式（不限定进程，只识别、从不写入）。 */
+/**
+ * 关闭的位的占位规则（规范化）：当前格式（只有合成进程路径）、上一版（合成进程 + `.invalid` 主机）与最早的格式（不限定进程）。
+ * 后两种只识别、从不写入。
+ */
 const LEGACY_PLACEHOLDER_N = normalizeRuleText(LEGACY_ENTRY_PLACEHOLDER_RULE);
-const PLACEHOLDERS_N = [normalizeRuleText(ENTRY_PLACEHOLDER_RULE), LEGACY_PLACEHOLDER_N];
+const PLACEHOLDERS_N = [normalizeRuleText(ENTRY_PLACEHOLDER_RULE), normalizeRuleText(PREVIOUS_ENTRY_PLACEHOLDER_RULE), LEGACY_PLACEHOLDER_N];
 
-/** 仍带旧格式占位规则的位（旧版本写入、没有见证的文件；下一次切换按未知重写）。 */
+/** 仍带最早格式占位规则（不限定进程）的位：旧版本写入、没有见证的文件，读回证据写明，下一次切换按未知重写。 */
 function legacyPlaceholderBits(files: Record<EntryBit, { bodies: string[] }>): EntryBit[] {
   return ENTRY_BITS_IN_ORDER.filter((b) => files[b].bodies.includes(LEGACY_PLACEHOLDER_N));
 }
-/** 占位规则中的主机（对照探测：Chrome 请求它也不得命中入口规则或 SFE-ROUTE）。 */
-const PLACEHOLDER_HOST = 'sfe-disabled.invalid';
 
 export interface RulesetStrategyDeps extends EntryStrategyDeps {
   files: NonNullable<EntryStrategyDeps['files']>;
@@ -115,6 +110,8 @@ interface FileState {
   value: boolean | null;
   digest: string | null;
   witness: string | null;
+  /** 文件带旧格式见证（按主机名的 `.invalid` 见证）：不作为已加载的证明，按没有见证处理（unwitnessed），下一次切换改写。 */
+  legacyWitness: boolean;
   /** 文件中的规则行（不含注释与见证行），用于识别 rule match 回显的子规则。 */
   bodies: string[];
 }
@@ -263,28 +260,29 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
   }
 
   /**
-   * 见证读回：Surge 已加载的这一位内容是不是带 token 的那一版。命中该位的 RULE-SET 行，或回显子规则时就是这条唯一的
-   * 见证行（其他文件不可能含有这一主机）；最终策略须与该位一致。读取失败抛出。
+   * 见证读回：Surge 已加载的这一位内容是不是带 token 的那一版。探测 `rule match <ENTRY_PROBE_IPV4> process-path=<见证路径>`：
+   * 目标是文档地址 IP 字面量，求值不需要 DNS——这一版尚未加载时见证不命中，求值走到用户规则或 FINAL，得到一个正常回答
+   * （读作“不是这一版”），而不是 DNS 失败。命中该位的 RULE-SET 行，或回显子规则时就是这条唯一的见证行（其他文件与其他位
+   * 不可能含有这一路径）；最终策略须与该位一致。读取失败抛出（结果未知，调用方失败即关闭）。
+   * 排在入口之前、能命中 192.0.2.1 或任何进程的规则（例如模块中的保留地址 IP-CIDR）会让见证一直读不到（超时，失败即关闭）。
    */
   async function witnessLoaded(bit: EntryBit, token: string): Promise<boolean> {
-    const host = entryWitnessHost(bit, token);
-    const r = await deps.adapter.matchRule({ host, processPath: WITNESS_PROBE_PROCESS_PATH, protocol: 'TCP', port: 443 });
+    const r = await deps.adapter.matchRule({ host: ENTRY_PROBE_IPV4, processPath: entryWitnessProcessPath(bit, token), protocol: 'TCP', port: 443 });
     const set = bitOfRuleSet(r.rule);
     const hit = set === bit || (set === null && sameRuleText(r.rule, entryWitnessRule(bit, token)));
     return hit && policyFits(BIT_OUTCOME[bit], r.policy);
   }
 
   /**
-   * Safari 与对照探测（runtimeProbes），另加对照进程对各文件当前见证主机与占位主机的探测：见证与占位规则限定合成进程，
-   * Chrome 请求这些主机也不得命中本应用入口规则或 SFE-ROUTE（DOMAIN 规则只看主机名，见 generate.ts）。
-   * 例外：还有文件带旧格式占位规则（不限定进程，旧版本写入）时不探测占位主机——那是已知、只涉及这一个 `.invalid` 主机的
-   * 旧格式问题（读回证据写明），切换会按未知重写这些文件；探测它只会让改写旧文件的每一步都失败。
+   * Safari 与对照探测（runtimeProbes：Safari 与对照进程 × {检测主机, 其他主机} × {TCP, UDP}）。不再另用对照进程探测见证与
+   * 占位规则：它们只由合成进程的完整路径构成，不含主机条件，对照进程（Chrome 的路径）只有在 Surge 的完整路径匹配本身出错时
+   * 才会命中——这由 P0 验证一次、由生成器测试固定（任何真实进程路径都不可能匹配）；而探测合成域名会在已加载的仍是旧格式
+   * （`.invalid` 主机）时走到用户的 IP 规则、因 DNS 失败让每一次读回失败。没有站点主机时“其他主机”是文档地址 IP 字面量，
+   * 对照进程照样有一个不需要 DNS 的探测。
    */
   async function probeRuntime(s: Pick<RulesetState, 'cfg' | 'files'>, known: Record<EntryBit, boolean | null>, issues: readonly PrecedenceIssue[]): Promise<ProbeJudgement> {
-    const witnessHosts = ENTRY_BITS_IN_ORDER.flatMap((b) => (s.files[b].witness ? [entryWitnessHost(b, s.files[b].witness!)] : []));
-    const controlHosts = legacyPlaceholderBits(s.files).length > 0 ? witnessHosts : [...witnessHosts, PLACEHOLDER_HOST];
     try {
-      const results = await runProbes(deps.adapter, runtimeProbes(s.cfg, controlHosts), identify(s.files));
+      const results = await runProbes(deps.adapter, runtimeProbes(s.cfg), identify(s.files));
       return judgeProbes(results, (c) => acceptableFirstBits(known, c), issues);
     } catch (e) {
       return probeReadFailure(e);
@@ -302,11 +300,13 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       const digest = await files.digest(name);
       let value: boolean | null = null;
       let witness: string | null = null;
+      let legacyWitness = false;
       let bodies: string[] = [];
       if (content === null) anomalies.push(`file_missing_${bit}`);
       else {
         const parsed = parseEntryRuleSetFile(bit, content);
         witness = parsed.witness;
+        legacyWitness = parsed.legacyWitness;
         bodies = parsed.bodies;
         if (bodies.length === 1 && PLACEHOLDERS_N.includes(bodies[0]!)) value = false;
         else if (sameList(bodies, entryRules(bit, true, cfg).map(normalizeRuleText))) value = true;
@@ -322,7 +322,7 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
           if (digest !== null && digest === rec.digest) intentWritten.push(bit);
         }
       } else if (rec.digest === null || rec.digest !== digest) anomalies.push(`file_changed_${bit}`);
-      fileStates[bit] = { bit, name, path: resolve(dir, name), value, digest, witness, bodies };
+      fileStates[bit] = { bit, name, path: resolve(dir, name), value, digest, witness, legacyWitness, bodies };
     }
     const resources = await deps.adapter.listExternalResources();
     for (const bit of ENTRY_BITS_IN_ORDER) {
@@ -348,7 +348,8 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
     const values = ENTRY_BITS_IN_ORDER.map((b) => fileStates[b].value);
     const bits = values.some((v) => v === null) ? null : { udp: values[0]!, verify: values[1]!, block: values[2]!, active: values[3]! };
 
-    // 已加载内容：每个带见证的文件读回一次见证。rule match 不可用（未映射、Unknown command）时不再逐个尝试。
+    // 已加载内容：每个带见证的文件读回一次见证（旧格式见证不读：按没有见证处理）。rule match 不可用（未映射、Unknown command）
+    // 时不再逐个尝试。
     const loaded = {} as Record<EntryBit, LoadedState>;
     let unavailable: unknown = null;
     for (const bit of ENTRY_BITS_IN_ORDER) {
@@ -490,7 +491,8 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       `规则集文件：${s.bits ? ENTRY_BITS_IN_ORDER.filter((b) => s.bits![b]).join('、') || '全部为占位规则' : '无法识别'}`,
       ...ENTRY_BITS_IN_ORDER.map((b) => `规则集 ${b}：${LOADED_LABEL[s.loaded[b]]}`),
       ...s.anomalies.map((a) => `异常：${a}`),
-      ...legacyPlaceholderBits(s.files).map((b) => `规则集 ${b}：旧格式占位规则（不限定进程，任何进程请求 ${PLACEHOLDER_HOST} 都会命中），下一次切换时改写`),
+      ...legacyPlaceholderBits(s.files).map((b) => `规则集 ${b}：旧格式占位规则（${LEGACY_ENTRY_PLACEHOLDER_RULE}，不限定进程，任何进程请求这一主机都会命中），下一次切换时改写`),
+      ...ENTRY_BITS_IN_ORDER.filter((b) => s.files[b].legacyWitness).map((b) => `规则集 ${b}：旧格式见证规则（按 .invalid 主机），不作为已加载的证明，下一次切换时改写`),
       ...(s.judgement?.evidence ?? []),
     ];
     let mode = baseModeOf(s);
@@ -666,7 +668,7 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       throw e;
     }
     // 写入之后、读回确认之前，已加载状态可能是写前或写后（两者都在计划允许之内）：出错时不再声称上一状态已确认。
-    const written: FileState = { ...f, witness: token, bodies: parseEntryRuleSetFile(step.bit, content).bodies, value: step.value };
+    const written: FileState = { ...f, witness: token, legacyWitness: false, bodies: parseEntryRuleSetFile(step.bit, content).bodies, value: step.value };
     const fileStates = { ...cur, [step.bit]: written };
     try {
       const writtenDigest = await files.digest(f.name);
@@ -868,7 +870,7 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       }
       const digest = await files.digest(f.name);
       await deps.ownership.confirm('entry_ruleset_file', f.name, 'present', digest);
-      cur[bit] = { ...f, witness: token, bodies: parseEntryRuleSetFile(bit, content).bodies, value: false, digest };
+      cur[bit] = { ...f, witness: token, legacyWitness: false, bodies: parseEntryRuleSetFile(bit, content).bodies, value: false, digest };
       rewrote.push(bit);
       onStep?.(step);
     }

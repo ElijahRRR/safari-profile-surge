@@ -33,13 +33,17 @@ export interface MatchRecord extends MatchProbe {
   error: string | null;
 }
 
-export function matchProbes(opts: { processPaths: readonly string[]; controlPaths: readonly string[]; verifyHost: string; otherHost: string }): MatchProbe[] {
+/**
+ * 探测集合：每个进程路径 × 检测主机与每个其他主机 × TCP/UDP/QUIC。其他主机可以是 IP 字面量（文档地址，例如服务在没有站点主机
+ * 时用的 ENTRY_PROBE_IPV4）：入口的“其他主机”条件是 NOT(DOMAIN,<检测主机>)，对 IP 字面量同样成立，域名规则也不触发 DNS
+ * （“Domain rules match the hostname of a request. They are the most common rule types and never trigger a DNS
+ * lookup”，https://manual.nssurge.com/rules/domain.html）。
+ */
+export function matchProbes(opts: { processPaths: readonly string[]; controlPaths: readonly string[]; verifyHost: string; otherHosts: readonly string[] }): MatchProbe[] {
   const out: MatchProbe[] = [];
+  const hosts: Array<readonly [string, boolean]> = [[opts.verifyHost, true], ...opts.otherHosts.map((h) => [h, false] as const)];
   const add = (processPath: string, safari: boolean): void => {
-    for (const [host, verify] of [
-      [opts.verifyHost, true],
-      [opts.otherHost, false],
-    ] as const) {
+    for (const [host, verify] of hosts) {
       for (const protocol of MATCH_PROTOCOLS) out.push({ processPath, host, protocol, safari, verify });
     }
   };
@@ -85,7 +89,7 @@ export function judgeMatchMatrix(records: readonly MatchRecord[], processPaths: 
     }
     const ours = isEntryRule(r.rule, processPaths);
     const actual = outcomeOfPolicy(r.policy);
-    const label = `${r.mode} ${r.protocol} ${r.verify ? '检测主机' : '其他主机'}`;
+    const label = `${r.mode} ${r.protocol} ${r.verify ? '检测主机' : `其他主机 ${r.host}`}`;
     if (!r.safari) {
       j.control.total++;
       if (ours || actual === 'route') j.control.hits.push(`${label}：对照进程命中「${r.rule}」，策略 ${r.policy}`);

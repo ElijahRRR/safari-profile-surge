@@ -36,12 +36,13 @@ function hang(name: 'updateExternalResource' | 'selectGroupPolicy' | 'getGroupMe
  * 只拦截刚写入、尚未被 Surge 加载的那一版见证的 rule match（载入时对已加载见证的读回照常）。bit 为空时任一入口文件。
  */
 function hangEntryWrite(bit?: string): { entered: () => boolean; restore: () => void } {
-  const fake = h.fake as unknown as { matchRule: (input: { host: string }) => Promise<unknown> };
+  const fake = h.fake as unknown as { matchRule: (input: { host: string; processPath: string }) => Promise<unknown> };
   const orig = fake.matchRule.bind(h.fake);
   let entered = false;
-  fake.matchRule = (input: { host: string }) => {
-    const m = /^sfe-entry-(udp|verify|block|active)-[0-9a-z]+\.invalid$/.exec(input.host);
-    const loaded = m ? (h.fake.loadedContent(`ruleset:sfe-entry-${m[1]}.list`) ?? '').includes(input.host) : true;
+  fake.matchRule = (input: { host: string; processPath: string }) => {
+    // 见证探测按合成进程路径识别（/var/empty/sfe-entry-witness-<位>-<标记>，目标是文档地址 IP）
+    const m = /^\/var\/empty\/sfe-entry-witness-(udp|verify|block|active)-[0-9a-z]+$/.exec(input.processPath);
+    const loaded = m ? (h.fake.loadedContent(`ruleset:sfe-entry-${m[1]}.list`) ?? '').includes(input.processPath) : true;
     if (!m || loaded || (bit !== undefined && m[1] !== bit)) return orig(input);
     entered = true;
     return new Promise(() => undefined);

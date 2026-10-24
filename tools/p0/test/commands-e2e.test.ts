@@ -36,6 +36,9 @@ const SOURCE = [
   '',
   '[Rule]',
   'DOMAIN-SUFFIX,daily.example.test,Daily',
+  // 需要目标地址的 IP 规则（没有 no-resolve）：目标是域名的求值走到这里要先解析，合成域名解析失败时 rule match 退出 1
+  // （2026-10-24 测试 Mac）。P0 的合成探测必须用文档地址 IP 字面量，才能在这样的配置上得到回答。
+  'IP-CIDR,203.0.113.0/24,DIRECT',
   'FINAL,DIRECT',
   '',
 ].join('\n');
@@ -418,17 +421,37 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(await main(args, env!.deps())).toBe(EXIT.OK);
     const entry = result('runtime_entry_modes');
     expect(entry.checks.find((c) => c.name === '四种模式依次精确生效（运行时读回）')?.ok).toBe(true);
-    expect(entry.checks.find((c) => c.name.startsWith('rule match：Safari'))).toMatchObject({ ok: true, note: '核对 24 条' });
-    expect(entry.checks.find((c) => c.name.startsWith('rule match：Chrome'))).toMatchObject({ ok: true, note: '核对 24 条；对照路径 1 个' });
+    // 检测主机、回显主机与文档地址 192.0.2.1 各 × TCP/UDP/QUIC × 四种模式
+    expect(entry.checks.find((c) => c.name.startsWith('rule match：Safari'))).toMatchObject({ ok: true, note: '核对 36 条' });
+    expect(entry.checks.find((c) => c.name.startsWith('rule match：Chrome'))).toMatchObject({ ok: true, note: '核对 36 条；对照路径 1 个' });
+    // 见证形式核对：配置中有需要目标地址的 IP 规则，合成请求仍得到回答（目标是 IP 字面量），而且从不触发 DNS 查询
+    expect(entry.checks.find((c) => c.name.startsWith('见证规则形式在这台 Surge 上成立'))).toMatchObject({ ok: true, note: expect.stringContaining('目标 192.0.2.1') });
+    expect(entry.summary.some((l) => l.startsWith('见证形式核对（完整路径 PROCESS-NAME，rule match 目标 192.0.2.1）：通过'))).toBe(true);
+    expect(env!.surge.tempRules).toEqual([]);
     expect(entry.checks.find((c) => c.name === '切换不发生配置重载或引擎重启')?.ok).toBe(true);
     // ruleset_resource 的规则集由文件监视重新读取：从不调用 update，也从不重载
     expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
     expect(env!.surge.reloadCount).toBe(0);
     const [file] = env!.run().listFiles('entry').filter((f) => /ruleset_resource-\d+\.json$/.test(f));
-    const ev = env!.run().readJson<{ controlPaths: string[]; ruleMatch: Array<{ mode: string; protocol: string; safari: boolean }> }>(file!)!;
+    const ev = env!.run().readJson<{
+      controlPaths: string[];
+      ruleMatch: Array<{ mode: string; protocol: string; safari: boolean; host: string; rule: string | null; policy: string | null }>;
+      witnessForm: { ok: boolean | null; witnessPath: string; probes: Array<{ phase: string; expect: string; host: string; ok: boolean | null; rule: string | null }> };
+    }>(file!)!;
     expect(ev.controlPaths).toEqual(['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']);
     expect(new Set(ev.ruleMatch.map((r) => r.mode))).toEqual(new Set(['BLOCKED', 'VERIFY_ONLY', 'ACTIVE', 'NORMAL']));
     expect(new Set(ev.ruleMatch.map((r) => r.protocol))).toEqual(new Set(['TCP', 'UDP', 'QUIC']));
+    // IP 字面量的“其他主机”：VERIFY_ONLY 下 Safari 的 TCP 被拒绝（NOT(DOMAIN,<检测主机>) 对 IP 字面量成立），ACTIVE 下经 SFE-ROUTE
+    const ipTcp = (mode: string) => ev.ruleMatch.find((r) => r.safari && r.host === '192.0.2.1' && r.protocol === 'TCP' && r.mode === mode)!;
+    expect(ipTcp('VERIFY_ONLY').policy).toBe('REJECT');
+    expect(ipTcp('ACTIVE').policy).toBe('SFE-ROUTE');
+    // NORMAL 下按用户规则：192.0.2.1 不在 203.0.113.0/24 内，走到 FINAL（IP 字面量不需要 DNS）
+    expect(ipTcp('NORMAL').rule).toBe('FINAL,DIRECT');
+    // 见证形式的原始结果：添加前后都有回答，添加后见证路径命中自己的测试规则
+    expect(ev.witnessForm.ok).toBe(true);
+    expect(ev.witnessForm.witnessPath).toMatch(/^\/var\/empty\/sfe-entry-witness-active-p0[0-9a-f]{8}$/);
+    expect(ev.witnessForm.probes.every((p) => p.host === '192.0.2.1')).toBe(true);
+    expect(ev.witnessForm.probes.find((p) => p.phase === 'added' && p.expect === 'witness')?.rule).toBe(`PROCESS-NAME,${ev.witnessForm.witnessPath},REJECT`);
   });
 
   it('the temp_rule sequence records the measured insertion position and passes the rule match matrix', async () => {
@@ -439,6 +462,11 @@ describe('P0 commands end to end (offline harness)', () => {
     const entry = result('runtime_entry_modes');
     expect(entry.checks.find((c) => c.name === '四种模式依次精确生效（运行时读回）')?.ok).toBe(true);
     expect(entry.checks.find((c) => c.name === '新临时规则的插入位置已实测')).toMatchObject({ ok: true, note: expect.stringContaining('插入位置 head') });
+    // 插入探测另用 rule match 看到求值顺序（合成请求的目标是 192.0.2.1，配置中的 IP 规则不让它失败）
+    expect(entry.summary.some((l) => l.includes('rule match 求值顺序：head'))).toBe(true);
+    // temp_rule 不用见证：见证形式核对只记入摘要，不是检查项
+    expect(entry.checks.some((c) => c.name.startsWith('见证规则形式'))).toBe(false);
+    expect(entry.summary.some((l) => l.startsWith('见证形式核对（完整路径 PROCESS-NAME，rule match 目标 192.0.2.1）：通过'))).toBe(true);
     expect(entry.checks.find((c) => c.name.startsWith('rule match：Safari'))?.ok).toBe(true);
     expect(entry.checks.find((c) => c.name.startsWith('rule match：Chrome'))?.ok).toBe(true);
     // 回到 NORMAL 后没有遗留本工具的临时规则

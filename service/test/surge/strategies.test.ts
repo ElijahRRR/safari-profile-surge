@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import { CAPABILITY_GATES, CAPABILITY_PRIMITIVES, ENTRY_MODE_BITS, ENTRY_PLACEHOLDER_RULE, ENTRY_RULESET_FILES, ENTRY_WITNESS_PROCESS_PATH, LEGACY_ENTRY_PLACEHOLDER_RULE, SfeError, type EntryBits, type KnownEntryMode } from '@sfe/contract';
+import { CAPABILITY_GATES, CAPABILITY_PRIMITIVES, ENTRY_MODE_BITS, ENTRY_PLACEHOLDER_RULE, ENTRY_PROBE_IPV4, ENTRY_RULESET_FILES, ENTRY_WITNESS_PROCESS_PREFIX, LEGACY_ENTRY_PLACEHOLDER_RULE, SfeError, type EntryBits, type KnownEntryMode } from '@sfe/contract';
 import type { EntryCleanupStep, EntryController, EntryStep, EntryTransitionOptions, SurgeAdapter, SurgeRuleMatchInput } from '../../src/ports.js';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST, FakeSurge, createFakeSurgeEnvironment } from '../../src/surge/fake.js';
 import { createProfileFiles, type ManagedProfileFiles } from '../../src/surge/files.js';
@@ -10,7 +10,7 @@ import {
   TEMP_ENTRY_MODE_KINDS,
   entryRuleSetFileContent,
   entryRules,
-  entryWitnessHost,
+  entryWitnessProcessPath,
   legacyTempRuleText,
   nodeLine,
   parseEntryRuleSetFile,
@@ -255,7 +255,7 @@ describe('ruleset_resource strategy', () => {
     expect(observe(fake).mode).toBe('BLOCKED');
     // 文件已改回写前内容，记录按写前摘要确认
     const active = (await files.read(ENTRY_RULESET_FILES.active))!;
-    expect(parseEntryRuleSetFile('active', active)).toEqual({ witness: 'off', bodies: [ENTRY_PLACEHOLDER_RULE] });
+    expect(parseEntryRuleSetFile('active', active)).toEqual({ witness: 'off', legacyWitness: false, bodies: [ENTRY_PLACEHOLDER_RULE] });
     expect(ownership.records().find((r) => r.identity === ENTRY_RULESET_FILES.active)).toMatchObject({ state: 'present', digest: await files.digest(ENTRY_RULESET_FILES.active) });
     expect((await ctrl.read()).mode).toBe('BLOCKED');
     // 监视恢复后可以继续完成切换
@@ -512,16 +512,16 @@ describe('ruleset_resource strategy', () => {
     ['the RULE-SET line without its policy', (rule: string) => rule.replace(/,(REJECT|SFE-ROUTE)$/, '')],
     [
       'the matched sub-rule of the set (block and active share it: told apart by the policy)',
-      (rule: string, host: string) => {
+      (rule: string, processPath: string) => {
         const bit = /^RULE-SET,sfe-entry-(udp|verify|block|active)\.list,/.exec(rule)?.[1] as 'udp' | 'verify' | 'block' | 'active' | undefined;
         if (!bit) return rule;
-        return host.startsWith('sfe-entry-') ? `AND,((PROCESS-NAME,${ENTRY_WITNESS_PROCESS_PATH}),(DOMAIN,${host}))` : entryRules(bit, true, CFG)[0]!;
+        return processPath.startsWith(ENTRY_WITNESS_PROCESS_PREFIX) ? `PROCESS-NAME,${processPath}` : entryRules(bit, true, CFG)[0]!;
       },
     ],
   ] as const) {
     test(`rule match echoing ${label} is still recognised (witness and Safari probes)`, async () => {
       const { ctrl, fake } = await setupRuleset({
-        adapter: (f) => rewriteMatch(f, (input, real) => ({ rule: echo(real.rule, input.host), policy: real.policy })),
+        adapter: (f) => rewriteMatch(f, (input, real) => ({ rule: echo(real.rule, input.processPath), policy: real.policy })),
       });
       const rec = stepRecorder(fake);
       expect((await ctrl.transition('ACTIVE', rec.onStep)).mode).toBe('ACTIVE');
@@ -754,23 +754,31 @@ describe('ruleset_resource strategy', () => {
     for (const bit of ['udp', 'verify', 'block', 'active'] as const) {
       expect(parseEntryRuleSetFile(bit, (await files.read(ENTRY_RULESET_FILES[bit]))!)).toMatchObject({ bodies: [ENTRY_PLACEHOLDER_RULE] });
     }
-    expect(fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'sfe-disabled.invalid', protocol: 'tcp' }).policyName).toBe('DIRECT');
+    // 改写之后 Chrome 请求这一主机不再命中入口规则：求值走到用户的 IP 规则，`.invalid` 解析失败（请求以 DNS 错误失败）
+    const after = fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'sfe-disabled.invalid', protocol: 'tcp' });
+    expect(after.rule).toBeNull();
+    expect(after.failed).toBe(true);
   });
 
-  test('witness and placeholder hosts never route Chrome (or any non-witness process): every bit, the public off token and random tokens, in every mode', async () => {
+  test('witness and placeholder rules never route Chrome (or any non-witness process): every bit, the public off token and random tokens, in every mode', async () => {
     const { ctrl, fake, files } = await setupRuleset();
     const otherApps = [FAKE_CHROME_PATH, '/usr/bin/curl', null];
     const check = async (label: string): Promise<void> => {
-      const hosts = ['sfe-disabled.invalid'];
       for (const bit of ['udp', 'verify', 'block', 'active'] as const) {
         const witness = parseEntryRuleSetFile(bit, (await files.read(ENTRY_RULESET_FILES[bit]))!).witness;
         expect(witness, `${label} ${bit}`).not.toBeNull();
-        hosts.push(entryWitnessHost(bit, witness!), entryWitnessHost(bit, 'off'));
-        // 合成见证进程照样读回该位的见证（证明见证仍然有效）
-        const w = await fake.matchRule({ host: entryWitnessHost(bit, witness!), processPath: ENTRY_WITNESS_PROCESS_PATH, protocol: 'TCP' });
+        // 合成见证进程照样读回该位的见证（证明见证仍然有效）；目标是文档地址 IP 字面量，不查询 DNS
+        const queries = fake.dnsQueries.length;
+        const w = await fake.matchRule({ host: ENTRY_PROBE_IPV4, processPath: entryWitnessProcessPath(bit, witness!), protocol: 'TCP' });
         expect(w.rule, `${label} ${bit}`).toBe(`RULE-SET,${ENTRY_RULESET_FILES[bit]},${bit === 'udp' || bit === 'block' ? 'REJECT' : 'SFE-ROUTE'}`);
+        // 公开的 off 标记（不是当前版本时）与其他位的路径：走到用户规则，得到正常回答
+        if (witness !== 'off') {
+          const stale = await fake.matchRule({ host: ENTRY_PROBE_IPV4, processPath: entryWitnessProcessPath(bit, 'off'), protocol: 'TCP' });
+          expect(stale.rule, `${label} ${bit} off`).not.toMatch(/^RULE-SET,sfe-entry-/);
+        }
+        expect(fake.dnsQueries.length).toBe(queries);
       }
-      for (const host of hosts) {
+      for (const host of [ENTRY_PROBE_IPV4, FAKE_VERIFY_HOST, SITE]) {
         for (const processPath of otherApps) {
           for (const protocol of ['tcp', 'udp'] as const) {
             const r = fake.simulateRequest({ processPath, host, protocol });
@@ -790,23 +798,26 @@ describe('ruleset_resource strategy', () => {
     }
   });
 
-  test('the readback probes the control process against every witness host and the placeholder host', async () => {
-    const seen: string[] = [];
+  test('the readback probes Safari and the control process against the verify and site hosts only (no synthetic domain), the witness against a documentation IP', async () => {
+    const seen: Array<{ host: string; processPath: string }> = [];
     const { ctrl } = await setupRuleset({
       adapter: (f) =>
         rewriteMatch(f, (input, real) => {
-          if (input.processPath === FAKE_CHROME_PATH) seen.push(input.host);
+          seen.push({ host: input.host, processPath: input.processPath });
           return real;
         }),
     });
     expect((await ctrl.read()).mode).toBe('NORMAL');
-    expect(new Set(seen)).toEqual(new Set([FAKE_VERIFY_HOST, SITE, 'sfe-disabled.invalid', ...(['udp', 'verify', 'block', 'active'] as const).map((b) => entryWitnessHost(b, 'off'))]));
-    // 对照进程命中某一位的见证（例如见证不限定进程的写法）：读回不宣称任何模式
+    expect(new Set(seen.filter((x) => x.processPath === FAKE_CHROME_PATH).map((x) => x.host))).toEqual(new Set([FAKE_VERIFY_HOST, SITE]));
+    expect(new Set(seen.filter((x) => x.processPath === FAKE_SAFARI_PATH).map((x) => x.host))).toEqual(new Set([FAKE_VERIFY_HOST, SITE]));
+    const witnessProbes = seen.filter((x) => x.processPath.startsWith(ENTRY_WITNESS_PROCESS_PREFIX));
+    expect(witnessProbes.map((x) => x.processPath).sort()).toEqual((['active', 'block', 'udp', 'verify'] as const).map((b) => entryWitnessProcessPath(b, 'off')));
+    expect(witnessProbes.every((x) => x.host === ENTRY_PROBE_IPV4)).toBe(true);
+    expect(seen.some((x) => x.host.endsWith('.invalid'))).toBe(false);
+    // 对照进程命中本应用入口（例如入口规则不限定进程的写法）：读回不宣称任何模式
     const { ctrl: leaky } = await setupRuleset({
       adapter: (f) =>
-        rewriteMatch(f, (input, real) =>
-          input.processPath === FAKE_CHROME_PATH && input.host === entryWitnessHost('active', 'off') ? { rule: 'RULE-SET,sfe-entry-active.list,SFE-ROUTE', policy: 'SFE-ROUTE' } : real,
-        ),
+        rewriteMatch(f, (input, real) => (input.processPath === FAKE_CHROME_PATH && input.host === SITE ? { rule: 'RULE-SET,sfe-entry-active.list,SFE-ROUTE', policy: 'SFE-ROUTE' } : real)),
     });
     const rb = await leaky.read();
     expect(rb.mode).toBe('UNKNOWN');

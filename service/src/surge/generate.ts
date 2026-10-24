@@ -5,7 +5,8 @@ import { isIP } from 'node:net';
 import {
   ENTRY_PLACEHOLDER_RULE,
   ENTRY_RULESET_FILES,
-  ENTRY_WITNESS_PROCESS_PATH,
+  ENTRY_WITNESS_PROCESS_PREFIX,
+  LEGACY_ENTRY_WITNESS_PROCESS_PATH,
   NODE_RESOURCE_FILE,
   ROUTE_GROUP_NAME,
   SfeError,
@@ -107,7 +108,13 @@ const GENERIC_WEBKIT_PREFIXES = [
 ];
 
 /**
- * Safari 进程路径：绝对路径、不含通配与规则分隔符、不是裸进程名、不是系统级通用 WebKit 路径；
+ * 本应用见证与占位规则使用的合成进程目录（/var/empty 及其规范路径 /private/var/empty）。Safari 进程路径不能落在这里：
+ * 否则入口规则行会与见证行相同，见证不再只由见证探测命中（纵深防御；真实可执行文件不会在这个空目录中）。
+ */
+const SYNTHETIC_PROCESS_DIRS = ['/var/empty/', '/private/var/empty/'];
+
+/**
+ * Safari 进程路径：绝对路径、不含通配与规则分隔符、不是裸进程名、不是系统级通用 WebKit 路径、不在合成进程目录中；
  * 存在性检查可注入（测试与非 macOS 环境）。
  */
 export function validateSafariProcessPaths(paths: unknown, opts: { exists?: (path: string) => boolean } = {}): FieldError[] {
@@ -127,6 +134,8 @@ export function validateSafariProcessPaths(paths: unknown, opts: { exists?: (pat
       errors.push({ field, message: '路径不规范' });
     } else if (GENERIC_WEBKIT_PREFIXES.some((prefix) => p.toLowerCase().startsWith(prefix.toLowerCase()))) {
       errors.push({ field, message: '不能使用系统通用 WebKit 组件路径：其他 WebKit 应用也会命中' });
+    } else if (SYNTHETIC_PROCESS_DIRS.some((dir) => p.toLowerCase().startsWith(dir))) {
+      errors.push({ field, message: '不能使用本应用见证规则的合成进程目录' });
     } else if (seen.has(p)) errors.push({ field, message: '进程路径重复' });
     else if (opts.exists && !opts.exists(p)) errors.push({ field, message: '进程路径不存在' });
     seen.add(p);
@@ -177,38 +186,60 @@ export function entryRules(bit: EntryBit, on: boolean, opts: EntryRuleOptions): 
 // ---------- 规则集文件的见证规则（ruleset_resource） ----------
 
 /**
- * 见证规则：每个入口规则集文件带一条只匹配合成进程（ENTRY_WITNESS_PROCESS_PATH）请求合成主机
- * `sfe-entry-<位>-<标记>.invalid` 的规则 `AND,((PROCESS-NAME,<合成进程>),(DOMAIN,<见证主机>))`。必须限定进程：
- * 规则文档写明“Domain rules match the hostname of a request … never trigger a DNS lookup”（rules/domain.html），
- * “.invalid” 不解析并不妨碍按主机名匹配，而规则集文件继承 RULE-SET 行的策略（verify/active 为 SFE-ROUTE）——
- * 不限定进程时 Chrome 或任何网页请求这一主机都会经买家出口发出；初始化写入的固定标记 off 又是公开的。
- * 每次写入换一个随机标记；用 `rule match <见证主机> process-path=<合成进程>` 读回命中的是不是该位的 RULE-SET，就能证明
+ * 见证规则：每个入口规则集文件带一条只由合成进程路径构成的规则 `PROCESS-NAME,/var/empty/sfe-entry-witness-<位>-<标记>`
+ * （contract ENTRY_WITNESS_PROCESS_PREFIX；完整路径模式：“If the expression starts with `/` (and does not end with `/`), it
+ * matches the executable's full absolute path.”，“Matching is case-sensitive in all modes.”，rules/process.html）。
+ * 每次写入换一个随机标记；用 `rule match <ENTRY_PROBE_IPV4> process-path=<见证路径>` 读回命中的是不是该位的 RULE-SET，就能证明
  * Surge 已加载的正是这一版内容——即使这一位被更前面的入口规则遮住、Safari 的探测看不出差别（例如 block 打开时的 active）。
- * 文档依据：本地规则集“Local files are watched and reloaded automatically when they change.”（规则集文档）；
+ * - 唯一性放在进程路径里，不放在主机里：规则集文件继承 RULE-SET 行的策略（verify/active 为 SFE-ROUTE），DOMAIN 规则对任何进程
+ *   按主机名匹配（“Domain rules match the hostname of a request … never trigger a DNS lookup”，rules/domain.html）；而尚未加载的
+ *   这一版见证不命中时，求值继续走到用户规则，探测合成域名会在第一条 IP 规则处触发 DNS 查询：“If the DNS lookup fails, rule
+ *   evaluation aborts and the request fails with a DNS error”（rules/ip.html）——2026-10-24 测试 Mac 上 `.invalid` 主机的
+ *   rule match 退出 1（DNS 空回答）。探测目标用文档地址 IP 字面量（“If the request targets an IP literal, the rule matches it
+ *   directly”），没加载的版本因此得到正常回答（某条用户规则或 FINAL），而不是读取失败。
+ * - 见证与占位规则不含任何主机或 IP 条件：入口规则集文件里的 IP 子规则会让整个规则集需要 DNS（规则集文档：RULE-SET 行的
+ *   no-resolve “Removes the set's DNS requirement”），Safari 的真实域名请求就会在本应用入口段内先做本地 DNS 查询。
+ * - 初始化写入的固定标记 off 是公开的，但只对应一个不可执行的路径；路径不含逗号，回显子规则时可按全文识别。
+ * 其余文档依据：本地规则集“Local files are watched and reloaded automatically when they change.”（rules/ruleset.html）；
  * `rule match`“Evaluate the active rule set without creating a connection”、“process-path=<path> Source process path;
- * affects PROCESS-NAME rules”（CLI 帮助，Mac 6.9.0+）；逻辑规则“AND,((Rule1),(Rule2),...),Policy”，规则集文件中的规则
- * 不带策略（规则文档）。
+ * affects PROCESS-NAME rules”（CLI 帮助，Mac 6.9.0+）；规则集文件中的规则不带策略（rules/ruleset.html）。
+ * TODO(P0)：rule match 接受不存在的 process-path、不把 /var 规范化为 /private/var（否则见证永远读不到：超时，失败即关闭）。
  */
 export const ENTRY_WITNESS_OFF_TOKEN = 'off';
 const WITNESS_TOKEN_RE = /^[0-9a-z]{2,32}$/;
 const escapeRe = (t: string): string => t.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
 /** 规范化之后（normalizeRuleText）的见证行。 */
-const WITNESS_LINE_RE = new RegExp(
-  `^AND,\\(\\(PROCESS-NAME,${escapeRe(ENTRY_WITNESS_PROCESS_PATH)}\\),\\(DOMAIN,sfe-entry-(udp|verify|block|active)-([0-9a-z]{2,32})\\.invalid\\)\\)$`,
+const WITNESS_LINE_RE = new RegExp(`^PROCESS-NAME,${escapeRe(ENTRY_WITNESS_PROCESS_PREFIX)}(udp|verify|block|active)-([0-9a-z]{2,32})$`);
+/** 旧格式见证行（合成进程 + `sfe-entry-<位>-<标记>.invalid` 主机）：只识别，从不当作已加载的证明，从不写入。 */
+const LEGACY_WITNESS_LINE_RE = new RegExp(
+  `^AND,\\(\\(PROCESS-NAME,${escapeRe(LEGACY_ENTRY_WITNESS_PROCESS_PATH)}\\),\\(DOMAIN,sfe-entry-(udp|verify|block|active)-([0-9a-z]{2,32})\\.invalid\\)\\)$`,
 );
 
-export function entryWitnessHost(bit: EntryBit, token: string): string {
+/** 某一位带 token 的见证进程路径（见证探测的 process-path）。 */
+export function entryWitnessProcessPath(bit: EntryBit, token: string): string {
   if (!WITNESS_TOKEN_RE.test(token)) throw new SfeError('VALIDATION_FAILED', '生成入口规则失败：见证标记不合法');
-  return `sfe-entry-${bit}-${token}.invalid`;
+  return `${ENTRY_WITNESS_PROCESS_PREFIX}${bit}-${token}`;
 }
 
 /** 某一位带 token 的见证规则（规则集文件中的一行，不带策略）。 */
 export function entryWitnessRule(bit: EntryBit, token: string): string {
-  return `AND,((PROCESS-NAME,${ENTRY_WITNESS_PROCESS_PATH}),(DOMAIN,${entryWitnessHost(bit, token)}))`;
+  return `PROCESS-NAME,${entryWitnessProcessPath(bit, token)}`;
 }
 
-/** 解析入口规则集文件：见证标记（没有或不止一条时为 null）与其余规则行（不含注释与见证行，已规范化空白）。 */
-export function parseEntryRuleSetFile(bit: EntryBit, content: string): { witness: string | null; bodies: string[] } {
+export interface ParsedEntryRuleSetFile {
+  /** 这一位的见证标记（当前格式恰好一条时）；没有、不止一条或只有旧格式见证时为 null。 */
+  witness: string | null;
+  /** 文件带一条这一位的旧格式见证（且没有当前格式的见证）：已从 bodies 去掉，按没有见证处理，下一次切换改写。 */
+  legacyWitness: boolean;
+  /** 其余规则行（不含注释与见证行，已规范化空白）。 */
+  bodies: string[];
+}
+
+/**
+ * 解析入口规则集文件。当前格式的见证行（任何位）都不算规则行；只有这一位恰好一条时给出标记。旧格式见证行只在“这一位恰好
+ * 一条、文件没有当前格式见证”时去掉（legacyWitness）；与当前格式混用、不止一条或属于其他位时留在 bodies 中，文件因此无法识别。
+ */
+export function parseEntryRuleSetFile(bit: EntryBit, content: string): ParsedEntryRuleSetFile {
   const lines = content
     .split(/\r?\n/)
     .map((l) => l.trim())
@@ -218,7 +249,14 @@ export function parseEntryRuleSetFile(bit: EntryBit, content: string): { witness
     const m = WITNESS_LINE_RE.exec(l);
     return m && m[1] === bit ? [m[2]!] : [];
   });
-  return { witness: witnesses.length === 1 ? witnesses[0]! : null, bodies: lines.filter((l) => !WITNESS_LINE_RE.test(l)) };
+  const rest = lines.filter((l) => !WITNESS_LINE_RE.test(l));
+  const legacy = rest.filter((l) => LEGACY_WITNESS_LINE_RE.test(l));
+  const legacyWitness = lines.length === rest.length && legacy.length === 1 && LEGACY_WITNESS_LINE_RE.exec(legacy[0]!)![1] === bit;
+  return {
+    witness: witnesses.length === 1 ? witnesses[0]! : null,
+    legacyWitness,
+    bodies: legacyWitness ? rest.filter((l) => l !== legacy[0]) : rest,
+  };
 }
 
 /**

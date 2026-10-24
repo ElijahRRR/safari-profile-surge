@@ -54,9 +54,12 @@ describe('rule match probes', () => {
       ['www.example.test', 'UDP', 'udpOther'],
     ]);
     expect(new Set(probes.filter((p) => p.cls === null).map((p) => p.processPath))).toEqual(new Set([CONTROL_PROCESS_PATH]));
-    // 没有站点主机时用合成的 .invalid 主机；对照路径可改，等于 Safari 路径的对照路径被忽略
+    // 没有站点主机时用文档地址 IP 字面量（不查询 DNS，见 common.ts）；对照路径可改，等于 Safari 路径的对照路径被忽略
     const none = runtimeProbes({ ...cfg, siteHosts: [], controlProcessPaths: [FAKE_SAFARI_PATH, '/usr/bin/curl'] });
+    expect(ENTRY_PROBE_OTHER_HOST).toBe('192.0.2.1');
     expect(none.filter((p) => p.cls === 'tcpOther')[0]!.host).toBe(ENTRY_PROBE_OTHER_HOST);
+    expect(none.filter((p) => p.cls === null).map((p) => p.host)).toEqual([FAKE_VERIFY_HOST, FAKE_VERIFY_HOST, '192.0.2.1', '192.0.2.1']);
+    expect(none.some((p) => p.host.endsWith('.invalid'))).toBe(false);
     expect(new Set(none.filter((p) => p.cls === null).map((p) => p.processPath))).toEqual(new Set(['/usr/bin/curl']));
   });
 

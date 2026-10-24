@@ -278,7 +278,7 @@ describe('reload signals', () => {
 describe('rule match matrix', () => {
   const SAFARI = '/Applications/Safari.app/Contents/MacOS/Safari';
   const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-  const probes = matchProbes({ processPaths: [SAFARI], controlPaths: [CHROME, SAFARI], verifyHost: 'api.ipify.org', otherHost: 'echo.p0.example.test' });
+  const probes = matchProbes({ processPaths: [SAFARI], controlPaths: [CHROME, SAFARI], verifyHost: 'api.ipify.org', otherHosts: ['echo.p0.example.test'] });
   const rec = (mode: MatchRecord['mode'], p: (typeof probes)[number], rule: string | null, policy: string | null): MatchRecord => ({ ...p, mode, rule, policy, error: rule === null ? 'SURGE_COMMAND_FAILED' : null });
   const udp = `AND,((PROCESS-NAME,${SAFARI}),(PROTOCOL,UDP)),REJECT`;
   const active = `AND,((PROCESS-NAME,${SAFARI}),(NOT,((PROTOCOL,UDP)))),SFE-ROUTE`;
@@ -313,6 +313,19 @@ describe('rule match matrix', () => {
     expect(j.safari.mismatches[0]).toContain('QUIC');
     expect(j.control.hits).toHaveLength(1);
     expect(j.errors).toBe(1);
+  });
+
+  it('an IP-literal other host (documentation address) is probed like any other host and judged by the same mode semantics', () => {
+    const withIp = matchProbes({ processPaths: [SAFARI], controlPaths: [CHROME], verifyHost: 'api.ipify.org', otherHosts: ['echo.p0.example.test', '192.0.2.1'] });
+    expect(withIp).toHaveLength(18);
+    const ipTcp = withIp.find((p) => p.safari && p.host === '192.0.2.1' && p.protocol === 'TCP')!;
+    expect(ipTcp.verify).toBe(false);
+    const blockOther = `AND,((PROCESS-NAME,${SAFARI}),(NOT,((DOMAIN,api.ipify.org)))),REJECT`;
+    // VERIFY_ONLY：其他主机 TCP 必须被本应用规则拒绝；走到用户规则（FINAL）是不符，备注带出主机
+    expect(judgeMatchMatrix([rec('VERIFY_ONLY', ipTcp, blockOther, 'REJECT')], [SAFARI]).safari.mismatches).toEqual([]);
+    const bad = judgeMatchMatrix([rec('VERIFY_ONLY', ipTcp, 'FINAL,DIRECT', 'DIRECT')], [SAFARI]).safari.mismatches;
+    expect(bad).toHaveLength(1);
+    expect(bad[0]).toContain('其他主机 192.0.2.1');
   });
 
   it('NORMAL: Safari must not hit an entry rule', () => {

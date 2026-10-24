@@ -7,7 +7,7 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
-import { CAPABILITY_CRITERIA, type TakeoverState } from '@sfe/contract';
+import { CAPABILITY_CRITERIA, ENTRY_PROBE_IPV4, type TakeoverState } from '@sfe/contract';
 import { CALLS_LOG } from '../constants.js';
 import {
   detectManagedConfigHeader,
@@ -83,9 +83,9 @@ async function probe(adapter: SurgeAdapter, p: ReadPrimitive, c: ProbeContext): 
       case 'checkProfile':
         return adapter.checkProfile(c.profilePath!);
       case 'matchRule':
-        // 只读求值（“without creating a connection”）：保留测试 IP 避免 .invalid 在 IP 规则求值时触发 DNS 失败。
-        // 只证明命令与输出可以解析；入口的运行时读回另行证明。
-        return adapter.matchRule({ host: '192.0.2.1', processPath: '/usr/bin/true' });
+        // 只读求值（“without creating a connection”）：目标是文档地址 IP 字面量（与服务探测共用 ENTRY_PROBE_IPV4），
+        // 合成域名在求值走到 IP 规则时会因 DNS 失败退出 1。只证明命令与输出可以解析；入口的运行时读回另行证明。
+        return adapter.matchRule({ host: ENTRY_PROBE_IPV4, processPath: '/usr/bin/true' });
       default:
         return (adapter[p] as () => Promise<unknown>)();
     }

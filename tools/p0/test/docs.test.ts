@@ -114,6 +114,37 @@ describe('docs/P0-RUNBOOK.md', () => {
     expect(text).toContain('### 1.6 文档没有写明、要在测试 Mac 上实测的行为（TODO(P0)）');
   });
 
+  it('3.6 describes the DNS-free probes: process-only witness and insertion rules, documentation-IP targets and the witness form check', () => {
+    const entry = text.slice(text.indexOf('### 3.6'), text.indexOf('### 3.7'));
+    // 当前写入的见证与占位规则只有完整路径的进程条件；旧的合成域名形式只作为“以前”的说明出现
+    expect(entry).toContain('见证规则 `PROCESS-NAME,/var/empty/sfe-entry-witness-<位>-<标记>`');
+    expect(entry).toContain('占位规则 `PROCESS-NAME,/var/empty/sfe-entry-disabled`');
+    expect(entry).not.toContain('(DOMAIN,sfe-entry-<位>-<编号>.invalid)');
+    expect(entry).not.toContain('Chrome 另探测各文件的见证主机与占位主机');
+    expect(entry).toContain('`rule match 192.0.2.1 process-path=<见证路径> protocol=TCP dest-port=443`');
+    // 插入探测：两条只匹配合成进程的规则，求值顺序用文档地址读
+    expect(entry).not.toContain('p0-insert-N.invalid');
+    expect(entry).toContain('`PROCESS-NAME,/var/empty/sfe-p0-insert-probe,REJECT` 与 `PROCESS-NAME,/var/empty/sfe-p0-insert-prob?,REJECT`');
+    expect(entry).toContain('`rule match 192.0.2.1 process-path=/var/empty/sfe-p0-insert-probe protocol=TCP dest-port=443`');
+    // 见证形式核对（设计复核 p0Confirmations 2–4）
+    expect(entry).toContain('- **见证形式核对**');
+    expect(entry).toContain('另一标记（同长度）、前缀延长、`/private/var/…` 形式、大写 `/VAR/…` 形式、对照进程（Chrome）、`/usr/bin/true` 与 Safari 路径都不能命中');
+    expect(entry).toContain('非零退出是确定的回答，同样不通过');
+    expect(entry).toContain('**不要**改用合成域名或在入口规则集中加 IP 条件');
+    // 矩阵的“其他主机”包括 IP 字面量
+    expect(entry).toContain('分别以检测主机、`echo.p0.example.test` 与文档地址 `192.0.2.1`');
+    // §1.6：DNS 失败输出的手动采集
+    const todo = text.slice(text.indexOf('### 1.6'), text.indexOf('## 2.'));
+    expect(todo).toContain('"$S" --raw rule match p0-inventory.invalid process-path=/usr/bin/true protocol=TCP dest-port=443 </dev/null; echo "exit=$?"');
+    // 合成请求只用文档地址；echo 与 canary 的 .test 主机仍是域名（不声称“从不用合成域名”）
+    expect(todo).not.toContain('工具本身从不用合成域名做 rule match');
+    expect(todo).toContain('合成请求的探测（插入探测、见证形式核对、inventory 的 rule match 读取）的目标只用 `192.0.2.1`');
+    expect(todo).toContain('echo 与 canary 的 `.test` 主机');
+    // 见证遮挡按有效规则列表的位置判断；模块与临时规则的先后是 TODO(P0)
+    expect(todo).toContain('排在入口段之前（模块中的局域网或保留地址 IP-CIDR 列表');
+    expect(todo).toContain('模块规则与临时规则谁先求值');
+  });
+
   it('documents the overall order and the manual profile switch', () => {
     for (const cmd of ['inventory', 'instance', 'test-servers', 'make-test-profile', 'attribution', 'entry', 'refresh', 'continuity', 'chain', 'charset', 'preflight', 'checklist', 'propose', 'rollback']) {
       expect(text).toContain(cmd);
@@ -271,10 +302,29 @@ describe('docs/ARCHITECTURE.md §0', () => {
     expect(s0).not.toContain('仍列 `updateExternalResource`、没有 `matchRule`');
   });
 
-  it('§5.5 scopes the witness and placeholder rules to the synthetic process and quotes the domain-rule doc', () => {
-    expect(text).toContain('`AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-<位>-<标记>.invalid))`');
+  it('§5.5 makes the witness and placeholder rules a synthetic full-path process only and quotes the process-rule doc', () => {
+    expect(text).toContain('**见证规则** `PROCESS-NAME,/var/empty/sfe-entry-witness-<位>-<标记>`');
+    expect(text).toContain('关闭的位写占位规则 `PROCESS-NAME,/var/empty/sfe-entry-disabled`');
+    expect(text).toContain("“If the expression starts with `/` (and does not end with `/`), it matches the executable's full absolute path.”，“Matching is case-sensitive in all modes.”");
+    // 不用主机区分的理由仍引用域名规则文档（按主机名的见证对任何进程都成立）
     expect(text).toContain('Domain rules match the hostname of a request. They are the most common rule types and never trigger a DNS lookup');
+    // 旧格式只识别、从不写入或探测
+    expect(text).toContain('旧格式见证 `AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-<位>-<标记>.invalid))`');
+    expect(text).not.toContain('读回因此另用对照进程探测各文件当前的见证主机与占位主机');
     expect(text).not.toContain('`.invalid` 永不解析，真实请求不会命中');
+  });
+
+  it('§5.5 explains why probe hosts are documentation IPs, quoting the IP-rule doc and the 2026-10-24 test-Mac observation', () => {
+    expect(text).toContain('**探测的目标主机是文档地址 IP 字面量**（contract `ENTRY_PROBE_IPV4` = `192.0.2.1`，RFC 5737）');
+    expect(text).toContain('“If the DNS lookup fails, rule evaluation aborts and the request fails with a DNS error, unless the FINAL rule carries the dns-failed parameter.”');
+    expect(text).toContain('“If the request targets an IP literal, the rule matches it directly; GEOIP and IP-ASN perform their database lookup without a DNS query.”');
+    expect(text).toContain('2026-10-24 测试 Mac（Surge 6.10.0 / 12500，docs/verification/2026-10-24-mac-p0-increment.md）');
+    expect(text).toContain('退出 1（DNS 空回答），同一命令改用 `192.0.2.1` 退出 0');
+    expect(text).toContain('轮询 `rule match 192.0.2.1 process-path=/var/empty/sfe-entry-witness-<位>-<标记> protocol=TCP dest-port=443`');
+    expect(text).not.toContain('`sfe-entry-probe.invalid`');
+    // DNS 失败是结果未知的读取失败，不是 rule match 不可用；真实主机探测的 DNS 依赖如实列为待决冲突
+    expect(text).toContain('它不是“rule match 不可用”（未映射、Unknown command），不走撤销入口的退路');
+    expect(s0).toContain('**DNS 失败（待用户决定，现按失败即关闭）**');
   });
 });
 

@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ENTRY_PLACEHOLDER_RULE, ENTRY_RULESET_FILES, ENTRY_WITNESS_PROCESS_PATH, NODE_RESOURCE_FILE } from '@sfe/contract';
+import { ENTRY_PLACEHOLDER_RULE, ENTRY_RULESET_FILES, ENTRY_WITNESS_PROCESS_PREFIX, NODE_RESOURCE_FILE } from '@sfe/contract';
 import { describe, expect, it } from 'vitest';
 import {
   FAKE_CHROME_PATH,
@@ -203,10 +203,12 @@ describe('buildTestProfile', () => {
     expect(r.files[NODE_RESOURCE_FILE]).toContain('underlying-proxy=P0-Front');
     for (const f of Object.values(ENTRY_RULESET_FILES)) {
       expect(r.files[f]).toContain(ENTRY_PLACEHOLDER_RULE);
-      // 占位与见证规则只匹配合成见证进程：DOMAIN 规则按主机名匹配任何进程（rules/domain.html），不限定进程的写法会经 SFE-ROUTE
-      const lines = r.files[f]!.split('\n').filter((l) => l.includes('.invalid'));
+      // 占位与见证规则只由合成进程的完整路径构成（不含主机或 IP 条件）：DOMAIN 规则按主机名匹配任何进程，探测合成域名又会在
+      // 求值走到 IP 规则时因 DNS 失败（ARCHITECTURE §5.5）
+      expect(r.files[f]).not.toContain('.invalid');
+      const lines = r.files[f]!.split('\n').filter((l) => l.includes('/var/empty/'));
       expect(lines).toHaveLength(2);
-      for (const l of lines) expect(l.startsWith(`AND,((PROCESS-NAME,${ENTRY_WITNESS_PROCESS_PATH}),(DOMAIN,`)).toBe(true);
+      for (const l of lines) expect(l === ENTRY_PLACEHOLDER_RULE || l.startsWith(`PROCESS-NAME,${ENTRY_WITNESS_PROCESS_PREFIX}`)).toBe(true);
     }
     expect(r.moduleText).toContain('DOMAIN,api.ipify.org,DIRECT');
     expect(PRECEDENCE_MODULE_FILE.endsWith('.sgmodule')).toBe(true);

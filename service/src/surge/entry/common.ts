@@ -1,7 +1,7 @@
 // 两种入口策略共用的判断：按本应用入口规则在有效规则中的实际顺序求“语义模式”，`rule match` 运行时探测与其判断，
 // 以及失败时附带最后确认状态的错误。
 
-import { ENTRY_MODE_BITS, ROUTE_GROUP_NAME, SfeError, type EntryBits, type EntryMode, type ErrorCode, type KnownEntryMode, type PrecedenceIssue } from '@sfe/contract';
+import { ENTRY_MODE_BITS, ENTRY_PROBE_IPV4, ROUTE_GROUP_NAME, SfeError, type EntryBits, type EntryMode, type ErrorCode, type KnownEntryMode, type PrecedenceIssue } from '@sfe/contract';
 import type { EntryStep, ProfileFiles, SurgeAdapter, SurgeRuleMatchInput } from '../../ports.js';
 import type { EntryBit, TempEntryKind } from '../generate.js';
 import { REJECT_POLICIES, normalizeRuleText, parseRule } from '../rules.js';
@@ -155,8 +155,14 @@ export interface EntryStrategyDeps {
 
 /** 对照：Chrome 的标准可执行路径。Chrome 永远不应被 Safari 规则命中。 */
 export const CONTROL_PROCESS_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-/** 没有站点主机时，“其他主机”类别用的合成主机（“.invalid” 永不解析）。 */
-export const ENTRY_PROBE_OTHER_HOST = 'sfe-entry-probe.invalid';
+/**
+ * 没有站点主机时，“其他主机”类别用的合成主机：文档地址 IP 字面量（contract ENTRY_PROBE_IPV4，RFC 5737）。不用合成域名：
+ * 求值走到用户的 IP 规则时会对域名做 DNS 查询，“If the DNS lookup fails, rule evaluation aborts and the request fails with
+ * a DNS error”（https://manual.nssurge.com/rules/ip.html）——2026-10-24 测试 Mac 上 `.invalid` 主机的 rule match 退出 1。
+ * IP 字面量不查询 DNS（“If the request targets an IP literal, the rule matches it directly”）。对 temp_rule 而言它照样是
+ * “其他主机”：NOT(DOMAIN,检测主机) 对 IP 字面量成立。检测主机与站点主机是真实域名，保留：它们用来发现遮住这些域名的用户规则。
+ */
+export const ENTRY_PROBE_OTHER_HOST = ENTRY_PROBE_IPV4;
 
 /**
  * 一次 `rule match <host> process-path=<path> protocol=<TCP|UDP> dest-port=443`（Mac 6.9.0+，协议 ≥20）：
@@ -174,10 +180,10 @@ export interface RuntimeProbe {
 }
 
 /**
- * Safari 每个进程路径 × {检测主机, 其他主机} × {TCP, UDP}，加上对照路径的同样四个组合；controlHosts：对照路径另外
- * 探测的主机（TCP；例如 ruleset_resource 的见证与占位主机——DOMAIN 规则只看主机名，与协议无关）。
+ * Safari 每个进程路径 × {检测主机, 其他主机} × {TCP, UDP}，加上对照路径的同样四个组合。其他主机：第一个不同于检测主机的
+ * 站点主机，没有时为 ENTRY_PROBE_OTHER_HOST（文档地址 IP 字面量）。
  */
-export function runtimeProbes(cfg: EntryConfig, controlHosts: readonly string[] = []): RuntimeProbe[] {
+export function runtimeProbes(cfg: EntryConfig): RuntimeProbe[] {
   const verify = cfg.verifyHost;
   const other = cfg.siteHosts.find((h) => typeof h === 'string' && h.length > 0 && h.toLowerCase() !== verify.toLowerCase()) ?? ENTRY_PROBE_OTHER_HOST;
   const controls = (cfg.controlProcessPaths ?? [CONTROL_PROCESS_PATH]).filter((p) => !cfg.processPaths.includes(p));
@@ -194,10 +200,7 @@ export function runtimeProbes(cfg: EntryConfig, controlHosts: readonly string[] 
     }
   };
   for (const p of cfg.processPaths) add(p, true);
-  for (const p of controls) {
-    add(p, false);
-    for (const host of controlHosts) out.push({ processPath: p, host, protocol: 'TCP', cls: null });
-  }
+  for (const p of controls) add(p, false);
   return out;
 }
 

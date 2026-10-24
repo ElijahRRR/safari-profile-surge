@@ -8,9 +8,14 @@
 // UDP/QUIC 结果另带逐协议覆盖：IPv6、WebSocket 在本次运行中实测；扩展页面请求与测试页请求无法区分，
 // 由同一进程路径的归属结果补足（见 analysis/udp-coverage.ts）。
 // 临时规则一律按规范化文本比较（Surge 列出时可能改变逗号与括号周围的空格）；注入测试规则前确认没有相同的用户规则。
+// 主序列之前另核对服务读回依赖的见证形式（完整路径 PROCESS-NAME + 文档地址目标，entry-driver.ts probeWitnessForm）；
+// 合成进程的 rule match（插入探测、见证形式核对）目标一律是文档地址 ENTRY_PROBE_IPV4，从不是合成域名（DNS 失败会让 rule match
+// 退出 1）；rule match 矩阵中的回显主机 ECHO_HOST 与规则集 canary 主机（test-ops.ts ruleSetCanaryLoaded）仍是 `.test` 域名，依赖测试配置的 DOMAIN-SUFFIX
+// 规则在任何需要目标地址的 IP 规则之前命中（模块把没有 no-resolve 的 IP 规则放在前面时读取失败，见 P0-RUNBOOK 3.6 第 3 步）。
 
+import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { CAPABILITY_CRITERIA, ENTRY_RULESET_FILES, type EntryStrategy, type KillResult, type KnownEntryMode, type ProtocolCoverage } from '@sfe/contract';
+import { CAPABILITY_CRITERIA, ENTRY_PROBE_IPV4, ENTRY_RULESET_FILES, type EntryStrategy, type KillResult, type KnownEntryMode, type ProtocolCoverage } from '@sfe/contract';
 import { analyzeEntryWindow, outcomeOf, type ObservedRequest } from '../analysis/entry-window.js';
 import { compareSignals, type ReloadSignals } from '../analysis/reload.js';
 import { judgeMatchMatrix, matchProbes, type MatchRecord } from '../analysis/rule-match.js';
@@ -31,7 +36,7 @@ import {
   type SurgeRequestRecord,
 } from '../deps.js';
 import { createFileEntryOwnership, loadEntryRecords } from '../entry-ownership.js';
-import { precedenceTest, probeTempInsertion, runEntrySequence, type ModeRecord } from '../entry-driver.js';
+import { describeWitnessForm, precedenceTest, probeTempInsertion, probeWitnessForm, runEntrySequence, type ModeRecord, type WitnessFormResult } from '../entry-driver.js';
 import { refused, type ExitCode } from '../errors.js';
 import { check, readResult, writeResult, type CheckItem } from '../results.js';
 import { markTempRule, recordTempRuleIntent, saveState } from '../state.js';
@@ -192,9 +197,14 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
     saveState(dir, ops.state);
   };
   let insertionNote: string | null = null;
-  // 插入探测：添加并删除两条永不命中的临时规则，测量插入位置，并正向确认 listTempRules（结果记入运行状态）。
+  const matchAvailable = session.mechanism.matchRule !== 'unavailable';
+  // 插入探测：添加并删除两条只匹配合成进程的临时规则，测量插入位置（有效规则列表中的先后与 rule match 的求值顺序），
+  // 并正向确认 listTempRules（结果记入运行状态）。
   const runInsertionProbe = async (): Promise<void> => {
-    const p = await probeTempInsertion(session.adapter, (r) => register(r, 'insertion-probe'), markRemoved, { profileRules: testProfileRules(ops.state.testProfilePath) });
+    const p = await probeTempInsertion(session.adapter, (r) => register(r, 'insertion-probe'), markRemoved, {
+      profileRules: testProfileRules(ops.state.testProfilePath),
+      ruleMatch: matchAvailable,
+    });
     probedNow = p.tempListConfirmed;
     if (p.insertion || p.tempListConfirmed !== null) {
       // null（无法确认）不覆盖之前的结论；false 只来自“添加已生效、列表却没有列出”的确定证据，之后的 true 可以覆盖它。
@@ -212,6 +222,8 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
               ? '临时规则排在测试配置规则之前'
               : '临时规则没有排在全部测试配置规则之前',
           p.tempListConfirmed === true ? `listTempRules（${listMech}）列出了刚添加的探测规则` : `listTempRules（${listMech}）${p.tempListConfirmed === false ? '' : '未确认：'}${p.tempListNote ?? '原因未知'}`,
+          p.matchInsertion !== null ? `rule match 求值顺序：${p.matchInsertion}` : 'rule match 求值顺序未测得',
+          ...(p.matchNote ? [p.matchNote] : []),
         ].join('；');
     ops.action('insertion_probe', {
       insertion: p.insertion,
@@ -219,6 +231,8 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
       tempListConfirmed: p.tempListConfirmed,
       tempListReadError: p.tempListReadError,
       addConfirmed: p.addConfirmed,
+      matchInsertion: p.matchInsertion,
+      matchObservations: p.matchObservations,
       skipped: p.skipped ?? null,
     });
     out.line(insertionNote);
@@ -244,7 +258,7 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
     const ok = await confirmWrites(
       ctx,
       `入口切换到 ${single}`,
-      [...(probe ? ['添加并删除两条永不命中的临时规则，正向确认 listTempRules 并测量插入位置'] : []), `按 ${strategy} 策略逐位切换到 ${single}，每步读回`],
+      [...(probe ? ['添加并删除两条只匹配 /var/empty 下合成进程的临时 REJECT 规则，正向确认 listTempRules 并测量插入位置'] : []), `按 ${strategy} 策略逐位切换到 ${single}，每步读回`],
       ['失败时停在已确认的更严格状态；进入普通模式：entry --to NORMAL', 'rollback --execute 删除本工具添加的临时规则'],
     );
     if (!ok) throw refused('已取消：没有写入任何东西');
@@ -275,12 +289,17 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   const precedenceTests = new Set(ctx.args.lists['precedence-test'] ?? []);
   // temp_rule 入口与 --precedence-test temp 都依赖 listTempRules：必须在本次运行中由插入探测正向确认。
   const probeMain = ctx.args.booleans['probe-insertion'] === true || strategy === 'temp_rule' || precedenceTests.has('temp');
+  // 见证形式核对需要 rule match 与按原文增删临时规则（读取当前临时规则以免接管用户自己的规则）。
+  const witnessCheckable = (['matchRule', 'listTempRules', 'addTempRule', 'removeTempRule'] as const).every((p) => (session.mechanism[p] ?? 'unavailable') !== 'unavailable');
   const ok = await confirmWrites(
     ctx,
     `入口模式测试（${strategy}）`,
     [
       `SFE-ROUTE 选择 ${TEST_NODES.a}；原子替换测试配置中的配置 canary 行作为重载检测（只影响测试主机；自动重载开时会让 Surge 重载测试配置，6.9.0 起可能升级为完整引擎重启，请先在 Surge 设置中关闭自动重载）`,
-      ...(probeMain ? ['添加并删除两条永不命中的临时规则，正向确认 listTempRules 并测量新临时规则的插入位置'] : []),
+      ...(probeMain ? ['添加并删除两条只匹配 /var/empty 下合成进程的临时 REJECT 规则，正向确认 listTempRules 并测量新临时规则的插入位置'] : []),
+      ...(witnessCheckable
+        ? [`见证形式核对：添加并删除两条只匹配 /var/empty 下合成进程的临时 REJECT 规则（服务见证行与占位行的同一形式），用 rule match ${ENTRY_PROBE_IPV4} 核对完整路径精确匹配，删除后求值不依赖 DNS`]
+        : []),
       ...(precedenceTests.has('temp') ? [`添加临时规则 DOMAIN,${verifyHost},DIRECT，确认 VERIFY_ONLY 被拒绝后删除`] : []),
       ...(precedenceTests.has('module') ? [`由你在 Surge 中手动启用测试模块 ${PRECEDENCE_MODULE_FILE}，确认 VERIFY_ONLY 被拒绝后手动停用`] : []),
       `按 ${strategy} 策略依次切换 ${SEQUENCE.join(' → ')}，每个模式停留 ${dwellMs / 1000} 秒${strategy === 'ruleset_resource' ? '（规则集文件原子替换后不调用 update，等待 Surge 文件监视重新读取）' : ''}`,
@@ -307,8 +326,9 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   };
   const checksPrecedence: CheckItem[] = [];
   const matchRecords: MatchRecord[] = [];
-  const matchAvailable = session.mechanism.matchRule !== 'unavailable';
-  const probes = matchProbes({ processPaths, controlPaths: controls, verifyHost, otherHost: ECHO_HOST });
+  // 其他主机：测试回显主机，以及文档地址 IP 字面量（服务在没有站点主机时用它作“其他主机”；NOT(DOMAIN,<检测主机>) 对 IP
+  // 字面量成立，Safari 的 TCP 在 VERIFY_ONLY 下应被拒绝、ACTIVE 下经 SFE-ROUTE）。
+  const probes = matchProbes({ processPaths, controlPaths: controls, verifyHost, otherHosts: [ECHO_HOST, ENTRY_PROBE_IPV4] });
   const probeMatrix = async (mode: KnownEntryMode): Promise<void> => {
     if (!matchAvailable) return;
     for (const p of probes) {
@@ -324,7 +344,12 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   let sigBefore: ReloadSignals | null = null;
   let sigAfter: ReloadSignals | null = null;
   // 在回调中写入的观察结果（放在对象里，避免闭包赋值后的类型收窄问题）。
-  const obs: { killResults: KillResult[] | null; killError: string | null; h3Observed: string | null } = { killResults: null, killError: null, h3Observed: null };
+  const obs: { killResults: KillResult[] | null; killError: string | null; h3Observed: string | null; witnessForm: WitnessFormResult | null } = {
+    killResults: null,
+    killError: null,
+    h3Observed: null,
+    witnessForm: null,
+  };
   const windows: ModeWindow[] = [];
   let restart: RestartInfo | null = null;
   let run: Awaited<ReturnType<typeof runEntrySequence>> | null = null;
@@ -347,6 +372,18 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
     // temp_rule 策略的每一步都靠 listTempRules 读回：本次运行没有正向确认它时，入口写入之前停止。
     if (strategy === 'temp_rule' && !tempListTrusted()) {
       throw refused(`前置条件不满足：listTempRules 没有经过正向确认（${insertionNote ?? '未探测'}），temp_rule 策略依赖它读回，未运行入口序列`);
+    }
+    // 见证形式核对（入口仍是 NORMAL、本应用规则写入之前）：两条测试临时规则按原文添加与删除，原始结果记入证据。
+    if (witnessCheckable) {
+      const wf = await probeWitnessForm(session.adapter, (r) => register(r, 'witness-check'), markRemoved, {
+        token: `p0${randomBytes(4).toString('hex')}`,
+        safariPaths: processPaths,
+        controlPaths: controls,
+      });
+      obs.witnessForm = wf;
+      ops.action('witness_form_check', { ok: wf.ok, skipped: wf.skipped, witnessPath: wf.witnessPath, leftInTempList: wf.leftInTempList });
+      out.line(`见证形式核对：${wf.ok === true ? '通过' : wf.ok === false ? '不通过' : '不完整'}（${describeWitnessForm(wf)}）`);
+      if (wf.ok === false) out.warn('见证形式在这台 Surge 上不成立：服务的 ruleset_resource 读回会一直等不到见证（失败即关闭）；把 entry 证据中的 witnessForm 交给开发者核对');
     }
     // 入口写入（优先级测试与主序列）之前登记意图；上面被拒绝时不登记从未写入的规则。
     for (const r of entryTempRules) await register(r, 'entry');
@@ -511,7 +548,10 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
   const h3Tcp = safariObs.filter((r) => inMode('ACTIVE', r) && r.protocol !== 'udp' && (r.host ?? '').toLowerCase() === h3Host.toLowerCase());
   const context = await measureContext(ctx, session, ops.state, { entryStrategy: strategy, processPaths });
   const at = now().toISOString();
-  const common = [`入口策略：${strategy}`, ...(strategy === 'ruleset_resource' ? [`自动重载条件（--auto-reload-condition）：${condition ?? '未提供'}；测量时读到的自动重载设置：${context.autoReload ?? '读不到'}`] : []), `模式：${run?.modes.map((m) => `${m.target}→${m.readbackMode ?? m.error?.code ?? '?'}`).join('，') ?? '未运行'}`, ...(insertionNote ? [insertionNote] : [])];
+  const wf = obs.witnessForm;
+  const witnessNote = !witnessCheckable ? 'matchRule 或临时规则增删没有可用实现，未核对' : wf === null ? '未运行（主序列在核对之前停止）' : describeWitnessForm(wf);
+  const witnessLine = `见证形式核对（完整路径 PROCESS-NAME，rule match 目标 ${ENTRY_PROBE_IPV4}）：${wf?.ok === true ? '通过' : wf?.ok === false ? '不通过' : '不完整'}；${witnessNote}`;
+  const common = [`入口策略：${strategy}`, witnessLine, ...(strategy === 'ruleset_resource' ? [`自动重载条件（--auto-reload-condition）：${condition ?? '未提供'}；测量时读到的自动重载设置：${context.autoReload ?? '读不到'}`] : []), `模式：${run?.modes.map((m) => `${m.target}→${m.readbackMode ?? m.error?.code ?? '?'}`).join('，') ?? '未运行'}`, ...(insertionNote ? [insertionNote] : [])];
 
   const entryChecks: CheckItem[] = [
     check('四种模式依次精确生效（运行时读回）', modesOk),
@@ -530,6 +570,9 @@ export async function runEntry(ctx: Ctx): Promise<ExitCode> {
       !matchAvailable ? null : matrix.control.hits.length > 0 ? false : matrix.control.total === 0 || matrix.errors > 0 ? null : true,
       !matchAvailable ? 'matchRule 没有可用实现' : `${matchNote(matrix.control.total, matrix.control.hits)}；对照路径 ${controls.length} 个`,
     ),
+    // ruleset_resource 的每一步都靠见证读回：见证形式在这台 Surge 上不成立时该策略无法确认任何一步。temp_rule 不用见证，
+    // 结果只记入摘要与证据。
+    ...(strategy === 'ruleset_resource' ? [check('见证规则形式在这台 Surge 上成立（完整路径 PROCESS-NAME 精确匹配，求值不依赖 DNS）', wf?.ok ?? null, witnessNote)] : []),
     ...(strategy === 'temp_rule'
       ? [check('新临时规则的插入位置已实测', ops.state.tempRuleInsertion === null ? null : true, `插入位置 ${ops.state.tempRuleInsertion ?? '未测得'}（文档只写“Add a temporary rule with the highest priority”）`)]
       : []),

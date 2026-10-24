@@ -7,7 +7,10 @@
 // - 本地 policy-path 文件是否被监视没有写入文档：watchLocalPolicyPaths 是测试参数，缺省关闭（成员只在 reloadProfile 时变化）；
 // - 资源类型按文档记为 policy-group / ruleset；新临时规则排在最前（“Add a temporary rule with the highest priority”，
 //   多条之间的顺序未写入文档，tempRuleInsertion 可改）；
-// - matchRule 与 simulateRequest 用同一套求值（模块规则 → 临时规则 → 配置规则）；
+// - matchRule 与 simulateRequest 用同一套求值（模块规则 → 临时规则 → 配置规则）；求值走到 IP 规则（没有 no-resolve）而目标是
+//   域名时按 IP 规则文档做一次假 DNS 查询（见 resolveHost）：查询失败时求值中止（“rule evaluation aborts and the request fails
+//   with a DNS error”，rules/ip.html），FINAL 带 dns-failed 时改用 FINAL 的策略；matchRule 因此以与 CLI 退出 1 相同的错误
+//   拒绝（2026-10-24 测试 Mac：`.invalid` 主机的 rule match 退出 1，DNS 空回答），simulateRequest 记为失败的请求；
 // - getVersion 报告版本、构建号、Core 版本与 Controller 协议号（缺省 6.10.0 / 12500）；
 // - `rule match` 与 `rule temp add/remove` 是 Mac 6.9.0+、协议 ≥20 的命令：低于它们时回答 Unknown command（随包技能：
 //   “An older core answers `Unknown command`”）；`--raw dump temp-rule` 与 `--raw dump rule` 不受影响。改版本用
@@ -40,7 +43,7 @@ import type {
   SurgeRuntimeInfo,
   SurgeVersion,
 } from '../ports.js';
-import { unsupportedCommandError } from './cli-adapter.js';
+import { commandExitError, unsupportedCommandError } from './cli-adapter.js';
 import { ruleMatchArgs } from './cli-commands.js';
 import { unrecognized } from './parse-output.js';
 import { ENTRY_BITS_IN_ORDER, entryRuleSetFileContent, entryRuleSetBlockLines, groupBlockLines, resourceFile } from './generate.js';
@@ -52,17 +55,46 @@ import { parseProxyLine } from './proxy-line.js';
 import { redactProxyLine } from './redact-profile.js';
 import {
   BUILTIN_POLICIES,
+  DnsLookupFailure,
   REJECT_POLICIES,
   evaluateCondition,
   isCommentLine,
   parseCondition,
   parseRule,
+  type ResolvedAddresses,
   type RuleCondition,
 } from './rules.js';
+import { createHash } from 'node:crypto';
+import { isIP } from 'node:net';
 
 export const FAKE_SAFARI_PATH = '/Applications/Safari.app/Contents/MacOS/Safari';
 export const FAKE_CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 export const FAKE_VERIFY_HOST = 'verify.example.test';
+/**
+ * 合成工作配置中排在入口段与用户规则之后、FINAL 之前的 IP 规则（不带 no-resolve）：真实配置里常见的这类规则让求值走到它时
+ * 对域名做 DNS 查询（rules/ip.html）。放进缺省配置，本应用的 rule match 探测一旦用了无法解析的合成域名就会像真实 Surge 一样失败。
+ */
+export const FAKE_IP_RULE = 'IP-CIDR,203.0.113.0/24,DIRECT';
+
+/**
+ * 假 DNS 查询失败的 rule match：与 CLI 适配器对非零退出的分类相同（commandExitError：SURGE_COMMAND_FAILED，details 只有
+ * primitive 与 exitCode 1，没有 reason），不是“rule match 不可用”。
+ */
+export function fakeRuleMatchDnsError(): SfeError {
+  return commandExitError('matchRule', 1, 'DNS 查询失败（模拟：DNS 空回答）');
+}
+
+/**
+ * 假 DNS 的缺省答案：RFC 6761 的 `.invalid` 名称总是失败（“Name resolution APIs and libraries SHOULD recognize "invalid" names
+ * as special and SHOULD always return immediate negative responses.”，RFC 6761 §6.4；测试 Mac 上的 DNS 空回答）；其他名称（测试用的
+ * `example.test` 代表真实域名）得到稳定的合成文档地址（198.51.100.0/24 与 2001:db8::/32）。dnsRecords 与 dnsFailures 可覆盖。
+ */
+function syntheticAddresses(host: string): ResolvedAddresses | null {
+  const h = host.toLowerCase().replace(/\.$/, '');
+  if (h === 'invalid' || h.endsWith('.invalid')) return null;
+  const n = createHash('sha256').update(h).digest().readUInt16BE(0);
+  return { v4: `198.51.100.${(n % 254) + 1}`, v6: `2001:db8::${((n % 0xfffe) + 1).toString(16)}` };
+}
 
 export interface FakeSurgeOptions {
   directory: string;
@@ -195,6 +227,12 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   private lies = new Map<string, Array<{ value: unknown }>>();
   private policyTests = new Map<string, SurgePolicyTestResult>();
   private checkResults = new Map<string, SurgeCheckResult>();
+  /** 假 DNS：指定域名的答案（覆盖合成答案）。 */
+  readonly dnsRecords = new Map<string, ResolvedAddresses>();
+  /** 假 DNS：查询总是失败的域名（小写）。 */
+  readonly dnsFailures = new Set<string>();
+  /** 假 DNS 的查询记录（域名，按求值顺序；不含 IP 字面量，它们从不查询）。 */
+  readonly dnsQueries: string[] = [];
 
   constructor(opts: FakeSurgeOptions) {
     this.directory = resolve(opts.directory);
@@ -326,7 +364,31 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
    */
   simulateRequest(req: { processPath: string | null; host: string; protocol: 'tcp' | 'udp'; longLived?: boolean }): SimulatedRequest {
     this.checkFileChanges();
-    const { rule: matchedRule, policy } = this.evaluate({ processPath: req.processPath, host: req.host, protocol: req.protocol });
+    let evaluated: { rule: string; policy: string };
+    try {
+      evaluated = this.evaluate({ processPath: req.processPath, host: req.host, protocol: req.protocol });
+    } catch (e) {
+      if (!(e instanceof DnsLookupFailure)) throw e;
+      // 求值中止：请求以 DNS 错误失败，没有命中规则也没有策略
+      const failed: SimulatedRequest = {
+        id: String(this.nextId++),
+        processPath: req.processPath,
+        remoteHost: req.host,
+        policyName: null,
+        leafPolicyName: null,
+        rule: null,
+        protocol: req.protocol,
+        startedAt: this.now(),
+        completed: true,
+        failed: true,
+        chain: [],
+        frontMissing: false,
+      };
+      this.recent.push(failed);
+      if (this.recent.length > 500) this.recent.shift();
+      return { ...failed, chain: [] };
+    }
+    const { rule: matchedRule, policy } = evaluated;
     const resolved = this.resolvePolicy(policy, 0);
     const rec: SimulatedRequest = {
       id: String(this.nextId++),
@@ -348,14 +410,46 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     return { ...rec, chain: [...rec.chain] };
   }
 
-  /** 规则求值：模块规则 → 临时规则 → 配置规则（RULE-SET 用已加载的内容），第一条命中的规则决定策略。 */
+  /** 假 DNS 查询（每次求值最多一次，见 evaluate）：失败抛出 DnsLookupFailure。 */
+  private resolveHost(host: string): ResolvedAddresses {
+    const h = host.toLowerCase().replace(/\.$/, '');
+    this.dnsQueries.push(h);
+    if (this.dnsFailures.has(h)) throw new DnsLookupFailure(h);
+    const answer = this.dnsRecords.get(h) ?? syntheticAddresses(h);
+    if (answer === null || (answer.v4 === null && answer.v6 === null)) throw new DnsLookupFailure(h);
+    return { ...answer };
+  }
+
+  /**
+   * 规则求值：模块规则 → 临时规则 → 配置规则（RULE-SET 用已加载的内容），第一条命中的规则决定策略。文档只写临时规则
+   * “precede all profile rules”（https://manual.nssurge.com/tools/cli.html），模块规则与临时规则谁先求值没有写明——这里的
+   * “模块先于临时规则”是假设（TODO(P0)：测试 Mac 上核对），测试不能依赖它证明真实 Surge 上的行为。目标是域名时，第一条需要
+   * 地址的 IP 规则触发一次假 DNS 查询，之后的 IP 规则沿用结果（rules/ip.html）；IP 字面量从不查询。查询失败时：生效的 FINAL
+   * （最后一条）带 dns-failed 则用它的策略（“With the dns-failed option, Surge uses the FINAL rule's policy instead”，
+   * rules/final.html），否则抛出 DnsLookupFailure（求值中止）。
+   */
   private evaluate(facts: { processPath: string | null; host: string; protocol: 'tcp' | 'udp' }): { rule: string; policy: string } {
-    const ctx = { ruleSet: (value: string) => this.resources.get(`ruleset:${value}`)?.conditions ?? null };
+    let resolved: ResolvedAddresses | null = null;
+    const lookup = (host: string, resolve: boolean): ResolvedAddresses | null => {
+      if (resolved !== null || !resolve || isIP(host) !== 0) return resolved;
+      resolved = this.resolveHost(host);
+      return resolved;
+    };
+    const ctx = { ruleSet: (value: string) => this.resources.get(`ruleset:${value}`)?.conditions ?? null, lookup };
     const ordered = [...this.modules.map((m) => m.text), ...this.temps, ...this.profileRules];
-    for (const text of ordered) {
-      const r = parseRule(text);
-      if (!r || !r.policy) continue;
-      if (evaluateCondition(r.condition, facts, ctx)) return { rule: text, policy: r.policy };
+    try {
+      for (const text of ordered) {
+        const r = parseRule(text);
+        if (!r || !r.policy) continue;
+        const noResolve = r.options.some((o) => o.trim().toLowerCase() === 'no-resolve');
+        if (evaluateCondition(r.condition, facts, ctx, noResolve)) return { rule: text, policy: r.policy };
+      }
+    } catch (e) {
+      if (!(e instanceof DnsLookupFailure)) throw e;
+      const final = [...this.profileRules].reverse().find((t) => parseRule(t)?.condition.type === 'FINAL');
+      const parsed = final ? parseRule(final) : null;
+      if (final && parsed?.policy && parsed.options.some((o) => o.trim().toLowerCase() === 'dns-failed')) return { rule: final, policy: parsed.policy };
+      throw e;
     }
     return { rule: 'FINAL,DIRECT', policy: 'DIRECT' };
   }
@@ -644,6 +738,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     });
   }
 
+  /** 有效规则列表，顺序与 evaluate 相同（模块与临时规则之间的先后是假设，TODO(P0)，见 evaluate）。 */
   listRules(): Promise<SurgeRuleRecord[]> {
     return this.invoke('listRules', () => [
       ...this.modules.map((m) => ({ text: m.text, source: 'module' as const, moduleName: m.moduleName })),
@@ -658,7 +753,13 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
       this.requireRuleCommands('matchRule');
       ruleMatchArgs(input);
       const protocol = input.protocol === 'UDP' || input.protocol === 'QUIC' ? 'udp' : 'tcp';
-      return this.evaluate({ processPath: input.processPath, host: input.host, protocol });
+      try {
+        return this.evaluate({ processPath: input.processPath, host: input.host, protocol });
+      } catch (e) {
+        // 与 CLI 相同：求值中止的 rule match 以非零退出失败（结果未知），不是 Unknown command
+        if (e instanceof DnsLookupFailure) throw fakeRuleMatchDnsError();
+        throw e;
+      }
     });
   }
 
@@ -736,6 +837,8 @@ export interface FakeEnvironmentOptions {
   verifyHost?: string;
   /** 额外写入 [Rule] 受管理段之后的用户规则（放在 FINAL 之前）。 */
   userRules?: string[];
+  /** 用户规则之后、FINAL 之前的 IP 规则（缺省 FAKE_IP_RULE，不带 no-resolve）；null 表示不写。 */
+  ipRule?: string | null;
 }
 
 export interface FakeEnvironment {
@@ -773,6 +876,7 @@ export function createFakeSurgeEnvironment(dir: string, opts: FakeEnvironmentOpt
     ...entryLines,
     '# SFE-END entry',
     ...(opts.userRules ?? ['DOMAIN-SUFFIX,daily.example.test,Daily']),
+    ...(opts.ipRule === null ? [] : [opts.ipRule ?? FAKE_IP_RULE]),
     'FINAL,DIRECT',
     '',
   ].join('\n');

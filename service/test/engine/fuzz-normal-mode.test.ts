@@ -56,7 +56,7 @@
 import { writeFileSync } from 'node:fs';
 import { describe, expect, test } from 'vitest';
 import {
-  ENTRY_WITNESS_PROCESS_PATH,
+  ENTRY_WITNESS_PROCESS_PREFIX,
   ROUTE_GROUP_NAME,
   SfeError,
   type ActivateRequest,
@@ -543,7 +543,7 @@ class World {
       out[name] = async (...args: unknown[]): Promise<unknown> => {
         if (gen.dead) return new Promise(() => undefined);
         // 文件监视见证的轮询次数取决于真实时间：不计入（保持回放确定）
-        const counted = !(name === 'matchRule' && (args[0] as { processPath?: string } | undefined)?.processPath === ENTRY_WITNESS_PROCESS_PATH);
+        const counted = !(name === 'matchRule' && ((args[0] as { processPath?: string } | undefined)?.processPath ?? '').startsWith(ENTRY_WITNESS_PROCESS_PREFIX));
         if (counted) this.beforeEngineCall(name);
         if (counted && this.crashArm && this.callMatches(this.crashArm.when) && --this.crashArm.countdown <= 0) {
           const after = this.crashArm.after;

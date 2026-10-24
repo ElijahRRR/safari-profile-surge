@@ -1,6 +1,9 @@
 // Surge 规则文本的解析与求值（PROCESS-NAME 按文档的三种模式与通配符）。假 Surge、优先级分类、入口读回与请求核对共用同一套解析，
 // 避免各处对 AND/OR/NOT 嵌套的理解不一致。只覆盖本应用需要判断的规则类型：
-// 未知类型在优先级分类中按“可能匹配”处理，在假 Surge 中按“不匹配”处理。
+// 未知类型在优先级分类中按“可能匹配”处理，在假 Surge 中按“不匹配”处理。IP 规则（IP-CIDR、IP-CIDR6、GEOIP、IP-ASN）按文档的
+// DNS 行为求值（见 evaluateCondition），供假 Surge 复现“求值走到 IP 规则时域名解析失败”。
+
+import { BlockList, isIP } from 'node:net';
 
 export interface RuleCondition {
   /** 大写规则类型，例如 PROCESS-NAME、AND、RULE-SET、FINAL。 */
@@ -9,6 +12,8 @@ export interface RuleCondition {
   value: string | null;
   /** AND/OR/NOT 的子条件。 */
   operands: RuleCondition[] | null;
+  /** 叶子条件的选项（例如 no-resolve）；没有时省略。整条规则的选项在 ParsedRule.options。 */
+  options?: string[];
 }
 
 export interface ParsedRule {
@@ -94,9 +99,11 @@ export function parseCondition(text: string): RuleCondition | null {
     return { type, value: null, operands };
   }
   if (type === 'FINAL') return { type, value: null, operands: null };
-  // 规则集文件中的叶子行可以带选项（例如 no-resolve），只取值。
+  // 规则集文件中的叶子行可以带选项（例如 no-resolve；规则集文档：“Per-line options such as no-resolve and extended-matching
+  // are allowed.”），保留在 options 中。
   if (parts.length < 2 || parts[1] === '') return null;
-  return { type, value: parts[1]!, operands: null };
+  const options = parts.slice(2).filter((o) => o !== '');
+  return options.length > 0 ? { type, value: parts[1]!, operands: null, options } : { type, value: parts[1]!, operands: null };
 }
 
 /** 解析一条完整规则（带策略）。注释与空行返回 null。 */
@@ -193,22 +200,92 @@ function hostMatches(type: string, value: string, host: string): boolean {
   return false;
 }
 
+/** 目标域名的解析结果（第一条 A 与第一条 AAAA 记录）。 */
+export interface ResolvedAddresses {
+  v4: string | null;
+  v6: string | null;
+}
+
+/** 求值中的 DNS 查询失败：IP 规则文档“If the DNS lookup fails, rule evaluation aborts and the request fails with a DNS error”。 */
+export class DnsLookupFailure extends Error {
+  constructor(readonly host: string) {
+    super('DNS lookup failed');
+    this.name = 'DnsLookupFailure';
+  }
+}
+
 export interface EvaluateContext {
   /** RULE-SET 的已加载内容（按规则中的路径/地址查找）；未加载返回 null。 */
   ruleSet?: (location: string) => RuleCondition[] | null;
+  /**
+   * 目标是域名时 IP 规则所需的地址。resolve 为 true 时在本次求值中第一次需要时查询（之后的 IP 规则沿用同一结果，失败抛出
+   * DnsLookupFailure）；为 false（no-resolve）时只返回本次求值中已有的结果，没有则为 null。没有提供时 IP 规则对域名不匹配。
+   */
+  lookup?: (host: string, resolve: boolean) => ResolvedAddresses | null;
 }
 
-/** 假 Surge 的求值：只判断已知类型，未知类型不匹配。 */
-export function evaluateCondition(c: RuleCondition, facts: RequestFacts, ctx: EvaluateContext = {}): boolean {
+const IP_RULE_TYPES = new Set(['IP-CIDR', 'IP-CIDR6', 'GEOIP', 'IP-ASN']);
+
+function hasOption(c: RuleCondition, name: string): boolean {
+  return (c.options ?? []).some((o) => o.trim().toLowerCase() === name);
+}
+
+function cidrMatches(value: string, address: string, family: 'ipv4' | 'ipv6'): boolean {
+  const [net, bits, ...rest] = value.trim().split('/');
+  if (rest.length > 0 || net === undefined || isIP(net) !== (family === 'ipv4' ? 4 : 6)) return false;
+  const max = family === 'ipv4' ? 32 : 128;
+  const prefix = bits === undefined ? max : Number(bits);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > max || (bits !== undefined && !/^\d+$/.test(bits))) return false;
+  const list = new BlockList();
+  list.addSubnet(net, prefix, family);
+  return list.check(address, family);
+}
+
+/**
+ * IP 规则（https://manual.nssurge.com/rules/ip.html）：
+ * - “If the request targets an IP literal, the rule matches it directly; GEOIP and IP-ASN perform their database lookup without a DNS query.”
+ * - “If the request targets a domain, Surge performs a DNS lookup when evaluation reaches the first IP-based rule, then resumes evaluation with
+ *   the result. IP-CIDR and GEOIP/IP-ASN lookups test the first IPv4 record of the result (falling back to the IPv6 record for GEOIP/IP-ASN);
+ *   IP-CIDR6 tests the first IPv6 record.”
+ * - no-resolve：“the rule is skipped for requests targeting a domain whose address has not been resolved yet, instead of triggering a DNS
+ *   lookup. The rule still matches requests that target IP literals.”；RULE-SET 行的 no-resolve “forces no-resolve on every sub-rule”
+ *   （rules/ruleset.html，由 inheritedNoResolve 传入）。
+ * 假 Surge 没有 GeoIP/ASN 数据库：任何地址的查询结果都为空，只有 UNKNOWN（“matches an empty country result”）匹配。
+ */
+function ipConditionMatches(c: RuleCondition, facts: RequestFacts, ctx: EvaluateContext, noResolve: boolean): boolean {
+  const host = facts.host;
+  if (host === null || host === '') return false;
+  let addr: ResolvedAddresses | null;
+  const literal = isIP(host);
+  if (literal === 4) addr = { v4: host, v6: null };
+  else if (literal === 6) addr = { v4: null, v6: host };
+  else addr = ctx.lookup ? ctx.lookup(host, !noResolve) : null;
+  if (addr === null) return false;
+  switch (c.type) {
+    case 'IP-CIDR':
+      return addr.v4 !== null && cidrMatches(c.value!, addr.v4, 'ipv4');
+    case 'IP-CIDR6':
+      return addr.v6 !== null && cidrMatches(c.value!, addr.v6, 'ipv6');
+    default:
+      return (addr.v4 ?? addr.v6) !== null && c.value!.trim().toUpperCase() === 'UNKNOWN';
+  }
+}
+
+/**
+ * 假 Surge 的求值：只判断已知类型，未知类型不匹配。inheritedNoResolve：整条规则或 RULE-SET 行带 no-resolve（作用于其中的
+ * IP 规则）。目标域名的 DNS 查询失败时抛出 DnsLookupFailure（调用方按 FINAL 的 dns-failed 或求值失败处理）。
+ */
+export function evaluateCondition(c: RuleCondition, facts: RequestFacts, ctx: EvaluateContext = {}, inheritedNoResolve = false): boolean {
+  if (IP_RULE_TYPES.has(c.type)) return ipConditionMatches(c, facts, ctx, inheritedNoResolve || hasOption(c, 'no-resolve'));
   switch (c.type) {
     case 'FINAL':
       return true;
     case 'AND':
-      return (c.operands ?? []).every((o) => evaluateCondition(o, facts, ctx));
+      return (c.operands ?? []).every((o) => evaluateCondition(o, facts, ctx, inheritedNoResolve));
     case 'OR':
-      return (c.operands ?? []).some((o) => evaluateCondition(o, facts, ctx));
+      return (c.operands ?? []).some((o) => evaluateCondition(o, facts, ctx, inheritedNoResolve));
     case 'NOT':
-      return !evaluateCondition(c.operands![0]!, facts, ctx);
+      return !evaluateCondition(c.operands![0]!, facts, ctx, inheritedNoResolve);
     case 'PROCESS-NAME':
       return processNameMatches(c.value!, facts.processPath);
     case 'DOMAIN':
@@ -222,7 +299,7 @@ export function evaluateCondition(c: RuleCondition, facts: RequestFacts, ctx: Ev
     }
     case 'RULE-SET': {
       const loaded = ctx.ruleSet?.(c.value!) ?? null;
-      return loaded !== null && loaded.some((r) => evaluateCondition(r, facts, ctx));
+      return loaded !== null && loaded.some((r) => evaluateCondition(r, facts, ctx, inheritedNoResolve));
     }
     default:
       return false;

@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { INSERTION_PROBE_RULES } from '../src/entry-driver.js';
 import { buildRollbackPlan, formatRollbackPlan } from '../src/rollback-plan.js';
 import { emptyState, markTempRule, recordTempRuleIntent, upsertCreatedFile, type RunState } from '../src/state.js';
 
 const T = new Date('2026-10-21T10:00:00Z');
 const R1 = 'AND,((PROCESS-NAME,/Applications/Safari.app/Contents/MacOS/Safari),(PROTOCOL,UDP)),REJECT';
 const R2 = 'PROCESS-NAME,/Applications/Safari.app/Contents/MacOS/Safari,REJECT';
-const R3 = 'DOMAIN,p0-insert-1.invalid,REJECT';
+const R3 = INSERTION_PROBE_RULES[0];
 const USER = 'DOMAIN-SUFFIX,user.example.test,DIRECT';
 
 /** 默认为 listTempRules 已由插入探测正向确认的运行状态（其他取值见下面的专门测试）。 */

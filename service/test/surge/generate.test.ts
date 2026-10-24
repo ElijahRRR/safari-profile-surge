@@ -1,10 +1,19 @@
 import { describe, expect, test } from 'vitest';
-import { ENTRY_PLACEHOLDER_RULE, ENTRY_WITNESS_PROCESS_PATH, LEGACY_ENTRY_PLACEHOLDER_RULE, SfeError } from '@sfe/contract';
+import {
+  ENTRY_PLACEHOLDER_PROCESS_PATH,
+  ENTRY_PLACEHOLDER_RULE,
+  ENTRY_PROBE_IPV4,
+  ENTRY_WITNESS_PROCESS_PREFIX,
+  LEGACY_ENTRY_PLACEHOLDER_RULE,
+  LEGACY_ENTRY_WITNESS_PROCESS_PATH,
+  PREVIOUS_ENTRY_PLACEHOLDER_RULE,
+  SfeError,
+} from '@sfe/contract';
 import {
   entryRuleSetBlockLines,
   entryRuleSetFileContent,
   entryRules,
-  entryWitnessHost,
+  entryWitnessProcessPath,
   entryWitnessRule,
   groupBlockLines,
   legacyTempRuleText,
@@ -15,12 +24,13 @@ import {
   tempRuleText,
   validateSafariProcessPaths,
 } from '../../src/surge/generate.js';
-import { evaluateCondition, parseCondition, parseRule } from '../../src/surge/rules.js';
+import { evaluateCondition, parseCondition, parseRule, processNameMayMatch, type RuleCondition } from '../../src/surge/rules.js';
 
 const SAFARI = '/Applications/Safari.app/Contents/MacOS/Safari';
 const SAFARI_TP = '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview';
-/** 见证与占位规则限定的合成进程。 */
-const W = ENTRY_WITNESS_PROCESS_PATH;
+/** 旧格式见证与占位规则限定的合成进程（只用于识别旧文件）。 */
+const W = LEGACY_ENTRY_WITNESS_PROCESS_PATH;
+const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const base = {
   name: 'SFE-N-E0001-US01-v003',
   host: '203.0.113.10',
@@ -140,6 +150,10 @@ describe('validateSafariProcessPaths', () => {
     [['/Applications/../Safari'], 'safariProcessPaths[0]'],
     [[SAFARI, SAFARI], 'safariProcessPaths[1]'],
     [[' /Applications/Safari.app/Contents/MacOS/Safari'], 'safariProcessPaths[0]'],
+    // 本应用见证与占位规则的合成进程目录（含规范路径 /private/var/empty）：入口规则行不能与见证行相同
+    [['/var/empty/sfe-entry-witness-active-ab12'], 'safariProcessPaths[0]'],
+    [['/var/empty/sfe-entry-disabled'], 'safariProcessPaths[0]'],
+    [[SAFARI, '/private/var/empty/Safari'], 'safariProcessPaths[1]'],
   ])('rejects %j', (paths, field) => {
     const errors = validateSafariProcessPaths(paths);
     expect(errors.length).toBeGreaterThan(0);
@@ -223,7 +237,7 @@ describe('entry rules', () => {
     expect(text.split('\n')).toEqual(['# SFE managed entry rule set · block', `PROCESS-NAME,${SAFARI}`, `PROCESS-NAME,${SAFARI_TP}`, '']);
     expect(entryRuleSetFileContent('block', true, two, 'a1b2c3d4').split('\n')).toEqual([
       '# SFE managed entry rule set · block',
-      'AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-block-a1b2c3d4.invalid))',
+      'PROCESS-NAME,/var/empty/sfe-entry-witness-block-a1b2c3d4',
       `PROCESS-NAME,${SAFARI}`,
       `PROCESS-NAME,${SAFARI_TP}`,
       '',
@@ -233,41 +247,108 @@ describe('entry rules', () => {
   test('off files carry the fixed off witness by default (initial files can be read back), or none when asked', () => {
     expect(entryRuleSetFileContent('udp', false, one).split('\n')).toEqual([
       '# SFE managed entry rule set · udp',
-      'AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-udp-off.invalid))',
-      ENTRY_PLACEHOLDER_RULE,
+      'PROCESS-NAME,/var/empty/sfe-entry-witness-udp-off',
+      'PROCESS-NAME,/var/empty/sfe-entry-disabled',
       '',
     ]);
     expect(entryRuleSetFileContent('udp', false, one, null).split('\n')).toEqual(['# SFE managed entry rule set · udp', ENTRY_PLACEHOLDER_RULE, '']);
-    expect(entryWitnessHost('verify', 'off')).toBe('sfe-entry-verify-off.invalid');
-    expect(catchErr(() => entryWitnessHost('verify', 'Bad.Token')).code).toBe('VALIDATION_FAILED');
+    expect(entryWitnessProcessPath('verify', 'off')).toBe('/var/empty/sfe-entry-witness-verify-off');
+    expect(catchErr(() => entryWitnessProcessPath('verify', 'Bad.Token')).code).toBe('VALIDATION_FAILED');
+    expect(catchErr(() => entryWitnessProcessPath('verify', 'a')).code).toBe('VALIDATION_FAILED');
   });
 
   test('parseEntryRuleSetFile separates the witness from the rules (only the witness of this bit counts)', () => {
-    expect(parseEntryRuleSetFile('active', entryRuleSetFileContent('active', true, one, 'ff00'))).toEqual({ witness: 'ff00', bodies: [`PROCESS-NAME,${SAFARI}`] });
-    expect(parseEntryRuleSetFile('active', entryRuleSetFileContent('active', true, one))).toEqual({ witness: null, bodies: [`PROCESS-NAME,${SAFARI}`] });
+    expect(parseEntryRuleSetFile('active', entryRuleSetFileContent('active', true, one, 'ff00'))).toEqual({ witness: 'ff00', legacyWitness: false, bodies: [`PROCESS-NAME,${SAFARI}`] });
+    expect(parseEntryRuleSetFile('active', entryRuleSetFileContent('active', true, one))).toEqual({ witness: null, legacyWitness: false, bodies: [`PROCESS-NAME,${SAFARI}`] });
     // 另一位的见证行不算本位的见证，也不是本位的规则；空白不同的写法规范化后照样识别
-    expect(parseEntryRuleSetFile('active', `# x\n${entryWitnessRule('block', 'ab12')}\nAND, ((PROCESS-NAME, ${W}), (DOMAIN, sfe-entry-active-cd34.invalid))\n`)).toEqual({
+    expect(parseEntryRuleSetFile('active', `# x\n${entryWitnessRule('block', 'ab12')}\nPROCESS-NAME , ${ENTRY_WITNESS_PROCESS_PREFIX}active-cd34\n`)).toEqual({
       witness: 'cd34',
+      legacyWitness: false,
       bodies: [],
     });
     // 两条见证：无法确定
     expect(parseEntryRuleSetFile('udp', `${entryWitnessRule('udp', 'ab12')}\n${entryWitnessRule('udp', 'cd34')}\n`).witness).toBeNull();
-    // 不限定合成进程的见证写法不是见证：它是一条普通规则行（文件因此无法识别），任何进程请求这一主机都会命中
-    expect(parseEntryRuleSetFile('active', 'DOMAIN,sfe-entry-active-cd34.invalid\n')).toEqual({ witness: null, bodies: ['DOMAIN,sfe-entry-active-cd34.invalid'] });
-    expect(parseEntryRuleSetFile('active', `AND,((PROCESS-NAME,${SAFARI}),(DOMAIN,sfe-entry-active-cd34.invalid))\n`).witness).toBeNull();
+    // 大小写不同、带子目录或以 “/” 结尾（App Bundle 前缀模式）的写法不是见证：它是一条普通规则行（文件因此无法识别）
+    for (const line of ['PROCESS-NAME,/VAR/empty/sfe-entry-witness-active-cd34', 'PROCESS-NAME,/var/empty/sfe-entry-witness-active-cd34/', 'PROCESS-NAME,/var/empty/sfe-entry-witness/active-cd34']) {
+      expect(parseEntryRuleSetFile('active', `${line}\n`)).toEqual({ witness: null, legacyWitness: false, bodies: [line] });
+    }
   });
 
-  test('witness and placeholder rules only match the synthetic witness process (a DOMAIN rule matches any process: rules/domain.html)', () => {
-    expect(entryWitnessRule('verify', 'off')).toBe(`AND,((PROCESS-NAME,${W}),(DOMAIN,sfe-entry-verify-off.invalid))`);
-    expect(ENTRY_PLACEHOLDER_RULE).toBe(`AND,((PROCESS-NAME,${W}),(DOMAIN,sfe-disabled.invalid))`);
+  test('legacy witness lines (synthetic process + .invalid host) are recognised but never taken as the witness', () => {
+    const legacy = (bit: string, token: string): string => `AND,((PROCESS-NAME,${W}),(DOMAIN,sfe-entry-${bit}-${token}.invalid))`;
+    // 旧格式的整份文件：见证行去掉、按没有见证处理；三种占位规则都留在 bodies 中（由策略识别为关闭）
+    expect(parseEntryRuleSetFile('udp', `# SFE managed entry rule set · udp\n${legacy('udp', 'off')}\n${PREVIOUS_ENTRY_PLACEHOLDER_RULE}\n`)).toEqual({
+      witness: null,
+      legacyWitness: true,
+      bodies: [PREVIOUS_ENTRY_PLACEHOLDER_RULE],
+    });
+    expect(parseEntryRuleSetFile('active', `AND, ((PROCESS-NAME, ${W}), (DOMAIN, sfe-entry-active-cd34.invalid))\nPROCESS-NAME,${SAFARI}\n`)).toEqual({
+      witness: null,
+      legacyWitness: true,
+      bodies: [`PROCESS-NAME,${SAFARI}`],
+    });
+    // 与当前格式混用、不止一条或属于其他位：旧行留在 bodies 中（文件无法识别），从不当作见证
+    expect(parseEntryRuleSetFile('active', `${entryWitnessRule('active', 'ab12')}\n${legacy('active', 'cd34')}\n`)).toEqual({
+      witness: 'ab12',
+      legacyWitness: false,
+      bodies: [legacy('active', 'cd34')],
+    });
+    expect(parseEntryRuleSetFile('active', `${legacy('active', 'ab12')}\n${legacy('active', 'cd34')}\n`)).toMatchObject({ witness: null, legacyWitness: false });
+    expect(parseEntryRuleSetFile('active', `${legacy('block', 'ab12')}\n`)).toEqual({ witness: null, legacyWitness: false, bodies: [legacy('block', 'ab12')] });
+    // 不限定合成进程的旧写法不是见证：普通规则行，任何进程请求这一主机都会命中
+    expect(parseEntryRuleSetFile('active', 'DOMAIN,sfe-entry-active-cd34.invalid\n')).toEqual({ witness: null, legacyWitness: false, bodies: ['DOMAIN,sfe-entry-active-cd34.invalid'] });
+    expect(parseEntryRuleSetFile('active', `AND,((PROCESS-NAME,${SAFARI}),(DOMAIN,sfe-entry-active-cd34.invalid))\n`)).toMatchObject({ witness: null, legacyWitness: false });
+  });
+
+  test('witness and placeholder rules are a full-path PROCESS-NAME of a synthetic process only (no host or IP condition)', () => {
+    expect(entryWitnessRule('verify', 'off')).toBe('PROCESS-NAME,/var/empty/sfe-entry-witness-verify-off');
+    expect(ENTRY_PLACEHOLDER_RULE).toBe(`PROCESS-NAME,${ENTRY_PLACEHOLDER_PROCESS_PATH}`);
+    expect(ENTRY_PLACEHOLDER_PROCESS_PATH).toBe('/var/empty/sfe-entry-disabled');
+    expect(PREVIOUS_ENTRY_PLACEHOLDER_RULE).toBe(`AND,((PROCESS-NAME,${W}),(DOMAIN,sfe-disabled.invalid))`);
     expect(LEGACY_ENTRY_PLACEHOLDER_RULE).toBe('DOMAIN,sfe-disabled.invalid');
-    for (const text of [entryWitnessRule('active', 'ab12'), ENTRY_PLACEHOLDER_RULE]) {
+    expect(ENTRY_PROBE_IPV4).toBe('192.0.2.1');
+    const tokens = ['off', 'ab12', '0a1b2c3d', 'w000001'];
+    const realPaths = [SAFARI, SAFARI_TP, CHROME, '/usr/bin/curl', '/usr/bin/true', '/private/var/empty/sfe-entry-disabled', '/private/var/empty/sfe-entry-witness-active-ab12'];
+    const synthetic = [ENTRY_PLACEHOLDER_RULE, ...(['udp', 'verify', 'block', 'active'] as const).flatMap((b) => tokens.map((t) => entryWitnessRule(b, t)))];
+    for (const text of synthetic) {
       const c = parseCondition(text)!;
-      const host = text.includes('sfe-disabled') ? 'sfe-disabled.invalid' : 'sfe-entry-active-ab12.invalid';
-      for (const processPath of [SAFARI, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', null]) {
-        for (const protocol of ['tcp', 'udp'] as const) expect(evaluateCondition(c, { processPath, host, protocol }, { ruleSet: () => null })).toBe(false);
+      expect(c.type).toBe('PROCESS-NAME');
+      // 完整路径模式：以 “/” 开头、不以 “/” 结尾，不含通配符
+      expect(c.value!.startsWith('/var/empty/')).toBe(true);
+      expect(c.value!.endsWith('/')).toBe(false);
+      expect(c.value).not.toMatch(/[*?,]/);
+      // “可能匹配”（文档没有说明的细节取最宽的解释）也不会匹配任何真实进程路径
+      for (const p of realPaths) expect(processNameMayMatch(c.value!, p), `${text} ${p}`).toBe(false);
+      for (const host of ['verify.example.test', ENTRY_PROBE_IPV4, 'sfe-disabled.invalid']) {
+        for (const processPath of [...realPaths, null]) {
+          for (const protocol of ['tcp', 'udp'] as const) expect(evaluateCondition(c, { processPath, host, protocol })).toBe(false);
+        }
+        expect(evaluateCondition(c, { processPath: c.value, host, protocol: 'tcp' })).toBe(true);
       }
-      expect(evaluateCondition(c, { processPath: W, host, protocol: 'tcp' }, { ruleSet: () => null })).toBe(true);
+    }
+    // 每个见证路径只命中它自己：其他位、其他标记与占位规则都不命中
+    for (const a of synthetic) {
+      for (const b of synthetic) expect(evaluateCondition(parseCondition(a)!, { processPath: parseCondition(b)!.value, host: ENTRY_PROBE_IPV4, protocol: 'tcp' })).toBe(a === b);
+    }
+  });
+
+  test('no generated entry rule set line or entry rule carries an IP condition (an IP sub-rule gives the set a DNS requirement)', () => {
+    const IP_TYPES = new Set(['IP-CIDR', 'IP-CIDR6', 'GEOIP', 'IP-ASN', 'SRC-IP', 'IN-PORT', 'DEST-PORT', 'SRC-PORT']);
+    const types = (c: RuleCondition): string[] => [c.type, ...(c.operands ?? []).flatMap(types)];
+    for (const opts of [one, two]) {
+      for (const bit of ['udp', 'verify', 'block', 'active'] as const) {
+        for (const on of [true, false]) {
+          for (const witness of [undefined, null, 'ab12', 'off']) {
+            const lines = entryRuleSetFileContent(bit, on, opts, witness).split('\n').filter((l) => l !== '' && !l.startsWith('#'));
+            for (const line of lines) {
+              const c = parseCondition(line)!;
+              expect(c, line).not.toBeNull();
+              expect(types(c).filter((t) => IP_TYPES.has(t)), line).toEqual([]);
+              expect(line).not.toContain('.invalid');
+            }
+          }
+        }
+      }
     }
   });
 

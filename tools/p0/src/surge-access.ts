@@ -7,7 +7,7 @@
 
 import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SfeError } from '@sfe/contract';
+import { ENTRY_PROBE_IPV4, SfeError } from '@sfe/contract';
 import {
   INTERACTIVE_BANNER_RE,
   SURGE_PRIMITIVES,
@@ -64,12 +64,14 @@ export const HTTP_NOT_IMPLEMENTED: readonly Primitive[] = [
   'removeTempRule',
 ];
 
+// 示例参数只用来构造 argv 的形状（固定命令词与允许清单），从不执行。rule match 的目标仍用文档地址 ENTRY_PROBE_IPV4，与实际
+// 执行的探测一致：合成域名在求值走到 IP 规则时会因 DNS 失败退出 1（docs/verification/2026-10-24-mac-p0-increment.md）。
 const DUMMY_ARGS: Partial<Record<Primitive, unknown[]>> = {
   checkProfile: ['/p0-dummy.conf'],
   getGroupMembers: ['P0-DUMMY-GROUP'],
   getGroupSelection: ['P0-DUMMY-GROUP'],
   selectGroupPolicy: ['SFE-ROUTE', 'P0-DUMMY-POLICY'],
-  matchRule: [{ host: 'p0-dummy.invalid', processPath: '/p0-dummy' }],
+  matchRule: [{ host: ENTRY_PROBE_IPV4, processPath: '/var/empty/p0-dummy' }],
   killRequest: ['1'],
   updateExternalResource: ['p0-dummy-key'],
   addTempRule: ['P0-DUMMY-RULE'],

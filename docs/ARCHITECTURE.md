@@ -131,6 +131,12 @@
   - ruleset_resource——入口文件在重启后照样生效，撤销入口只能走退路：照常按从不放宽的顺序逐位写入（同样的自动重载、资源与比较并替换检查），每步写入后等满文件监视上限（`watch.timeoutMs`，TODO(P0) 按实测设定）并核对四条 RULE-SET 的顺序，结果标为未经运行时确认，路由状态带 `entry_unverified`（“入口规则未能读回确认”），操作步骤写明。
 - **冲突**：等待不是证明——文件监视比上限慢时，后一步可能先于前一步被加载，中间可能短暂出现计划之外的组合；“进入普通模式永远可用”与“切换无放行窗口、须读回证明”在 rule match 不可用时无法同时满足，按用户决定 D5、D6 选择前者并如实标注。
 - 激活方向（VERIFY_ONLY/ACTIVE）从不使用退路，rule match 读不到即失败即关闭；超时等结果未知的读取失败也不走退路。
+- **DNS 失败（待用户决定，现按失败即关闭）**：rule match 在求值走到 IP 规则时对域名做 DNS 查询，失败即退出非零（rules/ip.html；2026-10-24 测试 Mac 实测，§5.5），这属于结果未知的读取失败，不是“rule match 不可用”。
+  - 见证与“其他主机”已改用文档地址 IP 字面量，不再依赖 DNS（§5.5）；检测主机与站点主机是真实域名，NORMAL 时的 Safari 探测与对照进程探测仍会走到用户的 IP 规则、需要本地 DNS。
+  - 本机 DNS 不可用时两种策略不同（service/test/surge/entry/dns-probe.test.ts 固定当前行为）：
+    - temp_rule——撤销入口中 BLOCKED 一步的探测读回失败时，保留刚加入的 REJECT 类规则，以 `runtimeConfirmed: false` 完成 BLOCKED；随后的普通模式按临时规则列表与有效规则顺序读回（没有本应用的临时规则即 NORMAL），不经过依赖 DNS 的探测，所以普通模式照常完成；
+    - ruleset_resource——撤销入口的每一步都要求见证与 Safari/对照探测读回，检测主机探测因 DNS 失败时该步以 READBACK_MISMATCH 停止（没有确认的位，读回 UNKNOWN），普通模式无法完成，与 D5、D6 的“进入普通模式永远可用”有张力。
+  - 需要用户决定的只有 ruleset_resource 的这一种情况：见证已确认、只有真实主机探测因 DNS 失败时，是否允许以 `runtimeConfirmed: false` 完成；决定之前不放宽。
 
 **最低 Surge 与 P0**：P0 与服务用同一规则核对版本：`inventory` 记录运行实例与 `surge-cli --raw version` 的交叉核对（`inventory/surge-version.json`），每次能力上下文测量都重新核对，未通过时上下文中的版本为 null，`propose` 拒绝依赖版本的能力；`instance` 读到低于 6.10.0（12500）的版本时退出 3。design 中“本机 6.5 实测”的表格与结论（固定工作配置设计 §3）只作历史记录，不作为 6.10 的证据。
 
@@ -485,11 +491,26 @@ SFE-N-E0001-US01-v003 = socks5, 203.0.113.10, 1080, username=<u>, password=<p>, 
 - “`PROTOCOL,UDP` also matches QUIC and STUN connections”，“`PROTOCOL,TCP` also matches HTTP, HTTPS, and MTProto connections”（https://manual.nssurge.com/rules/protocol-and-network.html）；
 - PROCESS-NAME 以 “/” 开头且不以 “/” 结尾为完整路径模式，“Matching is case-sensitive in all modes”（https://manual.nssurge.com/rules/process.html）。
 
-**ruleset_resource 的规则**：工作配置中四条 RULE-SET 固定先后 udp > verify > block > active > 用户规则，文件中的规则可以相交——udp `AND,((进程),(PROTOCOL,UDP))` → REJECT；verify `AND,((进程),(DOMAIN,<检测主机>))` → SFE-ROUTE；block/active 每个路径一行 `PROCESS-NAME,<路径>`；关闭的位写占位规则 `AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-disabled.invalid))`。
-- 每个文件另有一条**见证规则** `AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-<位>-<标记>.invalid))`：每次写入换一个随机标记；初始化写入的占位文件用固定标记 `off`。
-- 见证与占位规则都限定一个不存在、也无法创建的合成进程（`/var/empty` 只属于 root 且为空；contract `ENTRY_WITNESS_PROCESS_PATH`），只有见证探测命中：规则文档写明“Domain rules match the hostname of a request. They are the most common rule types and never trigger a DNS lookup”（https://manual.nssurge.com/rules/domain.html），`.invalid` 不解析并不妨碍按主机名匹配，而规则集文件继承 RULE-SET 行的策略（verify/active 为 SFE-ROUTE）——不限定进程时，Chrome 或任何网页请求 `sfe-entry-active-off.invalid` 都会经买家出口发出，固定标记 `off` 又是公开的。
-- 读回因此另用对照进程探测各文件当前的见证主机与占位主机（TCP），命中本应用入口规则或 SFE-ROUTE 即为对照命中。
-- 没有见证的旧格式文件只在全部为占位规则时可按 Safari 探测读作 NORMAL；早先版本写入的不限定进程的占位规则 `DOMAIN,sfe-disabled.invalid` 仍识别为关闭（只识别、从不写入），读回证据写明，下一次切换按未知重写（这些文件还在时不探测占位主机，否则改写它们的每一步都会因已知的旧格式问题失败）。
+**ruleset_resource 的规则**：工作配置中四条 RULE-SET 固定先后 udp > verify > block > active > 用户规则，文件中的规则可以相交——udp `AND,((进程),(PROTOCOL,UDP))` → REJECT；verify `AND,((进程),(DOMAIN,<检测主机>))` → SFE-ROUTE；block/active 每个路径一行 `PROCESS-NAME,<路径>`；关闭的位写占位规则 `PROCESS-NAME,/var/empty/sfe-entry-disabled`。
+- 每个文件另有一条**见证规则** `PROCESS-NAME,/var/empty/sfe-entry-witness-<位>-<标记>`：每次写入换一个随机标记（8 位十六进制）；初始化写入的占位文件用固定标记 `off`。
+- 见证与占位规则只由合成进程的完整路径构成，不含任何主机或 IP 条件（contract `ENTRY_WITNESS_PROCESS_PREFIX`、`ENTRY_PLACEHOLDER_RULE`）：
+  - 完整路径模式是精确匹配——“If the expression starts with `/` (and does not end with `/`), it matches the executable's full absolute path.”，“Matching is case-sensitive in all modes.”（https://manual.nssurge.com/rules/process.html）；
+  - 选 `/var/empty` 是因为应用的可执行文件不会放在这里：Safari 进程路径不能落在 `/var/empty/` 或 `/private/var/empty/` 下（校验拒绝），Chrome 与其他应用的可执行文件在各自的安装位置。以下几点文档没有写明、尚未实测，按 TODO(P0) 处理：
+    - `/var/empty` 在测试 Mac 上属于 root、为空（P0-RUNBOOK §1.6 用 `ls -ld`、`ls -A` 记录；root 仍可以在其下创建文件，所以这只说明真实请求通常不会以它为来源，不是保证）；
+    - `rule match` 是否接受不存在的 `process-path`、是否把 `/var` 规范化为 `/private/var`（进程规则文档只写完整路径模式与大小写敏感，没有写 Surge 如何报告或规范化进程路径）：由 P0 的见证形式核对实测（`entry` 3.6，`witnessForm`）；任一点不成立时核对为不通过，服务在这台 Surge 上等不到见证，失败即关闭；
+    - 在这些前提下只有见证探测会命中见证行；
+  - 不用主机区分：规则集文件继承 RULE-SET 行的策略（verify/active 为 SFE-ROUTE），而“Domain rules match the hostname of a request. They are the most common rule types and never trigger a DNS lookup”（https://manual.nssurge.com/rules/domain.html）——按主机名的见证对任何进程都成立，固定标记 `off` 又是公开的；
+  - 也不放 IP 条件：入口规则集文件里的 IP 子规则会让整个规则集需要 DNS（RULE-SET 行的 no-resolve “Removes the set's DNS requirement and forces no-resolve on every sub-rule”，https://manual.nssurge.com/rules/ruleset.html），Safari 的真实域名请求就会在本应用入口段内先做本地 DNS 查询（生成器测试固定：入口规则集文件与入口规则不含 IP 类条件）。
+- **探测的目标主机是文档地址 IP 字面量**（contract `ENTRY_PROBE_IPV4` = `192.0.2.1`，RFC 5737）：见证探测与没有站点主机时的“其他主机”都用它。
+  - 依据：“If the request targets a domain, Surge performs a DNS lookup when evaluation reaches the first IP-based rule”，“If the DNS lookup fails, rule evaluation aborts and the request fails with a DNS error, unless the FINAL rule carries the dns-failed parameter.”；“If the request targets an IP literal, the rule matches it directly; GEOIP and IP-ASN perform their database lookup without a DNS query.”（https://manual.nssurge.com/rules/ip.html）。
+  - 2026-10-24 测试 Mac（Surge 6.10.0 / 12500，docs/verification/2026-10-24-mac-p0-increment.md）：在含需要目标 IP 的规则的真实配置上，`rule match p0-inventory.invalid process-path=/usr/bin/true protocol=TCP dest-port=443` 退出 1（DNS 空回答），同一命令改用 `192.0.2.1` 退出 0 并返回 rule 与 policy。
+  - 所以尚未加载的这一版见证不命中时，求值走到用户规则或 FINAL，得到一个正常回答（读作“已加载的不是这一版”），而不是读取失败；旧设计用合成域名探测，每一步的第一次见证轮询都会在用户的 IP 规则处失败。
+  - 检测主机与站点主机是真实域名，保留：它们用来发现遮住这些域名的用户规则（这些探测在 NORMAL 时与对照进程上仍会走到用户的 IP 规则、需要 DNS，见 §0「进入普通模式与 `rule match`」）。
+  - rule match 的 DNS 失败（非零退出，`SURGE_COMMAND_FAILED`，没有 reason）是结果未知的读取失败，失败即关闭；它不是“rule match 不可用”（未映射、Unknown command），不走撤销入口的退路。
+- 早先版本写入的文件只识别、从不写入：
+  - 占位规则的两种旧写法——上一版 `AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-disabled.invalid))` 与最早不限定进程的 `DOMAIN,sfe-disabled.invalid`——都识别为关闭；后者读回证据写明（任何进程请求这一主机都会命中）。
+  - 旧格式见证 `AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-<位>-<标记>.invalid))`：同一位恰好一条、文件没有当前格式见证时按“没有见证”处理（从不探测、从不当作已加载的证明），读回证据写明；与当前格式混用、不止一条或属于其他位时文件无法识别（失败即关闭）。
+  - 没有见证的文件只在全部为占位规则时可按 Safari/对照探测读作 NORMAL（`witnessConfirmed: false`），其他组合读作 UNKNOWN；下一次切换按未知重写。测试 Mac 上按旧格式准备的初始化差异应重新生成后再启用。
 
 **temp_rule 的规则**：五种条件互不相交的临时规则（进程 = 单个 `PROCESS-NAME,<完整路径>` 或它们的 OR）。
 
@@ -528,7 +549,7 @@ SFE-N-E0001-US01-v003 = socks5, 203.0.113.10, 1080, username=<u>, password=<p>, 
     - 读取当前自动重载设置（与能力记录的条件不符或读不到且未记录 `any` → 拒绝，停在已确认的更严格模式；普通模式也一样，报告无法执行而不写入）→
     - 确认 Surge 中恰好有一个资源指向该文件（否则 `RESOURCE_MISSING`/`NAME_COLLISION`，不写入）→
     - 比较并替换地原子写入单个规则集文件（期望上次摘要，意图先记入归属，带新的见证标记）→
-    - 在有限时间内（`watch.timeoutMs`/`pollMs`，缺省 5 秒、每 0.2 秒，TODO(P0)：按实测的监视延迟设定）轮询 `rule match <见证主机> process-path=/var/empty/sfe-entry-witness`，直到命中该位的 RULE-SET（或回显的就是这条见证行）且最终策略与该位一致——这证明 Surge 已加载的正是这一版内容，**即使这一位被前面的 block 遮住**、Safari 的探测看不出差别（例如 NORMAL→ACTIVE 中 block 打开时写入的 active：之后撤下 block 不会暴露未加载的内容）→
+    - 在有限时间内（`watch.timeoutMs`/`pollMs`，缺省 5 秒、每 0.2 秒，TODO(P0)：按实测的监视延迟设定）轮询 `rule match 192.0.2.1 process-path=/var/empty/sfe-entry-witness-<位>-<标记> protocol=TCP dest-port=443`，直到命中该位的 RULE-SET（或回显的就是这条见证行）且最终策略与该位一致——这证明 Surge 已加载的正是这一版内容，**即使这一位被前面的 block 遮住**、Safari 的探测看不出差别（例如 NORMAL→ACTIVE 中 block 打开时写入的 active：之后撤下 block 不会暴露未加载的内容）→
     - 有效规则顺序与 Safari/对照探测读回（下文）→
     - 确认归属，才写下一步。
   - **超时**：结果按未知处理（`READBACK_MISMATCH`，`details.reason = watch_timeout`），不声称更宽松的状态。
@@ -559,10 +580,10 @@ SFE-N-E0001-US01-v003 = socks5, 203.0.113.10, 1080, username=<u>, password=<p>, 
 - temp_rule 下临时规则列表与记录完全一致、集合是目标模式的集合；
 - ruleset_resource 下四条 RULE-SET 各出现一次、先后正确、资源无错误、每个文件的见证读回一致（例外：四条 RULE-SET 都不在有效规则中、没有规则以 SFE-ROUTE 为策略、入口规则集文件不存在或只是占位规则时为「入口尚未写入工作配置」，按事实读作 NORMAL 并由探测核对，只有撤销入口走向普通模式时不写入地完成，其他方向不写入、停止；四条 RULE-SET 不完整、重复或顺序不对（入口段被外部改动）时撤销入口走向普通模式只关闭位、把入口规则集文件改写为占位规则，文件全部为占位规则且在有效规则中的那几位由见证确认已加载、探测一致时读作 NORMAL（`segmentDamaged`），激活与回滚不写入、停止，见 §5.2）。
 - 另外每步与每次读回都用 `rule match`（Mac 6.9.0+、协议 ≥20；CLI 帮助：“Evaluate the active rule set without creating a connection, then show the matched rule and final policy.”，“process-path=<path> Source process path; affects PROCESS-NAME rules”，“protocol=<name> Protocol, such as TCP, UDP, HTTP, HTTPS, QUIC, or STUN”）探测：
-  - Safari 每个进程路径 × {检测主机, 站点主机（没有时为 `sfe-entry-probe.invalid`）} × {TCP, UDP}，命中的必须是该类流量预期的本应用规则（或预期不命中本应用规则）；
+  - Safari 每个进程路径 × {检测主机, 站点主机（没有时为文档地址 `192.0.2.1`：IP 字面量不查询 DNS；temp_rule 的 `NOT(DOMAIN,<检测主机>)` 对它成立，所以它照样是“其他主机”）} × {TCP, UDP}，命中的必须是该类流量预期的本应用规则（或预期不命中本应用规则）；
   - 被已知的 REJECT 类优先级规则遮住的算一致，被可能放行的优先级规则遮住的按优先级问题处理（读回不能宣称受控）；
   - 对照进程（缺省 Chrome 标准路径，`EntryConfig.controlProcessPaths` 可改）的同样四个探测永远不得命中本应用入口规则或 SFE-ROUTE。
-  - ruleset_resource 的对照进程另外探测各文件当前的见证主机与占位主机（TCP）。
+  - 对照进程不再另外探测见证与占位规则：它们不含主机条件，对照进程的路径只有在 Surge 的完整路径匹配本身出错时才会命中（P0 验证一次，生成器测试固定任何真实进程路径都不可能匹配）；探测合成域名反而会在已加载的仍是旧格式时走到用户的 IP 规则、因 DNS 失败让读回失败。
 - 探测不一致、读取失败或对照命中都使读回为 UNKNOWN，切换中则停止（`READBACK_MISMATCH`，`details.runtime`/`controlHit`）。
   - 例外（§0「进入普通模式与 `rule match`」）：撤销入口（目标 BLOCKED/NORMAL）时 rule match **读不到**（不是不一致、不是对照命中）——temp_rule 按临时规则列表与有效规则顺序读回，ruleset_resource 在 rule match 不可用（未映射、Unknown command）时走退路——结果带 `runtimeConfirmed: false`，回滚与普通模式据此给路由状态加 `entry_unverified`。
 - 切换失败时错误中的最后确认位同样标明确认程度：

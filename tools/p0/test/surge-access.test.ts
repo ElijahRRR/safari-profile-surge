@@ -77,6 +77,9 @@ describe('CLI help analysis', () => {
     expect(cliLiteralWords('getCurrentProfile')).toEqual(['--raw', 'status']);
     expect(cliLiteralWords('getTakeoverState')).toEqual(['--raw', 'feature', 'get', 'enhanced-mode', 'system-proxy', 'mode']);
     expect(cliLiteralWords('matchRule')).toEqual(['--raw', 'rule', 'match', 'process-path', 'protocol', 'dest-port']);
+    // 示例 argv 与实际执行的探测一致：目标是文档地址 IP 字面量，从不是合成域名（DNS 失败会让 rule match 退出 1）
+    expect(cliSampleArgvs('matchRule')).toEqual([['--raw', 'rule', 'match', '192.0.2.1', 'process-path=/var/empty/p0-dummy', 'protocol=TCP', 'dest-port=443']]);
+    expect(cliSampleArgvs('matchRule')!.flat().join(' ')).not.toContain('.invalid');
     expect(cliLiteralWords('selectGroupPolicy')).toEqual(['policy-group', 'set']);
     expect(cliLiteralWords('killRequest')).toEqual(['kill']);
     const help610 = `${HELP}\nUsage: rule <match|explain> <host|url> [port] [key=value ...]\n  process-path=<path>       Source process path\n  protocol=<name>           Protocol\n  dest-port=<0-65535>       Destination port\n  rule match example.com port=443`;

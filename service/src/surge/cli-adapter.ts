@@ -69,6 +69,18 @@ export function isUnsupportedCommandError(e: unknown): boolean {
   return reason === 'unsupported_command' || reason === 'interactive_mode';
 }
 
+/**
+ * 命令以非零退出、输出既不是不支持的命令也不是无法连接：一次结果未知的命令失败（SURGE_COMMAND_FAILED，details 只有原语与
+ * 退出码，没有 reason）。例如 `rule match <域名>` 在求值走到 IP 规则时 DNS 查询失败（2026-10-24 测试 Mac：退出 1，DNS 空回答；
+ * IP 规则文档：“If the DNS lookup fails, rule evaluation aborts and the request fails with a DNS error”）——它不是“rule match
+ * 不可用”（entry/common.ts isRuleMatchUnavailable 为 false），调用方失败即关闭。detail 已脱敏截断。假 Surge 用同一形状。
+ */
+export function commandExitError(primitive: SurgePrimitive, exitCode: number, detail: string): SfeError {
+  return new SfeError('SURGE_COMMAND_FAILED', `执行 Surge 命令失败：${detail || `退出码 ${exitCode}`}`, {
+    details: { primitive, exitCode },
+  });
+}
+
 function showsInteractiveBanner(stdout: string, stderr: string): boolean {
   return INTERACTIVE_BANNER_RE.test(stdout) || INTERACTIVE_BANNER_RE.test(stderr);
 }
@@ -146,9 +158,7 @@ export function createCliAdapter(opts: CliAdapterOptions): SurgeAdapter {
       } else {
         const detail = truncate(scrubAll(stderr || stdout));
         if (UNREACHABLE_TEXT_RE.test(stderr || stdout)) throw new SfeError('SURGE_UNREACHABLE', `连接 Surge 失败：${detail}`);
-        throw new SfeError('SURGE_COMMAND_FAILED', `执行 Surge 命令失败：${detail || `退出码 ${err.code}`}`, {
-          details: { primitive, exitCode: err.code },
-        });
+        throw commandExitError(primitive, err.code, detail);
       }
     }
     // 先于解析：退出 0 加提示不是成功（--check 会被当作通过，写命令会被当作已写入）。
