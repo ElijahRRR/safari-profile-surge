@@ -271,7 +271,7 @@ export interface ProbeJudgement {
   controlHit: boolean;
   /**
    * rule match 读取失败（超时、不可达、命令不被支持或原语未映射），不是求值与预期不一致：ok 为 false。撤销本应用入口
-   * （普通模式、回滚）只把它记作证据，不因此停止（用户决定 1：进入普通模式永远可用，不依赖未经验证的原语）。
+   * （普通模式、回滚）只把它记作证据，不因此停止（用户决定 D5、D6：进入普通模式永远可用，不依赖未经验证的原语；docs/ARCHITECTURE.md §0）。
    */
   readFailed?: boolean;
   /** 读取失败的原因是 rule match 在当前 Surge 上不可用（isRuleMatchUnavailable），而不是超时等结果未知的失败。 */

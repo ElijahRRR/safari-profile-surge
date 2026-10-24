@@ -186,7 +186,7 @@ function acceptableFirstBits(known: Record<EntryBit, boolean | null>, c: EntryCl
 /**
  * 撤销本应用入口（普通模式、回滚；目标 BLOCKED/NORMAL）时 rule match 不可用的退路：原语未映射（安装配置早于 matchRule、
  * HTTP 没有对应接口）或 Surge 低于 Mac 6.9.0 回答 Unknown command（例如降级之后，入口文件仍在、Surge 启动时已加载）。
- * 用户决定 1 要求进入普通模式永远可用，而见证与探测都依赖 rule match——没有退路时每一步都停在阻断，普通模式永远无法完成。
+ * 用户决定 D5、D6（docs/ARCHITECTURE.md §0）要求进入普通模式永远可用，而见证与探测都依赖 rule match——没有退路时每一步都停在阻断，普通模式永远无法完成。
  * 退路：照常按计划逐位写入（同样的从不放宽的顺序、同样的自动重载与资源检查、比较并替换），每步写入后等满文件监视的上限
  * （watch.timeoutMs，TODO(P0)：按实测的监视延迟设定）再写下一步，并核对有效规则中四条 RULE-SET 的顺序；结果标为未经运行时
  * 确认（EntryReadback.runtimeConfirmed: false），之后的读回仍为 UNKNOWN。规划时本应用记录已确认的文件按文件内容视为已加载
@@ -690,7 +690,7 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
         //   改回写前内容会让比时限慢的监视永远加载不到收紧，普通模式与回滚每次重试都写入又改回，Safari 一直停在买家出口。
         // - 撤销入口（undoing：普通模式、回滚，目标 BLOCKED/NORMAL）中放宽的一步（只出现在走向 NORMAL 时：udp/block 关闭，
         //   路由位已关闭并确认之后）：同样保留新内容——它只走向用户要求的普通模式；改回会让比时限慢的监视永远加载不到
-        //   udp/block 关闭，普通模式每次重试都写入又改回，永远停在 BLOCKED（用户决定 1：进入普通模式永远可用）。
+        //   udp/block 关闭，普通模式每次重试都写入又改回，永远停在 BLOCKED（用户决定 D5、D6：进入普通模式永远可用）。
         //   两种保留都在下一次切换时由见证读到这一版、按事实确认归属（settleWitnessedIntents）。
         const loosening = step.value === PERMISSIVE_SIDE[step.bit];
         const restore = loosening && !undoing;

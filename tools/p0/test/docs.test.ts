@@ -209,11 +209,24 @@ describe('docs/ARCHITECTURE.md §0', () => {
   });
 
   it('records the no-keychain, plain-text secrets decision with the user question, the overridden design lines and the honest consequence', () => {
-    expect(s0).toContain('**秘密的存放（用户决定，2026-10-23；偏离方案 1 设计第 195–199 行、实时同步设计第 13、22、80 行、固定工作配置设计第 73 行，以及 docs/DEVELOPMENT.md 第 9、35 行');
+    expect(s0).toContain('**秘密的存放（用户决定 D8，2026-10-23；偏离方案 1 设计第 195–199、232 行、实时同步设计第 13、22、80 行、固定工作配置设计第 73 行，以及 docs/DEVELOPMENT.md 第 9、35 行');
     expect(s0).toContain('为什么要访问我本机的钥匙串？这个项目拿到的ip账号密码，亚马逊账号密码等信息默认保存在自己的一套资料里，不需要从钥匙串中读取');
     expect(s0).toContain('任何以同一 macOS 用户身份运行的进程都能直接读取 `sfe.sqlite`');
     expect(s0).toContain('时间机器');
     expect(s0).not.toContain('**登录填充依赖已过时的钥匙串接口。**');
+  });
+
+  it('numbers every user decision (D1–D9) with its date, and process decisions (W1–W3); no undefined decision number is cited', () => {
+    for (let i = 1; i <= 9; i++) expect(s0).toMatch(new RegExp(`^\\| D${i} \\| 2026-10-2\\d \\|`, 'm'));
+    for (let i = 1; i <= 3; i++) expect(s0).toMatch(new RegExp(`^\\| W${i} \\| 2026-10-2\\d \\|`, 'm'));
+    expect(s0).toContain('| D9 | 2026-10-24 | 切换进行中点击「进入普通模式」 | 保留排队');
+    expect(s0).toContain('PR #7');
+    for (const t of [text, readFileSync(new URL('../../../service/src/surge/entry/common.ts', import.meta.url), 'utf8'), readFileSync(new URL('../../../service/src/surge/entry/ruleset-strategy.ts', import.meta.url), 'utf8')]) {
+      expect(t).not.toContain('用户决定 1');
+    }
+    for (const cited of text.matchAll(/用户决定 ((?:D\d+[、，]?\s*)+)/g)) {
+      for (const id of cited[1]!.match(/D\d+/g)!) expect(s0).toMatch(new RegExp(`^\\| ${id} \\|`, 'm'));
+    }
   });
 
   it('deleted secrets are zeroed (secure_delete + WAL truncation), and legacy data dirs are refused before migrating', () => {
