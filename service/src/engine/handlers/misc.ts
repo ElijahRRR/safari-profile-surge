@@ -86,6 +86,7 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
   // 仅终结该环境自己的挂起编辑；批量发布可能还包含其他环境，不能整批取消。
   const obsolete = repos.operations.listByStatus(['parked'], { kinds: ['environment.create', 'environment.update'] })
     .filter((pending) => pending.environmentId === env.id);
+  const endedBatches: string[] = [];
   repos.tx(() => {
     const retired = new Set<string>();
     for (const r of revisions) {
@@ -110,10 +111,26 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
       repos.operations.update(pending.id, { status: 'superseded', phase: 'SUPERSEDED', supersededBy: op.id, error: null });
       repos.operations.appendStep(pending.id, 'SUPERSEDED', '环境已删除，取消尚未完成的环境发布');
     }
+    // 导入批次也有独立的停泊结果。只有它的全部逐行任务都因删除而被取代后才结束父任务；
+    // 仍有其他行待部署、已成功或失败的批次保留原结果，不把部分删除误报成整批取消。
+    const parents = new Set(obsolete.map((pending) => payloadOf(pending).parentOperationId).filter((id): id is string => typeof id === 'string'));
+    for (const id of parents) {
+      const parent = repos.operations.get(id);
+      if (!parent || parent.kind !== 'import.batch' || parent.status !== 'parked') continue;
+      const children = payloadOf(parent).children ?? [];
+      if (children.length === 0 || !children.every((childId) => {
+        const child = repos.operations.get(childId);
+        return child?.status === 'superseded' && child.environmentId !== null && repos.environments.get(child.environmentId)?.deletedAt != null;
+      })) continue;
+      repos.outbox.cancelForOperation(id);
+      repos.operations.update(id, { status: 'superseded', phase: 'SUPERSEDED', supersededBy: op.id, error: null });
+      repos.operations.appendStep(id, 'SUPERSEDED', '导入批次中的环境均已删除，取消尚未完成的批次发布');
+      endedBatches.push(id);
+    }
     repos.operations.update(op.id, { phase: 'COMPLETED', status: 'succeeded', resultRevision: env.revision + 1 });
     repos.operations.appendStep(op.id, 'COMPLETED', '环境已删除：映射与账号已清除，节点将在之后的发布中移除；Safari 场景、Cookie 与登录资料未改动');
   });
-  engine.emit({ operations: [op.id, ...obsolete.map((pending) => pending.id)], deletedEnvironments: [env.id], fronts: true, route: true });
+  engine.emit({ operations: [op.id, ...obsolete.map((pending) => pending.id), ...endedBatches], deletedEnvironments: [env.id], fronts: true, route: true });
 }
 
 export async function runUnbind(engine: Engine, op: OperationRecord): Promise<void> {

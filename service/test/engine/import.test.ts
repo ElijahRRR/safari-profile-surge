@@ -65,6 +65,38 @@ describe('import preview', () => {
 });
 
 describe('import commit', () => {
+  test('deleting the last draft in a parked import supersedes its batch without cancelling remaining rows or another batch', async () => {
+    h = await createHarness({ sourceProfile: '[Proxy]\nFront-A = socks5, 192.0.2.10, 1080\n[Proxy Group]\nDaily = select, Front-A, DIRECT\n[Rule]\nFINAL,DIRECT\n', capabilities: [] });
+    const makeBatch = async (names: string[]) => {
+      const req = csv(names.map((name, i) => `,${name},socks5,203.0.113.${20 + i},1080,,,Front-A,US,,,,,,`));
+      const preview = await h.app.importPreview(req, WEB);
+      const result = await h.app.importCommit({ ...req, request_id: rid(), preview_digest: preview.preview_digest, decisions: preview.rows.map((row) => ({ row: row.row, action: 'create' as const })) }, WEB);
+      await h.idle();
+      expect(h.repos.operations.get(result.operation_id)!.status).toBe('parked');
+      return result;
+    };
+    const batch = await makeBatch(['Draft-A', 'Draft-B']);
+    const other = await makeBatch(['Other-Draft']);
+    const before = { ...h.fake.calls };
+    const remove = async (id: string) => {
+      const env = h.repos.environments.get(id)!;
+      const result = await h.app.deleteEnvironment(id, { request_id: rid(), expected_revision: env.revision }, WEB);
+      await h.idle();
+      expect(h.repos.operations.get(result.operation_id)!.status).toBe('succeeded');
+      return result;
+    };
+    await remove(batch.items[0]!.environment_id!);
+    expect(h.repos.operations.get(batch.operation_id)!.status).toBe('parked');
+    expect(h.repos.operations.get(batch.items[1]!.operation_id!)!.status).toBe('parked');
+    const last = await remove(batch.items[1]!.environment_id!);
+    expect(h.repos.operations.get(batch.operation_id)).toMatchObject({ status: 'superseded', phase: 'SUPERSEDED', supersededBy: last.operation_id, error: null });
+    expect(h.repos.operations.get(other.operation_id)!.status).toBe('parked');
+    expect(h.repos.operations.get(other.items[0]!.operation_id!)!.status).toBe('parked');
+    for (const name of ['getGroupSelection', 'selectGroupPolicy', 'updateExternalResource', 'reloadProfile', 'killRequest', 'addTempRule', 'removeTempRule']) {
+      expect(h.fake.calls[name] ?? 0).toBe(before[name] ?? 0);
+    }
+  });
+
   test('one batch op + per-row ops + a single coalesced publish; per-row conflicts do not stop others', async () => {
     h = await createHarness();
     const existing = await createEnv(h, 'US-Existing', '203.0.113.10');
