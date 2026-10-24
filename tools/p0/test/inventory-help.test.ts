@@ -139,11 +139,29 @@ describe('inventory --help', () => {
       expect(cliHelp[p], p).toBe('in_help');
     }
     const cliArgvs = spawned.filter((c) => c.file === CLI).map((c) => c.args);
-    expect(cliArgvs).toEqual(expect.arrayContaining([['--raw', 'version'], ['--raw', 'dump', 'temp-rule'], ['--raw', 'rule', 'match', 'p0-inventory.invalid', 'process-path=/usr/bin/true', 'protocol=TCP', 'dest-port=443']]));
+    expect(cliArgvs).toEqual(expect.arrayContaining([['--raw', 'version'], ['--raw', 'dump', 'temp-rule'], ['--raw', 'rule', 'match', '192.0.2.1', 'process-path=/usr/bin/true', 'protocol=TCP', 'dest-port=443']]));
     // 盘点只执行允许清单中的只读命令：没有任何写命令（update、rule temp add/remove、policy-group set、kill）
     for (const argv of cliArgvs) {
       expect(isAllowedCliArgv(argv), argv.join(' ')).toBe(true);
       expect(argv[0], argv.join(' ')).toBe('--raw');
+    }
+  });
+
+  it('uses a reserved IP so DNS failure cannot hide an available rule-match primitive', async () => {
+    spawned.length = 0;
+    cliStdout.clear();
+    cliStdout.set('--raw rule match 192.0.2.1 process-path=/usr/bin/true protocol=TCP dest-port=443', JSON.stringify({ rule: 'FINAL,DIRECT', policy: 'DIRECT' }));
+    try {
+      const r = run(TOP_HELP_610, { topics: TOPIC_HELP_610 });
+      expect(await r.go()).toBe(EXIT.OK);
+      const { inventory } = runFiles(r.base);
+      expect((inventory.probes as { cli: Record<string, { status: string }> }).cli.matchRule!.status).toBe('ok');
+      const probes = spawned.filter((c) => c.args.includes('match'));
+      expect(probes).toHaveLength(1);
+      expect(probes[0]!.args[3]).toBe('192.0.2.1');
+      expect(probes[0]!.args).not.toContain('p0-inventory.invalid');
+    } finally {
+      cliStdout.clear();
     }
   });
 
