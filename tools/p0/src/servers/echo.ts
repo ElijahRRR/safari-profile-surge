@@ -57,7 +57,8 @@ export function createEchoServer(opts: EchoServerOptions): Server {
       sendJson(res, 200, { ok: true, service: 'sfe-p0-echo' });
       return;
     }
-    if (req.method === 'GET' && url.pathname === '/ip') {
+    // Surge 的连通性测试与 http probe 使用 HEAD；Node 会按 HEAD 语义省略响应体。
+    if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/ip') {
       sendJson(res, 200, {
         testId,
         app,

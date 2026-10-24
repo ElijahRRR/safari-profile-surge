@@ -141,6 +141,7 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(result('targeted_resource_refresh').checks.find((c) => c.name.startsWith('恰好一个 key'))?.note).toBe('local=true，来自配置');
     const reread = result('policy_path_reread');
     expect(reread.verdict).toBe('pass');
+    expect(env!.run().readJsonl<{ action: string }>('actions.jsonl').some((a) => a.action === 'node_publication_verified')).toBe(true);
     expect(reread.checks[0]!.note).toMatch(/ms 后成员与清单相等/);
     const fixed = result('fixed_profile_no_switch');
     expect(fixed.checks.find((c) => c.name.includes('实际经过'))?.ok).toBe(true);
@@ -162,6 +163,7 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(await main(['refresh', '--auto-reload', 'off', ...common()], env!.deps())).toBe(EXIT.OK);
     const reread = result('policy_path_reread');
     expect(reread.verdict).toBe('fail');
+    expect(env!.run().readJsonl<{ action: string }>('actions.jsonl').some((a) => a.action === 'node_publication_verified')).toBe(false);
     expect(reread.checks[0]).toMatchObject({ ok: false });
     expect(reread.checks[0]!.note).toContain('随后调用一次 update：报告跳过');
     expect(reread.checks[0]!.note).toContain('之后成员仍未变化');
