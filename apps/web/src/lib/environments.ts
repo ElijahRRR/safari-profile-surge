@@ -131,6 +131,13 @@ export function isCancellableRouteOperation(op: Pick<OperationView, 'status' | '
 export const HELD_ON_END = '若此时 SFE-ROUTE 已不是使用中环境已验证的出口（例如在 Surge 中被改选），会改选 REJECT（拒绝 Safari 经本应用出口的新连接）并要求处理。';
 
 /**
+ * Safari 重测取消的另一个例外（§6.1「已受理的取消优先」、§6.4）：取消排在已提交的检测结果之前受理时，服务不读 Surge、只按已提交
+ * 结果中的出口 IP 与环境的预期出口比较；不一致时取消照样记下出口不符（exit_ip_mismatch），停止自动打开订单与填充。所以重测的
+ * 取消确认与说明不能说「只结束本次检测」。
+ */
+export const RETEST_SUBMITTED_MISMATCH = '若已提交的检测结果中的出口 IP 与预期出口不一致，取消照样记下出口不符，并停止自动打开订单与填充。';
+
+/**
  * 当前环境的 Safari 重测（§6.4：不切换、不阻断、不回滚；超时或取消只结束检测，例外见 HELD_ON_END）：重测操作本身，或激活第 1 步复用时改为重测的
  * 激活（环境已在使用中而实测过期：操作仍是 route.activate，服务端记 probeKind 'safari'）。
  */

@@ -560,6 +560,74 @@ describe('crash recovery with a normal mode accepted behind the interrupted oper
     expectOriginalRules(normalId!);
     expect(h.repos.operations.get(createId!)!.status).toBe('succeeded');
   });
+
+  /** 路由空闲的普通模式；激活 Y 停在第 1–3 步读取 SFE-ROUTE 成员上（尚未写入：running、stage pending、没有 epoch），然后服务崩溃。 */
+  async function crashBeforeFirstWrite(): Promise<{ env: string; X: string }> {
+    const env = (await createEnv(h, 'US-Buyer-Y', '203.0.113.10')).environment_id!;
+    await bind(h, PROFILE_A, env);
+    const stuck = hang('getGroupMembers', (g) => g === ROUTE_GROUP_NAME);
+    const X = (await h.app.activate(env, { request_id: rid('act') }, WEB)).operation_id;
+    await until(stuck.entered);
+    const x = h.repos.operations.get(X)!;
+    expect(x).toMatchObject({ status: 'running', routeEpoch: null });
+    expect(payloadOf(x).route?.stage).toBe('pending');
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle' });
+    stuck.restore();
+    return { env, X };
+  }
+
+  for (const entryStrategy of ['ruleset_resource', 'temp_rule'] as const) {
+    test(`[${entryStrategy}] crash before an activation's first write, wall clock stepped back 30 s across the restart, then normal mode → the interrupted activation is recovered first and the normal mode leaves Safari on the original rules for good`, async () => {
+      h = await createHarness({ entryStrategy });
+      const { X } = await crashBeforeFirstWrite();
+      h.clock.advance(2_000);
+      h.clock.set(h.clock.now().getTime() - 30_000);
+      const order = recordClaims();
+      await h.crash();
+      await h.idle();
+      // 放回的条目可用时间在“将来”，仍最先领取：崩溃恢复不等墙上时钟追上
+      expect(order[0]).toBe(X);
+      expect(h.repos.operations.get(X)!.status).not.toBe('running');
+      const N = (await h.app.enterNormal({ request_id: rid('normal') }, WEB)).operation_id;
+      await h.idle();
+      expect(h.repos.operations.get(X)).toMatchObject({ status: 'superseded', supersededBy: N });
+      expectOriginalRules(N);
+      // 墙上时钟追上、到达截止时间之后：旧请求没有在普通模式之后重新阻断 Safari 或写入检测入口
+      await h.clock.advanceAsync(31_000);
+      await h.idle();
+      await h.clock.advanceAsync((h.repos.settings.get('profileArrivalTimeoutSec') + 5) * 1000);
+      await h.idle();
+      expect(h.repos.operations.get(X)).toMatchObject({ status: 'superseded', supersededBy: N });
+      expectOriginalRules(N);
+    });
+  }
+
+  for (const entryStrategy of ['ruleset_resource', 'temp_rule'] as const) {
+    test(`[${entryStrategy}] second line of defence: a normal mode that starts before an activation interrupted before its first write was recovered ends that activation (SUPERSEDED), so it never re-runs after the normal mode`, async () => {
+      h = await createHarness({ entryStrategy });
+      const { X } = await crashBeforeFirstWrite();
+      // 普通模式在崩溃之前受理、排在中断的激活之后
+      const N = (await h.app.enterNormal({ request_id: rid('normal') }, WEB)).operation_id;
+      expect(h.repos.operations.get(N)!.payload).toMatchObject({ normal: { queuedBehind: [X] } });
+      // 模拟错误的领取顺序（例如激活的条目暂时领取不到）：普通模式先于崩溃恢复中的激活执行
+      const writes = () => ({ select: h.fake.calls.selectGroupPolicy ?? 0, kill: h.fake.calls.killRequest ?? 0, ...entryWrites(h.fake) });
+      const claim = h.repos.outbox.claimNext.bind(h.repos.outbox);
+      h.repos.outbox.claimNext = (now, prefer) => claim(now, [[N], ...(prefer ?? [])]);
+      await h.crash();
+      await h.idle();
+      const x = h.repos.operations.get(X)!;
+      expect(x).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: N });
+      expect(h.repos.operations.listSteps(X).at(-1)!.message).toContain('服务重启时本操作在第一次写入 Surge 之前中断');
+      expect(h.repos.operations.listSteps(X).some((st) => st.phase === 'SAFARI_BLOCKED' || st.phase === 'VERIFY_ONLY')).toBe(false);
+      expect(h.repos.outbox.pendingForOperation(X)).toEqual([]);
+      expectOriginalRules(N);
+      const after = writes();
+      await h.clock.advanceAsync((h.repos.settings.get('profileArrivalTimeoutSec') + 5) * 1000);
+      await h.idle();
+      expect(writes()).toEqual(after);
+      expectOriginalRules(N);
+    });
+  }
 });
 
 /**
@@ -865,4 +933,55 @@ describe('crash at a route operation end point: a decided failure or REJECT hold
     expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
     expect(h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp' }).rule).toBe('FINAL,DIRECT');
   });
+
+  test.each(['temp_rule', 'ruleset_resource'] as const)(
+    '[%s] a running activation that fails before writing, whose end point selected REJECT while a normal mode was accepted (queued behind it), then the service died before recording the hold → after the restart the activation is re-ended with its recorded failure, not re-run: the hold is its own (never "stopped before the first write, no node changed"), and the route record ends on REJECT like Surge',
+    async (entryStrategy) => {
+      gateHits = 0;
+      h = await createHarness({ dbFile: true, entryStrategy, surge: (fake) => gated(fake) });
+      const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+      const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
+      // 用户在 Surge 中把 SFE-ROUTE 改选到 B 的节点，然后重新使用 A：第 2 步读 SFE-ROUTE 的成员失败（写入之前失败，操作仍是执行中、
+      // 没有 route.ending），结束点改选 REJECT（已生效，读回之前进程退出）
+      await h.fake.selectGroupPolicy(ROUTE_GROUP_NAME, h.repos.proxyRevisions.get(b, 1)!.nodeName);
+      let opId = '';
+      let selecting = false;
+      gate = (name, args) => {
+        if (opId === '' || h.app.executor.currentOperationId !== opId) return null;
+        if (name === 'getGroupMembers') return 'fail';
+        if (!selecting && name === 'selectGroupPolicy' && args[1] === 'REJECT') {
+          selecting = true;
+          return 'after';
+        }
+        return null;
+      };
+      opId = (await h.app.activate(a, { request_id: rid('act') }, WEB)).operation_id;
+      await until(() => selecting);
+      for (let i = 0; i < 500 && (await h.fake.getGroupSelection(ROUTE_GROUP_NAME)) !== 'REJECT'; i++) await new Promise((r) => setTimeout(r, 2));
+      expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
+      const before = h.repos.operations.get(opId)!;
+      expect(before.status).toBe('running');
+      expect(payloadOf(before).route?.ending).toBeUndefined();
+      expect(payloadOf(before).endHold?.ending).toMatchObject({ phase: 'FAILED', status: 'failed' });
+      // 改选期间用户点击「进入普通模式」：受理（从不拒绝），排在执行中的激活之后
+      const n = (await h.app.enterNormal({ request_id: rid('n'), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB)).operation_id;
+      expect(h.repos.operations.get(n)!.status).toBe('queued');
+      gate = null;
+      await h.crash();
+      await h.idle();
+      const op = h.repos.operations.get(opId)!;
+      expect(op).toMatchObject({ phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention' });
+      expect(op.result?.rejectSelected).toBe(true);
+      const last = h.repos.operations.listSteps(opId).at(-1)!.message;
+      expect(last).not.toContain('没有改选节点');
+      expect(last).toContain('SFE-ROUTE 已改选 REJECT（读回确认）');
+      expect(h.repos.operations.listSteps(opId).map((s) => s.phase)).not.toContain('SUPERSEDED');
+      // 普通模式接着撤销本应用入口：Safari 按 Surge 原规则发出，路由记录的选择与 Surge 一致（REJECT），Chrome 从不命中 Safari 规则
+      expect(h.repos.operations.get(n)!.phase).toBe('NORMAL_RESTORED');
+      expect(h.repos.routeState.get()).toMatchObject({ phase: 'idle', entryMode: 'NORMAL', activeEnvironmentId: null, operationId: n, selectedNode: 'REJECT' });
+      expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
+      expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+      expect(h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp' }).rule).toBe('FINAL,DIRECT');
+    },
+  );
 });

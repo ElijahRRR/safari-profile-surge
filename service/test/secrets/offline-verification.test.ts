@@ -14,6 +14,7 @@ import { entryRuleSetBlockLines, groupBlockLines, nodeLine, resourceFile } from 
 import { findManagedBlock, parseProfile, replaceManagedBlock } from '../../src/surge/profile.js';
 import { deriveKey, hmacHex, keyedRequestDigest, requestDigestParts } from '../../src/util/keyed-digest.js';
 import { AGENT, WEB, createEnv, createHarness, envInput, rid, type Harness } from '../engine/harness.js';
+import { NODE_RESOURCE_FILE } from '@sfe/contract';
 
 let h: Harness | undefined;
 const cleanup: string[] = [];
@@ -198,6 +199,54 @@ describe('replaced and swept passwords cannot be verified offline from a copy of
     }
   });
 
+  test('publishes keep no pepper-keyed digest of the working profile: the user\'s own node password, changed in Surge between publishes, cannot be checked against any persisted value and a profile copy from backups/', async () => {
+    const yr = 2000 + 25;
+    const first = `Summer${yr}`;
+    const second = `Autumn${yr}`;
+    h = await createHarness({ dbFile: true });
+    await createEnv(h, 'US-Buyer-01', '203.0.113.10');
+    // backups/ 中的工作配置副本（初始化、重新合并）：之后用户在 Surge 中只改了自己节点的密码，发布不改写工作配置
+    const copy = readFileSync(h.profilePath, 'utf8');
+    expect(copy).toContain('password=example-pass');
+    const withPassword = (pw: string) => copy.replace('password=example-pass', `password=${pw}`);
+    writeFileSync(h.profilePath, withPassword(first));
+    const b = await createEnv(h, 'US-Buyer-02', '203.0.113.11');
+    // 同一进程内照常提示受管理段之外的修改
+    expect(h.repos.operations.listSteps(b.operation_id).some((s) => s.message.includes('作为新基线'))).toBe(true);
+    writeFileSync(h.profilePath, withPassword(second));
+    const c = await createEnv(h, 'US-Buyer-03', '203.0.113.12');
+    expect(h.repos.operations.get(c.operation_id)!.phase).toBe('READY_FOR_NEXT_OPEN');
+    expect(h.repos.deployments.list(-1).filter((d) => d.state === 'verified').length).toBeGreaterThanOrEqual(3);
+    const pepper = Buffer.from((await h.store.get(PEPPER_REF))!, 'base64url');
+
+    const db = new DatabaseSync(snapshotCopy(join(h.dir, 'sfe.sqlite')), { readOnly: true });
+    try {
+      // 数据库中持久保存的全部字符串（各表各列，JSON 展开）
+      const persisted = new Set<string>();
+      const collect = (v: unknown): void => {
+        if (typeof v === 'string') {
+          persisted.add(v);
+          for (const part of v.split(':')) persisted.add(part);
+          try {
+            const parsed = JSON.parse(v) as unknown;
+            if (parsed !== null && typeof parsed === 'object') collect(parsed);
+          } catch {
+            // 不是 JSON
+          }
+        } else if (Array.isArray(v)) v.forEach(collect);
+        else if (v !== null && typeof v === 'object') Object.values(v).forEach(collect);
+      };
+      const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((t) => t.name);
+      for (const t of tables) for (const row of db.prepare(`SELECT * FROM "${t}"`).all()) collect(row);
+      expect(persisted.size).toBeGreaterThan(0);
+      const fd = (t: string) => hmacHex(pepperKey(pepper, 'file'), `sfe-file\0${t}`);
+      const hits = DICT.concat(['example-pass', first, second]).filter((g) => persisted.has(fd(withPassword(g))));
+      expect(hits).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
   test('a JSON records import (GPT or script) keyed by template headers or camelCase: the persisted request digest carries no password, even after it is replaced and swept', async () => {
     for (const pwKey of ['代理密码', 'proxyPassword']) {
       h = await createHarness({ dbFile: true });
@@ -371,6 +420,124 @@ describe('replaced and swept passwords cannot be verified offline from a copy of
   });
 });
 
+describe('a publish rollback whose Surge readback fails keeps no pepper-keyed digest of the rolled-back node resource (§0, INSTALL §6)', () => {
+  /** 推进到发布结束：写入后等待 Surge 重新读取用假时钟计时。 */
+  async function drive(opId: string): Promise<void> {
+    for (let i = 0; i < 4000; i++) {
+      const op = h!.repos.operations.get(opId)!;
+      if (op.status !== 'queued' && op.status !== 'running') break;
+      await new Promise((r) => setTimeout(r, 2));
+      if (op.phase === 'DEPLOYING' || op.phase === 'ROLLING_BACK' || op.phase === 'RECONCILING') await h!.clock.advanceAsync(250);
+    }
+    await h!.idle();
+  }
+
+  type Mode = 'members_throw' | 'reload_stalls' | 'earlier_version_residue';
+
+  /**
+   * 环境 A 已发布、已核对；创建环境 B（代理密码 pwB）的发布 N 写入含 B 节点行（明文凭据）的节点资源，读回不一致而回滚；回滚的
+   * 写入成功，但之后的读回失败（Surge 不可达，或还没有重新读取恢复的文件）。用户随后删除 B：它的版本立即退役、凭据被清扫。
+   * earlier_version_residue：回滚照常，但数据目录来自之前的版本——它在这时留下了写前摘要（发布 N 写入内容的摘要）与未确认的意图。
+   */
+  async function scenario(mode: Mode) {
+    h = await createHarness({ dbFile: true, resourceReloadWait: { timeoutMs: 2_000, pollMs: 500 } });
+    const userA = ['synth', 'UserA'].join('');
+    const pwA = ['synth', 'PwdA', '1'].join('');
+    const a = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-01', '203.0.113.10', { username: userA, password: pwA }) }, WEB);
+    await drive(a.operation_id);
+    expect(h.repos.deployments.latest()!.state).toBe('verified');
+    const fake = h.fake as unknown as { getPolicyDetail: (n: string) => Promise<Record<string, unknown>>; getGroupMembers: (g: string) => Promise<string[]> };
+    const origDetail = fake.getPolicyDetail.bind(h.fake);
+    const origMembers = fake.getGroupMembers.bind(h.fake);
+    let inRollback = false;
+    let lastMembers: string[] | null = null;
+    // 发布 N 的逐节点读回不一致（端口）→ 回滚；回滚之后 Surge 不可达或不重新读取
+    fake.getPolicyDetail = async (name: string) => {
+      const d = await origDetail(name);
+      if (!name.includes('E0002')) return d;
+      inRollback = true;
+      return { ...d, port: 1 };
+    };
+    fake.getGroupMembers = async (g: string) => {
+      if (inRollback && mode === 'members_throw') throw new Error('模拟：Surge 不可达');
+      if (inRollback && mode === 'reload_stalls') return lastMembers!;
+      lastMembers = await origMembers(g);
+      return lastMembers;
+    };
+    const userB = ['synth', 'UserB'].join('');
+    const pwB = ['Sum', 'mer', '2025'].join('');
+    const b = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-02', '203.0.113.20', { username: userB, password: pwB }) }, WEB);
+    await drive(b.operation_id);
+    fake.getGroupMembers = origMembers;
+    fake.getPolicyDetail = origDetail;
+    const depN = h.repos.deployments.latest()!;
+    // 发布 N 写入的内容：按发布记录（代数与清单）与真实凭据重建；与记录的摘要一致，说明重建的就是写入的那一份
+    const pepper = Buffer.from((await h.store.get(PEPPER_REF))!, 'base64url');
+    const fileKey = pepperKey(pepper, 'file');
+    const digestOf = (c: string) => hmacHex(fileKey, `sfe-file\0${c}`);
+    const lines: string[] = [];
+    for (const m of depN.nodeManifest) {
+      const r = h.repos.proxyRevisions.get(m.environmentId, m.proxyRevision)!;
+      const front = h.repos.frontProxies.get(r.frontProxyId!)!.surgeName;
+      lines.push(nodeLine({ name: r.nodeName, host: r.host, port: r.port, username: await h.store.get(r.usernameRef!), password: await h.store.get(r.passwordRef!), front }));
+    }
+    const writtenN = digestOf(resourceFile(depN.generation, lines));
+    expect(depN.resourceDigest).toBe(writtenN);
+    const opB = h.repos.operations.get(b.operation_id)!;
+    if (mode === 'earlier_version_residue') {
+      expect(opB.phase).toBe('FAILED');
+      const cur = h.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)!;
+      h.repos.managedObjects.setState('resource_file', NODE_RESOURCE_FILE, 'pending_add', { contentDigest: cur.contentDigest });
+      h.app.engine.kv.set(`mo_prev:resource_file:${NODE_RESOURCE_FILE}`, { digest: writtenN });
+    } else {
+      expect(opB).toMatchObject({ status: 'needs_attention', phase: 'BLOCKED_NEEDS_ATTENTION' });
+      // 回滚的写入成功即确认归属：读回失败不留写前摘要（发布 N 写入的内容的摘要）
+      expect(h.app.engine.kv.get(`mo_prev:resource_file:${NODE_RESOURCE_FILE}`)).toBeNull();
+      expect(h.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)).toMatchObject({ state: 'present', contentDigest: await h.app.engine.profileFiles()!.digest(NODE_RESOURCE_FILE) });
+    }
+    expect(depN.state).toBe(mode === 'earlier_version_residue' ? 'rolled_back' : 'failed');
+    const envB = h.repos.environments.get(b.environment_id!)!;
+    const del = await h.app.deleteEnvironment(envB.id, { request_id: rid('del'), expected_revision: envB.revision }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(del.operation_id)!.status).toBe('succeeded');
+    const revB = h.repos.proxyRevisions.get(envB.id, 1)!;
+    expect(revB.state).toBe('retired');
+    await h.app.engine.secrets.sweep();
+    expect(await h.store.get(revB.passwordRef!)).toBeNull();
+    return { writtenN };
+  }
+
+  for (const mode of ['members_throw', 'reload_stalls', 'earlier_version_residue', 'residue_found_at_startup'] as const) {
+    test(`${mode}: after deleting the environment and sweeping its credentials, no row of a data-directory copy equals the digest of the rolled-back content`, async () => {
+      const { writtenN } = await scenario(mode === 'residue_found_at_startup' ? 'members_throw' : mode);
+      if (mode === 'residue_found_at_startup') {
+        // 升级前的版本删除环境时没有结算归属：数据目录里仍有未确认的意图与写前摘要；新版本启动时按事实结算
+        const cur = h!.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)!;
+        h!.repos.managedObjects.setState('resource_file', NODE_RESOURCE_FILE, 'pending_add', { contentDigest: cur.contentDigest });
+        h!.app.engine.kv.set(`mo_prev:resource_file:${NODE_RESOURCE_FILE}`, { digest: writtenN });
+        await h!.crash();
+        await h!.idle();
+      }
+      const db = new DatabaseSync(snapshotCopy(join(h!.dir, 'sfe.sqlite')), { readOnly: true });
+      try {
+        const meta = db.prepare('SELECT key, value FROM meta').all() as Array<{ key: string; value: string }>;
+        expect(meta.filter((r) => r.value.includes(writtenN)).map((r) => r.key)).toEqual([]);
+        expect(meta.some((r) => r.key.startsWith('engine:mo_prev:resource_file:'))).toBe(false);
+        const mos = db.prepare('SELECT kind, identity, content_digest, state FROM managed_objects').all() as Array<{ content_digest: string | null; state: string; kind: string }>;
+        expect(mos.filter((r) => r.content_digest === writtenN)).toEqual([]);
+        // 节点资源文件的归属记录只保留当前文件内容的摘要（已确认）
+        const file = mos.find((r) => r.kind === 'resource_file')!;
+        expect(file.state).toBe('present');
+        expect(file.content_digest).toBe(await h!.app.engine.profileFiles()!.digest(NODE_RESOURCE_FILE));
+        const deps = db.prepare('SELECT resource_digest FROM deployments').all() as Array<{ resource_digest: string }>;
+        expect(deps.filter((r) => r.resource_digest === writtenN)).toEqual([]);
+      } finally {
+        db.close();
+      }
+    });
+  }
+});
+
 describe('migration 3 scrubs digests written before this version', () => {
   test('legacy request digests (operations and the request ledger), retired fingerprints and deployments with retired revisions', () => {
     const dir = mkdtempSync(join(tmpdir(), 'sfe-mig3-'));
@@ -422,10 +589,36 @@ describe('migration 3 scrubs digests written before this version', () => {
       { revision: 1, username_fp: null, password_fp: null },
       { revision: 2, username_fp: 'ufp2', password_fp: 'pfp2' },
     ]);
+    // 第 3 代不含退役版本，迁移 3 保留它的资源摘要；工作配置摘要随后由迁移 6 一律清除
     expect(db.all('SELECT generation, resource_digest, working_profile_digest FROM deployments ORDER BY generation')).toEqual([
       { generation: 1, resource_digest: 'scrubbed', working_profile_digest: null },
       { generation: 2, resource_digest: 'scrubbed', working_profile_digest: null },
-      { generation: 3, resource_digest: 'rd3', working_profile_digest: 'wp3' },
+      { generation: 3, resource_digest: 'rd3', working_profile_digest: null },
+    ]);
+    db.close();
+  });
+});
+
+describe('migration 6 removes the pepper-keyed working profile digests kept by every publish', () => {
+  test('every deployment loses its working profile digest; resource digests and the rest of the row are kept', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sfe-mig6-'));
+    cleanup.push(dir);
+    const db = openDatabase(join(dir, 'sfe.sqlite'));
+    for (const m of MIGRATIONS.slice(0, 5)) db.exec(m);
+    db.run("INSERT INTO meta(key, value) VALUES('schema_version', '5')");
+    const at = '2026-10-21T00:00:00.000Z';
+    for (const [g, state, wp] of [
+      [1, 'verified', 'a'.repeat(64)],
+      [2, 'published', 'b'.repeat(64)],
+      [3, 'rolled_back', null],
+    ] as const) {
+      db.run("INSERT INTO deployments(generation, working_profile_digest, resource_digest, node_manifest, state, created_at, updated_at) VALUES(?, ?, ?, '[]', ?, ?, ?)", [g, wp, `rd${g}`, state, at, at]);
+    }
+    expect(db.migrate()).toEqual({ from: 5, to: MIGRATIONS.length });
+    expect(db.all('SELECT generation, resource_digest, working_profile_digest, state FROM deployments ORDER BY generation')).toEqual([
+      { generation: 1, resource_digest: 'rd1', working_profile_digest: null, state: 'verified' },
+      { generation: 2, resource_digest: 'rd2', working_profile_digest: null, state: 'published' },
+      { generation: 3, resource_digest: 'rd3', working_profile_digest: null, state: 'rolled_back' },
     ]);
     db.close();
   });

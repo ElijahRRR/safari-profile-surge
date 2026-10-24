@@ -98,18 +98,52 @@ describe('rollbackText', () => {
     expect(text).toBe('已恢复原节点 SFE-N-E0009-US09-v002，Safari 保持阻断，需要重新核验原环境。');
   });
 
-  it('says when the node could not be restored', () => {
+  it('says no node was restored when there was no verified route before the switch, even if an older service names the failed node', () => {
+    for (const restoredSelection of [null, 'SFE-N-E0001-US01-v001']) {
+      const text = rollbackText({
+        previousEnvironmentId: null,
+        previousProxyRevision: null,
+        previousProbe: null,
+        restoredSelection,
+        entryModeAfter: 'BLOCKED',
+        failedProxyRevision: 3,
+        failureError: { code: 'SAFARI_VERIFY_FAILED', message: 'x' },
+        needsReverify: false,
+      });
+      expect(text).toBe('切换前没有已验证的路由，未恢复节点，Safari 保持阻断。');
+      expect(text).not.toContain('已恢复原节点');
+      expect(text).not.toContain('普通模式');
+    }
+  });
+
+  it('says SFE-ROUTE was already held at REJECT before the switch and no buyer node was restored (rejectKept), never "restored the original node"', () => {
     const text = rollbackText({
       previousEnvironmentId: null,
       previousProxyRevision: null,
       previousProbe: null,
       restoredSelection: null,
       entryModeAfter: 'BLOCKED',
+      failedProxyRevision: 1,
+      failureError: { code: 'SUPERSEDED', message: '已取消切换' },
+      needsReverify: false,
+      rejectKept: true,
+    });
+    expect(text).toBe('切换前 SFE-ROUTE 已改选 REJECT（没有已验证的路由可恢复），未恢复买家节点，SFE-ROUTE 保持 REJECT，Safari 保持阻断，路由需要处理：重新使用此环境或进入普通模式。');
+    expect(text).not.toContain('已恢复原节点');
+    expect(text).not.toContain('上次结果');
+  });
+
+  it('says when the previous node could not be restored', () => {
+    const text = rollbackText({
+      previousEnvironmentId: 'env_9',
+      previousProxyRevision: 2,
+      previousProbe: null,
+      restoredSelection: null,
+      entryModeAfter: 'BLOCKED',
       failedProxyRevision: 3,
       failureError: { code: 'SAFARI_VERIFY_FAILED', message: 'x' },
-      needsReverify: false,
+      needsReverify: true,
     });
     expect(text).toContain('未能恢复原节点');
-    expect(text).not.toContain('普通模式');
   });
 });

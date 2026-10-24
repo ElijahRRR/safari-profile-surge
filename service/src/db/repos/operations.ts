@@ -187,6 +187,14 @@ export function createOperationsRepo(ctx: RepoContext): OperationsRepo {
 
 // ---------- outbox ----------
 
+/**
+ * 计时器条目的恢复原因（handlers/route.ts handleTimeout）：只有它们要等可用时间（截止时间）到达才能领取，处理时再按截止时间
+ * 判断；其余条目按受理时的墙上时间入队、本应立即执行（claimNext）。
+ */
+export const TIMER_RESUME_REASONS = ['arrival_timeout', 'verify_timeout'] as const;
+
+const NOT_TIMER = `(resume_reason IS NULL OR resume_reason NOT IN (${TIMER_RESUME_REASONS.map((r) => `'${r}'`).join(', ')}))`;
+
 export interface OutboxRecord {
   id: number;
   operationId: string;
@@ -209,7 +217,10 @@ export interface OutboxRepo {
   /** 返回新条目 id。 */
   enqueue(operationId: string, reason: string | null, availableAt: Date | string): number;
   /**
-   * 原子领取：一条 UPDATE … RETURNING，最早可用且未领取、未完成的一条；没有则 null。prefer 为按优先级排列的操作 id 组：属于
+   * 原子领取：一条 UPDATE … RETURNING，可以领取且未领取、未完成的条目中最早的一条；没有则 null。只有计时器条目
+   * （TIMER_RESUME_REASONS：到达或实测截止时间）要等可用时间到达；其余条目（新受理的操作、取消、提交的实测、场景到达、重测失去
+   * 路由）按受理时的墙上时间入队、本应立即执行，一律可以领取——否则墙上时钟在入队之后回拨（例如 NTP 校正）时它们要多等回拨的
+   * 时长，排队的普通模式停在买家出口上、崩溃恢复中的操作领取不到（§6.1 领取顺序）。prefer 为按优先级排列的操作 id 组：属于
    * 前面一组的条目先于后面的组与其他条目（各组内仍按可用时间与 id 排序；空组忽略）。
    */
   claimNext(now: Date | string, prefer?: readonly (readonly string[])[] | null): OutboxRecord | null;
@@ -218,12 +229,16 @@ export interface OutboxRepo {
   /** 未完成的条目（含已领取），按可用时间排序。 */
   listPending(): OutboxRecord[];
   pendingForOperation(operationId: string): OutboxRecord[];
-  /** 启动恢复：把已领取但未完成的条目放回队列（上一次进程在执行中退出）。返回条数。 */
-  releaseClaims(): number;
+  /**
+   * 启动恢复：把已领取但未完成的条目放回队列（上一次进程在执行中退出）。返回条数。操作仍是 running（崩溃恢复，§6.1 领取顺序
+   * 第 ①组）的条目可用时间不晚于 now：上一次进程领取时它已到期（计时器条目也一样），恢复不因墙上时钟在重启前回拨而推迟。其他
+   * 操作的计时器条目保持原截止时间——提前领取时截止时间未到，处理器什么也不做，条目却已完成、截止时间就此丢失。
+   */
+  releaseClaims(now?: Date | string): number;
   /** 结束某操作的全部未完成条目（例如操作被取代）。返回条数。 */
   cancelForOperation(operationId: string, at?: Date | string): number;
-  /** 最早的未领取条目的可用时间（用于安排下一次唤醒）。 */
-  nextAvailableAt(): string | null;
+  /** 最早的未领取条目的可用时间（用于安排下一次唤醒）；非计时器条目一律按不晚于 now 计（claimNext 立即可以领取）。 */
+  nextAvailableAt(now?: Date | string): string | null;
 }
 
 export function createOutboxRepo(ctx: RepoContext): OutboxRepo {
@@ -241,7 +256,7 @@ export function createOutboxRepo(ctx: RepoContext): OutboxRepo {
           : 'ORDER BY available_at, id';
       const row = db.get(
         `UPDATE outbox SET claimed_at = ?
-         WHERE id = (SELECT id FROM outbox WHERE done_at IS NULL AND claimed_at IS NULL AND available_at <= ? ${order} LIMIT 1)
+         WHERE id = (SELECT id FROM outbox WHERE done_at IS NULL AND claimed_at IS NULL AND (available_at <= ? OR ${NOT_TIMER}) ${order} LIMIT 1)
            AND claimed_at IS NULL
          RETURNING *`,
         [t, t, ...groups.flat()],
@@ -258,12 +273,24 @@ export function createOutboxRepo(ctx: RepoContext): OutboxRepo {
     listPending: () => db.all('SELECT * FROM outbox WHERE done_at IS NULL ORDER BY available_at, id').map(outboxMap.fromRow),
     pendingForOperation: (operationId) =>
       db.all('SELECT * FROM outbox WHERE operation_id = ? AND done_at IS NULL ORDER BY available_at, id', [operationId]).map(outboxMap.fromRow),
-    releaseClaims: () => db.run('UPDATE outbox SET claimed_at = NULL WHERE done_at IS NULL AND claimed_at IS NOT NULL').changes,
+    releaseClaims(now) {
+      const t = now === undefined ? nowIso(ctx) : toIso(now);
+      return db.run(
+        `UPDATE outbox SET claimed_at = NULL,
+           available_at = CASE WHEN available_at > ? AND operation_id IN (SELECT id FROM operations WHERE status = 'running') THEN ? ELSE available_at END
+         WHERE done_at IS NULL AND claimed_at IS NOT NULL`,
+        [t, t],
+      ).changes;
+    },
     cancelForOperation(operationId, at) {
       return db.run('UPDATE outbox SET done_at = ? WHERE operation_id = ? AND done_at IS NULL', [at === undefined ? nowIso(ctx) : toIso(at), operationId]).changes;
     },
-    nextAvailableAt() {
-      const row = db.get<{ t: string | null }>('SELECT MIN(available_at) AS t FROM outbox WHERE done_at IS NULL AND claimed_at IS NULL');
+    nextAvailableAt(now) {
+      const t = now === undefined ? nowIso(ctx) : toIso(now);
+      const row = db.get<{ t: string | null }>(
+        `SELECT MIN(CASE WHEN ${NOT_TIMER} AND available_at > ? THEN ? ELSE available_at END) AS t FROM outbox WHERE done_at IS NULL AND claimed_at IS NULL`,
+        [t, t],
+      );
       return row?.t ?? null;
     },
   };

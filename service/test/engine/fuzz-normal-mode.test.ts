@@ -1379,10 +1379,11 @@ function checkIdle(w: World): void {
 
   // I6（回滚完成说明）：「Safari 保持阻断」——只在路由仍是这次回滚留下的状态（failed/BLOCKED）时核对；之后对账按事实改成
   // UNKNOWN 等，说明就只是当时的记录
-  // 回滚无法确认（BLOCKED_NEEDS_ATTENTION）的说明「Safari 保持已确认的阻断」同样只在路由仍是它留下的状态（attention/BLOCKED）时核对
+  // 回滚无法确认（BLOCKED_NEEDS_ATTENTION）的说明「Safari 保持已确认的阻断」同样只在路由仍是它留下的状态（attention/BLOCKED）时核对。
+  // 切换前 SFE-ROUTE 已改选 REJECT 的回滚（RollbackResult.rejectKept）留下 attention/BLOCKED，说明同样是「Safari 保持阻断」
   const rollbackClaim =
     op && op.kind !== 'route.normal' && route.entryMode === 'BLOCKED' && !w.externalDirty
-      ? op.phase === 'FAILED' && route.phase === 'failed'
+      ? op.phase === 'FAILED' && (route.phase === 'failed' || (route.phase === 'attention' && route.operationId === op.id))
         ? 'Safari 保持阻断'
         : op.phase === 'BLOCKED_NEEDS_ATTENTION' && route.phase === 'attention' && route.operationId === op.id
           ? 'Safari 保持已确认的阻断'

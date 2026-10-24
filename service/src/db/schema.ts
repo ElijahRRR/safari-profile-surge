@@ -355,4 +355,11 @@ export const MIGRATIONS: readonly string[] = [
   UPDATE operations SET request_digest = 'scrubbed-v1'
     WHERE kind = 'import.batch' AND request_digest LIKE 'v2:%' AND request_digest NOT LIKE '%:s';
   `,
+  /* 6 */ `
+  -- 同一类（迁移 3）：每次发布在 deployments.working_profile_digest 中保存整份工作配置按 pepper 派生密钥计算的摘要，没有期限。
+  -- 工作配置含用户自己的节点凭据、http-api 密钥与 MITM 证书口令；与 backups/ 中的工作配置副本一起，拿到数据目录副本的人能离线
+  -- 核对猜测的这些凭据（包括之后改过的）。改为只保存进程内随机密钥下的核对值（engine/handlers/publish.ts profileCheckOf），这里
+  -- 清除旧值（它只用于「工作配置在受管理段之外有修改」的提示，清除后升级后的第一次发布不显示这条提示）。
+  UPDATE deployments SET working_profile_digest = NULL WHERE working_profile_digest IS NOT NULL;
+  `,
 ];

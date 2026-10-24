@@ -158,9 +158,10 @@ export class Executor {
   /**
    * 领取顺序（§6.1），按优先级排列的操作组，各组内仍按可用时间与 id（受理顺序）：
    * 1. 崩溃恢复：状态仍是 running 的操作。串行执行器在两次领取之间没有执行中的操作，只有上一次进程在执行中退出时才有（启动时
-   *    releaseClaims 放回了它的条目）：它在退出前持有全局写锁，Surge 可能停在它半途的写入上，先由它按事实恢复（回滚或重新执行），
-   *    之后的操作才从恢复后的状态开始。否则排队的普通模式会先执行并报告成功，之后恢复的切换再按快照回滚、重新阻断 Safari——旧请求
-   *    的结果覆盖了新请求（方案 1 设计「多环境争抢」）。
+   *    releaseClaims 放回了它的条目，可用时间不晚于启动时间）：它在退出前持有全局写锁，Surge 可能停在它半途的写入上，先由它按
+   *    事实恢复（回滚或重新执行），之后的操作才从恢复后的状态开始。否则排队的普通模式会先执行并报告成功，之后恢复的切换再按快照
+   *    回滚或重新执行、重新阻断 Safari——旧请求的结果覆盖了新请求（方案 1 设计「多环境争抢」）。优先只在可以领取的条目之间起作用：
+   *    计时器以外的条目一律可以领取（claimNext），墙上时钟回拨不会让恢复或排队的普通模式领取不到。
    * 2. 有未完成的普通模式（排队中；崩溃恢复中的已在第 1 组）时，路由操作（isRouteOperation：激活、普通模式、重测，以及已进入
    *    切换或 WAITING_ROUTE 的活动环境发布）先于发布、预检等其他操作：进入普通模式永远可用（§5.2），被它取代或把路由交给它的
    *    激活（handlers/route.ts yieldToQueuedNormal）之后它立即执行，不排在受理更早的无关操作之后，过渡中的路由（阻断、已写入的
@@ -200,7 +201,7 @@ export class Executor {
     this.wakeCancel?.();
     this.wakeCancel = null;
     if (this.stopped) return;
-    const next = this.engine.repos.outbox.nextAvailableAt();
+    const next = this.engine.repos.outbox.nextAvailableAt(this.engine.now());
     if (next === null) return;
     const delay = Math.max(0, Date.parse(next) - this.engine.now().getTime());
     this.wakeCancel = this.engine.clock.setTimeout(() => {
@@ -217,7 +218,7 @@ export class Executor {
         continue;
       }
       if (this.stopped) return;
-      const next = this.engine.repos.outbox.nextAvailableAt();
+      const next = this.engine.repos.outbox.nextAvailableAt(this.engine.now());
       const due = next !== null && Date.parse(next) <= this.engine.now().getTime();
       if (due || this.internal.length > 0) {
         this.kick();

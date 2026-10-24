@@ -116,6 +116,13 @@ export interface SafariProbeEvidence {
  */
 export interface EndHoldIntent {
   externalSelectionBefore: boolean;
+  /**
+   * 结束点要记下的结束状态（endRouteOp 与执行器兜底中不负责过渡中路由的激活、重测与发布）。执行中的操作开始结束时不像等待中的
+   * 操作那样记下 RoutePayload.ending：改选之后、记下改选之前服务崩溃时，崩溃恢复（recoverRoute）按它重新结束——不重新执行
+   * 本操作（重新执行会在第一次写入之前让给排队的普通模式、说「没有改选节点」，或从记录之外已是 REJECT 的路由开始一次完整切换）。
+   * 早先的记录、核对已判定的重测（按 RoutePayload.verdict 重新结束）、被取代的切换与普通模式（重新执行）没有这一项。
+   */
+  ending?: RouteEnding;
 }
 
 /** RoutePayload.ending：结束点要记下的结束状态（结束点改选 REJECT 时另按 holdAtRouteEnd 改为需要处理）。 */

@@ -86,6 +86,26 @@ describe('publish after remerge restores the node resource', () => {
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
   });
 
+  test('restoring the node resource settles its ownership: an unsettled write-before digest (possibly of content with since-retired credentials) is dropped even when the follow-up publish fails', async () => {
+    h = await createHarness();
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    const resourcePath = join(h.surgeDir, NODE_RESOURCE_FILE);
+    writeFileSync(resourcePath, readFileSync(resourcePath, 'utf8').replace('203.0.113.10', '198.51.100.77'));
+    // 之前一次未结算的写入留下的写前摘要（例如回滚之后读回无法确认的旧版本留下的）
+    const files = h.app.engine.profileFiles()!;
+    const prevKey = `mo_prev:resource_file:${NODE_RESOURCE_FILE}`;
+    h.app.engine.kv.set(prevKey, { digest: files.digestContent(`# 合成的旧内容 ${['synth', 'Old', 'Body'].join('')}\n`) });
+    const preview = await h.app.remergePreview(WEB);
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: preview.preview_digest }, WEB);
+    h.fake.failNext('listPolicies', new SfeError('SURGE_UNREACHABLE', '连接 Surge 失败：模拟不可达'));
+    await h.idle();
+    expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
+    const follow = h.repos.operations.listRecent(50).find((o) => o.kind === 'deploy.publish' && o.requestId.startsWith('remerge:'))!;
+    expect(follow.status).toBe('failed');
+    expect(h.app.engine.kv.get(prevKey)).toBeNull();
+    expect(h.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)).toMatchObject({ state: 'present', contentDigest: await files.digest(NODE_RESOURCE_FILE) });
+  });
+
   test('a forced publish whose readback finds the tampered parameters still loaded rolls back and keeps the requirement', async () => {
     h = await createHarness();
     const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;

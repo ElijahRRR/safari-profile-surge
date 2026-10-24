@@ -87,6 +87,10 @@ const failedNote = computed(() => {
       return '不会改用直连或其他环境的出口。可以关闭此页面，在扩展弹窗中查看状态与下一步。';
     case 'probe_failed':
       if (routeLeft.value) return retestRouteLeftText(routeLeft.value);
+      // 取消排在已提交的结果之前受理，而提交的出口 IP 与预期出口不一致：取消照样记下不符（result.probeWarning，错误代码 SUPERSEDED）
+      if (probeStopped.value && s.operation?.error?.code === 'SUPERSEDED') {
+        return '已提交的出口 IP 与预期出口不一致，服务已记下出口不符：路由未改变，已停止自动打开订单与填充。可以关闭此页面，在扩展弹窗中查看状态与下一步。';
+      }
       return probeStopped.value
         ? '路由未改变，已停止自动打开订单与填充。可以关闭此页面，在扩展弹窗中查看状态与下一步。'
         : '这次重新检测已结束，路由与之前的检测结果都未改变，自动打开订单与填充不受这次重新检测影响。可以关闭此页面，在扩展弹窗中查看状态与下一步。';

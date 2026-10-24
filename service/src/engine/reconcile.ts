@@ -248,11 +248,16 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
     if (added.some((w) => ATTENTION_WARNINGS.includes(w))) phase = 'attention';
     else if (added.some((w) => w === 'external_selection_change' || w === 'external_profile_change') && phase !== 'attention') phase = 'external_change';
     // 之前一次成功回滚留下的 rollback_needs_reverify（「已恢复原节点并保持阻断」）：入口改记为未知（例如 Surge 重启丢弃了临时
-    // 规则、读回与记录不一致）或发现有规则排在入口之前时，「保持阻断」已不成立——去掉，环境改显示路由需要处理（§6.3 第 14 步）
+    // 规则、读回与记录不一致）或发现有规则排在入口之前时，「保持阻断」已不成立；SFE-ROUTE 的选择被外部改为其他节点（例如用户在
+    // Surge 中选了另一个买家的节点）时，「已恢复原节点」已不成立——都去掉，环境改显示路由需要处理（§6.3 第 14 步、§6.6）
     if (warnings.has('rollback_needs_reverify') && (entryMode === 'UNKNOWN' || added.includes('precedence_violation'))) {
       warnings.delete('rollback_needs_reverify');
       removed.push('rollback_needs_reverify');
       notes.push('回滚后的阻断已不能确认，去掉「已恢复原节点并保持阻断」');
+    } else if (warnings.has('rollback_needs_reverify') && warnings.has('external_selection_change')) {
+      warnings.delete('rollback_needs_reverify');
+      removed.push('rollback_needs_reverify');
+      notes.push('SFE-ROUTE 已不是回滚恢复的节点，去掉「已恢复原节点并保持阻断」');
     }
   } else if (extra && extra.segmentsChanged === false && warnings.has('managed_segments_changed')) {
     // 空闲且入口为 NORMAL：撤销入口时保留的 managed_segments_changed 在受管理段与本应用文件重新一致后清除

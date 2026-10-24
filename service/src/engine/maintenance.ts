@@ -48,7 +48,7 @@ import { insertOperation, type AcceptDeps } from './accept.js';
 import { checkCandidate } from './candidate.js';
 import { readRuntimeSample, surgeRestartedBetween, type Engine } from './context.js';
 import { acceptedOf, commitOperation, findDuplicateOperation, requestDigest, requireRequestId } from './ledger.js';
-import { registerInitialObjects, segmentDigest, SEGMENT_KIND, type SegmentName } from './ownership.js';
+import { confirmResource, registerInitialObjects, segmentDigest, SEGMENT_KIND, type SegmentName } from './ownership.js';
 import { generateResource, type ResourceEntry } from './resource.js';
 import { requireResourceRefresh } from './handlers/publish.js';
 import { unmeasuredFrom } from './capabilities.js';
@@ -636,7 +636,8 @@ export async function runRemerge(engine: Engine, op: OperationRecord, enqueuePub
         else await files.writeAtomic(NODE_RESOURCE_FILE, plan.restoreResource, cur);
         const d = files.digestContent(plan.restoreResource);
         repos.managedObjects.upsertIntent({ kind: 'resource_file', identity: NODE_RESOURCE_FILE, contentDigest: d, state: 'pending_add', createdByOperation: op.id });
-        repos.managedObjects.setState('resource_file', NODE_RESOURCE_FILE, 'present', { contentDigest: d });
+        // 归属已按恢复的内容确认：同时删除之前未结算的写前摘要（mo_prev），它可能是另一份内容（含之后退役的凭据）的摘要
+        confirmResource(repos, engine.kv, d);
         enqueuePublish();
         engine.step(op.id, '已恢复节点资源文件，并发起一次发布：等待 Surge 重新读取并逐节点读回');
       }

@@ -14,7 +14,10 @@ export type DeploymentState = 'candidate' | 'published' | 'verified' | 'failed' 
 
 export interface DeploymentRecord {
   generation: number;
-  /** 带密钥摘要（HMAC），只在服务内部用于变化检测。 */
+  /**
+   * 工作配置的核对值：本进程随机密钥下的 HMAC 与进程标记（engine/handlers/publish.ts profileCheckOf），只在同一进程内用于变化
+   * 提示；从不保存工作配置的 pepper 派生摘要（迁移 6 清除升级前保存的）。
+   */
   workingProfileDigest: string | null;
   resourceDigest: string;
   nodeManifest: NodeManifestEntry[];

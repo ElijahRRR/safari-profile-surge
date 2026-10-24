@@ -343,7 +343,7 @@ describe('bound popup', () => {
     expect(calls.find((m) => m.type === 'cancelOperation')).toMatchObject({ operation_id: 'op_w' });
   });
 
-  it('cancel text follows the pending operation\'s phase: an active-environment publish waiting for the scene only ends the wait; once it has switched (VERIFY_ONLY) cancelling rolls back like an activation; a retest only ends the retest', async () => {
+  it('cancel text follows the pending operation\'s phase: an active-environment publish waiting for the scene only ends the wait; once it has switched (VERIFY_ONLY) cancelling rolls back like an activation; a retest usually only ends the retest (exceptions: REJECT hold, submitted exit mismatch)', async () => {
     const waiting = { operation_id: 'op_w', kind: 'apply_new_revision' as const, waiting_route: true, deadline: iso(120) };
     const w = await mountPopup(currentState({ pendingVerification: waiting }));
     expect(w.wrapper.find('[data-test="cancel-pending"]').text()).toBe('取消等待');
@@ -372,8 +372,11 @@ describe('bound popup', () => {
     const r = await mountPopup(currentState({ pendingVerification: retest }));
     expect(r.wrapper.find('[data-test="cancel-pending"]').text()).toBe('取消重测');
     await r.wrapper.find('[data-test="cancel-pending"]').trigger('click');
-    expect(r.wrapper.text()).toContain('将结束本次出口检测，通常路由不变（不切换、不阻断 Safari）');
+    expect(r.wrapper.text()).toContain('通常只结束本次出口检测，路由不变（不切换、不阻断 Safari）');
+    expect(r.wrapper.text()).not.toContain('将结束本次出口检测');
     expect(r.wrapper.text()).toContain('会改选 REJECT（拒绝 Safari 经本应用出口的新连接）并要求处理');
+    // 取消排在已提交的检测结果之前受理、出口 IP 与预期出口不一致时，服务照样记下不符并停止订单与填充（§6.1）
+    expect(r.wrapper.text()).toContain('若已提交的检测结果中的出口 IP 与预期出口不一致，取消照样记下出口不符，并停止自动打开订单与填充。');
     expect(r.wrapper.text()).not.toContain('将尝试恢复切换前的节点选择');
   });
 

@@ -270,11 +270,26 @@ export interface RollbackResult {
   previousProxyRevision: number | null;
   /** 显示为“上次结果”，从不当作实时状态。 */
   previousProbe: ProbeView | null;
+  /**
+   * 回滚恢复并读回的切换前节点选择。切换前没有已验证的路由（previousEnvironmentId 为 null：第一次激活、普通模式之后的激活）时
+   * 没有可恢复的节点，为 null——SFE-ROUTE 仍选着刚失败的目标节点（入口已确认阻断），界面不能说「已恢复原节点」。切换前
+   * SFE-ROUTE 已改选 REJECT（rejectKept）时同样为 null：改回的 REJECT 不是恢复的节点。
+   */
   restoredSelection: string | null;
   entryModeAfter: EntryMode;
   failedProxyRevision: number | null;
   failureError: ApiErrorBody;
   needsReverify: boolean;
+  /**
+   * 切换前路由记着使用中的环境，但 SFE-ROUTE 已被失败即关闭地改选 REJECT、又没有保留的激活快照（之前一次路由操作的共同结束点，
+   * 含执行器兜底对不负责过渡中路由的操作的改选；没有激活快照时普通模式失败），没有已验证的出口可恢复：回滚把 SFE-ROUTE 改回
+   * REJECT 并读回确认，不恢复任何买家节点。回滚无法确认或执行器兜底对过渡中路由的改选之后激活快照保留：之后的回滚按快照恢复
+   * 最后一次已确认的节点、needsReverify 为 true，不是这一项。这时
+   * previousEnvironmentId、previousProxyRevision、previousProbe 与 restoredSelection 都为 null，needsReverify 为 false；路由需要
+   * 处理（attention），使用中的环境仍是切换前记录的环境。界面写明「切换前 SFE-ROUTE 已改选 REJECT，未恢复买家节点」，从不说
+   * 「已恢复原节点」。早先的服务没有这一项。
+   */
+  rejectKept?: boolean;
 }
 
 export interface OperationEffective {
@@ -311,7 +326,8 @@ export interface OperationView extends OperationSummary {
     /**
      * Safari 重测失败或出口不符时加到路由上的警告（自动打开订单与填充因此停止）。取消、超时与开始等待之前的失败没有这一项：
      * 通常路由与之前的检测结果都不变——除非结束时 SFE-ROUTE 已不是使用中环境已验证的出口而服务改选了 REJECT（rejectSelected），
-     * 或等待期间路由已不在已验证的使用中状态（routeLeftVerified）。
+     * 或等待期间路由已不在已验证的使用中状态（routeLeftVerified）。例外：取消排在已提交的检测结果之前受理、而提交的出口 IP 与
+     * 预期出口不一致时（服务不读 Surge 就能判断），取消照样记下不符，带 exit_ip_mismatch（错误代码仍是 SUPERSEDED）。
      */
     probeWarning?: 'probe_failed' | 'exit_ip_mismatch';
     /**

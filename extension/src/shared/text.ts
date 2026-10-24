@@ -164,13 +164,20 @@ export function formatRelative(iso: string | null | undefined, now: Date): strin
 
 export function rollbackText(rollback: RollbackResult): string {
   const parts: string[] = [];
-  if (rollback.restoredSelection) {
+  // 切换前 SFE-ROUTE 已失败即关闭改选 REJECT：没有已验证的出口可恢复，回滚改回 REJECT，没有恢复任何买家节点
+  if (rollback.rejectKept === true) {
+    parts.push('切换前 SFE-ROUTE 已改选 REJECT（没有已验证的路由可恢复），未恢复买家节点，SFE-ROUTE 保持 REJECT');
+  } else if (rollback.previousEnvironmentId === null) {
+    // 切换前没有已验证的路由：没有可恢复的节点（旧版服务此时仍在 restoredSelection 中给出刚失败的目标节点，按 previousEnvironmentId 判断）
+    parts.push('切换前没有已验证的路由，未恢复节点');
+  } else if (rollback.restoredSelection) {
     parts.push(`已恢复原节点 ${rollback.restoredSelection}`);
   } else {
     parts.push('未能恢复原节点');
   }
   parts.push(rollback.entryModeAfter === 'BLOCKED' ? 'Safari 保持阻断' : `入口为${ENTRY_MODE_TEXT[rollback.entryModeAfter]}`);
   if (rollback.needsReverify) parts.push('需要重新核验原环境');
+  if (rollback.rejectKept === true) parts.push('路由需要处理：重新使用此环境或进入普通模式');
   let text = `${parts.join('，')}。`;
   if (rollback.previousProbe?.exitIp) text += `上次结果：出口 ${rollback.previousProbe.exitIp}。`;
   return text;

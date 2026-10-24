@@ -797,7 +797,7 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
    * 只会经仍加载的阻断或落到原规则。否则普通模式永远停在这里（每次都在写入之前失败），而重新合并要求入口已是普通模式——没有
    * 恢复路径（§5.2「进入普通模式永远可用」）。逐个把本应用拥有的入口规则集文件改写为占位规则：RULE-SET 在有效规则中的位照常
    * 检查自动重载设置与资源、比较并替换地写入、由见证确认已加载（rule match 不可用时按文件监视上限等满，结果标为未经运行时确认）；
-   * 不在有效规则中的位 Surge 不加载，只写入、不等待（之后重新合并恢复这一行时 Surge 加载的就是占位规则）。已是占位规则且已由见证
+   * 不在有效规则中的位 Surge 不加载，只比较并替换地写入、不检查自动重载设置与资源、不等待（之后重新合并恢复这一行时 Surge 加载的就是占位规则）。已是占位规则且已由见证
    * 确认加载（或不在有效规则中）的位不写。最终读回为 notInstalled 或 detachedNormal 的 NORMAL（文件全部为占位规则、探测一致）；
    * 否则停止（READBACK_MISMATCH，不声称任何已确认状态）。返回的读回带 rewrote 列出本次改写的文件。
    */
@@ -817,8 +817,12 @@ export function createRulesetStrategy(deps: RulesetStrategyDeps): EntryControlle
       if (loadedPlaceholder) continue;
       bitsNow[bit] = false;
       const step: EntryStep = { bit, value: false, bits: { ...bitsNow }, effective: 'NORMAL' };
-      await checkAutoReload(null, step);
-      if (s.attached[bit]) uniqueKey(await deps.adapter.listExternalResources(), f.path, null, step);
+      // 自动重载设置与资源只对 Surge 加载的位有意义：不在有效规则中的位 Surge 不加载，只比较并替换地写入（否则一项与本应用入口
+      // 无关的设置——此时 Safari 已按原规则发出——会让普通模式失败，之后的重新合并也因入口不是普通模式而拒绝）
+      if (s.attached[bit]) {
+        await checkAutoReload(null, step);
+        uniqueKey(await deps.adapter.listExternalResources(), f.path, null, step);
+      }
       const token = newToken();
       const content = entryRuleSetFileContent(bit, false, s.cfg, token);
       const currentDigest = await files.digest(f.name);

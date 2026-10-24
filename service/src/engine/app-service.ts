@@ -57,6 +57,7 @@ import { Executor } from './executor.js';
 import { failOrphanedOperations } from './handlers/publish.js';
 import { importCommit, importPreview } from './import.js';
 import { initCommit, initPreview, remergeCommit, remergePreview } from './maintenance.js';
+import { resourceOwnershipUnsettled, settleResourceDigests } from './ownership.js';
 import { handleNative } from './native.js';
 import { controlAfterReconcile, reconcile, surgeStatus } from './reconcile.js';
 import { createViewService, type ViewService } from './view-service.js';
@@ -337,9 +338,20 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
       }
       await engine.refreshHostFacts();
       // 启动：放回上次未完成的领取，读 Surge 事实对账，再开始执行器（未完成操作由执行器按事实恢复）
-      const released = engine.repos.outbox.releaseClaims();
+      const released = engine.repos.outbox.releaseClaims(engine.now());
       if (released > 0) engine.log('warn', 'startup.released_claims', { count: released });
       failOrphanedOperations(engine);
+      // 节点资源文件未结算的归属（之前的版本在发布回滚的读回失败时留下未确认的意图与写前摘要 mo_prev；其中的内容可能含之后已
+      // 退役、凭据已清扫的版本的节点行）：按事实确认或清除，只保留当前文件内容的摘要（ownership.ts settleResourceDigests；与
+      // 崩溃恢复 recoverPublish 对写前或写后内容的确认相同）
+      const resourceFiles = engine.profileFiles();
+      if (resourceFiles && resourceOwnershipUnsettled(engine.repos, engine.kv)) {
+        try {
+          settleResourceDigests(engine.repos, engine.kv, await resourceFiles.digest(NODE_RESOURCE_FILE));
+        } catch (err) {
+          engine.log('warn', 'startup.resource_ownership_unsettled', { error: err instanceof Error ? err.name : 'unknown' });
+        }
+      }
       try {
         await reconcile(engine, 'startup');
       } catch (err) {

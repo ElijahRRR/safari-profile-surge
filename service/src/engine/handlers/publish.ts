@@ -35,6 +35,7 @@ import { readbackCovered } from '../capabilities.js';
 import { checkCandidate } from '../candidate.js';
 import { checkSegments, confirmResource, recordResourceIntent, resourcePreviousDigest } from '../ownership.js';
 import { entryKey, generateResource, manifestMatches, resourceNodeNames, type ResourceEntry } from '../resource.js';
+import { hmacHex } from '../../util/keyed-digest.js';
 import { enterWaitingRoute, isActiveEnvironment } from './route.js';
 import { recordPreflight } from './probes.js';
 
@@ -517,7 +518,8 @@ async function publishBatch(engine: Engine, batch: Batch): Promise<void> {
     if (gen !== generation) throw new SfeError('INTERNAL', '发布失败：配置代数已变化');
     const d = repos.deployments.insert({
       generation: gen,
-      workingProfileDigest: plan!.profileDigest,
+      // 不保存工作配置的 pepper 派生摘要，只保存进程内随机密钥下的核对值（profileCheckOf）
+      workingProfileDigest: profileCheckOf(engine, plan!.profileDigest),
       resourceDigest: plan!.newDigest,
       nodeManifest: plan!.manifest,
       selectionBefore,
@@ -611,6 +613,26 @@ interface Plan {
   resourceBodyDigestBefore: string | null;
   bodyDigest: string;
   unchanged: boolean;
+}
+
+/**
+ * 发布记录中工作配置的核对值（deployments.working_profile_digest，docs/ARCHITECTURE.md §0「秘密的存放」）。工作配置含用户自己的
+ * 节点凭据、http-api 密钥与 MITM 证书口令；按 pepper 派生密钥计算的摘要（files.digestContent）与 backups/ 中的工作配置副本一起，
+ * 能让拿到数据目录副本的人离线核对猜测的这些凭据（之后改过的也一样），而发布记录没有期限。所以只保存它在本进程随机密钥下的
+ * HMAC 与进程标记（engine.requestEphemeral，从不持久保存，与维护提交的 previewCheck 相同）：进程结束之后任何人都无法再用它核对。
+ * 迁移 6 清除升级前保存的摘要。
+ */
+const PROFILE_CHECK_TAG = 'eph1:';
+
+function profileCheckOf(engine: Engine, profileDigest: string): string {
+  const { key, epoch } = engine.requestEphemeral;
+  return `${PROFILE_CHECK_TAG}${epoch}:${hmacHex(key, `profile-check\0${profileDigest}`)}`;
+}
+
+/** 上一次发布记下的核对值由本进程计算、且与当前工作配置不同。之前的进程记下的（或迁移 6 清除的）无从比较：不说明有修改。 */
+function profileChangedSince(engine: Engine, recorded: string | null, profileDigest: string): boolean {
+  if (recorded === null || !recorded.startsWith(`${PROFILE_CHECK_TAG}${engine.requestEphemeral.epoch}:`)) return false;
+  return recorded !== profileCheckOf(engine, profileDigest);
 }
 
 async function readText(path: string): Promise<string | null> {
@@ -727,9 +749,9 @@ async function buildPlan(
     throw fail({ code: 'SURGE_CHECK_FAILED', message: `校验候选配置失败：${check.message}` });
   }
 
-  // 受管理段之外的用户修改直接成为新基线
+  // 受管理段之外的用户修改直接成为新基线（只在上一次发布由本进程记下核对值时能说明这一点，profileChangedSince）
   const last = repos.deployments.latestWithState(['verified', 'published']);
-  if (last?.workingProfileDigest && last.workingProfileDigest !== profileDigest) {
+  if (profileChangedSince(engine, last?.workingProfileDigest ?? null, profileDigest)) {
     for (const op of batch.ops) engine.step(op.id, '工作配置在受管理段之外有修改，已作为新基线', false);
   }
   void describeOutsideChanges;
@@ -957,6 +979,10 @@ async function rollbackPublish(
       if (currentDigest !== null && (await files.digest(NODE_RESOURCE_FILE)) === currentDigest) confirmResource(repos, engine.kv, currentDigest);
       throw err;
     }
+    // 文件已是恢复的内容（写入成功）：立即确认归属，删除写前摘要。之后的读回只决定操作与路由的结局，不决定文件归属——否则读回
+    // 无法确认时（Surge 不可达、重新读取慢，常与触发回滚的原因相同）写前摘要一直留着本次写入、含刚加入的凭据的那份内容的
+    // pepper 派生摘要；删除该环境之后版本退役、凭据被清扫，它仍能离线核对猜测的旧值（§0「秘密的存放」）
+    confirmResource(repos, engine.kv, prevDigest);
     // 文件已恢复为上一份内容（不论之后的读回能否确认）：本次写入的那组节点行的写入对照再也用不上，删除
     dropUnusableWriteBaseline(engine, resourceBodyDigest(files.digestContent, content));
     // 与发布相同：等待 Surge 自动重新读取恢复的文件，从不调用外部资源更新
@@ -972,7 +998,6 @@ async function rollbackPublish(
       sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
     }
     ok = membersOk && sel === ctx.selectionBefore;
-    if (ok) confirmResource(repos, engine.kv, prevDigest);
   } catch {
     ok = false;
   }
@@ -986,10 +1011,15 @@ async function rollbackPublish(
     finishOps(engine, batch, { phase: 'FAILED', status: 'failed', error: ctx.failure, step: '已回滚到上一份节点资源并恢复原选择' });
     return;
   }
-  // 回滚无法确认：活动环境需要处理（从不改为 NORMAL、DIRECT 或其他出口）
+  // 回滚无法确认：活动环境需要处理（从不改为 NORMAL、DIRECT 或其他出口）。之前一次成功回滚留下的 rollback_needs_reverify
+  // （「已恢复原节点并保持阻断」）：SFE-ROUTE 的选择已无法确认，「已恢复原节点」不再成立——去掉，环境改显示路由需要处理（与对账
+  // 发现选择被外部修改时相同，engine/reconcile.ts）
   const route = repos.routeState.get();
+  const kept = route.warnings.filter((w) => w !== 'rollback_needs_reverify');
   if (route.entryMode !== 'NORMAL') {
-    repos.routeState.update({ phase: 'attention', warnings: [...route.warnings, 'external_selection_change'] });
+    repos.routeState.update({ phase: 'attention', warnings: [...new Set([...kept, 'external_selection_change' as const])] });
+  } else if (kept.length !== route.warnings.length) {
+    repos.routeState.update({ warnings: kept });
   }
   const body: ApiErrorBody = { code: 'READBACK_MISMATCH', message: '发布回滚失败：节点资源与选择无法确认，需要处理', details: { cause: ctx.failure.code } };
   for (const u of batch.units) {
@@ -998,7 +1028,7 @@ async function rollbackPublish(
     u.error = body;
   }
   finishOps(engine, batch, { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', error: body, step: body.message });
-  engine.emit({ route: true });
+  engine.emit({ route: true, environments: route.activeEnvironmentId ? [route.activeEnvironmentId] : [] });
 }
 
 /** 按某次发布的清单重建其资源内容；摘要不一致（凭据已回收等）时返回 null。 */
@@ -1062,12 +1092,21 @@ async function settle(engine: Engine, batch: Batch, s: SettleInput | null): Prom
       for (const opId of unitsByOp(batch.units).keys()) {
         repos.deployments.setOperationOutcome(s.deployment.generation, opId, opOutcome(batch.units, opId));
       }
-      // 已移除的旧版本：retired，并回收不再被引用的代理秘密
+      // 已移除的旧版本：retired，并回收不再被引用的代理秘密。仍在回滚目标（结算之后最近一次 verified 的发布，本次不可接受时是更早
+      // 的那一次）清单中的版本不退役：只从资源中移除、记为 superseded，等有更新的 verified 发布之后再由 retireStaleRevisions 退役
+      const rollbackKeep = rollbackTargetKeys(engine);
+      const retiredNow = new Set<string>();
       for (const rev of s.plan.removed) {
+        const k = entryKey(rev.environmentId, rev.revision);
+        if (rollbackKeep.has(k) && rev.state !== 'retired') {
+          if (rev.state !== 'superseded') repos.proxyRevisions.updateState(rev.environmentId, rev.revision, 'superseded');
+          continue;
+        }
         repos.proxyRevisions.updateState(rev.environmentId, rev.revision, 'retired');
+        retiredNow.add(k);
         for (const ref of [rev.usernameRef, rev.passwordRef]) if (ref) engine.secrets.orphanIfUnreferenced(ref);
       }
-      scrubRetiredDeploymentDigests(engine, new Set(s.plan.removed.map((rev) => entryKey(rev.environmentId, rev.revision))));
+      scrubRetiredDeploymentDigests(engine, retiredNow);
       retireStaleRevisions(engine, manifestKeys);
     });
     confirmResource(repos, engine.kv, s.plan.newDigest);
@@ -1146,9 +1185,10 @@ async function settle(engine: Engine, batch: Batch, s: SettleInput | null): Prom
 export const SCRUBBED_DIGEST = 'scrubbed';
 
 /**
- * 含刚退役版本的旧发布记录：资源摘要（与工作配置摘要）按当时的节点资源内容计算，其中有这些版本的明文代理凭据；pepper 在同一个
- * 数据库中，留着就能从数据目录的副本离线核对猜测的旧凭据（§0「秘密的存放」）。这些发布已无法也不会再重建（回滚目标是最近一次
- * 可接受的发布，它不含退役的版本；退役版本的凭据随后被回收），清除它们的摘要。在调用方的结算事务中执行。
+ * 含刚退役版本的旧发布记录：资源摘要按当时的节点资源内容计算，其中有这些版本的明文代理凭据；pepper 在同一个数据库中，留着就能
+ * 从数据目录的副本离线核对猜测的旧凭据（§0「秘密的存放」）。这些发布已无法也不会再重建（回滚目标是最近一次 verified 的发布，它
+ * 清单中的版本在有更新的 verified 发布之前不退役——rollbackTargetKeys；退役版本的凭据随后被回收），清除它们的摘要（工作配置一栏
+ * 现在只有进程内的核对值 profileCheckOf，一并清除；升级前保存的 pepper 派生摘要由迁移 6 清除）。在调用方的结算事务中执行。
  */
 export function scrubRetiredDeploymentDigests(engine: Engine, retired: ReadonlySet<string>): void {
   if (retired.size === 0) return;
@@ -1164,10 +1204,23 @@ export function scrubRetiredDeploymentDigests(engine: Engine, retired: ReadonlyS
   }
 }
 
+/**
+ * 发布回滚的目标（rollbackPublish：最近一次 verified 的发布）清单中的代理版本（entryKey）。在有更新的 verified 发布之前它们不退役
+ * （发布结算、retireStaleRevisions 与删除环境都按它保留）：退役会回收它们的秘密（之后被清扫）并清除含它们的发布记录的摘要，
+ * 之后一次读回不一致的发布就无法重建回滚目标，只能结束为需要处理。例如删除环境之后一次读回不完整（published）的发布把它的
+ * 节点从资源中移除，而回滚目标仍是之前那次含它的 verified 发布。
+ */
+export function rollbackTargetKeys(engine: Engine): Set<string> {
+  const d = engine.repos.deployments.latestWithState(['verified']);
+  return new Set((d?.nodeManifest ?? []).map((m) => entryKey(m.environmentId, m.proxyRevision)));
+}
+
 function retireStaleRevisions(engine: Engine, manifestKeys: ReadonlySet<string>): void {
   const { repos } = engine;
   const route = repos.routeState.get();
   const keep = new Set<string>(manifestKeys);
+  // 回滚目标仍需要的版本（rollbackTargetKeys）
+  for (const k of rollbackTargetKeys(engine)) keep.add(k);
   for (const e of repos.environments.list()) {
     for (const n of [e.desiredProxyRevision, e.deployedProxyRevision, e.lastVerifiedProxyRevision]) if (n !== null) keep.add(entryKey(e.id, n));
   }

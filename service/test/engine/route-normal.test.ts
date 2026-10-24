@@ -4,7 +4,7 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { ENTRY_PLACEHOLDER_RULE, ENTRY_RULESET_FILES, SfeError, type ProtocolCoverage } from '@sfe/contract';
+import { ENTRY_PLACEHOLDER_RULE, ENTRY_RULESET_FILES, ROUTE_GROUP_NAME, SfeError, type ProtocolCoverage } from '@sfe/contract';
 import { processPathsDigest } from '../../src/engine/capabilities.js';
 import { capabilityUnverified } from '../../src/surge/primitives.js';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST, FakeSurge } from '../../src/surge/fake.js';
@@ -1445,6 +1445,36 @@ describe('the entry RULE-SET lines removed or reordered in the working profile o
     expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
   });
 
+  test('whole segment removed while Surge\'s auto-reload setting no longer matches the measured condition: the detached entry files are only rewritten (no auto-reload check), normal mode completes, and remerge waits only for the setting to be restored', async () => {
+    h = await createHarness();
+    const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    await editEntrySegment('block');
+    const rec = h.repos.capabilities.get('auto_reload_atomic_replace')!;
+    h.repos.capabilities.upsert({ key: 'auto_reload_atomic_replace', status: rec.status, context: { ...rec.context!, autoReload: 'on' }, verifiedAt: rec.verifiedAt, note: rec.note });
+    h.fake.reportedAutoReload = false;
+    // 四条入口 RULE-SET 都不在有效规则中：Safari 已按原规则发出
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    const n = await enterNormal(envId);
+    const op = h.repos.operations.get(n)!;
+    expect(op.error).toBeNull();
+    expect(op).toMatchObject({ phase: 'NORMAL_RESTORED', status: 'succeeded' });
+    for (const bit of ['udp', 'verify', 'block', 'active'] as const) expect(placeholderOnly(bit)).toBe(true);
+    expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle', activeEnvironmentId: null });
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    // 入口已是普通模式；重新合并的维护写入门槛仍要求自动重载设置与实测条件一致
+    let p = await h.app.remergePreview(WEB);
+    expect(p.checks.find((c) => c.name === 'entry')!.ok).toBe(true);
+    expect(p.checks.find((c) => c.name === 'gate')!.ok).toBe(false);
+    h.fake.reportedAutoReload = true;
+    await h.app.runPeriodicReconcile();
+    p = await h.app.remergePreview(WEB);
+    expect(p.checks.every((c) => c.ok)).toBe(true);
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+  });
+
   test('an activation while the segment is damaged stops before its first write (no block written, SFE-ROUTE untouched) and says how to recover', async () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
@@ -1491,5 +1521,40 @@ describe('an older queued activation never runs after a newer normal mode that a
     expect(safariOutcome(h, FAKE_VERIFY_HOST)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
     // 按原规则发出的 Safari 长连接没有被结束
     expect((await h.fake.listActiveRequests()).some((r) => r.id === daily.id)).toBe(true);
+  });
+});
+
+describe('a queued normal mode runs as soon as the route is handed to it even after the wall clock stepped back (§6.1: only timer entries wait for their available time)', () => {
+  test.each(['ruleset_resource', 'temp_rule'] as const)('%s: environment A in use, activation of B paused before its first write, normal mode accepted, clock steps back 30 s → B yields and the normal mode completes at once', async (entryStrategy) => {
+    h = await createHarness({ entryStrategy });
+    const { envId: A } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const B = (await createEnv(h, 'US-Buyer-B', '203.0.113.20')).environment_id!;
+    await bind(h, PROFILE_B, B);
+    // B 的激活停在第 1–3 步读取 SFE-ROUTE 成员上（执行器忙）
+    const fake = h.fake as unknown as { getGroupMembers: (group: string) => Promise<unknown> };
+    const orig = fake.getGroupMembers.bind(h.fake);
+    let release: (() => void) | null = null;
+    fake.getGroupMembers = (group: string) => {
+      if (group !== ROUTE_GROUP_NAME || release !== null) return orig(group);
+      return new Promise((resolve, reject) => {
+        release = () => void orig(group).then(resolve, reject);
+      });
+    };
+    const x = (await h.app.activate(B, { request_id: rid('act'), old_session_policy: 'closed_confirmed', confirmed_environment_id: A }, WEB)).operation_id;
+    const end = Date.now() + 5000;
+    while (release === null && Date.now() < end) await new Promise((r) => setTimeout(r, 2));
+    expect(h.repos.operations.get(x)!.status).toBe('running');
+    const n = (await h.app.enterNormal({ request_id: rid('normal'), old_session_policy: 'closed_confirmed', confirmed_environment_id: A }, WEB)).operation_id;
+    expect(h.repos.operations.get(n)!.status).toBe('queued');
+    // 受理之后墙上时钟回拨（例如 NTP 校正）：普通模式的条目按受理时的时间入队，可用时间在“将来”
+    h.clock.set(h.clock.now().getTime() - 30_000);
+    release!();
+    await h.idle();
+    // 时钟不前进：激活在第一次写入之前让路，普通模式立即执行，Safari 不在 A 的买家出口上多停留回拨的时长
+    expect(h.repos.operations.get(x)).toMatchObject({ phase: 'SUPERSEDED', status: 'superseded', supersededBy: n });
+    expect(h.repos.operations.get(n)).toMatchObject({ phase: 'NORMAL_RESTORED', status: 'succeeded' });
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'idle', entryMode: 'NORMAL', activeEnvironmentId: null, operationId: n });
+    expect(safariOutcome(h)).toMatchObject({ rule: 'FINAL,DIRECT', failed: false });
+    expect(h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.example.test', protocol: 'tcp' }).rule).toBe('FINAL,DIRECT');
   });
 });

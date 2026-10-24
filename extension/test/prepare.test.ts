@@ -301,6 +301,21 @@ describe('prepare page flow', () => {
         note: '路由与之前的检测结果都未改变',
         notNote: '已停止自动打开订单与填充',
       },
+      // 取消排在已提交的结果之前受理、而提交的出口 IP 与预期出口不一致：服务照样记下不符（probeWarning），订单与填充已停止
+      {
+        op: operation({
+          phase: 'FAILED',
+          status: 'failed',
+          probeKind: 'safari',
+          error: { code: 'SUPERSEDED', message: '已取消重新检测：路由未改变；已提交的检测结果中的出口 IP 与预期出口不一致…' },
+          result: { probeWarning: 'exit_ip_mismatch' },
+        }),
+        outcome: 'probe_failed',
+        title: '已取消重新检测',
+        guarantee: false,
+        note: '已提交的出口 IP 与预期出口不一致，服务已记下出口不符：路由未改变，已停止自动打开订单与填充',
+        notNote: '路由与之前的检测结果都未改变',
+      },
       {
         op: operation({ phase: 'FAILED', status: 'failed', probeKind: 'safari', error: { code: 'SAFARI_VERIFY_TIMEOUT', message: 'Safari 实测超时：未在截止时间内完成出口检测' } }),
         outcome: 'probe_failed',

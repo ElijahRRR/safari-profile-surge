@@ -390,6 +390,17 @@ describe('docs/INSTALL.md', () => {
     // 替换 App 不重启已在运行的旧服务：先停止，否则旧服务继续应答新扩展
     expect(legacy).toContain('**然后先在旧版本的菜单中「停止后台服务」，再安装新版本 App**');
     expect(legacy).toContain('本机服务的填充应答格式不符');
+    // 只请求账号的页面不涉及密码项：旧服务照常填入账号，不能无条件说「一个字段也不填」；扩展照常显示「已填充账号」面板，
+    // 只是看不出旧服务仍在运行——不能说「不显示任何提示」
+    expect(legacy).toContain('只请求账号的页面（例如亚马逊登录的第一步只有邮箱或手机号）照常填入账号（页面照常显示「已填充账号」，看不出旧服务仍在运行）');
+    expect(legacy).not.toContain('不显示任何提示');
+    expect(legacy).not.toContain('登录页显示「本机服务的填充应答格式不符……」，一个字段也不填。');
+    // 第 4 步：新版本从不在改名的旧目录上启动、不会清理它——旧的「重新合并」备份中的 sfe-nodes.list 与 tmp/ 中遗留的候选副本含明文
+    // 买家代理凭据，改名之后立即删除
+    expect(legacy).toContain('**改名之后立即删除其中的明文买家代理凭据。**');
+    expect(legacy).toContain(`find "$OLD/backups" -name 'sfe-nodes.list' -type f -print -delete`);
+    expect(legacy).toContain('rm -rf "$OLD/tmp"');
+    expect(legacy.indexOf('**改名之后立即删除其中的明文买家代理凭据。**')).toBeLessThan(legacy.indexOf('5. **删除 Surge 配置目录中旧版本的文件**'));
     // 第 4 步把 p0/ 一起改名：propose 默认找不到旧运行，要指向旧的证据目录
     expect(legacy).toContain('--raw-dir "$HOME/Library/Application Support/SafariProfileSurge.keychain-old/p0"');
     expect(legacy).toContain('`propose` 会重新测量当前上下文，与测量时不一致');
@@ -459,6 +470,35 @@ describe('docs/ARCHITECTURE.md §6.1, §6.3 step 14 and §6.4 (route end points)
     expect(text).toContain('都结束为 `BLOCKED_NEEDS_ATTENTION`（needs_attention；错误保留原来的代码，没有错误时 `UNKNOWN_STATE`）');
     expect(text).toContain('或路由记在另一个未结束（排队、执行中、等待中）的操作名下——不论路由阶段');
   });
+
+  it('retest cancel texts carry the §6.1 submitted-mismatch exception: a cancel behind a mismatching submitted result records the mismatch and stops orders and fill', () => {
+    expect(text).not.toContain('Safari 重测（含第 1 步复用时改为重测的激活，§6.4）只结束检测、通常路由不变。');
+    expect(text).toContain('Safari 重测的取消确认与说明（网页的取消确认与路由卡，弹窗的取消确认）还写明 §6.1 的例外：「若已提交的检测结果中的出口 IP 与预期出口不一致，取消照样记下出口不符，并停止自动打开订单与填充」');
+    expect(text).not.toContain('超时与取消同样只结束检测。');
+  });
+
+  it('rejectKept only follows a REJECT held without a kept activation snapshot; an unconfirmed rollback or an executor-guard hold on a transition keeps the snapshot, so a later failed switch restores the last confirmed node', () => {
+    expect(text).not.toContain('下面的共同结束点、回滚无法确认、普通模式失败或执行器兜底改选之后，它们保留使用中的环境、不留激活快照');
+    expect(text).toContain('又没有保留的激活快照（下面的共同结束点 `holdAtRouteEnd` 改选之后——含执行器兜底对不负责过渡中路由的操作的改选——以及没有激活快照时普通模式失败改选之后');
+    expect(text).toContain('回滚无法确认（下面两种情况）与执行器兜底对过渡中路由的改选（`settleAbandonedTransition`）之后激活快照保留');
+  });
+
+  it('only timer entries wait for their available time; crash recovery and a queued normal mode are claimable after a backward wall-clock step (§6.1)', () => {
+    expect(text).toContain('只有计时器条目（到达与实测截止时间，`resume_reason` 为 `arrival_timeout`、`verify_timeout`）要等可用时间到达');
+    expect(text).not.toContain('可用时间未到的条目也不能领取');
+    expect(text).toContain('服务重启时在第一次写入 Surge 之前中断、尚未恢复的同一类操作');
+  });
+
+  it('WAITING_ROUTE is only for the in-use environment: another environment\'s commit ends it as READY_FOR_NEXT_OPEN (§6.1, §6.3 step 4)', () => {
+    expect(text).toContain('`WAITING_ROUTE` 只针对使用中的环境：另一个环境的切换通过实测、成为使用中的环境时，提交事务同时结束停在 `WAITING_ROUTE` 的其他环境的发布');
+    expect(text).toContain('在另一个环境的切换受理之后才进入等待的，由该切换提交时结束');
+  });
+
+  it('rollback_needs_reverify is dropped once SFE-ROUTE is no longer the restored node (external re-select, unconfirmed publish rollback), in §6.2, §6.3 step 14 and §6.6', () => {
+    expect(text).toContain('SFE-ROUTE 的选择不再是恢复的原节点时');
+    expect(text).toContain('发现选择被外部修改（`external_selection_change`）时同样去掉它');
+    expect(text).toContain('同时去掉之前一次成功的激活回滚留下的 `rollback_needs_reverify`');
+  });
 });
 
 describe('the Surge-directory temp files of atomic writes are listed where secrets live and in the delete lists (ARCHITECTURE §2, INSTALL §5–§7)', () => {
@@ -492,5 +532,14 @@ describe('persisted digests cannot verify replaced passwords offline (ARCHITECTU
     expect(arch).toContain('迁移 4 删除升级前保存的 `previewDigest`');
     expect(read('INSTALL.md')).toContain('数据库里也没有能用来离线核对猜测旧值的摘要');
     expect(read('ACCEPTANCE.md')).toContain('不能用于离线核对已替换、已清扫的旧密码');
+    // 发布记录不保存工作配置的 pepper 派生摘要（迁移 6 清除升级前的）
+    expect(arch).toContain('工作配置一栏（`working_profile_digest`）从不保存工作配置的 pepper 派生摘要');
+    expect(arch).toContain('迁移 6 清除升级前保存的摘要');
+    expect(arch).not.toContain('资源与工作配置的带密钥摘要只用于变化检测');
+    expect(read('INSTALL.md')).toContain('发布记录不保存工作配置的摘要');
+    // 节点资源文件的归属记录只保留当前文件内容的摘要（回滚之后读回失败、删除环境、启动时）
+    expect(arch).toContain('发布回滚的写入成功即确认归属、删除意图的写前摘要');
+    expect(read('INSTALL.md')).toContain('节点资源文件的归属记录只保留当前文件内容的摘要');
+    expect(read('ACCEPTANCE.md')).toContain('发布记录只保存进程内随机密钥下的工作配置核对值');
   });
 });

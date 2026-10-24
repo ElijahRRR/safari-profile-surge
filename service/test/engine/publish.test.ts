@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { CAPABILITY_GATES, NODE_RESOURCE_FILE, WORKING_PROFILE_NAME, type CapabilityKey } from '@sfe/contract';
+import { CAPABILITY_GATES, NODE_RESOURCE_FILE, SfeError, WORKING_PROFILE_NAME, type CapabilityKey } from '@sfe/contract';
 import { profileMatches } from '../../src/engine/context.js';
 import { anyContext, ADMIN, PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, envInput, rid, safariOutcome, type Harness } from './harness.js';
 
@@ -169,6 +169,23 @@ describe('baseline checks', () => {
     const steps = h.repos.operations.listSteps(op.id).map((s) => s.message);
     expect(steps.some((m) => m.includes('作为新基线'))).toBe(true);
     expect(readFileSync(h.profilePath, 'utf8')).toContain('user-added.example.test');
+  });
+
+  test('the deployment keeps only a process-local check of the working profile: after a restart an outside edit is still adopted, without the note', async () => {
+    h = await createHarness({ dbFile: true });
+    await createEnv(h, 'US-Buyer-01', '203.0.113.10');
+    const recorded = h.repos.deployments.latest()!.workingProfileDigest!;
+    // 不是工作配置的 pepper 派生摘要（files.digestContent），而是本进程随机密钥下的核对值
+    expect(recorded).toMatch(/^eph1:[0-9a-f]{16}:[0-9a-f]{64}$/);
+    expect(recorded).not.toContain(h.app.engine.profileFiles()!.digestContent(readFileSync(h.profilePath, 'utf8')));
+    await h.crash();
+    writeFileSync(h.profilePath, readFileSync(h.profilePath, 'utf8').replace('FINAL,DIRECT', 'DOMAIN-SUFFIX,user-added.example.test,DIRECT\nFINAL,DIRECT'));
+    const b = await createEnv(h, 'US-Buyer-02', '203.0.113.11');
+    const op = h.repos.operations.get(b.operation_id)!;
+    expect(op.phase).toBe('READY_FOR_NEXT_OPEN');
+    // 之前的进程记下的核对值无从比较：不提示，也不因此失败
+    expect(h.repos.operations.listSteps(op.id).some((s) => s.message.includes('作为新基线'))).toBe(false);
+    expect(h.repos.deployments.latest()!.workingProfileDigest).not.toBe(recorded);
   });
 
   test('managed-segment edit stops with BASELINE_CHANGED and nothing is written', async () => {
@@ -347,5 +364,135 @@ describe('retention', () => {
     await h.idle();
     expect(h.repos.deployments.latest()!.nodeManifest.map((m) => m.nodeName)).toEqual(['SFE-N-E0002-US02-v001']);
     expect(h.repos.proxyRevisions.get(env.id, 1)!.state).toBe('retired');
+  });
+
+  /** 下一次发布：Surge 重新读取后组选择回落到首成员 → 读回不一致 → 回滚到最近一次 verified 的发布。 */
+  async function publishWithSelectionDrop(name: string, host: string): Promise<string> {
+    const orig = h.fake.getGroupMembers.bind(h.fake);
+    let first = true;
+    h.fake.getGroupMembers = async (group: string) => {
+      const r = await orig(group);
+      if (first) {
+        first = false;
+        await h.fake.selectGroupPolicy('SFE-ROUTE', 'REJECT');
+      }
+      return r;
+    };
+    const c = await createEnv(h, name, host);
+    h.fake.getGroupMembers = orig;
+    return c.operation_id;
+  }
+
+  /** 一次读回不完整（getPolicyDetail 瞬时失败一次，没有读回覆盖记录）的发布：结束为 published，不是 verified。 */
+  async function partialPublish(): Promise<void> {
+    const origDetail = h.fake.getPolicyDetail.bind(h.fake);
+    let failOnce = true;
+    h.fake.getPolicyDetail = async (n: string) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('transient');
+      }
+      return origDetail(n);
+    };
+    await h.app.publishPending({ request_id: rid('pub') }, WEB);
+    await h.idle();
+    h.fake.getPolicyDetail = origDetail;
+    expect(h.repos.deployments.latest()!.state).toBe('published');
+  }
+
+  test('a deleted environment\'s node removed by a partial (published) publish is not retired while the latest verified publish still lists it: its secrets survive the sweep and the next mismatching publish rolls back cleanly; a later verified publish retires it', async () => {
+    h = await createHarness();
+    const pw = ['syn', 'th', 'pw', 'R'].join('');
+    const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10', { password: `${pw}7` });
+    await activeEnv(h, 'US-Buyer-02', '203.0.113.11', PROFILE_A);
+    const gen2 = h.repos.deployments.latest()!;
+    expect(gen2.state).toBe('verified');
+    const selected = h.repos.routeState.get().selectedNode!;
+    const envA = h.repos.environments.get(a.environment_id!)!;
+    const a1 = h.repos.proxyRevisions.get(envA.id, 1)!;
+    const del = await h.app.deleteEnvironment(envA.id, { request_id: rid(), expected_revision: envA.revision }, ADMIN);
+    await h.idle();
+    expect(h.repos.operations.get(del.operation_id)!.phase).toBe('COMPLETED');
+    await partialPublish();
+    // A1 已从资源中移除，但仍是回滚目标（gen 2）的一部分：不退役、摘要不清除、凭据仍被引用
+    expect(h.repos.deployments.latest()!.nodeManifest.map((m) => m.nodeName)).not.toContain(a1.nodeName);
+    expect(h.repos.proxyRevisions.get(envA.id, 1)!.state).toBe('superseded');
+    expect(h.repos.deployments.list(50).find((d) => d.generation === gen2.generation)!.resourceDigest).not.toBe('scrubbed');
+    expect(h.repos.secretRefs.get(a1.passwordRef!)?.state).toBe('committed');
+    await h.app.engine.secrets.sweep();
+    expect(h.store.has(a1.passwordRef!)).toBe(true);
+    const opId = await publishWithSelectionDrop('US-Buyer-03', '203.0.113.12');
+    const op = h.repos.operations.get(opId)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('READBACK_MISMATCH');
+    expect(h.repos.deployments.latest()!.state).toBe('rolled_back');
+    expect(h.repos.routeState.get().phase).toBe('active_verified');
+    expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe(selected);
+    expect(safariOutcome(h).leafPolicyName).toBe(selected);
+    // 之后一次 verified 的发布：回滚目标不再含 A1 → 退役、凭据回收、含它的发布记录摘要清除
+    await h.app.publishPending({ request_id: rid('pub') }, WEB);
+    await h.idle();
+    expect(h.repos.deployments.latest()!.state).toBe('verified');
+    expect(h.repos.proxyRevisions.get(envA.id, 1)!.state).toBe('retired');
+    expect(h.repos.secretRefs.get(a1.passwordRef!)?.state).toBe('orphaned');
+    expect(h.repos.deployments.list(50).find((d) => d.generation === gen2.generation)!.resourceDigest).toBe('scrubbed');
+  });
+
+  test('deleting an environment while the node resource cannot be read keeps every revision superseded (no retirement, no secret reclaim): a failed read is not evidence the node is gone; the next publish removes and retires it', async () => {
+    h = await createHarness();
+    await activeEnv(h, 'US-Buyer-02', '203.0.113.11', PROFILE_A);
+    const pw = ['syn', 'th', 'pw', 'D'].join('');
+    // A 的节点经一次读回不完整的发布写入资源（published）：它不在回滚目标（最近一次 verified 的发布）中
+    const origDetail = h.fake.getPolicyDetail.bind(h.fake);
+    let failOnce = true;
+    h.fake.getPolicyDetail = async (n: string) => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('transient');
+      }
+      return origDetail(n);
+    };
+    const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10', { password: `${pw}9` });
+    h.fake.getPolicyDetail = origDetail;
+    expect(h.repos.deployments.latest()!.state).toBe('published');
+    const envA = h.repos.environments.get(a.environment_id!)!;
+    const a1 = h.repos.proxyRevisions.get(envA.id, 1)!;
+    expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).toContain(a1.nodeName);
+    // 删除时读取节点资源失败一次（与 createProfileFiles 对非 ENOENT 错误抛出的相同）
+    const engine = h.app.engine as unknown as { profileFiles: () => ReturnType<Harness['app']['engine']['profileFiles']> };
+    const origPF = engine.profileFiles.bind(engine);
+    let failures = 1;
+    engine.profileFiles = () => {
+      const f = origPF();
+      if (!f) return f;
+      return {
+        ...f,
+        async read(name: string) {
+          if (name === NODE_RESOURCE_FILE && failures > 0) {
+            failures--;
+            throw new SfeError('UNSAFE_LOCATION', '读取文件失败：无法访问配置目录');
+          }
+          return f.read(name);
+        },
+      };
+    };
+    const del = await h.app.deleteEnvironment(envA.id, { request_id: rid(), expected_revision: envA.revision }, ADMIN);
+    await h.idle();
+    engine.profileFiles = origPF;
+    expect(failures).toBe(0);
+    expect(h.repos.operations.get(del.operation_id)!.phase).toBe('COMPLETED');
+    // 节点仍在资源中、Surge 仍加载着它：不退役，凭据不回收
+    expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).toContain(a1.nodeName);
+    expect(h.repos.proxyRevisions.get(envA.id, 1)!.state).toBe('superseded');
+    expect(h.repos.secretRefs.get(a1.passwordRef!)?.state).toBe('committed');
+    expect(h.repos.operations.listSteps(del.operation_id).map((st) => st.message).join('\n')).toContain('读取节点资源失败');
+    await h.app.engine.secrets.sweep();
+    expect(h.store.has(a1.passwordRef!)).toBe(true);
+    // 之后的发布按保留规则移除并退役
+    await h.app.publishPending({ request_id: rid('pub') }, WEB);
+    await h.idle();
+    expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).not.toContain(a1.nodeName);
+    expect(h.repos.proxyRevisions.get(envA.id, 1)!.state).toBe('retired');
+    expect(h.repos.secretRefs.get(a1.passwordRef!)?.state).toBe('orphaned');
   });
 });

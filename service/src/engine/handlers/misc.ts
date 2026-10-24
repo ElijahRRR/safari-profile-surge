@@ -7,8 +7,9 @@ import type { OperationRecord } from '../../db/index.js';
 import { payloadOf } from '../../domain/operations.js';
 import type { Engine } from '../context.js';
 import { environmentRouteBusy } from '../route-control.js';
+import { settleResourceDigests } from '../ownership.js';
 import { entryKey, resourceNodeNames } from '../resource.js';
-import { scrubRetiredDeploymentDigests } from './publish.js';
+import { rollbackTargetKeys, scrubRetiredDeploymentDigests } from './publish.js';
 import { expireSafariProbe, recordPreflight } from './probes.js';
 
 function envIdOf(op: OperationRecord): string | null {
@@ -61,9 +62,27 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
     engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message);
     return;
   }
-  // 仍在节点资源中的版本留给之后的发布移除；不在资源中的版本立即 retired 并回收秘密
+  // 仍在节点资源中的版本留给之后的发布移除；确认不在资源中的版本立即 retired 并回收秘密。只有确认节点资源中没有它（文件读到、
+  // 其中没有这一行；文件不存在；尚未初始化、没有工作配置）才算不在资源中：读取失败（权限、I/O 错误，或数据库密钥未载入、无法
+  // 读取工作配置目录）不说明文件里没有它——Surge 可能仍加载着这一行，退役会回收它的秘密并清除含它的发布记录的摘要（回滚目标
+  // 无法重建）。这时全部按仍在资源中处理（superseded），由之后的发布按保留规则移除
   const files = engine.profileFiles();
-  const inResource = new Set(resourceNodeNames(files ? await files.read(NODE_RESOURCE_FILE).catch(() => null) : null));
+  let inResource: Set<string> | null;
+  /** 读到的节点资源文件的摘要（不存在为 null）：退役之后归属记录只保留它（settleResourceDigests）。 */
+  let resourceDigest: string | null = null;
+  if (files) {
+    try {
+      inResource = new Set(resourceNodeNames(await files.read(NODE_RESOURCE_FILE)));
+      resourceDigest = await files.digest(NODE_RESOURCE_FILE);
+    } catch {
+      inResource = null;
+    }
+  } else {
+    inResource = engine.workingProfile() === null ? new Set() : null;
+  }
+  if (inResource === null) engine.step(op.id, '读取节点资源失败：不能确认该环境的节点已不在其中，全部留给之后的发布移除（不立即回收代理凭据）');
+  // 发布回滚的目标（最近一次 verified 的发布）仍需要的版本同样留给之后的发布（rollbackTargetKeys）
+  const rollbackKeep = rollbackTargetKeys(engine);
   // 仅终结该环境自己的挂起编辑；批量发布可能还包含其他环境，不能整批取消。
   const obsolete = repos.operations.listByStatus(['parked'], { kinds: ['environment.create', 'environment.update'] })
     .filter((pending) => pending.environmentId === env.id);
@@ -71,7 +90,7 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
     const retired = new Set<string>();
     for (const r of revisions) {
       if (r.state === 'retired') continue;
-      if (inResource.has(r.nodeName)) repos.proxyRevisions.updateState(env.id, r.revision, 'superseded');
+      if (inResource === null || inResource.has(r.nodeName) || rollbackKeep.has(entryKey(env.id, r.revision))) repos.proxyRevisions.updateState(env.id, r.revision, 'superseded');
       else {
         repos.proxyRevisions.updateState(env.id, r.revision, 'retired');
         retired.add(entryKey(env.id, r.revision));
@@ -79,6 +98,8 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
       }
     }
     scrubRetiredDeploymentDigests(engine, retired);
+    // 归属记录中不是当前文件内容的意图摘要与写前摘要（例如回滚写入之后读回无法确认）可能含刚退役的版本的凭据行：按事实确认或删除
+    if (retired.size > 0) settleResourceDigests(repos, engine.kv, resourceDigest);
     const account = repos.accounts.get(env.id);
     if (account?.passwordRef) engine.secrets.orphan(account.passwordRef);
     repos.accounts.delete(env.id);

@@ -149,7 +149,17 @@ const rollbackItems = computed(() => {
   return [
     { key: 'prevEnv', label: '恢复的环境', value: prevEnv ? envLabel(prevEnv) : (r.previousEnvironmentId ?? '无') },
     { key: 'prevRev', label: '恢复的版本', value: formatRevision(r.previousProxyRevision) },
-    { key: 'selection', label: '恢复的节点选择', value: r.restoredSelection ?? '—' },
+    // 切换前没有已验证的路由时没有恢复任何节点（旧版服务此时仍在 restoredSelection 中给出刚失败的目标节点）；切换前 SFE-ROUTE 已改选
+    // REJECT 时改回的 REJECT 也不是恢复的节点
+    {
+      key: 'selection',
+      label: '恢复的节点选择',
+      value: r.rejectKept
+        ? '未恢复（切换前 SFE-ROUTE 已改选 REJECT，保持 REJECT）'
+        : r.previousEnvironmentId === null
+          ? '未恢复（切换前没有已验证的路由）'
+          : (r.restoredSelection ?? '—'),
+    },
     { key: 'entry', label: '回滚后入口', value: ENTRY_MODE_LABELS[r.entryModeAfter]?.label ?? r.entryModeAfter },
     { key: 'failedRev', label: '失败的版本', value: formatRevision(r.failedProxyRevision) },
     { key: 'probe', label: '上次结果', value: null },
@@ -228,6 +238,10 @@ const rollbackItems = computed(() => {
         <NoticeBox tone="warning">
           新版本失败：{{ rollback.failureError.message }}
           <template v-if="rollback.needsReverify"> 已恢复原节点并保持阻断，需要重新核验。</template>
+          <template v-else-if="rollback.rejectKept">
+            切换前 SFE-ROUTE 已改选 REJECT（没有已验证的路由可恢复），未恢复买家节点：SFE-ROUTE 保持 REJECT，Safari 保持阻断；路由需要处理，请重新使用此环境或进入普通模式。
+          </template>
+          <template v-else-if="rollback.previousEnvironmentId === null"> 切换前没有已验证的路由，未恢复节点，Safari 保持阻断。</template>
         </NoticeBox>
         <KeyValueList :items="rollbackItems" class="mt-2">
           <template #v-probe>

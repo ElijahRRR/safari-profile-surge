@@ -86,6 +86,40 @@ export function confirmResource(repos: Repositories, kv: EngineKv, digest: strin
   });
 }
 
+/**
+ * 退役代理版本（删除环境按节点资源文件的当前内容立即退役，handlers/misc.ts runDelete）之后：节点资源文件的归属记录只保留当前文件
+ * 内容的摘要。意图摘要（pending_add 的 content_digest）与写前摘要（mo_prev）不是当前文件内容时，就是不在磁盘上的内容的 pepper
+ * 派生摘要，可能含刚退役的版本的凭据行——凭据被清扫之后它们仍能离线核对猜测的旧值（docs/ARCHITECTURE.md §0「秘密的存放」）。
+ * current 为当前文件的摘要（文件不存在为 null）。文件仍是意图或写前内容 → 按事实确认（与崩溃恢复 recoverPublish 相同）；
+ * 否则删除写前摘要，与文件不一致的意图或记录摘要清除（SCRUBBED_RESOURCE_DIGEST）——与文件不一致的记录本来就按被外部修改
+ * 处理（发布的基线检查失败、对账报告被修改），需要重新合并，清除不改变这一点。服务启动时对之前的版本留下的未结算归属同样
+ * 处理（engine/app-service.ts）。
+ */
+export function settleResourceDigests(repos: Repositories, kv: EngineKv, current: string | null): void {
+  repos.tx(() => {
+    const rec = repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
+    const prev = kv.get<{ digest: string | null }>(prevKey('resource_file', NODE_RESOURCE_FILE));
+    if (rec?.state === 'pending_add' && current !== null && (current === rec.contentDigest || current === (prev?.digest ?? null))) {
+      confirmResource(repos, kv, current);
+      return;
+    }
+    kv.delete(prevKey('resource_file', NODE_RESOURCE_FILE));
+    // 置为不是任何摘要的占位（不置空：文件不存在时空摘要会与“读不到”相等，对账就不再报告文件被删除）
+    if (rec && rec.contentDigest !== null && rec.contentDigest !== current && rec.contentDigest !== SCRUBBED_RESOURCE_DIGEST) {
+      repos.managedObjects.setState('resource_file', NODE_RESOURCE_FILE, rec.state, { contentDigest: SCRUBBED_RESOURCE_DIGEST });
+    }
+  });
+}
+
+/** 清除后的摘要占位（与发布记录的 SCRUBBED_DIGEST 相同）：不等于任何文件的摘要，记录按与文件不一致处理。 */
+export const SCRUBBED_RESOURCE_DIGEST = 'scrubbed';
+
+/** 节点资源文件的归属尚未结算：未确认的意图，或留有写前摘要（settleResourceDigests 启动时按事实结算）。 */
+export function resourceOwnershipUnsettled(repos: Repositories, kv: EngineKv): boolean {
+  const rec = repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
+  return rec?.state === 'pending_add' || kv.get(prevKey('resource_file', NODE_RESOURCE_FILE)) !== null;
+}
+
 /** 资源文件意图的写前摘要（崩溃恢复：文件仍是写前内容时可安全回到 present）。 */
 export function resourcePreviousDigest(kv: EngineKv): string | null {
   return kv.get<{ digest: string | null }>(prevKey('resource_file', NODE_RESOURCE_FILE))?.digest ?? null;

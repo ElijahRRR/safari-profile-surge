@@ -235,7 +235,8 @@ export type BeginVerificationResponse =
       message: string;
       /**
        * 这是一次切换（激活、活动环境发布在场景到达后的切换），切换期间 Safari 的其他请求会被暂时拒绝。重新检测（从不切换、不阻断，
-       * §6.4；含路由已不在已验证状态、重新检测正在结束）、停在 WAITING_ROUTE 尚未到达、已请求取消时为 false。旧版服务没有这个字段：按 false 处理，不声称阻断。
+       * §6.4；含路由已不在已验证状态、重新检测正在结束）、停在 WAITING_ROUTE 尚未到达或已到达而另一个切换或检测正在进行（等它结束，
+       * 另一个环境切换成功时不再切换）、已请求取消时为 false。旧版服务没有这个字段：按 false 处理，不声称阻断。
        */
       switching?: boolean;
     }

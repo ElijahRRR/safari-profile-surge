@@ -7,6 +7,7 @@ import { createRouteActions } from '../src/store/route-actions';
 import EnvironmentsView from '../src/views/EnvironmentsView.vue';
 import RouteActionHost from '../src/components/RouteActionHost.vue';
 import RouteCard from '../src/components/RouteCard.vue';
+import OperationDialog from '../src/components/OperationDialog.vue';
 import { allSupported, byText, capabilities, click, environment, flush, mountWith, operation, route, snapshot, testContext, type Call } from './fixtures';
 
 const details: NeedsConfirmationDetails = {
@@ -278,10 +279,14 @@ describe('activation from the environments page', () => {
     }, snapshot({ route: route({ operationId: 'op_1', phase: 'active_verified', entryMode: 'ACTIVE', activeEnvironmentId: 'env_1', activeProxyRevision: 1, awaitingDeadline: deadline }), pendingOperations: [reuseOp] }));
     const Page = defineComponent({ render: () => [h(RouteCard), h(RouteActionHost)] });
     const m = await mountWith(Page, ctx);
-    // 路由卡：取消只结束检测，通常路由不变（例外：SFE-ROUTE 已不是已验证的出口时改选 REJECT）
+    // 路由卡：取消通常只结束检测，路由不变（例外：SFE-ROUTE 已不是已验证的出口时改选 REJECT；已提交的结果中出口 IP 与预期出口
+    // 不一致时照样记下不符、停止订单与填充——不能说取消只结束检测）
     expect(document.body.querySelector('[data-test="route-cancel"]')?.textContent?.trim()).toBe('取消重测');
-    expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).toContain('取消只结束本次检测，通常路由不变');
-    expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).toContain('会改选 REJECT');
+    const cancelNote = document.body.querySelector('[data-test="route-cancel-note"]')?.textContent ?? '';
+    expect(cancelNote).toContain('取消通常只结束本次检测，路由不变');
+    expect(cancelNote).not.toContain('取消只结束本次检测');
+    expect(cancelNote).toContain('会改选 REJECT');
+    expect(cancelNote).toContain('若已提交的检测结果中的出口 IP 与预期出口不一致，取消照样记下出口不符，并停止自动打开订单与填充。');
     expect(document.body.querySelector('[data-test="route-cancel-note"]')?.textContent).not.toContain('恢复原节点');
     ctx.viewer.open('op_1', 'US-买家01');
     await flush();
@@ -292,8 +297,10 @@ describe('activation from the environments page', () => {
     click(document.body.querySelector('[data-test="cancel-operation"]'));
     await flush();
     expect(document.body.textContent).toContain('确定要取消这次 Safari 重测吗？');
-    expect(document.body.textContent).toContain('只结束本次检测，不会进入普通模式。通常路由不变（不切换、不阻断 Safari）');
+    expect(document.body.textContent).toContain('不会进入普通模式。通常只结束本次检测，路由不变（不切换、不阻断 Safari）');
+    expect(document.body.textContent).not.toContain('只结束本次检测，不会进入普通模式');
     expect(document.body.textContent).toContain('会改选 REJECT（拒绝 Safari 经本应用出口的新连接）并要求处理');
+    expect(document.body.textContent).toContain('若已提交的检测结果中的出口 IP 与预期出口不一致，取消照样记下出口不符，并停止自动打开订单与填充。');
     expect(document.body.textContent).not.toContain('确定要取消此次切换吗？');
     expect(document.body.textContent).not.toContain('服务会尝试恢复切换前的节点选择');
     click(byText('.modal-footer button', '取消重测'));
@@ -334,6 +341,75 @@ describe('activation from the environments page', () => {
     expect(held).toContain('路由已改变，需要处理');
     expect(held).toContain('服务已把它改选 REJECT');
     expect(held).toContain('自动打开订单与填充已停止');
+    m.unmount();
+  });
+
+  it('a failed first activation (no verified route before the switch) never lists the failed target\'s node as a restored selection, even from an older service that still names it', async () => {
+    const failed = operation({
+      phase: 'FAILED',
+      status: 'failed',
+      error: { code: 'SAFARI_VERIFY_FAILED', message: 'Safari 实测失败：检测服务没有返回成功状态' },
+      result: {
+        rollback: {
+          previousEnvironmentId: null,
+          previousProxyRevision: null,
+          previousProbe: null,
+          restoredSelection: 'SFE-N-E0001-US01-v001',
+          entryModeAfter: 'BLOCKED',
+          failedProxyRevision: 1,
+          failureError: { code: 'SAFARI_VERIFY_FAILED', message: 'Safari 实测失败：检测服务没有返回成功状态' },
+          needsReverify: false,
+        },
+      },
+    });
+    const { ctx } = testContext((call: Call) => {
+      if (call.url === '/api/operations/op_1') return { status: 200, body: failed };
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: '找不到' } } };
+    }, snapshot({ pendingOperations: [] }));
+    const m = await mountWith(OperationDialog, ctx);
+    ctx.viewer.open('op_1');
+    await flush();
+    const detail = document.body.querySelector('[data-test="operation-detail"]')!;
+    expect(detail).not.toBeNull();
+    expect(detail.textContent).toContain('切换前没有已验证的路由，未恢复节点，Safari 保持阻断');
+    expect(detail.textContent).toContain('未恢复（切换前没有已验证的路由）');
+    expect(detail.textContent).not.toContain('SFE-N-E0001-US01-v001');
+    expect(detail.textContent).not.toContain('已恢复原节点');
+    m.unmount();
+  });
+
+  it('a failed re-use after an end point had held SFE-ROUTE at REJECT (rejectKept) says REJECT was kept and no buyer node was restored, never "restored the original node"', async () => {
+    const failed = operation({
+      phase: 'FAILED',
+      status: 'failed',
+      error: { code: 'SUPERSEDED', message: '已取消切换' },
+      result: {
+        rollback: {
+          previousEnvironmentId: null,
+          previousProxyRevision: null,
+          previousProbe: null,
+          restoredSelection: null,
+          entryModeAfter: 'BLOCKED',
+          failedProxyRevision: 1,
+          failureError: { code: 'SUPERSEDED', message: '已取消切换' },
+          needsReverify: false,
+          rejectKept: true,
+        },
+      },
+    });
+    const { ctx } = testContext((call: Call) => {
+      if (call.url === '/api/operations/op_1') return { status: 200, body: failed };
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: '找不到' } } };
+    }, snapshot({ pendingOperations: [] }));
+    const m = await mountWith(OperationDialog, ctx);
+    ctx.viewer.open('op_1');
+    await flush();
+    const detail = document.body.querySelector('[data-test="operation-detail"]')!;
+    expect(detail).not.toBeNull();
+    expect(detail.textContent).toContain('切换前 SFE-ROUTE 已改选 REJECT（没有已验证的路由可恢复），未恢复买家节点');
+    expect(detail.textContent).toContain('未恢复（切换前 SFE-ROUTE 已改选 REJECT，保持 REJECT）');
+    expect(detail.textContent).not.toContain('已恢复原节点');
+    expect(detail.textContent).not.toContain('切换前没有已验证的路由，未恢复节点');
     m.unmount();
   });
 });

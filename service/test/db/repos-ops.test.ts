@@ -136,7 +136,7 @@ describe('outbox', () => {
     const { repos, clock } = makeRepos();
     const op1 = seedOperation(repos);
     const op2 = seedOperation(repos);
-    const later = repos.outbox.enqueue(op1.id, 'retry', '2026-10-21T00:01:00.000Z');
+    const later = repos.outbox.enqueue(op1.id, 'arrival_timeout', '2026-10-21T00:01:00.000Z');
     const now = repos.outbox.enqueue(op2.id, null, T0);
     expect(repos.outbox.nextAvailableAt()).toBe(T0);
     const claimed = repos.outbox.claimNext(clock.now());
@@ -214,6 +214,52 @@ describe('outbox', () => {
     expect(r2.outbox.claimNext(c2.now())?.operationId).toBe(p2.id);
     expect(r2.outbox.claimNext(c2.now(), [[], []])?.operationId).toBe(n2.id);
     expect(r2.outbox.claimNext(c2.now(), [[], [q2.id]])?.operationId).toBe(q2.id);
+  });
+
+  test('only timer entries wait for their availableAt: entries due on acceptance stay claimable after the wall clock steps back (§6.1)', () => {
+    const { repos, clock } = makeRepos();
+    const timer = seedOperation(repos, { kind: 'route.activate', status: 'waiting', phase: 'VERIFY_ONLY' });
+    const normal = seedOperation(repos, { kind: 'route.normal' });
+    const waiting = seedOperation(repos, { kind: 'route.activate', status: 'waiting', phase: 'VERIFY_ONLY' });
+    const deadline = repos.outbox.enqueue(timer.id, 'arrival_timeout', '2026-10-21T00:00:30.000Z');
+    const verifyDeadline = repos.outbox.enqueue(timer.id, 'verify_timeout', '2026-10-21T00:00:40.000Z');
+    // 受理时按墙上时间入队，之后墙上时钟回拨 10 分钟
+    const accepted = repos.outbox.enqueue(normal.id, null, T0);
+    const cancel = repos.outbox.enqueue(waiting.id, 'cancel', T0);
+    clock.set(Date.parse(T0) - 600_000);
+    // 计时器以外的条目立即可以领取，下一次唤醒也按现在计
+    expect(repos.outbox.nextAvailableAt(clock.now())).toBe(clock.now().toISOString());
+    expect(repos.outbox.claimNext(clock.now())?.id).toBe(accepted);
+    expect(repos.outbox.claimNext(clock.now())?.id).toBe(cancel);
+    // 计时器条目等到截止时间
+    expect(repos.outbox.claimNext(clock.now())).toBeNull();
+    expect(repos.outbox.nextAvailableAt(clock.now())).toBe('2026-10-21T00:00:30.000Z');
+    clock.set(Date.parse('2026-10-21T00:00:30.000Z'));
+    expect(repos.outbox.claimNext(clock.now())?.id).toBe(deadline);
+    expect(repos.outbox.claimNext(clock.now())).toBeNull();
+    clock.set(Date.parse('2026-10-21T00:00:40.000Z'));
+    expect(repos.outbox.claimNext(clock.now())?.id).toBe(verifyDeadline);
+  });
+
+  test('releaseClaims: a released entry of a still-running (crash-recovering) operation is due now even after the wall clock stepped back; other timer entries keep their deadline', () => {
+    const { repos, clock } = makeRepos();
+    const recovering = seedOperation(repos, { kind: 'route.activate', status: 'waiting', phase: 'VERIFY_ONLY' });
+    const waiting = seedOperation(repos, { kind: 'route.activate', status: 'waiting', phase: 'VERIFY_ONLY' });
+    const r1 = repos.outbox.enqueue(recovering.id, 'arrival_timeout', T0);
+    const w1 = repos.outbox.enqueue(waiting.id, 'arrival_timeout', '2026-10-21T00:00:00.500Z');
+    clock.advance(1_000);
+    // 上一次进程领取了两个到期的计时器条目：第一个操作已开始处理（running）时进程退出；第二个尚未开始（仍在等待）
+    expect(repos.outbox.claimNext(clock.now())?.id).toBe(r1);
+    expect(repos.outbox.claimNext(clock.now())?.id).toBe(w1);
+    repos.operations.update(recovering.id, { status: 'running', phase: 'ROLLING_BACK' });
+    // 重启之前墙上时钟回拨 10 分钟
+    clock.set(Date.parse(T0) - 600_000);
+    expect(repos.outbox.releaseClaims(clock.now())).toBe(2);
+    expect(repos.outbox.get(r1)).toMatchObject({ claimedAt: null, availableAt: clock.now().toISOString() });
+    // 未开始处理的计时器条目保持截止时间（提前领取时处理器按截止时间什么也不做，截止时间就此丢失）
+    expect(repos.outbox.get(w1)).toMatchObject({ claimedAt: null, availableAt: '2026-10-21T00:00:00.500Z' });
+    expect(repos.outbox.claimNext(clock.now())?.id).toBe(r1);
+    expect(repos.outbox.claimNext(clock.now())).toBeNull();
   });
 
   test('releaseClaims returns stale claims to the queue; cancelForOperation ends them', () => {

@@ -129,6 +129,116 @@ function failOnce<T extends object, K extends keyof T>(obj: T, key: K, err: Erro
 
 const dbError = (code: string) => Object.assign(new Error(`synthetic ${code}`), { code });
 
+describe('step 13/16: an expected exit IP edited while a submitted result is being checked is compared against the result (never lost)', () => {
+  const EXPECTED = ['198', '51', '100', '7'].join('.');
+  const OBSERVED = ['192', '0', '2', '50'].join('.');
+  /**
+   * 第一次调用 trigger（或已记下写入 ACTIVE 之后的第一次 Surge 调用）之前保存预期出口：保存不经执行器、立即生效（受理处理器
+   * 按最近一次 ok 的实测重新比较，只对使用中的环境）。
+   */
+  function harnessSavingExpected(trigger: 'listRecentRequests' | 'getTakeoverState' | 'active_write', envOf: () => string, opOf: () => string) {
+    let armed = false;
+    let fired = false;
+    let afterSave: string[] = [];
+    const writeStarted = (): boolean => {
+      const op = opOf() ? h.repos.operations.get(opOf()) : undefined;
+      return (op ? (payloadOf(op).route as { activeWriteStarted?: boolean } | undefined)?.activeWriteStarted : false) === true;
+    };
+    const surge = (fake: object) =>
+      new Proxy(fake, {
+        get(target, prop) {
+          const v = Reflect.get(target, prop, target) as unknown;
+          if (typeof v !== 'function') return v;
+          const fn = (v as (...a: unknown[]) => unknown).bind(target);
+          return (...args: unknown[]) => {
+            const due = armed && !fired && (trigger === 'active_write' ? writeStarted() : prop === trigger);
+            if (!due) return fn(...args);
+            fired = true;
+            return (async () => {
+              const env = h.repos.environments.get(envOf())!;
+              await h.app.updateEnvironment(envOf(), { request_id: rid(), expected_revision: env.revision, changes: { proxy: { expectedExitIp: EXPECTED } } }, WEB);
+              afterSave = [...h.repos.routeState.get().warnings];
+              return fn(...args);
+            })();
+          };
+        },
+      }) as never;
+    return { surge, arm: () => (armed = true), fired: () => fired, afterSave: () => afterSave };
+  }
+
+  test('retest: saved while the Surge request records are read → the retest fails with the mismatch, the earlier ok probe no longer counts, orders and fill stop', async () => {
+    let envId = '';
+    let opId = '';
+    const s = harnessSavingExpected('listRecentRequests', () => envId, () => opId);
+    h = await createHarness({ surge: s.surge });
+    ({ envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A));
+    opId = (await h.app.probe(envId, { request_id: rid(), kind: 'safari' }, WEB)).operation_id;
+    await h.idle();
+    s.arm();
+    await verify(h, PROFILE_A, opId, { observedIp: OBSERVED });
+    await h.idle();
+    expect(s.fired()).toBe(true);
+    expect(s.afterSave()).toContain('exit_ip_mismatch');
+    const op = h.repos.operations.get(opId)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('EXIT_IP_MISMATCH');
+    expect(h.repos.routeState.get().warnings).toContain('exit_ip_mismatch');
+    expect(h.repos.probes.latest(envId, 'safari')).toMatchObject({ outcome: 'mismatch', exitIp: OBSERVED });
+    expect((await h.app.ensureInControl()).ok).toBe(false);
+  });
+
+  test.each(['getTakeoverState', 'active_write'] as const)('switch to an environment not yet in use: saved during %s → never committed; rolled back per step 14', async (trigger) => {
+    let envId = '';
+    let opId = '';
+    const s = harnessSavingExpected(trigger, () => envId, () => opId);
+    h = await createHarness({ surge: s.surge });
+    envId = (await createEnv(h, 'US-Buyer-B', '203.0.113.20')).environment_id!;
+    await bind(h, PROFILE_B, envId);
+    opId = await startSwitch(envId);
+    expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
+    s.arm();
+    expect((await verify(h, PROFILE_B, opId, { observedIp: OBSERVED })).ok).toBe(true);
+    await h.idle();
+    expect(s.fired()).toBe(true);
+    // 环境尚未使用：受理处理器不比较
+    expect(s.afterSave()).not.toContain('exit_ip_mismatch');
+    const op = h.repos.operations.get(opId)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('EXIT_IP_MISMATCH');
+    expect(op.error?.message).toContain('核对期间预期出口已修改');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: null });
+    expect(h.repos.environments.get(envId)!.lastVerifiedProxyRevision).toBeNull();
+    // 写入 ACTIVE 已开始：目标环境的窗口可能已经过它的出口（旧窗口警告）
+    if (trigger === 'active_write') expect(h.repos.routeState.get().warnings).toContain('managed_windows_on_original_rules');
+    expect(safariOutcome(h).failed).toBe(true);
+  });
+
+  test('re-activation of the active environment on a new proxy revision: saved during the ACTIVE write → the mismatch is not dropped by a commit; the switch rolls back to the earlier revision and needs re-verification', async () => {
+    let envId = '';
+    let opId = '';
+    const s = harnessSavingExpected('active_write', () => envId, () => opId);
+    h = await createHarness({ surge: s.surge });
+    ({ envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A));
+    const env = h.repos.environments.get(envId)!;
+    opId = (await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB)).operation_id;
+    await h.idle();
+    await h.native(PROFILE_A, { type: 'beginSafariVerification', operation_id: opId, amazon_tabs_open: false });
+    await h.idle();
+    expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
+    s.arm();
+    await verify(h, PROFILE_A, opId, { observedIp: OBSERVED });
+    await h.idle();
+    expect(s.fired()).toBe(true);
+    const op = h.repos.operations.get(opId)!;
+    expect(op).toMatchObject({ phase: 'FAILED', status: 'failed' });
+    expect(op.error?.code).toBe('EXIT_IP_MISMATCH');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeProxyRevision: 1 });
+    expect(h.repos.routeState.get().warnings).toContain('rollback_needs_reverify');
+    expect(h.repos.environments.get(envId)!.lastVerifiedProxyRevision).toBe(1);
+    expect((await h.app.ensureInControl()).ok).toBe(false);
+  });
+});
+
 describe('step 13: unexpected errors after a passed verification roll back from the snapshot (never an orphaned VERIFY_ONLY wait)', () => {
   test('home directory becomes unresolvable (link loop) during the VERIFY_ONLY wait → reading facts does not throw, the activation completes', async () => {
     h = await createHarness();
@@ -260,6 +370,9 @@ describe('an interrupted switch never becomes the "previous route" of the next a
     const op = h.repos.operations.get(opC)!;
     expect(op.error?.code).toBe('SAFARI_VERIFY_TIMEOUT');
     expect((op.result as { rollback: RollbackResult }).rollback).toMatchObject({ previousEnvironmentId: a, restoredSelection: nodeA, entryModeAfter: 'BLOCKED', needsReverify: true });
+    // 激活快照保留着最初的切换前状态：恢复最后一次已确认的节点并要求重新核验，不是「切换前已改选 REJECT」（rejectKept）
+    expect((op.result as { rollback: RollbackResult }).rollback.rejectKept).toBeUndefined();
+    expect(h.repos.operations.listSteps(opC).at(-1)!.message).toContain('已回滚：恢复切换前的节点，Safari 保持阻断，需要重新核验');
     const route = h.repos.routeState.get();
     expect(route).toMatchObject({ phase: 'failed', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeA });
     expect(route.warnings).toContain('rollback_needs_reverify');
@@ -290,6 +403,44 @@ describe('an interrupted switch never becomes the "previous route" of the next a
     await h.idle();
     expect(h.repos.operations.get(opB)!.phase).toBe('BLOCKED_NEEDS_ATTENTION');
     expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'BLOCKED', activeEnvironmentId: a, selectedNode: nodeB });
+    await activateCAndTimeOut(a, c, nodeA);
+  });
+
+  test('a rollback whose return to BLOCKED is not runtime-confirmed holds REJECT and keeps the snapshot → the next activation fails → rollback restores A\'s original node (needs re-verification), not rejectKept', async () => {
+    const { a, c, nodeA, opB } = await switchedToB();
+    // 监视器慢于等待：回到阻断无法经运行时求值确认（holdUnconfirmedRollback），SFE-ROUTE 改选 REJECT，激活快照保留
+    h.fake.localWatchLatencyMs = 60_000;
+    await h.app.cancelOperation(opB, { request_id: rid() }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(opB)!.phase).toBe('BLOCKED_NEEDS_ATTENTION');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', entryMode: 'UNKNOWN', activeEnvironmentId: a, selectedNode: 'REJECT' });
+    expect(h.repos.routeState.get().activationSnapshot).toMatchObject({ previousEnvironmentId: a, previousSelectedNode: nodeA });
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
+    h.clock.advance(120_000);
+    h.fake.localWatchLatencyMs = 0;
+    await activateCAndTimeOut(a, c, nodeA);
+  });
+
+  test('the executor guard holds REJECT on a transition and keeps the snapshot → the next activation fails → rollback restores A\'s original node (needs re-verification), not rejectKept', async () => {
+    const { a, c, nodeA, opB } = await switchedToB();
+    // 回滚开始写路由状态时意外异常：执行器兜底对过渡中的路由失败即关闭（settleAbandonedTransition），激活快照保留
+    const routeState = h.repos.routeState as { update: typeof h.repos.routeState.update };
+    const orig = routeState.update.bind(h.repos.routeState);
+    let thrown = false;
+    routeState.update = (patch) => {
+      if (!thrown && patch.phase === 'rolling_back') {
+        thrown = true;
+        throw new Error('模拟：数据库错误');
+      }
+      return orig(patch);
+    };
+    await h.app.cancelOperation(opB, { request_id: rid() }, WEB);
+    await h.idle();
+    routeState.update = orig;
+    expect(thrown).toBe(true);
+    expect(h.repos.operations.get(opB)!.phase).toBe('BLOCKED_NEEDS_ATTENTION');
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'attention', activeEnvironmentId: a, selectedNode: 'REJECT' });
+    expect(h.repos.routeState.get().activationSnapshot).toMatchObject({ previousEnvironmentId: a, previousSelectedNode: nodeA });
     await activateCAndTimeOut(a, c, nodeA);
   });
 

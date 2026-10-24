@@ -7,7 +7,7 @@ import { SfeError, buildVerifyUrl, type BeginVerificationResponse, type NativeRe
 import type { OperationRecord } from '../db/index.js';
 import { payloadOf, type RoutePayload, type VerificationSubmission } from '../domain/operations.js';
 import type { Engine } from './context.js';
-import { currentSelection, retestRouteLost } from './handlers/route.js';
+import { currentSelection, otherRouteOpOpen, retestRouteLost } from './handlers/route.js';
 
 type SubmitMessage = Extract<NativeRequest, { type: 'submitSafariVerification' }>;
 
@@ -109,6 +109,12 @@ export async function beginVerification(engine: Engine, op: OperationRecord, ctx
         savePayload(engine, op, { arrivedAt: engine.nowIso(), arrivedProfileId: ctx.profileId, amazonTabsAtVerify: ctx.amazonTabsOpen });
         repos.operations.appendStep(op.id, op.phase, '绑定场景已到达');
       });
+    }
+    // 另一个切换或检测正在进行：执行器不会切换（continueWaitingRoute 继续等待），不排入到达，准备页继续轮询、等它结束；另一个
+    // 环境的切换成功时本次等待随之结束（commitActive，READY_FOR_NEXT_OPEN）。不说「正在切换到新版本」，也不说 Safari 因本次切换被拒绝
+    if (otherRouteOpOpen(engine, op.id)) {
+      engine.emit({ operations: [op.id] });
+      return { status: 'pending', phase: op.phase, message: '已到达：另一个切换或检测正在进行，等它结束后再处理新版本（另一个环境切换成功时不再切换）', switching: false };
     }
     if (!repos.outbox.pendingForOperation(op.id).some((r) => r.resumeReason === 'profile_arrived')) {
       repos.outbox.enqueue(op.id, 'profile_arrived', engine.now());
