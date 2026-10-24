@@ -21,6 +21,7 @@ GitHub 仓库标识使用 `safari-profile-surge`，项目中文名称保留为 `
 - [实现规格](docs/ARCHITECTURE.md)：设计文档落地后的数据模型、事务、接口与已知冲突（第 0 节）。
 - [安装与回退](docs/INSTALL.md)：构建、免费 Apple ID 签名、首次运行、卸载。
 - [P0 实测手册](docs/P0-RUNBOOK.md) 与 [验收报告模板](docs/ACCEPTANCE.md)：在测试 Mac 上逐项验证能力门槛。
+- [测试 Mac 执行清单](docs/P0-CHECKLIST.md)：当前真机状态、开始前要用户决定的事项、P0 的执行顺序与停止条件。
 - [实测记录](docs/verification/)：测试 Mac 上每轮实测的脱敏结果与证据边界（目前有 [2026-10-24](docs/verification/2026-10-24-mac-p0-increment.md)）。
 
 ## 代码结构与本地演示

@@ -48,6 +48,8 @@ npx tsx tools/p0/src/cli.ts help
 
 ### 0.4 顺序
 
+在测试 Mac 上实际执行时按 docs/P0-CHECKLIST.md：它记录当前真机状态（已初始化的固定工作配置、已测与阻塞的项目）、开始前要用户决定的事项，以及按架构关键程度调整后的顺序与停止条件。下表是完整的阶段划分。
+
 | 顺序 | 阶段 | 命令或操作 | 产出的能力结论 |
 |---|---|---|---|
 | 1 | 盘点（只读） | `instance` 并按 §1.5 完成 V1–V8；`inventory --profile <当前配置>`（读取逐条命令帮助、核对 `surge-cli --raw version`） | takeover_state_readable；原语映射建议；运行中 Surge 版本与交叉核对的证据 |
