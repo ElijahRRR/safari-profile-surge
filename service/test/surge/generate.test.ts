@@ -146,6 +146,15 @@ describe('validateSafariProcessPaths', () => {
     expect(errors[0]!.field).toBe(field);
   });
 
+  test('rejects the Incoming OS WebKit path observed in Surge request attribution', () => {
+    const incomingOS =
+      '/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking';
+    expect(validateSafariProcessPaths([incomingOS])).toEqual([
+      { field: 'safariProcessPaths[0]', message: '不能使用系统通用 WebKit 组件路径：其他 WebKit 应用也会命中' },
+    ]);
+    expect(() => tempRuleText('active', { processPaths: [incomingOS], verifyHost: 'verify.example.test' })).toThrow(SfeError);
+  });
+
   test('allows a Safari-specific WebKit copy (decided by P0 evidence, not by the validator)', () => {
     const appCryptex =
       '/System/Volumes/Preboot/Cryptexes/App/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc/Contents/MacOS/com.apple.WebKit.Networking';
