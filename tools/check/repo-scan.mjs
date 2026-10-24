@@ -36,6 +36,8 @@ for (const f of files) {
     for (const m of text.matchAll(IPV4)) {
       const ip = m[0];
       if (ip.split('.').some((o) => Number(o) > 255)) continue;
+      // 五段及以上的点分数字是版本或构建号（例如 Safari 构建号 22625.1.29.11.28），不是 IPv4
+      if (/\d\.$/.test(text.slice(Math.max(0, m.index - 2), m.index)) || /^\.\d/.test(text.slice(m.index + ip.length, m.index + ip.length + 2))) continue;
       if (ALLOWED_V4.some((r) => r.test(ip))) continue;
       if (VERSIONISH.test(ip) && /version|v\d|build/i.test(text.slice(Math.max(0, m.index - 20), m.index))) continue;
       problems++;
