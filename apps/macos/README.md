@@ -2,7 +2,7 @@
 
 宿主 App（菜单栏）、Safari Web Extension 原生桥，以及让 LaunchAgent 启动本机服务的 sfe-service-launcher。本项目不使用 macOS 钥匙串（见「秘密的存放」）。实现规格见 [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) §2、§7.2、§10。
 
-本目录在 Linux 开发容器中写成，**没有编译过**。Swift 编译、签名、Safari 行为都只能在测试 Mac 上验证；离线测试通过不代表网络验收通过。代码中凡依赖测试 Mac 实测的地方都标有 `// P0:`。
+本目录在 Linux 开发容器中写成。2026-10-24 在测试 Mac（macOS 27.0.1、Safari 27.0.1、Xcode 27.1）上用提交 `6b776cd` 构建并安装了 App，XCTest 132 项、0 失败（新的 DerivedData、`CODE_SIGNING_ALLOWED=NO`，只编译并运行纯逻辑测试），扩展在 Safari 退出重开后仍启用、弹窗经原生桥读到同一场景（[实测记录](../../docs/verification/2026-10-24-mac-p0-increment.md)）。这些只是部分观察：签名与启用持久性、原生桥与场景 ID 的全部情形仍按 P0 逐项验证；离线测试与 XCTest 通过都不代表网络验收通过。代码中凡依赖测试 Mac 实测的地方都标有 `// P0:`。
 
 ## 组成
 
@@ -81,7 +81,7 @@ xcodebuild -scheme SafariProfileSurge test     # 运行 XCTest
    - 合并写入 `install.json`（0600）：`surgeCliPath`（只有 `/Applications/Surge.app/Contents/Applications/surge-cli` 存在时）、`nodeVersionPin`、`bridge`、`webRoot`（App 内的 `service/web`），以及首次创建时全部为 `unavailable` 的 `adapterMechanism`（之后由 P0 填写，App 从不覆盖）。合并从不删除字段：旧版本写入的 `keychainHelperPath`（指向旧版本 App 中的 sfe-keychain）原样保留——本版本的服务读取时忽略它，装回旧版本时旧服务需要它（docs/INSTALL.md §7 第 1 步）。新建的 `install.json` 不写这个字段。`install.json` 不含任何秘密。
 3. 菜单「注册后台服务」：以 `SMAppService.agent(plistName: "com.sfe.service.plist")` 注册。系统可能要求在「系统设置 → 通用 → 登录项与扩展」（macOS 14 为「登录项」）中允许；菜单会显示状态并提供「打开登录项与扩展设置」（macOS 14 为「打开登录项设置」，按运行中的系统版本显示）。服务不带演示参数，不含任何秘密。
    - macOS 26 或更高：后台服务运行中从菜单「退出」App 时，系统会询问是否允许后台任务继续运行（“On Mac computers with macOS 26 or later, if background tasks are started by an app and remain active after a user quits the app, the user is prompted to allow or not allow the background tasks to remain active.”，https://support.apple.com/guide/deployment/manage-login-items-background-tasks-mac-depdca572563/web）。选「允许」服务才会继续运行。选「不允许」后服务与 `SMAppService.status` 如何变化，Apple 没有写明，由 P0 `native_bridge_ipc` 记录（`sfltool dumpbtm` 查看）；菜单「退出」目前不额外提示（`App/SafariProfileSurgeApp.swift`）。服务停止时入口规则与 SFE-ROUTE 选择保持原样，见 docs/INSTALL.md §2 第 2 步。
-4. 「停止后台服务」只注销 LaunchAgent，**不改变** Surge 中的入口规则或 SFE-ROUTE 选择；要撤销本应用的规则，先进入普通模式，再按 docs/INSTALL.md 移除受管理段。
+4. 「停止后台服务」只注销 LaunchAgent，**不改变** Surge 中的入口规则或 SFE-ROUTE 选择；要撤销本应用的规则，先进入普通模式，再按 docs/INSTALL.md §5 切回原配置、删除工作配置与本应用文件（受管理段只在工作配置中，本应用没有移除受管理段的功能）。
 
 ## 启用扩展并授权 www.amazon.com
 

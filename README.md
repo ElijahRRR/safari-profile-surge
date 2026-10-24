@@ -2,7 +2,9 @@
 
 Safari 用户场景驱动的 Surge 出口控制。目标是在使用一个已绑定场景时，让 Safari 使用该环境的代理链，减少手动调整 Surge 的步骤，并保持其他浏览器使用原规则。
 
-**当前状态：已有第一版实现（本机服务、网页后台、Safari 扩展、macOS 原生宿主与 P0 实测工具），离线测试通过，但尚未在测试 Mac 上做任何真实网络验收。**所有依赖网络能力的动作都受能力门槛约束：P0 实测通过并在网页后台确认之前会被拒绝。离线测试、语法检查与旧实验结果不能替代真实网络验收。
+**当前状态（2026-10-24）：已有第一版实现（本机服务、网页后台、Safari 扩展、macOS 原生宿主与 P0 实测工具），离线测试通过；测试 Mac 上只做过部分 P0 实测，还没有任何一项能力门槛在网页后台确认，真实网络验收尚未进行。**所有依赖网络能力的动作都受能力门槛约束：P0 实测通过并在网页后台确认之前会被拒绝。离线测试、语法检查与旧实验结果不能替代真实网络验收。
+
+测试 Mac 上已有的实测（[2026-10-24 记录](docs/verification/2026-10-24-mac-p0-increment.md)，macOS 27.0.1、Safari 27.0.1、Surge 6.10.0 (12500)）：Swift XCTest 132 项通过；P0 `instance` 通过；`takeover_state_readable` 的 P0 结果通过（尚未在网页确认）；`rule match` 与临时规则的添加、按完整文本撤销可用；扩展在 Safari 退出重开后仍启用、弹窗读到同一场景。**`safari_process_attribution`（Safari 精确进程归属）目前阻塞**：Safari 与独立 WKWebView 的对照还不能给出稳定的 Safari 专属进程路径，而入口规则的前提正是它。其余能力的证据状态见该记录的矩阵。
 
 GitHub 仓库标识使用 `safari-profile-surge`，项目中文名称保留为 `safari场景-surge`。
 
@@ -19,6 +21,7 @@ GitHub 仓库标识使用 `safari-profile-surge`，项目中文名称保留为 `
 - [实现规格](docs/ARCHITECTURE.md)：设计文档落地后的数据模型、事务、接口与已知冲突（第 0 节）。
 - [安装与回退](docs/INSTALL.md)：构建、免费 Apple ID 签名、首次运行、卸载。
 - [P0 实测手册](docs/P0-RUNBOOK.md) 与 [验收报告模板](docs/ACCEPTANCE.md)：在测试 Mac 上逐项验证能力门槛。
+- [实测记录](docs/verification/)：测试 Mac 上每轮实测的脱敏结果与证据边界（目前有 [2026-10-24](docs/verification/2026-10-24-mac-p0-increment.md)）。
 
 ## 代码结构与本地演示
 

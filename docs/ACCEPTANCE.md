@@ -4,6 +4,8 @@
 
 ## 填写说明
 
+- 已有的部分实测记录在 docs/verification/（目前有 [2026-10-24](verification/2026-10-24-mac-p0-increment.md)：XCTest、P0 `instance`、`takeover_state_readable` 的 P0 结果通过但尚未在网页确认，`safari_process_attribution` 阻塞）。那些是增量观察，不是本模板的验收结论：本模板的格子只在完整验收时按下面的规则改写。
+
 - 证据列按 docs/DEVELOPMENT.md §9：测试编号、时间、场景代号、扩展/入口状态、期望节点、Surge 实际策略、实际出口、连接处理结果、配置身份、对照应用结果。
 - 公开报告只写代号与脱敏字段：场景写代号（例如 P0-测试、场景-A），出口写代号（例如 出口-A、与基线一致/不一致），**不写出口 IP、账号、原始请求头或浏览记录**。原始证据留在测试 Mac 的 `~/Library/Application Support/SafariProfileSurge/p0/<运行编号>/`。
 - 测试编号使用 P0 测试页的测试编号或 `<运行编号>-<步骤>`；时间写本地时间与时区。
