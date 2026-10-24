@@ -83,8 +83,9 @@ async function probe(adapter: SurgeAdapter, p: ReadPrimitive, c: ProbeContext): 
       case 'checkProfile':
         return adapter.checkProfile(c.profilePath!);
       case 'matchRule':
-        // 只读求值（“without creating a connection”）：合成的主机与进程，只证明命令与输出可以解析；入口的运行时读回另行证明。
-        return adapter.matchRule({ host: 'p0-inventory.invalid', processPath: '/usr/bin/true' });
+        // 只读求值（“without creating a connection”）：保留测试 IP 避免 .invalid 在 IP 规则求值时触发 DNS 失败。
+        // 只证明命令与输出可以解析；入口的运行时读回另行证明。
+        return adapter.matchRule({ host: '192.0.2.1', processPath: '/usr/bin/true' });
       default:
         return (adapter[p] as () => Promise<unknown>)();
     }
