@@ -368,6 +368,34 @@ describe('createCliAdapter', () => {
     }
   });
 
+  // Sanitized Surge Mac 6.10.0 (12500) observations from the synthetic loopback
+  // matrix on 2026-10-25: all these commands exited 0, but retained cached nodes.
+  test.each([
+    ...[401, 403, 404, 500, 503].map(status => `服务器返回了异常状态码：${status}。`),
+    '服务器未返回任何数据。',
+    'Failed to parse remote resource data',
+    '网络连接已中断。 (NSURLErrorDomain:-1005) [未能完成操作。（kCFErrorDomainCFNetwork错误-1005。） (kCFErrorDomainCFNetwork:-1005)]',
+    '请求超时。 (NSURLErrorDomain:-1001) [未能完成操作。（kCFErrorDomainCFNetwork错误-1001。） (kCFErrorDomainCFNetwork:-1001)]',
+    '无法连接服务器。 (NSURLErrorDomain:-1004) [未能完成操作。（kCFErrorDomainCFNetwork错误-1004。） (kCFErrorDomainCFNetwork:-1004)]',
+  ])('rejects a zero-exit resource update with observed failure text: %s', async detail => {
+    const key = 'synthetic-resource-key';
+    const exec = okExec(`${key}: ${detail}\n`);
+    await expect(cli(exec).updateExternalResource(key)).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED' });
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec).toHaveBeenCalledWith(CLI, ['external-resource', 'update', key], expect.anything());
+  });
+
+  test.each([
+    { stdout: 'Surge CLI is not connected.', stderr: '' },
+    { stdout: 'other-key: 无法连接服务器。', stderr: '' },
+    { stdout: 'synthetic-resource-key: success\nSurge CLI is not connected.', stderr: '' },
+    { stdout: 'synthetic-resource-key: success', stderr: 'The controller connection was closed' },
+  ])('still detects controller failures outside the exact keyed result: %j', async output => {
+    const exec = vi.fn<ExecFn>().mockResolvedValue(output);
+    await expect(cli(exec).updateExternalResource('synthetic-resource-key')).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
+    expect(exec).toHaveBeenCalledTimes(1);
+  });
+
   test('uses execFile with fixed argv and returns parsed output', async () => {
     const exec = okExec('[]');
     const a = cli(exec);
