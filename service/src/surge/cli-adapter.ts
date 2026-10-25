@@ -166,7 +166,14 @@ export function createCliAdapter(opts: CliAdapterOptions): SurgeAdapter {
     if (textMatching(UNSUPPORTED_COMMAND_RE, out.stdout, out.stderr) !== null) throw unsupportedCommandError(primitive);
     // 同样先于解析：退出 0 但输出说无法连接，不是结果（空输出会被当作“没有临时规则”，--check 会被当作通过，
     // 写命令会被当作已写入）。
-    const unreachable = textMatching(UNREACHABLE_TEXT_RE, out.stdout, out.stderr);
+    // A single response for the requested resource key is a controller result:
+    // “无法连接服务器” can describe the resource host, while Surge itself is reachable
+    // (6.10.0 synthetic loopback outage). Let the strict resource parser reject it.
+    // Stderr, non-keyed output and every other primitive retain transport checks.
+    const resourceLines = out.stdout.trim().split(/\r?\n/);
+    const keyedResourceResult = primitive === 'updateExternalResource' && out.exitCode === 0 &&
+      resourceLines.length === 1 && resourceLines[0]!.startsWith(`${argv[2]}: `);
+    const unreachable = textMatching(UNREACHABLE_TEXT_RE, keyedResourceResult ? '' : out.stdout, out.stderr);
     if (unreachable !== null) throw new SfeError('SURGE_UNREACHABLE', `连接 Surge 失败：${truncate(scrubAll(unreachable))}`);
     const envelope = out.exitCode === 0 ? envelopeError(out.stdout) : null;
     if (envelope !== null) {
