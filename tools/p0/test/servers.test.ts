@@ -140,6 +140,11 @@ describe('test servers end to end', () => {
     const { ports } = running;
     expect((await directGet(ports.echo, '/health')).json).toEqual({ ok: true, service: 'sfe-p0-echo' });
 
+    const head = await fetch(`http://127.0.0.1:${ports.echo}/ip?t=head-preflight`, { method: 'HEAD' });
+    expect(head.status).toBe(200);
+    expect(await head.text()).toBe('');
+    expect(logs.some((l) => l.file === 'echo' && l.e.method === 'HEAD' && l.e.testId === 'head-preflight')).toBe(true);
+
     // 客户端 → 前置（不认证）→ 出口（认证）→ 回显
     const sock = connect(ports.front, '127.0.0.1');
     await new Promise((r) => sock.once('connect', r));

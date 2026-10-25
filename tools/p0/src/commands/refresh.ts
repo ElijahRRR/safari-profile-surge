@@ -261,6 +261,10 @@ export async function runRefresh(ctx: Ctx): Promise<ExitCode> {
     if (nodeWait.ok) {
       const selC = await ops.select(TEST_NODES.c);
       const viaC = await requestViaRoute(proxy, servers.echoPort, 'refresh-c');
+      // 文件落盘不是发布成功；连续性测量必须看到新成员被读取且真实请求经过它。
+      if (selC === TEST_NODES.c && viaC.ok && viaC.via === TEST_USERS.c) {
+        ops.action('node_publication_verified', { file: NODE_RESOURCE_FILE });
+      }
       await ops.select(TEST_NODES.a);
       checks.reread!.push(
         check('不调用 update，本地 policy-path 修改后在时限内被自动重新读取', true, rereadNote),

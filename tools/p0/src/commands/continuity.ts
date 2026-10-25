@@ -1,7 +1,7 @@
 // continuity：工具作为“其他应用”经 Surge HTTP 代理端口保持长连接流、WebSocket 与周期短请求，记录时间线；
 // 操作员在另一个终端执行 refresh/entry 或在 Surge 中手动重载同一配置，在本终端输入事件名标记。
 // 第一个事件之前的时段是对照（本身有重置或失败时结论为不完整）。也合并其他命令写入的动作时间线（文件写入，其中
-// 写入测试节点资源即“发布”；选择；入口切换；update 调用）。
+// 文件写入仅表示尝试；发布必须另有新成员真实请求成功的证据；选择；入口切换；update 调用）。
 // 同一配置重载（--reload-test）：先布置配置 canary（原子替换测试配置中的一行，只在配置重载时被读取）作为“重载确实发生”
 // 的证据，整个观察窗口内的中断都计入重载影响（操作员的标记可能晚于实际重载）；没有重载证据时不判定“无影响”。
 // 6.9.0 起 reload 只应用差异，但“Automatically performs a full engine restart if a change requires one.”：引擎运行时长回落
@@ -25,6 +25,18 @@ const BASELINE_MIN_MS = 30_000;
 /** 点击「重新加载配置」与输入 reload 标记之间允许的延迟：标记前这段时间的中断归入重载，不算对照。 */
 const RELOAD_LEAD_MS = 15_000;
 const isReloadLabel = (label: string): boolean => label.startsWith('reload');
+
+/** 只接受本次观察窗口中 refresh 对新成员的实测证据，不能用落盘、update 或旧结果代替。 */
+export function observedNodePublication(actions: readonly ActionEntry[], start: number, end: number): boolean {
+  let written = false;
+  for (const a of [...actions].sort((a, b) => Date.parse(a.at) - Date.parse(b.at))) {
+    const t = Date.parse(a.at);
+    if (!Number.isFinite(t) || t < start || t > end || a.command !== 'refresh' || a.detail?.file !== NODE_RESOURCE_FILE) continue;
+    if (a.action === 'test_file_written') written = true;
+    if (a.action === 'node_publication_verified' && written) return true;
+  }
+  return false;
+}
 
 export async function runContinuity(ctx: Ctx, stopSignal: () => Promise<void>): Promise<ExitCode> {
   const { out, now } = ctx.deps;
@@ -119,8 +131,8 @@ export async function runContinuity(ctx: Ctx, stopSignal: () => Promise<void>): 
   const end = now().getTime();
   const sigAfter = ops ? await ops.signals(proxy, servers.echoPort, canaryIndex) : null;
 
-  const actions = dir
-    .readJsonl<ActionEntry>(ACTIONS_LOG)
+  const recordedActions = dir.readJsonl<ActionEntry>(ACTIONS_LOG);
+  const actions = recordedActions
     .filter((a) => a.command !== 'continuity' && ['resource_update_call', 'select', 'entry_step', 'test_file_written'].includes(a.action))
     .map((a): MarkedEvent => ({ t: Date.parse(a.at), label: `${a.command}:${a.action}${typeof a.detail?.file === 'string' ? `:${a.detail.file}` : ''}`, source: 'action' }))
     .filter((e) => e.t >= start && e.t <= end);
@@ -132,8 +144,7 @@ export async function runContinuity(ctx: Ctx, stopSignal: () => Promise<void>): 
   const profileAfter = (await tryRead(() => session.adapter.getCurrentProfile()))?.name ?? null;
   const baseline = analysis.periods[0]!;
   const changes = analysis.impacts.filter((i) => !isReloadLabel(i.label));
-  // 节点资源发布 = 写入测试节点资源（之后由 Surge 自动重新读取；不调用 update）。
-  const refreshSeen = events.some((e) => e.label.endsWith(`test_file_written:${NODE_RESOURCE_FILE}`));
+  const refreshSeen = observedNodePublication(recordedActions, start, end);
   const vias = new Set(analysis.periods.flatMap((p) => p.vias));
   const context = await measureContext(ctx, session, state);
   const continuity = writeResult(dir, {
@@ -144,7 +155,7 @@ export async function runContinuity(ctx: Ctx, stopSignal: () => Promise<void>): 
       check('有至少 30 秒的对照时段', baseline.to - baseline.from >= BASELINE_MIN_MS && baseline.shortTotal > 0, `${Math.round((baseline.to - baseline.from) / 1000)} 秒`),
       // 对照本身有中断时无法比较：结论为不完整，而不是把变更期间的结果当作通过或不通过。
       check('对照时段没有重置或失败', periodImpacted(baseline) ? null : true, periodImpacted(baseline) ? '对照时段已有重置、重连失败或短请求失败：测试环境本身不稳定，请重测' : ''),
-      check('期间执行过节点资源发布（refresh）', refreshSeen ? true : null, refreshSeen ? '' : '没有观察到写入测试节点资源的动作'),
+      check('期间执行过节点资源发布（refresh）', refreshSeen ? true : null, refreshSeen ? '新成员已自动读取且真实请求经过新节点' : '没有观察到新成员自动读取并实际生效的证据；文件写入或 update 调用不能证明发布成功'),
       check('长连接与 WebSocket 没有重置', changes.length === 0 ? null : changes.every((i) => i.streamResets === 0 && i.wsResets === 0 && i.wsOpenFailures === 0)),
       check('新请求正常', changes.length === 0 ? null : changes.every((i) => i.failedShorts === 0)),
       check('出口不变（始终经过 p0-plain）', vias.size === 0 ? null : vias.size === 1 && vias.has('p0-plain'), [...vias].join('、')),
