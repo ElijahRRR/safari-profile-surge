@@ -1,0 +1,154 @@
+# XcodeGen 工程定义：在 apps/macos 下运行 `xcodegen generate` 生成 SafariProfileSurge.xcodeproj（不提交）。
+# 构建前先在仓库根目录 `npm ci && npm run build`，并按 Local.xcconfig.example 写好 Local.xcconfig。
+name: SafariProfileSurge
+
+options:
+  bundleIdPrefix: com.sfe
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  developmentLanguage: zh-Hans
+
+configFiles:
+  Debug: Config/Base.xcconfig
+  Release: Config/Base.xcconfig
+
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Run Script 读取仓库内的构建结果与 Local.xcconfig 指定的 Node，不能在脚本沙盒中运行
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    DEAD_CODE_STRIPPING: YES
+
+settingGroups:
+  signing:
+    base:
+      # 自动签名；DEVELOPMENT_TEAM 只来自未跟踪的 Local.xcconfig（不要在这里设置，否则会覆盖它）
+      CODE_SIGN_STYLE: Automatic
+      CODE_SIGN_IDENTITY: Apple Development
+
+targets:
+  SafariProfileSurge:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+      - path: Shared
+      - path: LaunchAgents/com.sfe.service.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchAgents
+      - path: Scripts
+        buildPhase: none
+      - path: Config
+        buildPhase: none
+    settings:
+      groups: [signing]
+      base:
+        PRODUCT_NAME: SafariProfileSurge
+        PRODUCT_BUNDLE_IDENTIFIER: com.sfe.SafariProfileSurge
+        INFOPLIST_FILE: Config/App-Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Config/App.entitlements
+        ENABLE_APP_SANDBOX: NO
+    dependencies:
+      - target: SafariProfileSurgeExtension
+        embed: true
+        codeSign: true
+      - target: sfe-service-launcher
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Helpers
+    postBuildScripts:
+      # Node（Mach-O，代码）复制到 Contents/Helpers/node 并先行签名；service/dist（脚本与静态文件）复制到 Contents/Resources/service
+      - name: Embed Node and service
+        path: Scripts/embed-runtime.sh
+        shell: /bin/sh
+        basedOnDependencyAnalysis: false
+
+  SafariProfileSurgeExtension:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Extension
+      - path: Shared
+      # 构建好的扩展目录，只作为文件夹引用显示在工程中；实际由下面的 Run Script 平铺复制进 Contents/Resources
+      - path: ../../extension/dist
+        name: Resources
+        type: folder
+        buildPhase: none
+        optional: true
+    settings:
+      groups: [signing]
+      base:
+        PRODUCT_NAME: SafariProfileSurgeExtension
+        PRODUCT_BUNDLE_IDENTIFIER: com.sfe.SafariProfileSurge.Extension
+        INFOPLIST_FILE: Config/Extension-Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        # 只用无限制权限（App 沙盒、application-groups、network.client）；本项目不使用钥匙串，不声明 keychain-access-groups
+        CODE_SIGN_ENTITLEMENTS: Config/Extension.entitlements
+        ENABLE_APP_SANDBOX: YES
+        SKIP_INSTALL: YES
+    postBuildScripts:
+      - name: Embed web extension resources
+        path: Scripts/embed-extension-resources.sh
+        shell: /bin/sh
+        basedOnDependencyAnalysis: false
+
+  sfe-service-launcher:
+    type: tool
+    platform: macOS
+    sources:
+      - path: ServiceLauncher
+      - path: CommandLineSupport
+    settings:
+      groups: [signing]
+      base:
+        PRODUCT_NAME: sfe-service-launcher
+        PRODUCT_BUNDLE_IDENTIFIER: com.sfe.service-launcher
+        GENERATE_INFOPLIST_FILE: YES
+        CREATE_INFOPLIST_SECTION_IN_BINARY: YES
+        SKIP_INSTALL: YES
+
+  # 纯 Swift 逻辑测试（不需要宿主 App 或网络）：直接编译被测源文件。
+  SafariProfileSurgeTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+      - path: Shared/NDJSON.swift
+      - path: Shared/BridgeProtocol.swift
+      - path: Shared/BridgeHandshake.swift
+      - path: Shared/BridgeConfig.swift
+      - path: Shared/BridgeForwarder.swift
+      - path: CommandLineSupport/BundleLayout.swift
+      - path: App/AdminProtocol.swift
+      - path: App/InstallConfig.swift
+      - path: App/SecureFile.swift
+      - path: App/ServiceAgent.swift
+    settings:
+      groups: [signing]
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.sfe.SafariProfileSurgeTests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  SafariProfileSurge:
+    build:
+      targets:
+        SafariProfileSurge: all
+        SafariProfileSurgeTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - SafariProfileSurgeTests
+    archive:
+      config: Release

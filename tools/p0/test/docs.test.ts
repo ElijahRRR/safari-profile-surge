@@ -1,0 +1,724 @@
+// 文档与契约保持一致：手册与验收模板逐字引用 CAPABILITY_CRITERIA，覆盖每一项能力；
+// 验收模板的每个结果格子初始为「未验证」。
+import { readFileSync } from 'node:fs';
+import { CAPABILITY_CRITERIA, CAPABILITY_KEYS, CAPABILITY_LABELS } from '@sfe/contract';
+import { describe, expect, it } from 'vitest';
+import { SERVICE_CODESIGN_TIMEOUT_MS, SERVICE_INSTANCE_READ_BUDGET_MS, SURGE_MINIMUM } from '../src/deps.js';
+import { CLI_HELP_TOPICS } from '../src/surge-access.js';
+
+const read = (name: string): string => readFileSync(new URL(`../../../docs/${name}`, import.meta.url), 'utf8');
+
+describe('docs/P0-RUNBOOK.md', () => {
+  const text = read('P0-RUNBOOK.md');
+
+  it('has a section and the verbatim pass criteria for every capability', () => {
+    for (const key of CAPABILITY_KEYS) {
+      expect(text).toMatch(new RegExp(`^### \\d+\\.\\d+ ${key}（`, 'm'));
+      expect(text).toContain(`**通过条件**：${CAPABILITY_CRITERIA[key]}`);
+    }
+    expect(text).not.toContain('{{CRITERIA');
+  });
+
+  it('every capability section covers purpose, steps, failure handling, evidence and rollback', () => {
+    const sections = text.split(/^### /m).filter((s) => CAPABILITY_KEYS.some((k) => s.includes(` ${k}（`)));
+    expect(sections).toHaveLength(CAPABILITY_KEYS.length);
+    for (const s of sections) {
+      for (const label of ['**用途**', '**步骤**', '**通过条件**', '**失败处理**', '**证据**', '**回退**']) expect(s).toContain(label);
+    }
+  });
+
+  it('documents the read-only running-instance checks V1–V10 and the instance command', () => {
+    expect(text).toMatch(/^### 1\.5 运行中 Surge 的版本（只读核对 V1–V10）/m);
+    for (let i = 1; i <= 10; i++) expect(text).toMatch(new RegExp(`^\\| V${i} \\|`, 'm'));
+    for (const s of ['instance [--surge-team-id', '--self-test-bundle', 'test.sfe.p0.instance-selftest', '不要为了测试而触发更新', 'SURGE_BUNDLE_IDS', 'TODO(P0)', 'inventory/surge-instance.json']) expect(text).toContain(s);
+    // PR #5 的过渡说明已被替换：版本读取已经实现（仍待测试 Mac 核对）
+    expect(text).not.toContain('运行实例版本读取仍待实现与验证');
+    expect(text).toContain('从**运行中的 Surge 实例**取得');
+  });
+
+  it('V1 and V5 hold the instance read to the service reader limits (P0 waits longer than the service)', () => {
+    const row = (n: number) => text.split('\n').find((l) => l.startsWith(`| V${n} |`))!;
+    expect(row(5)).toContain(`在 ${SERVICE_CODESIGN_TIMEOUT_MS / 1000} 秒内完成`);
+    expect(row(1)).toContain(`合计在 ${SERVICE_INSTANCE_READ_BUDGET_MS / 1000} 秒内`);
+    expect(text).toContain('instance 同时按服务的时限核对');
+  });
+
+  it('V6 defines RUN as an absolute $HOME path (instance prints ~, which does not expand inside quotes) and builds a new scratch app per case', () => {
+    const v6 = text.slice(text.indexOf('V6 的步骤'), text.indexOf('## 2. 通用回退'));
+    expect(v6).toContain('RUN="$HOME/Library/Application Support/SafariProfileSurge/p0/<运行编号>"');
+    expect(v6).not.toMatch(/RUN="~/);
+    expect(v6).toContain('绝对路径');
+    expect(v6).toMatch(/APP="\$DIR\/SFE-P0-Selftest\.app"/);
+    expect(v6).toContain('DIR="$RUN/selftest/$CASE-$(date +%Y%m%d%H%M%S)"');
+    expect(v6).toContain('instance --run <运行编号> --self-test-bundle "$APP"');
+  });
+
+  it('V6 command blocks carry no # comments: macOS zsh (interactivecomments off) passes them to the command as arguments', () => {
+    const v6 = text.slice(text.indexOf('V6 的步骤'), text.indexOf('## 2. 通用回退'));
+    const blocks = [...v6.matchAll(/```sh\n([\s\S]*?)```/g)].map((m) => m[1]!);
+    expect(blocks).toHaveLength(2);
+    for (const line of blocks.join('').split('\n')) {
+      // 单引号中的 # 是字面量（printf 写出的 #include）
+      expect(line.replace(/'[^']*'/g, "''"), line).not.toContain('#');
+    }
+    // 第一段建 App 并运行一次 instance；按情况的改动写在正文中；第二段再运行一次并结束进程
+    expect(blocks[0]).toContain('CASE=plain\n');
+    expect(blocks[0]).toContain('cp -p "$APP/Contents/MacOS/selftest" "$DIR/selftest.copy"\n');
+    expect(blocks[0]).toContain('instance --run <运行编号> --self-test-bundle "$APP"\n');
+    expect(blocks[1]).toBe('npx tsx tools/p0/src/cli.ts instance --run <运行编号> --self-test-bundle "$APP"\nkill "$SELFTEST_PID"\n');
+    for (const c of ['plutil -convert xml1 -o "$DIR/Info.new" "$APP/Contents/Info.plist" && mv "$DIR/Info.new" "$APP/Contents/Info.plist"', 'mv "$DIR/selftest.copy" "$APP/Contents/MacOS/selftest"', 'xattr -w com.example.sfe-p0 1 "$APP"']) {
+      expect(v6).toContain(`\`${c}\``);
+    }
+    expect(v6).toContain('--raw-dir <目录>');
+  });
+
+  it('targets Surge Mac 6.10.0 (12500) with the documented minimum, and V8 is the surge-cli --raw version cross-check', () => {
+    expect(text).toContain('Surge Mac 6.10.0 (12500)');
+    expect(text).toContain(`最低支持 ${SURGE_MINIMUM.version}、构建 ≥ ${SURGE_MINIMUM.build}、Controller 协议 ≥ ${SURGE_MINIMUM.controllerProtocol}`);
+    const row = (n: number) => text.split('\n').find((l) => l.startsWith(`| V${n} |`))!;
+    expect(row(8)).toContain('| V8 | 版本交叉核对 |');
+    expect(row(8)).toContain('--raw version');
+    expect(row(8)).toContain('inventory/surge-version.json');
+    // --version 只记录现在的行为，产品与工具从不使用；不再期望它打印交互模式提示
+    expect(row(8)).toContain('产品与工具从不使用');
+    expect(text).not.toContain('`--version` 在 2 秒内结束并打印交互模式提示');
+    // V7 的期望文字来自 6.10 的发布说明与包内文字
+    expect(row(7)).toContain("Surge isn't running on the local machine. Use --remote to specify a remote target.");
+    expect(row(7)).toContain('Command errors are now written to standard error and produce a non-zero exit status.');
+    expect(text).not.toContain('不借用新版本文档中的能力');
+  });
+
+  it('describes the per-command help that inventory reads', () => {
+    for (const topic of CLI_HELP_TOPICS) expect(text).toContain(`\`help ${topic.join(' ')}\``);
+    expect(text).toContain('inventory/surge-cli-help/');
+    expect(text).toContain('`--check/-c` 这样的写法按 `--check` 识别');
+  });
+
+  it('measures the documented local rule-set watcher, publishes test nodes through the loopback resource (D10), and the 6.9+ reload escalation', () => {
+    for (const quote of [
+      'Local resources are skipped.',
+      'Local files are watched and reloaded automatically when they change.',
+      'Automatically performs a full engine restart if a change requires one.',
+      '`PROTOCOL,UDP` also matches QUIC and STUN connections.',
+      'Add a temporary rule with the highest priority',
+    ]) {
+      expect(text).toContain(quote);
+    }
+    // 配置 canary 与引擎运行时长取代规则集 canary 作为重载/重启信号
+    const signals = text.slice(text.indexOf('### 1.4'), text.indexOf('### 1.5'));
+    expect(signals).toContain('配置 canary');
+    expect(signals).toContain('引擎运行时长');
+    // 旧机制的说法已移除
+    for (const stale of ['temp-rule add', '按 key 定向刷新', '定向刷新被重新读取', 'updateExternalResource(key) 后改变匹配', '资源更新时间前进']) expect(text).not.toContain(stale);
+    expect(text).toContain('不要为了测试运行 `restart-engine`');
+    expect(text).toContain('### 1.6 文档没有写明、要在测试 Mac 上实测的行为（TODO(P0)）');
+  });
+
+  it('documents the loopback test resource server and the four loopback capabilities without a reload fallback (D10)', () => {
+    // 测试资源服务的命令行与场景集合
+    expect(text).toContain('`resource-server [--port N] [--scenario S] [--squat squat200|squat404|squatHang]`');
+    for (const s of ['loopback --setup', 'loopback --rollback', 'loopback-auth', 'loopback-restart --phase prepare|after-surge-restart|after-mac-restart', 'loopback-crash']) {
+      expect(text).toContain(s);
+    }
+    // 每一项回环能力的失败处理：新版本保持待部署，从不自动重载兜底
+    const section = (key: string) => {
+      const start = text.indexOf(` ${key}（`);
+      return text.slice(start, text.indexOf('\n### ', start));
+    };
+    for (const key of ['loopback_resource_update', 'loopback_resource_auth', 'loopback_resource_restart', 'loopback_publish_crash']) {
+      const s = section(key);
+      const failure = s.slice(s.indexOf('**失败处理**'), s.indexOf('**证据**'));
+      expect(failure, key).toContain('新节点保持「已保存，待部署」');
+      expect(failure, key).toContain('**不自动重载兜底**');
+    }
+    // 只对单个 key 更新一次，从不 update all；本地 policy-path 的旧方案与它的等待参数不再出现
+    expect(section('loopback_resource_update')).toContain('只对测试资源执行**一次**单 key 更新（从不 update all，结果不明时从不重放）');
+    for (const stale of ['不实现回环地址', 'resourceReloadWait', '### 3.10 targeted_resource_refresh', 'policy_path_reread（']) expect(text).not.toContain(stale);
+    // 回退：撤除测试资源并确认端口空闲
+    const rollback = text.slice(text.indexOf('## 2. 通用回退'), text.indexOf('## 3. 逐项能力'));
+    expect(rollback).toContain('`loopback --rollback`');
+    expect(rollback).toContain('资源端口已空闲');
+  });
+
+  it('3.6 describes the DNS-free probes: process-only witness and insertion rules, documentation-IP targets and the witness form check', () => {
+    const entry = text.slice(text.indexOf('### 3.6'), text.indexOf('### 3.7'));
+    // 当前写入的见证与占位规则只有完整路径的进程条件；旧的合成域名形式只作为“以前”的说明出现
+    expect(entry).toContain('见证规则 `PROCESS-NAME,/var/empty/sfe-entry-witness-<位>-<标记>`');
+    expect(entry).toContain('占位规则 `PROCESS-NAME,/var/empty/sfe-entry-disabled`');
+    expect(entry).not.toContain('(DOMAIN,sfe-entry-<位>-<编号>.invalid)');
+    expect(entry).not.toContain('Chrome 另探测各文件的见证主机与占位主机');
+    expect(entry).toContain('`rule match 192.0.2.1 process-path=<见证路径> protocol=TCP dest-port=443`');
+    // 插入探测：两条只匹配合成进程的规则，求值顺序用文档地址读
+    expect(entry).not.toContain('p0-insert-N.invalid');
+    expect(entry).toContain('`PROCESS-NAME,/var/empty/sfe-p0-insert-probe,REJECT` 与 `PROCESS-NAME,/var/empty/sfe-p0-insert-prob?,REJECT`');
+    expect(entry).toContain('`rule match 192.0.2.1 process-path=/var/empty/sfe-p0-insert-probe protocol=TCP dest-port=443`');
+    // 见证形式核对（设计复核 p0Confirmations 2–4）
+    expect(entry).toContain('- **见证形式核对**');
+    expect(entry).toContain('另一标记（同长度）、前缀延长、`/private/var/…` 形式、大写 `/VAR/…` 形式、对照进程（Chrome）、`/usr/bin/true` 与 Safari 路径都不能命中');
+    expect(entry).toContain('非零退出是确定的回答，同样不通过');
+    expect(entry).toContain('**不要**改用合成域名或在入口规则集中加 IP 条件');
+    // 矩阵的“其他主机”包括 IP 字面量
+    expect(entry).toContain('分别以检测主机、`echo.p0.example.test` 与文档地址 `192.0.2.1`');
+    // §1.6：DNS 失败输出的手动采集
+    const todo = text.slice(text.indexOf('### 1.6'), text.indexOf('## 2.'));
+    expect(todo).toContain('"$S" --raw rule match p0-inventory.invalid process-path=/usr/bin/true protocol=TCP dest-port=443 </dev/null; echo "exit=$?"');
+    // 合成请求只用文档地址；echo 与 canary 的 .test 主机仍是域名（不声称“从不用合成域名”）
+    expect(todo).not.toContain('工具本身从不用合成域名做 rule match');
+    expect(todo).toContain('合成请求的探测（插入探测、见证形式核对、inventory 的 rule match 读取）的目标只用 `192.0.2.1`');
+    expect(todo).toContain('echo 与 canary 的 `.test` 主机');
+    // 见证遮挡按有效规则列表的位置判断；模块与临时规则的先后是 TODO(P0)
+    expect(todo).toContain('排在入口段之前（模块中的局域网或保留地址 IP-CIDR 列表');
+    expect(todo).toContain('模块规则与临时规则谁先求值');
+  });
+
+  it('documents the overall order and the manual profile switch', () => {
+    for (const cmd of ['inventory', 'instance', 'test-servers', 'make-test-profile', 'attribution', 'entry', 'resource-server', 'loopback', 'loopback-auth', 'loopback-restart', 'loopback-crash', 'refresh', 'continuity', 'chain', 'charset', 'preflight', 'checklist', 'propose', 'rollback']) {
+      expect(text).toContain(cmd);
+    }
+    expect(text).toContain('手动');
+    expect(text).toContain('SFE-P0-测试');
+  });
+
+  it('native sections measure what Apple leaves open: default-profile ID, embedded provisioning profile, macOS 26 quit prompt', () => {
+    const section = (key: string) => {
+      const start = text.indexOf(` ${key}（`);
+      return text.slice(start, text.indexOf('\n### ', start));
+    };
+    const profile = section('native_profile_id');
+    expect(profile).toContain('Perform normal browsing tasks.');
+    expect(profile).toContain('未识别当前场景');
+    expect(profile).not.toContain('加上默认场景都启用扩展');
+    const persistence = section('extension_install_persistence');
+    expect(persistence).toContain('embedded.provisionprofile');
+    expect(persistence).toContain('Unlike Apple’s other platforms, macOS doesn’t require a provisioning profile to run third-party code.');
+    expect(persistence).toContain('In Safari 17 or later, use the Developer tab in Settings');
+    const bridge = section('native_bridge_ipc');
+    expect(bridge).toContain('`quit_prompt`');
+    expect(bridge).toContain('sfltool dumpbtm');
+    // ps 的 comm 是 argv[0]，V1 只作候选
+    const v1 = text.split('\n').find((l) => l.startsWith('| V1 |'))!;
+    expect(v1).toContain('argv[0]');
+  });
+
+  it('report alarm steps: the delay expression handles a fired alarm, and the wake test schedules its own alarm after the background unloads', () => {
+    const start = text.indexOf(' native_bridge_ipc（');
+    const bridge = text.slice(start, text.indexOf('\n### ', start));
+    // 闹钟已到点时 get() 没有结果；`(…)?.scheduledTime - Date.now()` 会得到 NaN 而不是 undefined
+    expect(bridge).toContain("const a = await browser.alarms.get('sfe-profile-report'); a ? a.scheduledTime - Date.now() : '已到点'");
+    expect(bridge).not.toContain("?.scheduledTime - Date.now()");
+    // 新建标签页本身就会唤醒后台：唤醒测试由检查器创建闹钟、确认后台已卸载、之后不再操作 Safari
+    expect(bridge).toContain("browser.alarms.create('sfe-profile-report', { delayInMinutes: 2 })");
+    expect(bridge).toContain('确认后台已卸载');
+    expect(bridge).toContain('不能**用它证明闹钟能唤醒已卸载的后台');
+  });
+});
+
+describe('docs/ACCEPTANCE.md', () => {
+  const text = read('ACCEPTANCE.md');
+
+  it('has one table per capability with label and criteria', () => {
+    for (const key of CAPABILITY_KEYS) {
+      expect(text).toContain(`${key}（${CAPABILITY_LABELS[key]}）`);
+      expect(text).toContain(CAPABILITY_CRITERIA[key]);
+    }
+  });
+
+  it('uses the DEVELOPMENT §9 evidence columns and protocol rows', () => {
+    expect(text).toContain('| 测试编号 | 时间 | 场景代号 | 扩展/入口状态 | 期望节点 | Surge 实际策略 | 实际出口 | 连接处理结果 | 配置身份 | 对照应用结果 |');
+    for (const row of ['HTTP', 'HTTPS', 'HTTP/2', 'HTTP/3（QUIC）', 'WebSocket', 'WebRTC', 'DNS', 'IPv6', '系统服务']) expect(text).toContain(`| ${row} | 未验证 |`);
+  });
+
+  it('every result cell starts as 未验证', () => {
+    const rows = text
+      .split('\n')
+      .filter((l) => l.startsWith('| ') && !l.startsWith('| 协议') && !l.startsWith('| 检查项') && !l.startsWith('| 项目') && !l.startsWith('| 限制') && !l.startsWith('|---'));
+    expect(rows.length).toBeGreaterThan(300);
+    for (const r of rows) {
+      const cells = r.split('|').slice(1, -1).map((c) => c.trim());
+      expect(cells.at(-1)).toBe('未验证');
+    }
+  });
+
+  it('lists the known limitations', () => {
+    for (const s of ['免费 Apple ID 签名', '接管与出站模式可读性', '页面登录身份', '不关闭，直接继续', '最低 Surge 版本', '维护重载', '秘密以明文保存（不使用钥匙串）']) expect(text).toContain(s);
+    // 用户决定（2026-10-23）不使用钥匙串：不再声称钥匙串保护
+    expect(text).not.toContain('钥匙串的保护范围');
+  });
+
+  it('records the 6.10 version cross-check and the loopback resource facts (D10) in the environment table', () => {
+    for (const row of [
+      '| 版本交叉核对（surge-cli --raw version 一致、Controller 协议 ≥ 22） | 未验证 |',
+      '| 本应用资源的 key 形式与 updateExternalResource 的实现（cli 只在 key 是 32 位十六进制且不含令牌时；3.10 实测） | 未验证 |',
+      '| Surge 资源缓存的位置与凭据保存方式（3.11 实测） | 未验证 |',
+      '| 新临时规则的插入位置（entry 插入探测） | 未验证 |',
+    ]) {
+      expect(text).toContain(row);
+    }
+    // 本地 policy-path 的测量已被 D10 取代
+    expect(text).not.toContain('本地 policy-path 是否被自动重新读取');
+    expect(text).not.toContain('不实现回环地址');
+  });
+
+  it('loopback_publish_crash lists the automated-test items, and the limitations name the loopback residual risks', () => {
+    const start = text.indexOf('loopback_publish_crash（');
+    const crash = text.slice(start, text.indexOf('\n### ', start));
+    for (const item of ['| 自动化测试：发布互斥', '| 自动化测试：启动顺序', '| 自动化测试：崩溃恢复']) expect(crash).toContain(item);
+    for (const s of ['| 回环资源的读取令牌与端口占用 |', '| Surge 一侧的凭据副本 |', '| 部分接受与重名 |', '| 不使用自定义认证请求头 |']) expect(text).toContain(s);
+  });
+});
+
+describe('docs/ARCHITECTURE.md §0', () => {
+  const text = read('ARCHITECTURE.md');
+  const s0 = text.slice(text.indexOf('## 0.'), text.indexOf('## 1.'));
+
+  it('records the deviations from the design docs: minimum Surge, local-file refresh mechanism, reload semantics, temp_rule texts', () => {
+    for (const s of ['**最低 Surge（用户决定', '**节点发布机制（用户决定', '**入口规则（偏离', '**本地文件的重新读取与 P0 测量（偏离', '**reload 语义（6.9.0 起', '**临时规则命令（偏离固定工作配置设计 §3']) {
+      expect(s0).toContain(s);
+    }
+    // 契约措辞已改写：不再说“待文档步骤改写”
+    expect(s0).not.toContain('待文档步骤改写');
+    expect(text).not.toContain('6.5 没有版本命令');
+  });
+
+  it('records the no-keychain, plain-text secrets decision with the user question, the overridden design lines and the honest consequence', () => {
+    expect(s0).toContain('**秘密的存放（用户决定 D8，2026-10-23；偏离方案 1 设计第 195–199、232 行、实时同步设计第 13、22、80 行、固定工作配置设计第 73 行，以及 docs/DEVELOPMENT.md 第 9、35 行');
+    expect(s0).toContain('为什么要访问我本机的钥匙串？这个项目拿到的ip账号密码，亚马逊账号密码等信息默认保存在自己的一套资料里，不需要从钥匙串中读取');
+    expect(s0).toContain('任何以同一 macOS 用户身份运行的进程都能直接读取 `sfe.sqlite`');
+    expect(s0).toContain('时间机器');
+    expect(s0).not.toContain('**登录填充依赖已过时的钥匙串接口。**');
+  });
+
+  it('numbers every user decision (D1–D10) with its date, and process decisions (W1–W3); no undefined decision number is cited', () => {
+    for (let i = 1; i <= 9; i++) expect(s0).toMatch(new RegExp(`^\\| D${i} \\| 2026-10-2\\d \\|`, 'm'));
+    // D10（2026-10-31）取代 D7：D7 保留为历史并标明已被取代
+    expect(s0).toMatch(/^\| D10 \| 2026-10-31 \| 节点发布机制（取代 D7） \|/m);
+    expect(s0.split('\n').find((l) => l.startsWith('| D7 |'))).toContain('已被 D10 取代');
+    for (let i = 1; i <= 3; i++) expect(s0).toMatch(new RegExp(`^\\| W${i} \\| 2026-10-2\\d \\|`, 'm'));
+    expect(s0).toContain('| D9 | 2026-10-24 | 切换进行中点击「进入普通模式」 | 保留排队');
+    expect(s0).toContain('PR #7');
+    for (const t of [text, readFileSync(new URL('../../../service/src/surge/entry/common.ts', import.meta.url), 'utf8'), readFileSync(new URL('../../../service/src/surge/entry/ruleset-strategy.ts', import.meta.url), 'utf8')]) {
+      expect(t).not.toContain('用户决定 1');
+    }
+    for (const cited of text.matchAll(/用户决定 ((?:D\d+[、，]?\s*)+)/g)) {
+      for (const id of cited[1]!.match(/D\d+/g)!) expect(s0).toMatch(new RegExp(`^\\| ${id} \\|`, 'm'));
+    }
+  });
+
+  it('deleted secrets are zeroed (secure_delete + WAL truncation), and legacy data dirs are refused before migrating', () => {
+    expect(text).not.toContain('服务没有开启 SQLite 的 `secure_delete`');
+    expect(text).not.toContain('被删除的旧值可能留在空闲页或 WAL 中');
+    expect(s0).toContain('`wal_checkpoint(TRUNCATE)`');
+    expect(text).not.toContain('检测在迁移之后执行');
+    expect(text).toContain('检测在迁移之前执行，拒绝时数据库原样保留');
+    expect(text).toContain('完整的中文说明 `message`');
+  });
+
+  it('the -wal truncation never waits for another reader (deferred to a later delete, sweep or stop), and profile backups never copy the generated files that hold buyer proxy credentials', () => {
+    expect(s0).toContain('这次 checkpoint 不等待锁（执行时临时把 `busy_timeout` 设为 0）');
+    expect(s0).toContain('`SecretStore.flush`');
+    expect(s0).toContain('配置备份从不复制本应用生成的文件（`sfe-nodes.list` 与四个 `sfe-entry-*.list`');
+    const install = read('INSTALL.md');
+    expect(install).not.toContain('截断可能推迟到下一次删除或服务停止）');
+    expect(install).toContain('服务不等待它：这次截断不做，推迟到之后的删除、下一次清理');
+    expect(install).toContain('不复制本应用生成的 `sfe-nodes.list` 与 `sfe-entry-*.list`');
+  });
+
+  it('§6.1 states what cancelling does per operation kind and that an accepted cancel wins over a queued verification result', () => {
+    expect(text).not.toContain('取消（`cancelOperation`）只适用于等待中的路由操作：激活/重测按 §6.3.14 回滚');
+    expect(text).toContain('Safari 重测（`probeKind` safari，含第 1 步复用时改为重测的激活，§6.4）只把检测结束为 FAILED，不回滚');
+    // 通常不改变路由，例外是共同结束点（§6.3 第 14 步）：不无条件承诺路由不变
+    expect(text).toContain('这两种通常不改变路由，例外是 §6.3 第 14 步的共同结束点');
+    expect(text).toContain('已受理的取消优先，旧请求的结果不能覆盖新请求');
+  });
+
+  it('does not promise that replaced proxy credentials leave secret_values at the next sweep (they wait for the old revision to retire)', () => {
+    expect(s0).not.toContain('被替换、清除或回收的旧值在清扫（启动时与每小时）时删除');
+    expect(s0).toContain('被替换或清除的账号密码（以及删除环境时的账号密码）在同一事务中标为 orphaned，下一次清扫（启动时与每小时）删除');
+    expect(s0).toContain('只有该版本在发布结算时 retired 之后的清扫才删除');
+    expect(s0).toContain('部署新版本的那次发布仍保留旧节点');
+  });
+
+  it('records the normal-mode conflict when rule match is unavailable instead of claiming normal mode is unaffected', () => {
+    expect(s0).toContain('**进入普通模式与 `rule match`（需要指出的冲突');
+    expect(s0).toContain('entry_unverified');
+    expect(s0).not.toContain('进入普通模式不受影响');
+    // CAPABILITY_PRIMITIVES 已调整：不再说仍列 updateExternalResource、没有 matchRule
+    expect(s0).not.toContain('仍列 `updateExternalResource`、没有 `matchRule`');
+  });
+
+  it('§5.5 makes the witness and placeholder rules a synthetic full-path process only and quotes the process-rule doc', () => {
+    expect(text).toContain('**见证规则** `PROCESS-NAME,/var/empty/sfe-entry-witness-<位>-<标记>`');
+    expect(text).toContain('关闭的位写占位规则 `PROCESS-NAME,/var/empty/sfe-entry-disabled`');
+    expect(text).toContain("“If the expression starts with `/` (and does not end with `/`), it matches the executable's full absolute path.”，“Matching is case-sensitive in all modes.”");
+    // 不用主机区分的理由仍引用域名规则文档（按主机名的见证对任何进程都成立）
+    expect(text).toContain('Domain rules match the hostname of a request. They are the most common rule types and never trigger a DNS lookup');
+    // 旧格式只识别、从不写入或探测
+    expect(text).toContain('旧格式见证 `AND,((PROCESS-NAME,/var/empty/sfe-entry-witness),(DOMAIN,sfe-entry-<位>-<标记>.invalid))`');
+    expect(text).not.toContain('读回因此另用对照进程探测各文件当前的见证主机与占位主机');
+    expect(text).not.toContain('`.invalid` 永不解析，真实请求不会命中');
+  });
+
+  it('§5.5 explains why probe hosts are documentation IPs, quoting the IP-rule doc and the 2026-10-24 test-Mac observation', () => {
+    expect(text).toContain('**探测的目标主机是文档地址 IP 字面量**（contract `ENTRY_PROBE_IPV4` = `192.0.2.1`，RFC 5737）');
+    expect(text).toContain('“If the DNS lookup fails, rule evaluation aborts and the request fails with a DNS error, unless the FINAL rule carries the dns-failed parameter.”');
+    expect(text).toContain('“If the request targets an IP literal, the rule matches it directly; GEOIP and IP-ASN perform their database lookup without a DNS query.”');
+    expect(text).toContain('2026-10-24 测试 Mac（Surge 6.10.0 / 12500，docs/verification/2026-10-24-mac-p0-increment.md）');
+    expect(text).toContain('退出 1（DNS 空回答），同一命令改用 `192.0.2.1` 退出 0');
+    expect(text).toContain('轮询 `rule match 192.0.2.1 process-path=/var/empty/sfe-entry-witness-<位>-<标记> protocol=TCP dest-port=443`');
+    expect(text).not.toContain('`sfe-entry-probe.invalid`');
+    // DNS 失败是结果未知的读取失败，不是 rule match 不可用；真实主机探测的 DNS 依赖如实列为待决冲突
+    expect(text).toContain('它不是“rule match 不可用”（未映射、Unknown command），不走撤销入口的退路');
+    expect(s0).toContain('**DNS 失败（待用户决定，现按失败即关闭）**');
+  });
+});
+
+describe('docs/ARCHITECTURE.md D10: loopback node resource (deviation, publish flow, listener, warning, startup order, secrets)', () => {
+  const text = read('ARCHITECTURE.md');
+  const s0 = text.slice(text.indexOf('## 0.'), text.indexOf('## 1.'));
+
+  it('§0 quotes design line 83, says how each clause is met and lists the residual risks', () => {
+    expect(s0).toContain('**节点发布机制（用户决定 D10，2026-10-31，取代 D7；');
+    expect(s0).toContain('可以另测受保护的回环资源服务，但它增加了凭据读取边界，不能随便开放一个无需认证的 localhost 订阅地址；也不能假设 Surge 支持任意自定义鉴权头。未经验证不纳入首版承诺。');
+    for (const s of ['不退化为重载', '增加的凭据读取边界', '不开放无需认证的地址', '不假设自定义鉴权头', '未经验证不纳入首版承诺：`resourceServe` 门槛', '**剩余风险**', 'lo0', 'Surge 的资源缓存', '用户决定 D8', '`rotateResourceUrl`']) {
+      expect(s0).toContain(s);
+    }
+    // 旧方案的说法不再作为现行机制出现
+    for (const stale of ['不实现回环地址', 'resourceReloadWait', '`updateExternalResource` 不在任何一项中（从不调用）']) expect(text).not.toContain(stale);
+  });
+
+  it('§6.2 publishes by serving a candidate and exactly one single-key update, with the rollback and crash rules', () => {
+    const s62 = text.slice(text.indexOf('### 6.2 发布'), text.indexOf('### 6.3'));
+    for (const s of ['恰好一次 `updateExternalResource(key)`（从不 update all；结果不明时从不重放）', '在**同一个事务**中', '`revertToCommitted`', '**不执行第二次更新**', '`recoverPublish`', '`READBACK_COVERAGE_KEYS`']) {
+      expect(s62).toContain(s);
+    }
+    expect(s62).not.toContain('原子替换资源文件');
+    expect(s62).not.toContain('resource:writeBaseline');
+  });
+
+  it('documents the resource listener, node_resource_unverified, the startup order and the token in the secrets list', () => {
+    const s74 = text.slice(text.indexOf('### 7.4 本机资源服务'), text.indexOf('## 8.'));
+    for (const s of ['`timingSafeEqual`', '同样的 404', '**启动顺序**', '在开始监听**之前**做一次下载核对', '从不提供未提交的版本']) expect(s74).toContain(s);
+    const s66 = text.slice(text.indexOf('### 6.6'), text.indexOf('### 6.7'));
+    expect(s66).toContain('**节点资源未确认（`node_resource_unverified`，D10）**');
+    expect(s66).toContain('进入普通模式与 REJECT 的保持**从不**因为它被拒绝');
+    const s2 = text.slice(text.indexOf('## 2.'), text.indexOf('## 3.'));
+    const secrets = s2.slice(s2.indexOf('- **含秘密的位置**'));
+    for (const s of ['读取令牌：', 'Surge 的资源缓存', '旧版 `sfe-nodes.list`（只有 D10 之前的安装才有']) expect(secrets).toContain(s);
+    expect(secrets).not.toContain('  - `sfe-nodes.list`（Surge 语法要求明文代理凭据）；');
+  });
+});
+
+describe('docs/P0-CHECKLIST.md (D10)', () => {
+  const text = read('P0-CHECKLIST.md');
+
+  it('U2 is answered by D10, the loopback step exists and the report covers all capability keys', () => {
+    expect(text).toContain('**已决定（2026-10-31，用户决定 D10）**');
+    expect(text).toContain('### 第 5 步：本机回环节点资源');
+    expect(text).toContain(`${CAPABILITY_KEYS.length} 项能力（\`CAPABILITY_KEYS\`）`);
+    expect(text).not.toContain('不实现回环地址');
+    expect(text).not.toContain('19 项能力');
+  });
+});
+
+describe('README.md and docs/DEVELOPMENT.md (read first per CLAUDE.md)', () => {
+  const readme = readFileSync(new URL('../../../README.md', import.meta.url), 'utf8');
+  const dev = read('DEVELOPMENT.md');
+
+  it('state the 6.10 minimum and node publishing through the loopback resource (D10), not the 6.5 target or the superseded local-file wait', () => {
+    expect(readme).toContain('最低支持 Surge for Mac 6.10.0（构建 ≥ 12500、Controller 协议 ≥ 22');
+    expect(dev).toContain('最低支持 Surge for Mac 6.10.0（构建 ≥ 12500、Controller 协议 ≥ 22）');
+    for (const t of [readme, dev]) {
+      expect(t).toContain('external-resource update');
+      expect(t).toContain('D10');
+      for (const stale of ['本次设计调研的目标版本为 Surge 6.5.0', '定向刷新并读回', '当前仅有 Surge 6.5 的只读命令', '节点资源定向刷新 |', '定向节点刷新', '不实现回环地址', '原子写入受管理的本地节点资源']) expect(t).not.toContain(stale);
+    }
+  });
+});
+
+describe('docs/INSTALL.md', () => {
+  const text = read('INSTALL.md');
+
+  it('covers build, install, first run, uninstall and security notes', () => {
+    for (const s of ['xcodegen generate', 'Personal Team', '注册后台服务', 'www.amazon.com', '日常-Safari环境', '先进入普通模式', 'com.sfe.proxy', 'bridge.token', '同一用户的本机进程']) {
+      expect(text).toContain(s);
+    }
+  });
+
+  it('states the minimum Surge version and that getVersion, matchRule and getCurrentProfile must be mapped to cli', () => {
+    expect(text).toContain('Surge for Mac 6.10.0（构建 12500）或更高');
+    expect(text).toContain('`getVersion` 必须映射为 `cli`');
+    expect(text).toContain('`matchRule` 也必须映射为 `cli`');
+    expect(text).toContain('`getCurrentProfile` 必须映射为 `cli`');
+    expect(text).not.toContain('开发调研时为 6.5.0');
+  });
+
+  it('regression: §4 promises that deployed nodes keep working only when the resource service still serves them', () => {
+    const daily = text.slice(text.indexOf('## 4. 日常使用'), text.indexOf('## 5.'));
+    expect(daily).not.toContain('新版本显示“已保存，待部署”，已部署的节点照常使用');
+    expect(daily).toContain('资源服务照常提供时，已部署的节点照常使用');
+    expect(daily).toContain('资源服务停止提供已提交的节点（答复 503）');
+    expect(daily).toContain('loopback_resource_restart');
+  });
+
+  it('never instructs the tool to switch profiles or bulk-delete certificates', () => {
+    expect(text).toContain('工具从不调用 switch-profile');
+    expect(text).toContain('不批量删除证书');
+  });
+
+  it('follows Apple: site access is granted once for all profiles, extensions are enabled per profile, and binding uses named profiles', () => {
+    expect(text).toContain('across all profiles, private browsing, and browsing without a profile');
+    expect(text).toContain('By default, extensions are turned off for each new profile.');
+    expect(text).toContain('网站授权只需一次');
+    expect(text).not.toContain('新建场景后需要重复本步');
+    expect(text).not.toContain('不能替你给以后新建的场景自动授权');
+    expect(text).toContain('Perform normal browsing tasks.');
+    expect(text).toContain('**已命名** Safari 场景');
+  });
+
+  it('states Safari 17.6 as the minimum, the Developer tab for unsigned extensions and the macOS 26 quit prompt', () => {
+    expect(text).toContain('Safari 17.6 或更高');
+    expect(text).toContain('Fixed an issue where Safari Web Extension background pages would stop responding after about 30 seconds.');
+    expect(text).not.toContain('macOS 14（Safari 17）或更高');
+    expect(text).toContain('In Safari 17 or later, use the Developer tab in Settings');
+    expect(text).not.toContain('「开发」菜单中的「允许未签名扩展」');
+    expect(text).toContain('if background tasks are started by an app and remain active after a user quits the app');
+    expect(text).toContain('登录项与扩展');
+  });
+
+  it('does not overstate keychain protection or the 7-day profile (TN3125: no profile needed without restricted entitlements)', () => {
+    expect(text).not.toContain('拿到引用也读不到');
+    expect(text).not.toContain('但读不到账号密码');
+    expect(text).toContain('A Mac app that uses no restricted entitlements doesn’t need a provisioning profile.');
+    expect(text).not.toContain('过期前需要在 Xcode 中重新构建运行');
+  });
+
+  it('states plain-text secrets honestly and explains the legacy keychain data directory (user decision 2026-10-23)', () => {
+    expect(text).toContain('**本应用不使用 macOS 钥匙串**');
+    expect(text).toContain('**`<数据目录>/sfe.sqlite`（及 `-wal`/`-shm`）：全部代理凭据、亚马逊账号密码与 pepper 的明文。**');
+    expect(text).not.toContain('账号密码只存在钥匙串');
+    expect(text).not.toContain('一次性钥匙串引用');
+    const legacy = text.slice(text.indexOf('## 7. 从使用钥匙串的旧版本升级'));
+    expect(legacy.length).toBeGreaterThan(0);
+    expect(legacy).toContain('legacy_keychain_data');
+    expect(legacy).toContain('while security delete-generic-password -s "$s" >/dev/null; do :; done');
+    expect(legacy).toContain('for s in com.sfe.proxy com.sfe.account com.sfe.system; do');
+    // 手动撤销旧临时规则时逐条移除，从不建议 flush（会清掉用户自己的临时规则）
+    expect(legacy).toContain('不要用 `rule temp flush`');
+  });
+
+  it('legacy upgrade: the refusal leaves the data dir to the old version, the log carries the message, and the App is quit before the move', () => {
+    const legacy = text.slice(text.indexOf('## 7. 从使用钥匙串的旧版本升级'));
+    expect(legacy).not.toContain('之后装回旧版本也打不开这个数据目录');
+    expect(legacy).toContain('检查在数据库迁移之前进行，拒绝时数据库原样保留');
+    expect(legacy).toContain('`message` 字段是完整的中文说明');
+    // 新版本 App 改写 install.json，但保留旧服务需要的 keychainHelperPath；装回旧版本后先打开旧 App，停止过的服务重新注册
+    expect(legacy).not.toContain('拒绝时数据目录原样保留');
+    expect(legacy).toContain('但保留旧版本的钥匙串工具路径 `keychainHelperPath`');
+    expect(legacy).toContain('**打开一次旧版本 App**');
+    expect(legacy).toContain('已经在新版本中「停止后台服务」时在旧版本菜单中「注册后台服务」');
+    // App 只在启动时准备数据目录：改名前退出、之后重新打开（打开仍在运行的 App 什么也不创建）
+    expect(legacy).toContain('再选菜单「退出」**退出 App**');
+    expect(legacy).toContain('重新打开 App（第 4 步已退出，这是一次新的启动');
+  });
+
+  it('the host App keeps the old keychainHelperPath in install.json (rollback to the Keychain version needs it)', () => {
+    const install = text.slice(text.indexOf('## 2. 安装'), text.indexOf('## 3.'));
+    expect(text).not.toContain('`keychainHelperPath` 在合并时删除');
+    expect(install).toContain('合并从不删除字段：旧版本写入的钥匙串工具路径 `keychainHelperPath` 原样保留');
+    const arch = read('ARCHITECTURE.md');
+    expect(arch).not.toContain('时删除旧版本写入的 `keychainHelperPath`');
+    expect(arch).toContain('宿主 App 合并 `install.json` 时从不删除字段，旧版本写入的 `keychainHelperPath` 原样保留');
+    expect(arch).not.toContain('（数据库迁移之前，不改动数据目录）');
+    const macReadme = readFileSync(new URL('../../../apps/macos/README.md', import.meta.url), 'utf8');
+    expect(macReadme).not.toContain('在合并时删除');
+    expect(macReadme).not.toContain('含删除旧版本留下的 `keychainHelperPath`');
+    expect(macReadme).toContain('保留旧版本留下的 `keychainHelperPath`');
+  });
+
+  it('describes how deleted secrets are removed from disk instead of denying secure_delete', () => {
+    expect(text).not.toContain('服务没有开启 SQLite 的 `secure_delete`');
+    expect(text).toContain('数据库开启了 SQLite 的 `secure_delete`');
+    expect(text).toContain('每删除一个值（清理与导入一次删除一批时，在这一批结束时）就把 `-wal` 写回数据库并截断为 0 字节');
+  });
+
+  it('§6 separates account passwords (next sweep) from proxy credentials (only after the old revision retires)', () => {
+    expect(text).not.toContain('修改、清除或删除环境后，旧值在下一次清理时');
+    expect(text).toContain('**账号密码**：修改、清除密码或删除环境后，旧值在下一次清理时（服务启动时与之后每小时）删除。');
+    expect(text).toContain('**代理用户名与密码**：旧值属于旧的代理版本，要等这个版本“退役”（retired）之后的下一次清理才删除。');
+    expect(text).toContain('部署新版本的那次发布仍保留旧节点');
+    expect(text).toContain('旧值一直留在 `secret_values` 中，通常也仍在本机资源服务提供的节点列表与 Surge 自己的资源缓存中（D10 之前的安装是 `sfe-nodes.list`），没有期限');
+  });
+
+  it('D10: no placeholder node file at init, resource port and token are not in install.json, the Surge resource cache is in the uninstall list, legacy sfe-nodes.list is removed by remerge', () => {
+    const install = text.slice(text.indexOf('## 2. 安装'), text.indexOf('## 3.'));
+    expect(install).toContain('本机资源服务的端口与读取令牌都不在 `install.json` 中');
+    const first = text.slice(text.indexOf('## 3.'), text.indexOf('## 4.'));
+    expect(first).toContain('不再创建 `sfe-nodes.list`');
+    expect(first).not.toContain('与占位资源文件');
+    expect(first).toContain('**D10 之前初始化的工作配置**');
+    expect(first).not.toContain('节点发布依赖 Surge 自动重新读取 `sfe-nodes.list`');
+    const s5 = text.slice(text.indexOf('## 5.'), text.indexOf('## 6.'));
+    expect(s5).toContain('**Surge 自己的资源缓存**');
+    expect(s5).toContain('TODO(P0)');
+    const s6 = text.slice(text.indexOf('## 6.'), text.indexOf('## 7.'));
+    expect(s6).toContain('**本机资源服务的读取令牌与它提供的节点列表**');
+  });
+
+  it('§7 stops the old service before the App is replaced and reuses old P0 runs with --raw-dir', () => {
+    const legacy = text.slice(text.indexOf('## 7. 从使用钥匙串的旧版本升级'));
+    // 替换 App 不重启已在运行的旧服务：先停止，否则旧服务继续应答新扩展
+    expect(legacy).toContain('**然后先在旧版本的菜单中「停止后台服务」，再安装新版本 App**');
+    expect(legacy).toContain('本机服务的填充应答格式不符');
+    // 只请求账号的页面不涉及密码项：旧服务照常填入账号，不能无条件说「一个字段也不填」；扩展照常显示「已填充账号」面板，
+    // 只是看不出旧服务仍在运行——不能说「不显示任何提示」
+    expect(legacy).toContain('只请求账号的页面（例如亚马逊登录的第一步只有邮箱或手机号）照常填入账号（页面照常显示「已填充账号」，看不出旧服务仍在运行）');
+    expect(legacy).not.toContain('不显示任何提示');
+    expect(legacy).not.toContain('登录页显示「本机服务的填充应答格式不符……」，一个字段也不填。');
+    // 第 4 步：新版本从不在改名的旧目录上启动、不会清理它——旧的「重新合并」备份中的 sfe-nodes.list 与 tmp/ 中遗留的候选副本含明文
+    // 买家代理凭据，改名之后立即删除
+    expect(legacy).toContain('**改名之后立即删除其中的明文买家代理凭据。**');
+    expect(legacy).toContain(`find "$OLD/backups" -name 'sfe-nodes.list' -type f -print -delete`);
+    expect(legacy).toContain('rm -rf "$OLD/tmp"');
+    expect(legacy.indexOf('**改名之后立即删除其中的明文买家代理凭据。**')).toBeLessThan(legacy.indexOf('5. **删除 Surge 配置目录中旧版本的文件**'));
+    // 第 4 步把 p0/ 一起改名：propose 默认找不到旧运行，要指向旧的证据目录
+    expect(legacy).toContain('--raw-dir "$HOME/Library/Application Support/SafariProfileSurge.keychain-old/p0"');
+    expect(legacy).toContain('`propose` 会重新测量当前上下文，与测量时不一致');
+  });
+});
+
+describe('docs/ARCHITECTURE.md §0.1 and apps/macos/README.md (Apple documentation check)', () => {
+  const arch = read('ARCHITECTURE.md');
+  const s0 = arch.slice(arch.indexOf('## 0.'), arch.indexOf('## 1.'));
+  const macReadme = readFileSync(new URL('../../../apps/macos/README.md', import.meta.url), 'utf8');
+
+  it('§0 summarises the Apple-doc architecture risks with quotes, URLs and the measurement that decides each', () => {
+    const risks = s0.slice(s0.indexOf('### 0.1 Apple 官方文档核对的架构风险'));
+    expect(risks.length).toBeGreaterThan(0);
+    for (const [title, measurement, url] of [
+      ['**签名：Personal Team 能否作为正式交付', '`extension_install_persistence`', 'https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles'],
+      ['**原生桥依赖 App Group 容器。**', '`native_bridge_ipc`', 'https://developer.apple.com/documentation/macos-release-notes/macos-15-release-notes'],
+      ['**默认场景可能拿不到场景 ID。**', '`native_profile_id`', 'https://developer.apple.com/documentation/safariservices/messaging-between-the-app-and-javascript-in-a-safari-web-extension'],
+      ['**进程归属与后台安全改进（BSI）。**', '`safari_process_attribution`', 'https://support.apple.com/guide/security/background-security-improvements-sec87fc038c2/web'],
+    ] as const) {
+      const at = risks.indexOf(title);
+      expect(at, title).toBeGreaterThanOrEqual(0);
+      const next = risks.indexOf('\n\n', risks.indexOf('由谁决定', at));
+      const item = risks.slice(at, next === -1 ? undefined : next);
+      expect(item, title).toContain(measurement);
+      expect(item, title).toContain(url);
+    }
+    expect(s0).toContain('**最低系统**：macOS 14、Safari 17.6 或更高');
+    expect(arch).not.toContain('拿到引用也读不到');
+    expect(arch).toContain('`comm` 是进程自己提供的 argv[0]');
+  });
+
+  it('apps/macos/README.md drops unsupported keychain claims and per-profile site grants', () => {
+    expect(macReadme).not.toContain('对文件型钥匙串在 macOS 14 上仍有效');
+    expect(macReadme).not.toContain('不能替用户给未来的场景自动授权');
+    expect(macReadme).not.toContain('（开发菜单）');
+    expect(macReadme).not.toContain('各场景（含默认场景）');
+    expect(macReadme).toContain('Safari 17.6 或更高');
+    expect(macReadme).toContain('**只需一次**');
+  });
+
+  it('apps/macos/README.md gives the INSTALL §7 upgrade order for a legacy keychain data directory', () => {
+    const note = macReadme.slice(macReadme.indexOf('- 用旧的钥匙串版本创建的数据目录不能直接沿用'), macReadme.indexOf('## 秘密与日志'));
+    expect(note).toContain('docs/INSTALL.md §7');
+    expect(note).toContain('**顺序不能颠倒**');
+    expect(note).not.toContain('需要重新初始化（重新导入）。旧版本留在钥匙串中的项');
+    // 先撤销旧入口，再停服务、退出 App、改名数据目录、删除旧 Surge 文件，最后重新初始化与导入
+    const order = ['进入普通模式', '临时规则', '停止后台服务', '退出', '改名保存', '新的数据目录', '日常-Safari环境.conf', '重新初始化', '重新导入'].map((k) => note.indexOf(k));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+});
+
+describe('docs/ARCHITECTURE.md §6.1, §6.3 step 14 and §6.4 (route end points)', () => {
+  const text = read('ARCHITECTURE.md');
+
+  it('the crash-superseded switch is an end point that may move SFE-ROUTE to REJECT, consistently in §6.1 and §6.3 step 14', () => {
+    expect(text).not.toContain('不回滚、不写入 Surge，记为 `SUPERSEDED`');
+    expect(text).toContain('不回滚、不改写入口，记为 `SUPERSEDED`（`superseded_by` 为接手的操作，步骤写明）；接手的操作已结束而 Safari 仍可能经未验证的出口时');
+    expect(text).toContain('崩溃恢复中被之后的操作取代的切换（接手的操作已结束时）');
+  });
+
+  it('waiting and re-test cancels and timeouts do not promise an unchanged route unconditionally; an end point that selected REJECT ends as needing attention', () => {
+    expect(text).not.toContain('只把检测结束为 FAILED，路由不变、不回滚');
+    expect(text).not.toContain('超时或取消只把本次重测结束为 FAILED，路由不变（');
+    expect(text).not.toContain('截止仍未到达 → 结束为 `READY_FOR_NEXT_OPEN`（下一步「切换到新版本」），路由不变。');
+    expect(text).toContain('都结束为 `BLOCKED_NEEDS_ATTENTION`（needs_attention；错误保留原来的代码，没有错误时 `UNKNOWN_STATE`）');
+    expect(text).toContain('或路由记在另一个未结束（排队、执行中、等待中）的操作名下——不论路由阶段');
+  });
+
+  it('retest cancel texts carry the §6.1 submitted-mismatch exception: a cancel behind a mismatching submitted result records the mismatch and stops orders and fill', () => {
+    expect(text).not.toContain('Safari 重测（含第 1 步复用时改为重测的激活，§6.4）只结束检测、通常路由不变。');
+    expect(text).toContain('Safari 重测的取消确认与说明（网页的取消确认与路由卡，弹窗的取消确认）还写明 §6.1 的例外：「若已提交的检测结果中的出口 IP 与预期出口不一致，取消照样记下出口不符，并停止自动打开订单与填充」');
+    expect(text).not.toContain('超时与取消同样只结束检测。');
+  });
+
+  it('rejectKept only follows a REJECT held without a kept activation snapshot; an unconfirmed rollback or an executor-guard hold on a transition keeps the snapshot, so a later failed switch restores the last confirmed node', () => {
+    expect(text).not.toContain('下面的共同结束点、回滚无法确认、普通模式失败或执行器兜底改选之后，它们保留使用中的环境、不留激活快照');
+    expect(text).toContain('又没有保留的激活快照（下面的共同结束点 `holdAtRouteEnd` 改选之后——含执行器兜底对不负责过渡中路由的操作的改选——以及没有激活快照时普通模式失败改选之后');
+    expect(text).toContain('回滚无法确认（下面两种情况）与执行器兜底对过渡中路由的改选（`settleAbandonedTransition`）之后激活快照保留');
+  });
+
+  it('only timer entries wait for their available time; crash recovery and a queued normal mode are claimable after a backward wall-clock step (§6.1)', () => {
+    expect(text).toContain('只有计时器条目（到达与实测截止时间，`resume_reason` 为 `arrival_timeout`、`verify_timeout`）要等可用时间到达');
+    expect(text).not.toContain('可用时间未到的条目也不能领取');
+    expect(text).toContain('服务重启时在第一次写入 Surge 之前中断、尚未恢复的同一类操作');
+  });
+
+  it('WAITING_ROUTE is only for the in-use environment: another environment\'s commit ends it as READY_FOR_NEXT_OPEN (§6.1, §6.3 step 4)', () => {
+    expect(text).toContain('`WAITING_ROUTE` 只针对使用中的环境：另一个环境的切换通过实测、成为使用中的环境时，提交事务同时结束停在 `WAITING_ROUTE` 的其他环境的发布');
+    expect(text).toContain('在另一个环境的切换受理之后才进入等待的，由该切换提交时结束');
+  });
+
+  it('rollback_needs_reverify is dropped once SFE-ROUTE is no longer the restored node (external re-select, unconfirmed publish rollback), in §6.2, §6.3 step 14 and §6.6', () => {
+    expect(text).toContain('SFE-ROUTE 的选择不再是恢复的原节点时');
+    expect(text).toContain('发现选择被外部修改（`external_selection_change`）时同样去掉它');
+    expect(text).toContain('同时去掉之前一次成功的激活回滚留下的 `rollback_needs_reverify`');
+  });
+});
+
+describe('the Surge-directory temp files of atomic writes are listed where secrets live and in the delete lists (ARCHITECTURE §2, INSTALL §5–§7)', () => {
+  it('lists `.<file>.sfe-tmp-<hex>` with the startup sweep and in the uninstall and upgrade delete steps', () => {
+    const arch = read('ARCHITECTURE.md');
+    const install = read('INSTALL.md');
+    const s2 = arch.slice(arch.indexOf('## 2.'), arch.indexOf('## 3.'));
+    expect(s2).toContain('`.<文件名>.sfe-tmp-<16 位十六进制>`');
+    expect(s2).toContain('sweepProfileTempFiles');
+    const s5 = install.slice(install.indexOf('## 5.'), install.indexOf('## 6.'));
+    const s6 = install.slice(install.indexOf('## 6.'), install.indexOf('## 7.'));
+    const s7 = install.slice(install.indexOf('## 7.'));
+    expect(s5).toContain('.sfe-tmp-<16 位十六进制>');
+    expect(s6).toContain('.sfe-tmp-<16 位十六进制>');
+    expect(s7).toContain('.sfe-tmp-<16 位十六进制>');
+  });
+});
+
+describe('persisted digests cannot verify replaced passwords offline (ARCHITECTURE §0 and §4, INSTALL §6, ACCEPTANCE)', () => {
+  it('describes the v2 request digest, the fingerprints cleared at retirement and migration 3 instead of "unchanged fingerprint rules"', () => {
+    const arch = read('ARCHITECTURE.md');
+    expect(arch).not.toContain('回收、指纹与 pepper 的规则不变');
+    expect(arch).not.toContain('`request_digest`（对秘密值做 HMAC 后的规范形式的带密钥摘要）');
+    expect(arch).toContain('`v2:<shape>:<进程标记>:<full>`');
+    expect(arch).toContain('代理版本退役时清除它的用户名与密码指纹');
+    expect(arch).toContain('`scrubbed-v1`');
+    expect(arch).toContain('服务重新启动之后，同一 `request_id`、不带秘密值、内容相同的请求按重复返回原操作；带秘密值');
+    expect(arch).not.toContain('服务重新启动之后，同一 `request_id`、秘密以外的内容相同的请求按重复返回原操作');
+    // 维护操作不保存预览摘要（迁移 4 删除升级前的）
+    expect(arch).toContain('操作中只保存进程内随机密钥下的核对值（`previewCheck`）');
+    expect(arch).toContain('迁移 4 删除升级前保存的 `previewDigest`');
+    expect(read('INSTALL.md')).toContain('数据库里也没有能用来离线核对猜测旧值的摘要');
+    expect(read('ACCEPTANCE.md')).toContain('不能用于离线核对已替换、已清扫的旧密码');
+    // 发布记录不保存工作配置的 pepper 派生摘要（迁移 6 清除升级前的）
+    expect(arch).toContain('工作配置一栏（`working_profile_digest`）从不保存工作配置的 pepper 派生摘要');
+    expect(arch).toContain('迁移 6 清除升级前保存的摘要');
+    expect(arch).not.toContain('资源与工作配置的带密钥摘要只用于变化检测');
+    expect(read('INSTALL.md')).toContain('发布记录不保存工作配置的摘要');
+    // 节点资源文件的归属记录只保留当前文件内容的摘要（回滚之后读回失败、删除环境、启动时）
+    expect(arch).toContain('发布回滚的写入成功即确认归属、删除意图的写前摘要');
+    expect(read('INSTALL.md')).toContain('节点资源文件的归属记录只保留当前文件内容的摘要');
+    expect(read('ACCEPTANCE.md')).toContain('发布记录只保存进程内随机密钥下的工作配置核对值');
+  });
+});

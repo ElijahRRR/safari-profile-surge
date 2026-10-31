@@ -1,0 +1,56 @@
+<!-- @dsCard height=288 -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>EasyQuick UI</title>
+<style>
+  html, body { margin:0; height:100%; }
+  body { min-height:0; background:var(--bg-page); color:var(--text-strong); font-family:var(--font-sans); overflow:hidden; }
+  .cover { position:relative; width:960px; height:288px; overflow:hidden; }
+  .art { position:absolute; top:0; left:480px; width:480px; height:288px; overflow:hidden; }
+  .art svg { display:block; width:480px; height:288px; }
+  .brand { fill:var(--primary-500); }
+  .brand-deep { fill:var(--primary-700); }
+  .tint { fill:var(--primary-100); }
+  .deep { fill:var(--dark-800); }
+  [data-theme="dark"] .deep { fill:var(--dark-700); }
+  .blk { rx:var(--radius-2xl); }
+  .tile { rx:var(--radius-xl); }
+  .words { position:absolute; left:var(--space-8); bottom:var(--space-8); max-width:440px; }
+  .name { margin:0; font-size:80px; line-height:.95; font-weight:700; letter-spacing:-.02em; color:var(--text-strong); }
+  .tag { margin:var(--space-3) 0 0 2px; font-size:14px; line-height:20px; color:var(--text-muted); }
+</style>
+</head>
+<body>
+<div class="cover">
+<div class="art" aria-hidden="true">
+<svg viewBox="0 0 480 288" width="480" height="288">
+<!--
+  blocks      primary-500 104×216 slab bled off the top (the brand, largest) · dark-800 160×232 bled off the bottom (dark-700 in the dark theme, so it never sinks into dark-950) · primary-100 200×104 bled off the right (the tint) · primary-700 104×120 under the slab — ≈30% of 960×288
+  arrangement a flush modular grid like the dashboard it dresses: 48px cells on a 56px pitch, blocks spanning cells, three edges bled
+  pattern     tiles cut by the radius tokens, some merged two-wide — the stat-icon squares and rounded-xl controls of a dense admin console; nine tiles, two of them cut into the deep slab like stat icons on a card
+  scales      cells space-12 (48) · gutters space-2 (8) · insets space-4 (16) · blocks rx radius-2xl · tiles rx radius-xl · name inset space-8
+-->
+<rect class="brand blk" x="16" y="-40" width="104" height="216" rx="16"/>
+<rect class="brand-deep blk" x="16" y="184" width="104" height="120" rx="16"/>
+<rect class="deep blk" x="128" y="72" width="160" height="232" rx="16"/>
+<rect class="tint blk" x="296" y="16" width="200" height="104" rx="16"/>
+<rect class="brand tile" x="144" y="88" width="48" height="48" rx="12"/>
+<rect class="tint tile" x="144" y="144" width="48" height="48" rx="12"/>
+<rect class="brand tile" x="296" y="128" width="104" height="48" rx="12"/>
+<rect class="tint tile" x="408" y="128" width="48" height="48" rx="12"/>
+<rect class="deep tile" x="296" y="184" width="48" height="48" rx="12"/>
+<rect class="brand tile" x="352" y="184" width="48" height="48" rx="12"/>
+<rect class="brand-deep tile" x="408" y="184" width="48" height="48" rx="12"/>
+<rect class="tint tile" x="296" y="240" width="48" height="64" rx="12"/>
+<rect class="deep tile" x="352" y="240" width="104" height="64" rx="12"/>
+</svg>
+</div>
+<div class="words">
+<h1 class="name">EasyQuick<br>UI</h1>
+<p class="tag">青绿与深蓝灰，为数据密集的后台而设计。</p>
+</div>
+</div>
+</body>
+</html>
