@@ -6,7 +6,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { ROUTE_GROUP_NAME } from '@sfe/contract';
 import { confirmNodeResource, serveCommittedGeneration } from '../../src/engine/node-resource.js';
 import { FAKE_REMOTE_ERRORS } from '../../src/surge/fake.js';
-import { matchAuditRecord, readNeedsRefresh, readTokenSuspect } from '../../src/resource/index.js';
+import { matchAuditRecord, readForgedNodes, readNeedsRefresh, readTokenSuspect } from '../../src/resource/index.js';
 import { nodeLine, resourceBody } from '../../src/surge/generate.js';
 import { PROFILE_A, PROFILE_B, WEB, bind, createEnv, createHarness, rid, verify, type Harness } from './harness.js';
 import { commitNodes, fetchResource, ourResource, serveAndFetch } from './resource-fixtures.js';
@@ -235,7 +235,7 @@ describe('node parameters', () => {
     expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
   });
 
-  test('regression: a drifted in-use node (same name, other server) on an active route converges by one system refresh; the warning clears and the route stays in attention', async () => {
+  test('regression (D11): a drifted in-use node (same name, other server) on an active route → the service holds REJECT before the one system refresh; the refresh clears the forged state, REJECT is kept and explicit re-use works', async () => {
     h = await createHarness({ nodeResource: 'loopback' });
     await h.idle();
     const { envId, nodeName } = await activeLoopbackEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
@@ -246,22 +246,57 @@ describe('node parameters', () => {
     expect((await h.fake.getPolicyDetail(nodeName)).server).toBe('192.0.2.99');
     const updates = h.fake.calls.updateExternalResource ?? 0;
     const selects = h.fake.calls.selectGroupPolicy ?? 0;
+    const kills = h.fake.calls.killConnection ?? 0;
+    // Surge 写入的先后：REJECT 保持必须在系统强制刷新恢复参数之前
+    const order: string[] = [];
+    const origSelect = h.fake.selectGroupPolicy.bind(h.fake);
+    const origUpdate = h.fake.updateExternalResource.bind(h.fake);
+    h.fake.selectGroupPolicy = async (group: string, policy: string) => {
+      order.push(`select:${policy}`);
+      return origSelect(group, policy);
+    };
+    h.fake.updateExternalResource = async (key: string) => {
+      order.push('update');
+      return origUpdate(key);
+    };
     await h.app.runPeriodicReconcile();
-    expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
+    expect(h.repos.routeState.get().warnings).toEqual(expect.arrayContaining(['node_resource_unverified', 'node_resource_forged']));
     expect(readNeedsRefresh(h.app.engine.kv)).toMatchObject({ reason: 'node_detail_mismatch' });
+    expect(readForgedNodes(h.app.engine.kv)).toMatchObject({ reasons: ['node_detail_mismatch'] });
     await h.idle();
-    // 一次单 key 更新恢复已提交的参数（同名参数变化立即生效、保持选择），从不改选
+    // 改选 REJECT 一次（执行器先领取 REJECT 保持），之后一次单 key 更新恢复已提交的参数；从不改回买家节点
+    expect(order).toEqual(['select:REJECT', 'update']);
     expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(1);
-    expect(h.fake.calls.selectGroupPolicy ?? 0).toBe(selects);
+    expect((h.fake.calls.selectGroupPolicy ?? 0) - selects).toBe(1);
+    expect(h.fake.calls.killConnection ?? 0).toBe(kills);
+    expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
     expect(await h.fake.getPolicyDetail(nodeName)).toMatchObject({ server: rev.host, port: rev.port });
-    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe(nodeName);
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
+    const hold = h.repos.operations.listRecent(50).filter((o) => o.kind === 'route.hold');
+    expect(hold).toHaveLength(1);
+    expect(hold[0]).toMatchObject({ phase: 'COMPLETED', status: 'succeeded', result: { rejectSelected: true, rejectCause: 'node_resource_forged' } });
+    // 经确认（逐节点参数完整）的读回清除伪造状态与两项警告；REJECT 与路由的需要处理保持（不自动恢复）
     const route = h.repos.routeState.get();
     expect(route.warnings).not.toContain('node_resource_unverified');
+    expect(route.warnings).not.toContain('node_resource_forged');
+    expect(route.warnings).toContain('buyer_exit_connections_unconfirmed');
+    expect(route).toMatchObject({ phase: 'attention', selectedNode: 'REJECT' });
+    expect(readForgedNodes(h.app.engine.kv)).toBeNull();
     expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
-    // 路由仍需要现有的重新核验流程才能回到已验证
-    expect(route.phase).toBe('attention');
+    expect((await h.app.ensureInControl()).ok).toBe(false);
     await h.app.runPeriodicReconcile();
-    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
+    await h.idle();
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
+    expect(h.repos.operations.listRecent(50).filter((o) => o.kind === 'route.hold')).toHaveLength(1);
+    // 用户显式重新使用环境：完整切换，实测之后回到已验证
+    h.fake.selectGroupPolicy = origSelect;
+    h.fake.updateExternalResource = origUpdate;
+    const act = await h.app.activate(envId, { request_id: rid('act') }, WEB);
+    await h.idle();
+    const r = await verify(h, PROFILE_A, act.operation_id);
+    expect(r.ok).toBe(true);
+    expect(h.repos.operations.get(act.operation_id)).toMatchObject({ phase: 'ACTIVE_VERIFIED' });
+    expect(h.repos.routeState.get()).toMatchObject({ phase: 'active_verified', selectedNode: nodeName });
   });
 });
 

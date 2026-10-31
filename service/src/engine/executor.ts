@@ -166,13 +166,17 @@ export class Executor {
    *    切换或 WAITING_ROUTE 的活动环境发布）先于发布、预检等其他操作：进入普通模式永远可用（§5.2），被它取代或把路由交给它的
    *    激活（handlers/route.ts yieldToQueuedNormal）之后它立即执行，不排在受理更早的无关操作之后，过渡中的路由（阻断、已写入的
    *    ACTIVE）不因此多停留。路由操作之间仍按受理顺序：排在它之前的激活开始执行时就会停下，把路由交给它。
+   * 3. 节点资源可能被伪造时的 REJECT 保持（route.hold，用户决定 D11）：在崩溃恢复之后、其他操作（发布、预检、激活等）之前——同一次
+   *    对账排入的系统强制刷新在它之后，Safari 先离开可能伪造的节点；有未完成的普通模式时排在路由操作（含普通模式）之后。它不是
+   *    路由操作（isRouteOperation 为 false）：只改选 SFE-ROUTE，从不碰入口或连接。
    */
   private claimPreference(): string[][] {
     const open = this.engine.repos.operations.listByStatus([...OPEN_STATUSES]);
     const recovering = open.filter((o) => o.status === 'running').map((o) => o.id);
     const normalOpen = open.some((o) => o.kind === 'route.normal' && (o.status === 'queued' || o.status === 'running'));
     const routeFirst = normalOpen ? open.filter((o) => o.status !== 'running' && isRouteOperation(o)).map((o) => o.id) : [];
-    return [recovering, routeFirst];
+    const holds = open.filter((o) => o.kind === 'route.hold' && o.status === 'queued').map((o) => o.id);
+    return normalOpen ? [recovering, routeFirst, holds] : [recovering, holds];
   }
 
   private async dispatchRow(row: OutboxRecord): Promise<void> {

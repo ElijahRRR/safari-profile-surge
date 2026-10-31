@@ -11,7 +11,8 @@
 //   读回，必须回到已提交版本。
 // 每一轮的观察追加到运行目录（可能相隔数天）；结论只由上下文与当前一致、准备与观察之间上下文没有变化（例如重启时装上了
 // Surge 或 macOS 更新）且变体核对相符的观察推出，其余列为需重测（缺少的变体为不完整）。任何观察中 Surge 载入了未提交的版本
-// 即不通过。工具从不重载配置、从不 update all，也不用重载补救缓存。
+// 即不通过；例外是 Surge 退出重开的 candidate 变体中，暂存的那一代候选在 Surge 启动时（进程启动时间之后）被下载，只记录为
+// 行为（用户决定 D12，classifyUncommitted）。工具从不重载配置、从不 update all，也不用重载补救缓存。
 
 import { CAPABILITY_CONTEXT_DEPS, CAPABILITY_CRITERIA, type CapabilityContext, type CapabilityContextField } from '@sfe/contract';
 import { contextDrift } from '../context.js';
@@ -20,7 +21,7 @@ import { readAuditRecords, readServerStatus, requestsBetween, serverRunning, typ
 import { check, writeResult, type CheckItem } from '../results.js';
 import { bootTime, surgeStartFingerprint, surgeStartedAtMs } from '../system.js';
 import { TEST_NODES } from '../test-profile.js';
-import { resourceFile } from '../deps.js';
+import { DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS, matchAuditRecord, resourceFile } from '../deps.js';
 import { testNodeLine } from '../test-profile.js';
 import { confirmWrites, measureContext, printResult, tryRead, type Ctx } from './common.js';
 import { errorClass, openLoopback, readbackText, type OpenedLoopback } from './loopback-ops.js';
@@ -86,8 +87,18 @@ export interface RestartObservation {
   downloads: { count: number; generations: number[]; statuses: Array<number | null> };
   /** 服务开始提供之后 Surge 自己是否下载（服务晚于 Surge 启动时）。 */
   fetchedAfterServerStart: boolean | null;
-  /** 是否载入了未提交的版本：读到候选（或其他未提交）这一代的完整下载，或成员不是已提交版本的子集。 */
+  /**
+   * 是否载入了未提交的版本（classifyUncommitted）：准备之后有未提交代的完整下载，或成员不是已提交版本的子集。例外（用户决定
+   * D12）：Surge 退出重开的 candidate 变体中，暂存的那一代候选在启动时被下载（只记录在 stagedCandidate 中）。
+   */
   loadedUncommitted: boolean | null;
+  /** candidate 变体中暂存候选的下载与载入（用户决定 D12，只记录）；其他变体为 null；D12 之前的记录没有这一项。 */
+  stagedCandidate?: StagedCandidateObservation | null;
+  /**
+   * 更新时间变了（不为空）而准备之后没有与它对应的完整下载记录（与产品下载核对相同的匹配）：产品会按无法解释的下载处理。
+   * 只记录，是否算作不通过待用户决定；旧记录没有。
+   */
+  updatedAtUnexplained?: boolean;
   /** 重启之后（Surge 不再更新时）缓存不存在时下载失败是否可见（classifyEmptyCache；旧记录没有，按 unknown）。 */
   emptyCache?: EmptyCacheError;
   recovered: boolean | null;
@@ -121,6 +132,101 @@ const EMPTY_CACHE_TEXT: Record<EmptyCacheError, string> = {
   hidden: '缓存不存在，只报告未就绪而本服务答复过失败的下载（下载错误被隐藏）',
   unknown: '缓存不存在时下载失败是否可见无法判断',
 };
+
+/**
+ * 更新时间变了而没有对应的完整下载记录（例如 Surge 重开不下载也改写更新时间）：产品的下载核对按 unexplained_fetch 处理（用户决定
+ * D11 之下还会改选 REJECT）。只记录，是否算作这项能力不通过待用户决定，工具不判定。
+ */
+const UNEXPLAINED_UPDATED_AT_TEXT =
+  '更新时间变了而准备之后没有与它对应的完整下载记录：产品会按无法解释的下载处理（令牌可疑，路由不是普通模式时改选 REJECT）；是否算作这项能力不通过待用户决定，工具只记录';
+
+/** candidate 变体中暂存候选的观察（用户决定 D12：Surge 退出重开、启动时下载了这个候选只记录为行为）。 */
+export interface StagedCandidateObservation {
+  /** 准备之后 Surge 完整下载过暂存的那一代候选（测试资源服务的审计记录）。 */
+  downloaded: boolean;
+  /** 重启后读回的成员恰好是候选的名称（成员读不到为 null；没有下载为 false）。 */
+  loaded: boolean | null;
+  /** 这些下载是否都在重启（Surge 进程启动；Mac 重启按系统启动）之后；没有下载或读不到重启的时刻为 null（无法判断下载时间）。 */
+  atLaunch: boolean | null;
+  /** 属于用户决定 D12 的例外：Surge 退出重开、这些下载都在启动时。只记录为行为，不算载入未提交的版本。 */
+  exempt: boolean;
+  /** 读到的重启时刻不晚于准备（主进程没有在准备之后重开，例如只是辅助进程变了）：无法说下载在启动时（atLaunch 为 null）。 */
+  restartBeforePrepare?: true;
+}
+
+function sameNames(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((n) => b.includes(n)) && b.every((n) => a.includes(n));
+}
+
+/**
+ * 重启之后是否载入了未提交的版本（纯函数）。未提交 = 准备之后不是已提交代的完整下载，或成员（REJECT 之后）不在允许的名称中。
+ * 唯一的例外（用户决定 D12）：Surge 退出重开的 candidate 变体中，Surge 主进程在准备之后重新启动（restartAt 晚于 preparedAt），
+ * 暂存的那一代候选的下载都在它启动之后（restartAt 之后）——这些下载不算，候选的名称也算允许的名称，只记录在 stagedCandidate 中。
+ * 其余都算：暂存的候选在重启之前（例如准备之后 Surge 的定时刷新）、读不到重启时刻或重启时刻不晚于准备时被下载、Mac 重启的
+ * candidate 变体中的下载（重启后服务只提供已提交版本）、其他未提交代的下载、其他变体中的任何未提交下载。restartAt 由引擎运行
+ * 时长换算（可能比真实的启动晚约 1 秒）时按 restartToleranceMs 放宽比较。成员恰好是候选的名称（不同于已提交版本）而没有候选的
+ * 完整下载记录时无法判断（null）。
+ */
+export function classifyUncommitted(input: {
+  kind: RestartKind;
+  variant: RestartVariant;
+  committed: { generation: number; names: readonly string[] };
+  candidate: { generation: number; names: readonly string[] } | null;
+  /** 准备之后（写出时间不早于准备时刻）的审计记录。 */
+  records: ReadonlyArray<{ generation: number; complete: boolean; at: Date }>;
+  /** 重启后立即读回的组成员（首个是 REJECT）；读不到为 null。 */
+  members: readonly string[] | null;
+  /** 重启的时刻（毫秒；Surge 退出重开按 Surge 进程启动时间，读不到时引擎启动时间；Mac 重启按系统启动时间）；读不到为 null。 */
+  restartAt: number | null;
+  /** 准备的时刻（毫秒）：重启时刻不晚于它时，重启不是准备之后的，下载不能说在启动时。 */
+  preparedAt: number;
+  /** restartAt 的取整容差（毫秒）：由引擎运行时长换算时可能比真实的启动晚，比较时放宽；按进程启动时间时为 0。 */
+  restartToleranceMs?: number;
+}): { loadedUncommitted: boolean | null; stagedCandidate: StagedCandidateObservation | null } {
+  const candidate = input.variant === 'candidate' ? input.candidate : null;
+  const uncommitted = input.records.filter((r) => r.complete && r.generation !== input.committed.generation);
+  const staged = candidate === null ? [] : uncommitted.filter((r) => r.generation === candidate.generation);
+  const restartAt = input.restartAt;
+  const tolerance = Math.max(0, input.restartToleranceMs ?? 0);
+  // 主进程在准备之后重新启动（按容差放宽之后仍晚于准备）才可能有「启动时」的下载
+  const restartBeforePrepare = restartAt !== null && restartAt - tolerance <= input.preparedAt;
+  const atLaunch =
+    staged.length === 0 || restartAt === null || restartBeforePrepare ? null : staged.every((r) => r.at.getTime() >= restartAt - tolerance);
+  const exempt = input.kind === 'surge' && atLaunch === true;
+  const others = exempt ? uncommitted.filter((r) => r.generation !== candidate!.generation) : uncommitted;
+  const rest = input.members?.slice(1) ?? null;
+  const allowed = new Set([...input.committed.names, ...(exempt ? candidate!.names : [])]);
+  const outside = rest === null ? null : !rest.every((n) => allowed.has(n));
+  const isCandidateSet = rest !== null && candidate !== null && sameNames(rest, candidate.names);
+  let loadedUncommitted: boolean | null = others.length > 0 || outside === true ? true : outside;
+  // 成员恰好是候选（不同于已提交版本）而没有候选的完整下载：Surge 持有的不是已提交的集合，又没有本服务完整的 200
+  if (loadedUncommitted === false && candidate !== null && staged.length === 0 && isCandidateSet && !sameNames(candidate.names, input.committed.names)) {
+    loadedUncommitted = null;
+  }
+  const stagedCandidate: StagedCandidateObservation | null =
+    candidate === null
+      ? null
+      : {
+          downloaded: staged.length > 0,
+          loaded: rest === null ? null : staged.length > 0 && isCandidateSet,
+          atLaunch,
+          exempt,
+          ...(staged.length > 0 && restartBeforePrepare ? { restartBeforePrepare: true as const } : {}),
+        };
+  return { loadedUncommitted, stagedCandidate };
+}
+
+/** 暂存候选的一句说明（观察备注与结论的检查项共用）。 */
+export function stagedCandidateText(kind: RestartKind, s: StagedCandidateObservation): string {
+  if (!s.downloaded) return '已暂存候选：Surge 没有下载暂存的候选';
+  if (s.exempt) return `已暂存候选：Surge 启动时下载了暂存的候选${s.loaded === true ? '并载入' : s.loaded === null ? '（成员读不到，是否载入无法判断）' : '（没有载入）'}（只记录为行为，用户决定 D12）`;
+  if (kind === 'mac') return '已暂存候选：Surge 下载了暂存的候选，Mac 重启不属于用户决定 D12 的例外（重启后服务只提供已提交版本），按载入了未提交的版本';
+  if (s.atLaunch === null && s.restartBeforePrepare === true) {
+    return '已暂存候选：Surge 下载了暂存的候选，但读到的 Surge 启动时间不晚于准备（主进程没有在准备之后重开），无法判断下载是否在启动时，不属于用户决定 D12 的例外，按载入了未提交的版本；准备之后退出并重新打开 Surge，在新的运行目录重测';
+  }
+  if (s.atLaunch === null) return '已暂存候选：Surge 下载了暂存的候选，但读不到重启的时刻，无法判断下载时间（是否在启动时），不属于用户决定 D12 的例外，按载入了未提交的版本；在能读到 Surge 启动时间时，在新的运行目录重测';
+  return '已暂存候选：暂存的候选在 Surge 重开之前已被下载（例如准备之后 Surge 的定时刷新），不属于用户决定 D12 的例外，按载入了未提交的版本；准备之后尽快退出重开 Surge（不要等到它的定时刷新），在新的运行目录重测';
+}
 
 /** 必须观察到的变体（每种重启都要有：服务先于或晚于启动、不可用、只返回 503；Surge 重开要两种先后都有）。 */
 export const REQUIRED: ReadonlyArray<{ kind: RestartKind; variants: readonly RestartVariant[]; label: string }> = [
@@ -193,21 +299,54 @@ export function restartChecks(observations: readonly RestartObservation[], curre
     );
   });
   const loaded = observations.filter((o) => o.loadedUncommitted === true);
-  const candidateMeasured = counted.some((o) => o.kind === 'surge' && o.variant === 'candidate');
+  const candidates = counted.filter((o) => o.kind === 'surge' && o.variant === 'candidate');
+  const candidateMeasured = candidates.length > 0;
   const notCounted = judged.filter((j) => !j.counted).length;
+  // 不通过的观察为什么不通过：D12 之前的 candidate 记录没有区分暂存的候选（失败即关闭）；暂存候选不属于例外时写明原因
+  const loadedWhy = (o: RestartObservation): string => {
+    if (o.variant !== 'candidate') return '';
+    if (o.stagedCandidate === undefined) return '（D12 之前的记录无法区分是否只是暂存的候选，按不通过；在新的运行目录重测）';
+    if (o.stagedCandidate === null) return '';
+    if (o.stagedCandidate.exempt) return '（暂存候选之外的未提交内容；暂存候选在启动时被下载只记录为行为）';
+    return o.stagedCandidate.downloaded ? `（${stagedCandidateText(o.kind, o.stagedCandidate)}）` : '';
+  };
   checks.push(
     check(
-      candidateMeasured ? '任何情况下都不会载入本服务未提交的版本（含已暂存候选）' : '任何情况下都不会载入本服务未提交的版本',
+      candidateMeasured ? '任何情况下都不会载入本服务未提交的版本（含已暂存候选：Surge 重开启动时下载暂存的候选只记录为行为，D12）' : '任何情况下都不会载入本服务未提交的版本',
       loaded.length > 0 ? false : counted.length === 0 ? null : counted.some((o) => o.loadedUncommitted === null) ? null : true,
       loaded.length > 0
-        ? loaded.map((o) => `${observationLabel(o)}${counted.includes(o) ? '' : '（不计入的观察：上下文不同或变体不符，仍按不通过）'}`).join('；')
+        ? loaded.map((o) => `${observationLabel(o)}${counted.includes(o) ? '' : '（不计入的观察：上下文不同或变体不符，仍按不通过）'}${loadedWhy(o)}`).join('；')
         : [
             `${counted.length} 次可计入的观察`,
-            ...(candidateMeasured ? [] : ['已暂存候选（可选）未测']),
+            ...(candidateMeasured
+              ? candidates.map((o) => `${observationLabel(o)}（${o.at}）：${o.stagedCandidate ? stagedCandidateText(o.kind, o.stagedCandidate) : 'D12 之前的记录，没有区分暂存的候选'}`)
+              : ['已暂存候选（可选）未测']),
             ...(notCounted > 0 ? [`${notCounted} 次没有计入（上下文不同或变体不符，需重测）`] : []),
           ].join('；'),
     ),
   );
+  // 暂存候选的例外（D12）只豁免「载入」：Surge 重开的 candidate 一轮（计入的，或豁免了载入的——不计入的同样）仍要确认重开过、
+  // 服务恢复后经一次单 key 更新与读回回到已提交版本；任何一轮没有回到即不通过，计入的一轮无法判断时不完整。没有这样的一轮时
+  // 不列这一项（候选是可选变体）
+  const candidateRounds = observations.filter((o) => o.kind === 'surge' && o.variant === 'candidate' && (counted.includes(o) || o.stagedCandidate?.exempt === true));
+  const unrecovered = candidateRounds.filter((o) => o.recovered === false || o.restarted === false);
+  if (candidateRounds.length > 0) {
+    const unknown = candidateRounds.filter((o) => counted.includes(o) && (o.recovered === null || o.restarted === null));
+    const why = (o: RestartObservation): string => (o.restarted === false ? '没有确认 Surge 已重开' : '服务恢复后没有回到已提交版本');
+    checks.push(
+      check(
+        '已暂存候选（Surge 重开）：服务恢复后经一次单 key 更新与读回回到已提交版本（启动时下载暂存的候选只豁免载入，D12）',
+        unrecovered.length > 0 ? false : unknown.length > 0 ? null : candidates.length > 0 ? true : null,
+        unrecovered.length > 0
+          ? unrecovered.map((o) => `${observationLabel(o)}（${o.at}）${counted.includes(o) ? '' : '（不计入的观察，仍按不通过）'}：${why(o)}`).join('；')
+          : unknown.length > 0
+            ? `无法判断：${unknown.map((o) => `${observationLabel(o)}（${o.at}）${o.restarted === null ? '没有确认重开' : '恢复结果无法判断'}`).join('；')}`
+            : candidates.length > 0
+              ? `${candidates.length} 次可计入的已暂存候选一轮都回到了已提交版本`
+              : '已暂存候选一轮没有计入（上下文不同或变体不符，需重测）',
+      ),
+    );
+  }
   // 下载核对中“未就绪”例外的前提：任何观察（包括不计入的）看到下载错误被藏在未就绪之后即不通过；计入的观察中看到过缓存不存在时
   // 失败可见、或缓存从来都保留（例外在重开时不适用）才通过；其余无法判断（不完整）
   const hidden = observations.filter((o) => o.emptyCache === 'hidden');
@@ -248,6 +387,8 @@ export interface VariantFacts {
 
 /** ps lstart 只到秒：在这一秒之内的先后无法判断。 */
 const START_RESOLUTION_MS = 1000;
+/** 由引擎运行时长换算的启动时刻与真实启动的最大偏差（与上面判断重启时允许的 2 秒相同）。 */
+const ENGINE_START_TOLERANCE_MS = 2000;
 
 /**
  * 变体是否与运行目录记下的事实相符（纯函数）。Surge 退出重开由工具设置测试资源服务的场景（stop、restartUninitialized、候选），
@@ -424,18 +565,32 @@ async function after(ctx: Ctx, kind: RestartKind): Promise<ExitCode> {
   // 立即读回（恢复之前）
   await lb.ensureKey();
   const first = await lb.snapshot();
-  const surgeStartedAt = (await surgeStartedAtMs(exec)) ?? engineStartedAt?.getTime() ?? null;
+  const processStartedAt = await surgeStartedAtMs(exec);
+  const surgeStartedAt = processStartedAt ?? engineStartedAt?.getTime() ?? null;
+  // 读不到进程启动时间而用引擎运行时长换算时，启动时刻可能比真实的晚约 1 秒（取整与请求延迟）：判断「启动时」的下载时放宽
+  const restartToleranceMs = kind === 'surge' && processStartedAt === null && surgeStartedAt !== null ? ENGINE_START_TOLERANCE_MS : 0;
   // 重启的时刻（Mac 重启按系统启动时间，Surge 退出重开按 Surge 的启动时间）：之前的请求（例如准备之后、重启之前 Surge 的定时
   // 刷新）不算重启之后的下载；读不到时从准备开始算
   const restartAt = kind === 'mac' ? (boot !== null ? boot * 1000 : null) : surgeStartedAt;
   const since = Math.max(tPrep, restartAt ?? tPrep);
   const downloads = requestsBetween(dir, since, now().getTime() + 1000, 'server');
   const records = readAuditRecords(dir).filter((r) => r.at.getTime() >= tPrep);
-  const uncommittedRecords = records.filter((r) => r.complete && r.generation !== pending.committed.generation);
-  const rest = first.members?.slice(1) ?? null;
-  const notSubset = rest === null ? null : !rest.every((n) => pending.committed.names.includes(n));
-  const candidateLoaded = pending.candidate !== null && rest !== null && rest.length === pending.candidate.names.length && pending.candidate.names.every((n) => rest.includes(n)) && uncommittedRecords.some((r) => r.generation === pending.candidate!.generation);
-  const loadedUncommitted = uncommittedRecords.length > 0 || candidateLoaded ? true : notSubset;
+  // 未提交内容的载入；candidate 变体中暂存的那一代在 Surge 启动时被下载只记录为行为（用户决定 D12）
+  const { loadedUncommitted, stagedCandidate } = classifyUncommitted({
+    kind,
+    variant: pending.variant,
+    committed: pending.committed,
+    candidate: pending.candidate,
+    records,
+    members: first.members,
+    restartAt,
+    preparedAt: tPrep,
+    restartToleranceMs,
+  });
+  const updatedAtChanged = first.updatedAt === null && pending.baseline.updatedAt === null ? false : (first.updatedAt?.toISOString() ?? null) !== pending.baseline.updatedAt;
+  // 更新时间变了而准备之后没有与它对应的完整下载（与产品下载核对相同的匹配）：产品按无法解释的下载处理（只记录）
+  const updatedAtUnexplained = updatedAtChanged && first.updatedAt !== null && matchAuditRecord(records, first.updatedAt, DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS, 1) === null;
+  if (updatedAtUnexplained) out.warn(UNEXPLAINED_UPDATED_AT_TEXT);
 
   // 变体核对（Mac 重启时资源服务由操作员手动启动）：服务是否在运行、启动先后与收到的请求，在工具提示启动服务之前读
   const serverAtStart = readServerStatus(dir);
@@ -484,11 +639,13 @@ async function after(ctx: Ctx, kind: RestartKind): Promise<ExitCode> {
     members: first.members ? [...first.members] : null,
     selection: first.selection,
     error: errorClass(first.error),
-    updatedAtChanged: first.updatedAt === null && pending.baseline.updatedAt === null ? false : (first.updatedAt?.toISOString() ?? null) !== pending.baseline.updatedAt,
+    updatedAtChanged,
     updating: first.updating,
     downloads: { count: downloads.length, generations: [...new Set(downloads.map((d) => d.generation).filter((g): g is number => g !== null))], statuses: downloads.map((d) => d.status) },
     fetchedAfterServerStart,
     loadedUncommitted,
+    stagedCandidate,
+    updatedAtUnexplained,
     emptyCache,
     recovered: recovery.assessment.ok,
     note: '',
@@ -498,8 +655,10 @@ async function after(ctx: Ctx, kind: RestartKind): Promise<ExitCode> {
     ...(kind === 'mac' ? [`变体核对：${variantCheck.ok === true ? '相符' : variantCheck.ok === false ? '不符' : '无法核对'}（${variantCheck.note}）`] : []),
     ...(contextChanged.length > 0 ? [`重启前后上下文不同（${contextChanged.join('、')}）`] : []),
     `重启后成员 ${obs.members?.join('、') ?? '读不到'}、选择 ${obs.selection ?? '读不到'}、错误 ${obs.error}、更新时间${obs.updatedAtChanged ? '变了' : '没变'}`,
+    ...(updatedAtUnexplained ? [UNEXPLAINED_UPDATED_AT_TEXT] : []),
     `重启后测试资源服务收到 ${obs.downloads.count} 个请求${obs.downloads.generations.length > 0 ? `（第 ${obs.downloads.generations.join('、')} 代）` : ''}`,
     ...(fetchedAfterServerStart === null ? [] : [`服务开始提供之后 Surge ${fetchedAfterServerStart ? '自己下载了' : '没有自己下载'}`]),
+    ...(stagedCandidate ? [stagedCandidateText(kind, stagedCandidate)] : []),
     loadedUncommitted ? '载入了未提交的版本' : loadedUncommitted === false ? '没有载入未提交的版本' : '无法判断是否载入了未提交的版本',
     EMPTY_CACHE_TEXT[emptyCache],
     `恢复：${readbackText(recovery.assessment)}`,
@@ -508,6 +667,7 @@ async function after(ctx: Ctx, kind: RestartKind): Promise<ExitCode> {
   dir.writeJson(OBSERVATIONS_FILE, observations);
   dir.writeJson(PENDING_FILE, { ...pending, version: 0, consumedAt: now().toISOString() });
   out.heading(`${kind === 'mac' ? 'Mac 重启' : 'Surge 退出重开'} · ${VARIANT_TEXT[pending.variant]}`);
+  if (stagedCandidate?.downloaded) out.line(stagedCandidateText(kind, stagedCandidate));
   out.line(obs.note);
 
   // 结论按现在的上下文：只有上下文一致的观察计入（可能相隔数天的各轮之间装上了更新时，旧的观察列为需重测）

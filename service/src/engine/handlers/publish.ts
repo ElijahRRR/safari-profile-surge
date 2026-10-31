@@ -71,6 +71,7 @@ import { capabilityError, profileMatches, readRuntimeSample, surgeRestartedBetwe
 import { readbackCovered } from '../capabilities.js';
 import { checkCandidate } from '../candidate.js';
 import {
+  FORGED_WARNING,
   NODE_RESOURCE_WARNING,
   applyNodeResourceConfirmation,
   auditForPublish,
@@ -80,10 +81,15 @@ import {
   enqueueSystemRefreshAfterCrash,
   findOurResource,
   flagUnexplainedFetch,
+  markForgedNodes,
+  maybeEnqueueForgedHold,
   membersMatchCommitted,
+  nodeResourceHeld,
   raiseNodeResourceWarning,
   type NodeResourceConfirmed,
 } from '../node-resource.js';
+import { routeNotConfirmedNormal } from '../../domain/route-rules.js';
+import { readForgedNodes } from '../../resource/index.js';
 import { checkSegments } from '../ownership.js';
 import { entryKey, generateResource, manifestMatches, type ResourceEntry } from '../resource.js';
 import { hmacHex } from '../../util/keyed-digest.js';
@@ -581,11 +587,11 @@ function fallbackToReject(selectionBefore: string | null, reads: ReadonlyArray<O
 
 /**
  * 回滚之后改回原选择：只在有回落证据（fallbackToReject）、原选择仍是成员、当前选择是 REJECT、且路由没有 node_resource_unverified
- * 时；从不改选别的买家出口。返回是否改回。
+ * （也没有节点可能被伪造的标记，用户决定 D11）时；从不改选别的买家出口。返回是否改回。
  */
 async function reselectAfterFallback(engine: Engine, selectionBefore: string | null, evidence: boolean): Promise<boolean> {
   if (!evidence || selectionBefore === null) return false;
-  if (engine.repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) return false;
+  if (nodeResourceHeld(engine, engine.repos.routeState.get())) return false;
   const sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
   if (sel === selectionBefore || sel === null || sel.toUpperCase() !== 'REJECT') return false;
   const members = await engine.surge.getGroupMembers(ROUTE_GROUP_NAME);
@@ -837,9 +843,9 @@ async function publishBatch(engine: Engine, batch: Batch): Promise<void> {
   // 5. 没有修改的捷径：没有待发布与待移除、清单与已提交版本相同、Surge 中正是已提交版本且没有资源错误、没有刷新要求
   const pending = batch.units.filter((u) => u.outcome === null);
   const needsRefreshBefore = readNeedsRefresh(engine.kv);
-  // 节点资源未确认的警告只由经确认的读回清除：警告在时不走捷径（门槛已保证工作配置指向本服务当前地址、令牌不可疑）
-  const forced =
-    needsRefreshBefore !== null || batch.ops.some((o) => payloadOf(o).forceRefresh === true) || repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING);
+  // 节点资源未确认的警告（或节点可能被伪造的标记）只由经确认的读回清除：在时不走捷径（门槛已保证工作配置指向本服务当前地址、
+  // 令牌不可疑）
+  const forced = needsRefreshBefore !== null || batch.ops.some((o) => payloadOf(o).forceRefresh === true) || nodeResourceHeld(engine, repos.routeState.get());
   const beforeSnap = snapshotOf(before);
   const surgeClean = resourceErrorOf(beforeSnap) === null && membersMatchCommitted(before.members ?? [], plan.committedNames);
   if (pending.length === 0 && plan.removed.length === 0 && plan.unchanged && surgeClean && !forced) {
@@ -1214,10 +1220,23 @@ async function deploy(engine: Engine, ctx: DeployContext): Promise<void> {
       });
       const failed = [...assessment.failed, ...extra.failed];
       for (const f of [...after.failed, ...afterRepeat.failed]) if (!failed.includes(f)) failed.push(f);
-      // Surge 载入了本服务没有提供过的内容：读取令牌可能已泄露（与审计相同的处理）
+      // Surge 载入了本服务没有提供过的内容：读取令牌可能已泄露、节点可能被伪造（与审计相同的处理，用户决定 D11）
       if (fetchUnexplained(engine, host, beforeSnap, afterSnap)) {
         if (!failed.includes('unexplained_fetch')) failed.push('unexplained_fetch');
         flagUnexplainedFetch(engine);
+      }
+      // SFE-ROUTE 选中的、已提交的节点参数与其版本不同（节点名按版本区分：候选从不改变已提交节点名的服务器、端口或前置）而路由不是
+      // 经确认的普通模式：节点可能被伪造（用户决定 D11）——不等回滚读回或之后的对账（回滚可能被跳过），立即记下并排入 REJECT 保持
+      const sb = ctx.selectionBefore;
+      if (
+        sb !== null &&
+        sb.toUpperCase() !== 'REJECT' &&
+        failed.includes(`detail:${sb}`) &&
+        (committedNodeNames(engine)?.includes(sb) ?? false) &&
+        routeNotConfirmedNormal(engine.repos.routeState.get())
+      ) {
+        markForgedNodes(engine, 'node_detail_mismatch');
+        raiseNodeResourceWarning(engine, ['node_detail_mismatch']);
       }
       for (const n of extra.notes) stepAll(engine, batch, n);
       if (update.kind !== 'downloaded') {
@@ -1334,7 +1353,7 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
   });
   emitBatch(engine, batch);
   let confirmed = false;
-  let confirmation: { matchedSeq: number; snapshot: { updatedAt: Date; error: string | null }; clearNeedsRefresh: boolean; failuresBaseline: number } | null = null;
+  let confirmation: { matchedSeq: number; snapshot: { updatedAt: Date; error: string | null }; clearNeedsRefresh: boolean; detailsChecked: boolean; failuresBaseline: number } | null = null;
   let reason: string | null = null;
   let reselected = false;
   /** 确认读回中读到的 SFE-ROUTE 选择（没有确认时不用）。 */
@@ -1403,11 +1422,18 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
                 matchedSeq: matched.seq,
                 snapshot: { updatedAt: u, error: snapshotOf(r1).error },
                 clearNeedsRefresh: assessment.level === 'full' || readbackCovered(engine.capabilityViews(), unchecked),
+                detailsChecked: assessment.level === 'full',
                 failuresBaseline,
               };
               observedSelection = r1.selection;
               confirmed = true;
             } else {
+              // 按已提交版本的读回中 SFE-ROUTE 选中节点的参数与其版本不同、路由不是经确认的普通模式：节点可能被伪造（用户决定 D11）；
+              // 下面的回滚无法确认路径另带 node_resource_forged 并排入 REJECT 保持
+              const sel = r1.selection;
+              if (sel !== null && sel.toUpperCase() !== 'REJECT' && assessment.failed.includes(`detail:${sel}`) && routeNotConfirmedNormal(repos.routeState.get())) {
+                markForgedNodes(engine, 'node_detail_mismatch');
+              }
               reason = `读回不一致（${[...new Set([...assessment.failed, ...readFailed])].join('、')}）`;
             }
           }
@@ -1488,6 +1514,8 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
     const r = repos.routeState.get();
     const kept = r.warnings.filter((w) => w !== 'rollback_needs_reverify');
     const warnings = new Set([...kept, NODE_RESOURCE_WARNING]);
+    // 节点可能被伪造（用户决定 D11，例如回滚读回中选中节点的参数与已提交版本不同）：另带 node_resource_forged，之后排入 REJECT 保持
+    if (readForgedNodes(kv) !== null) warnings.add(FORGED_WARNING);
     if (r.entryMode !== 'NORMAL') {
       warnings.add('external_selection_change');
       repos.routeState.update({ phase: 'attention', warnings: [...warnings] });
@@ -1509,6 +1537,7 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
   }
   finishOps(engine, batch, { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', error: body, step: body.message });
   engine.emit({ route: true, surge: true, environments: route.activeEnvironmentId ? [route.activeEnvironmentId] : [] });
+  maybeEnqueueForgedHold(engine);
 }
 
 /** D10 的四项回环资源补测（发布门槛中这四项的说明合并为一句）。 */
@@ -1571,7 +1600,14 @@ function commitDeployment(engine: Engine, batch: Batch, s: CommitInput): void {
     });
     const gen = commitCandidatePointer(engine.kv);
     if (gen !== s.deployment.generation) throw new SfeError('INTERNAL', '发布失败：提交的候选代数不一致');
-    const result = confirmNodeResource(engine, { generation: gen, matchedSeq: s.matchedSeq, snapshot: s.snapshot, clearNeedsRefresh: s.acceptable, failuresBaseline: s.failuresBaseline });
+    const result = confirmNodeResource(engine, {
+      generation: gen,
+      matchedSeq: s.matchedSeq,
+      snapshot: s.snapshot,
+      clearNeedsRefresh: s.acceptable,
+      detailsChecked: s.readback.level === 'full',
+      failuresBaseline: s.failuresBaseline,
+    });
     for (const u of batch.units) {
       if (u.outcome !== null) continue;
       const k = entryKey(u.target.environmentId, u.target.proxyRevision);

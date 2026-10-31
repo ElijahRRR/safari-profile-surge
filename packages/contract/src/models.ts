@@ -333,9 +333,17 @@ export interface OperationView extends OperationSummary {
     /**
      * 路由操作结束时服务失败即关闭地把 SFE-ROUTE 改选 REJECT（docs/ARCHITECTURE.md §6.3 第 14 步的结束点、普通模式）：true 为读回
      * 确认，false 为改选或读回失败。有这一项就说明路由已改变（Safari 经本应用出口的新连接被拒绝、订单与填充停止），界面不能说
-     * 「路由未改变」或「不受影响」；结束点改选时操作结束为 BLOCKED_NEEDS_ATTENTION。
+     * 「路由未改变」或「不受影响」；结束点改选时操作结束为 BLOCKED_NEEDS_ATTENTION。例外：节点资源可能被伪造时服务排入的
+     * REJECT 保持（route.hold，用户决定 D11）读回确认时结束为 COMPLETED/succeeded（它本身就是这次改选），未能确认时为
+     * FAILED；界面按 rejectSelected 与 rejectCause 写明，不按状态。
      */
     rejectSelected?: boolean;
+    /** 改选 REJECT 的原因：节点资源可能被伪造（用户决定 D11；route.hold 与因此改选的结束点）。 */
+    rejectCause?: 'node_resource_forged';
+    /** route.hold 开始时已不需要改选（伪造状态已清除、入口是经确认的普通模式，或 SFE-ROUTE 已是 REJECT）：没有读写 SFE-ROUTE。 */
+    forgedHold?: 'not_needed';
+    /** route.hold 排入或执行时节点资源可能被伪造的原因（代码，不含令牌、地址或端口）。 */
+    forgedReasons?: ResourceForgedReason[];
     /**
      * Safari 重测已开始等待检测（开始时路由是使用中且已验证的），结束时路由已不在已验证的使用中状态（等待期间对账发现 Surge
      * 重启、出站模式改变、选择被外部修改等；不是这次重测改变的）：结束时路由记录的警告。有这一项时界面不能说「路由与之前的检测
@@ -375,7 +383,15 @@ export type RouteWarning =
    * 成员或参数与已提交版本不同、令牌可能泄露。活动路由转为需要处理并停止复用、填充、自动打开与激活；普通模式与 REJECT
    * 保持从不因它被拒绝。只在一次核对一致的发布或回滚读回之后清除。
    */
-  | 'node_resource_unverified';
+  | 'node_resource_unverified'
+  /**
+   * Surge 中的节点可能是伪造的（用户决定 D11）：下载核对发现 Surge 报告了本服务没有提供过的下载（unexplained_fetch，读取令牌同时
+   * 视为可能泄露），或路由不是普通模式时 SFE-ROUTE 选中节点的服务器、端口或前置与其版本不同（node_detail_mismatch），或这一
+   * 记录（令牌可疑记录）无法读取。路由不是经确认的普通模式、Surge 可连接且是固定工作配置时，服务由执行器把 SFE-ROUTE 改选
+   * REJECT（操作 route.hold；是否已改选以 SFE-ROUTE 的当前选择与该操作为准），不会自动恢复。总是与 node_resource_unverified
+   * 一起出现，只在一次经确认的发布或回滚读回之后与它一起清除（参数不同的原因要求逐节点参数的完整读回）。
+   */
+  | 'node_resource_forged';
 
 export interface RouteStateView {
   routeEpoch: number;
@@ -413,6 +429,16 @@ export interface ActivationSnapshot {
   previousSafariProbeId: string | null;
   previousRouteEpoch: number;
   previousPhase: RoutePhase;
+  /**
+   * 这次（或沿用这一快照的之前一次）切换进行中，服务因节点资源可能被伪造把 SFE-ROUTE 改选了 REJECT（用户决定 D11，route.hold）：
+   * 之后的回滚不恢复切换前的买家节点（即使伪造状态已经清除），改选 REJECT 并保持阻断。早先的记录没有这一项。
+   */
+  forgedHeld?: true;
+  /**
+   * 这一次切换等待期间，服务的 REJECT 保持（route.hold）把 SFE-ROUTE 改选 REJECT 并读回确认（forgedHeld 不论改选是否成功都记）：
+   * 只用于回滚说明「等待期间已改选 REJECT」；新的切换沿用快照时去掉。
+   */
+  forgedHoldSelected?: true;
 }
 
 /** 对非当前环境绑定场景返回的受限路由信息。 */
@@ -537,12 +563,24 @@ export interface PrecedenceIssue {
  */
 export type NodeResourceState = 'serving' | 'not_listening' | 'token_unavailable' | 'legacy_line' | 'not_installed';
 
+/**
+ * Surge 中的节点可能是伪造的原因（用户决定 D11）：unexplained_fetch 为 Surge 报告了本服务没有提供过的下载；node_detail_mismatch
+ * 为路由不是普通模式时 SFE-ROUTE 选中节点的服务器、端口或前置与其版本不同；unreadable 为这一记录（或令牌可疑记录）无法读取，
+ * 按可能被伪造处理。
+ */
+export type ResourceForgedReason = 'unexplained_fetch' | 'node_detail_mismatch' | 'unreadable';
+
 export interface NodeResourceStatusView {
   state: NodeResourceState;
   /** 读取令牌可能已泄露（出现无法解释的下载或资源错误、端口被他人占用）：只能经重新合并的“轮换资源地址”清除。 */
   tokenSuspect: boolean;
   /** Surge 可能载入了未提交的版本或与已提交版本不一致：下一次发布单 key 更新并读回。 */
   needsRefresh: boolean;
+  /**
+   * Surge 中的节点可能是伪造的（用户决定 D11；与路由警告 node_resource_forged 同一来源 resource:forgedNodes）：只在经确认的发布或
+   * 回滚读回之后清除。
+   */
+  forgedNodes: boolean;
 }
 
 export interface SurgeStatusView {

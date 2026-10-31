@@ -13,6 +13,7 @@ import {
   formatRelative,
   isExpired,
   policyConsequence,
+  rejectHeldText,
   retestRouteLeftText,
   rollbackText,
 } from '../src/shared/text';
@@ -57,6 +58,25 @@ describe('interface text', () => {
     expect(text).toContain('自动打开订单与填充已停止');
     // 不是使路由离开已验证状态的警告不列为原因
     expect(text).not.toContain(WARNING_TEXT.probe_expired);
+  });
+
+  it('D11: node_resource_forged has text that does not claim the selection already changed, counts as route-left, and REJECT-hold texts by cause', () => {
+    expect(WARNING_TEXT.node_resource_forged).toContain('Surge 中的节点可能是伪造的');
+    expect(WARNING_TEXT.node_resource_forged).toContain('尝试把 SFE-ROUTE 改选 REJECT');
+    expect(WARNING_TEXT.node_resource_forged).not.toContain('已把 SFE-ROUTE 改选');
+    expect(ROUTE_LEFT_WARNINGS).toContain('node_resource_forged');
+    const ok = rejectHeldText(true, 'node_resource_forged');
+    expect(ok).toContain('服务已把 SFE-ROUTE 改选 REJECT');
+    expect(ok).toContain('不会自动恢复');
+    expect(ok).not.toContain('使用中环境已验证的出口');
+    const fail = rejectHeldText(false, 'node_resource_forged');
+    expect(fail).toContain('未能把 SFE-ROUTE 改选 REJECT');
+    expect(fail).toContain('请立即进入普通模式');
+    expect(rejectHeldText(true)).toContain('使用中环境已验证的出口');
+    for (const t of [ok, fail, WARNING_TEXT.node_resource_forged]) {
+      expect(t).not.toContain('用户决定');
+      expect(t).not.toMatch(/[!！]/);
+    }
   });
 
   it('never claims a save is already syncing: publishing may stay pending', () => {

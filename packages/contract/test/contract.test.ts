@@ -35,6 +35,11 @@ import {
   ROUTE_GROUP_NAME,
   nodeResourceUrl,
   parseNodeResourceUrl,
+  OPERATION_KINDS,
+  type ActivationSnapshot,
+  type NodeResourceStatusView,
+  type OperationView,
+  type ResourceForgedReason,
   type RouteWarning,
   type LoginFillResponse,
   type LoginFillServiceResponse,
@@ -200,6 +205,30 @@ describe('phases, errors, routes', () => {
     expect(httpStatusFor('RESOURCE_SERVER_UNAVAILABLE')).toBe(503);
     const warning: RouteWarning = 'node_resource_unverified';
     expect(warning).toBe('node_resource_unverified');
+  });
+
+  test('D11: forged node content — warning, route.hold kind, status flag, rejectCause and snapshot flag', () => {
+    const forged: RouteWarning = 'node_resource_forged';
+    expect(forged).toBe('node_resource_forged');
+    expect(OPERATION_KINDS).toContain('route.hold');
+    const status: NodeResourceStatusView = { state: 'serving', tokenSuspect: true, needsRefresh: true, forgedNodes: true };
+    expect(status.forgedNodes).toBe(true);
+    const reasons: ResourceForgedReason[] = ['unexplained_fetch', 'node_detail_mismatch', 'unreadable'];
+    const result: NonNullable<OperationView['result']> = { rejectSelected: true, rejectCause: 'node_resource_forged', forgedReasons: reasons };
+    expect(result.rejectCause).toBe('node_resource_forged');
+    const notNeeded: NonNullable<OperationView['result']> = { forgedHold: 'not_needed' };
+    expect(notNeeded.forgedHold).toBe('not_needed');
+    const snapshot: ActivationSnapshot = {
+      previousEnvironmentId: null,
+      previousProxyRevision: null,
+      previousSelectedNode: null,
+      previousEntryMode: 'NORMAL',
+      previousSafariProbeId: null,
+      previousRouteEpoch: 0,
+      previousPhase: 'idle',
+      forgedHeld: true,
+    };
+    expect(snapshot.forgedHeld).toBe(true);
   });
 
   test('errors serialize without extra fields', () => {

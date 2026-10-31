@@ -151,7 +151,7 @@ describe('startup order', () => {
     expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
     // 状态视图：不含令牌、地址或端口
     const snapshot = h.app.views.snapshot('0.0.0-test', false);
-    expect(snapshot.surge.nodeResource).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: true });
+    expect(snapshot.surge.nodeResource).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: true, forgedNodes: false });
     const json = JSON.stringify(snapshot);
     expect(json).not.toContain(token);
     expect(json).not.toContain(url);
@@ -666,7 +666,7 @@ describe('listen', () => {
     expect(readTokenSuspect(engine.kv)).toMatchObject({ reason: 'port_in_use' });
     expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
     // 警告总是带着刷新要求（网页据此提供“重新同步节点资源”）
-    expect(h.app.views.snapshot('0.0.0-test', false).surge.nodeResource).toEqual({ state: 'not_listening', tokenSuspect: true, needsRefresh: true });
+    expect(h.app.views.snapshot('0.0.0-test', false).surge.nodeResource).toEqual({ state: 'not_listening', tokenSuspect: true, needsRefresh: true, forgedNodes: false });
     h.binderRegistry.delete(h.resourcePort);
     await h.app.runPeriodicReconcile();
     expect(engine.resource!.listening()).toBe(true);

@@ -426,6 +426,17 @@ export function buildEnvironmentView(d: EnvironmentViewData, ctx: EnvironmentVie
     const primary: NextAction = { kind: 'activate', message: '路由状态需要处理：请重新使用此环境或进入普通模式' };
     nextActions = [primary, ...nextActions.filter((a) => a.kind !== 'probe_safari' && a.kind !== 'open_orders' && a.kind !== 'activate')];
   }
+  // 节点资源可能被伪造（用户决定 D11）：使用中的环境要在节点资源经确认的同步之后才能重新使用；SFE-ROUTE 的选择按路由记录如实写明
+  if (isActive && ctx.route.warnings.includes('node_resource_forged')) {
+    const primary: NextAction = {
+      kind: 'activate',
+      message:
+        ctx.route.selectedNode === 'REJECT'
+          ? 'Surge 中的节点可能是伪造的，SFE-ROUTE 当前是 REJECT：节点资源经确认的同步之后才能重新使用此环境（读取令牌可能已泄露时先进入普通模式，再在维护中更换本机资源地址）；也可以进入普通模式'
+          : 'Surge 中的节点可能是伪造的，SFE-ROUTE 尚未确认改选 REJECT（改选失败或尚未执行）：请立即进入普通模式；节点资源经确认的同步之后再重新使用此环境',
+    };
+    nextActions = [primary, ...nextActions.filter((a) => a.kind !== 'probe_safari' && a.kind !== 'open_orders' && a.kind !== 'activate')];
+  }
 
   const last = d.operations[0] ?? null;
   const lastError: ApiErrorBody | null =

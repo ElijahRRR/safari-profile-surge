@@ -4,12 +4,14 @@
 //   resource:needsRefresh  Surge 可能载入了未提交的版本、或与已提交版本不一致：下一次发布必须单 key 更新并读回；
 //   resource:audit         最近 64 次令牌正确的 200 响应（写出前记一次、写完再记一次）与下一个序号；404 从不保存；
 //   resource:auditState    上次审计确认过的更新时间、资源错误、已核对到的记录序号与审计窗口的起点；
-//   resource:tokenSuspect  读取令牌可能已泄露：只能由重新合并的“轮换资源地址”清除。
-// 读取时校验形状：指针形状不对按不存在处理（启动时重新初始化）；needsRefresh 与 tokenSuspect 只要有这一行、而值无法解析、
+//   resource:tokenSuspect  读取令牌可能已泄露：只能由重新合并的“轮换资源地址”清除；
+//   resource:forgedNodes   Surge 中的节点可能是伪造的（用户决定 D11）及其原因：只由经确认的发布或回滚读回清除（node-resource.ts
+//                          confirmNodeResource），存在时服务把 SFE-ROUTE 改选 REJECT（路由不是经确认的普通模式时）。
+// 读取时校验形状：指针形状不对按不存在处理（启动时重新初始化）；needsRefresh、tokenSuspect 与 forgedNodes 只要有这一行、而值无法解析、
 // 是 JSON null 或形状不对，就按“已设置”处理（fail closed，包括 D10 之前发布写下的 {operationId} 刷新记录）。写入 null
 // 时删除键。事务由调用方负责。
 
-import { SfeError } from '@sfe/contract';
+import { SfeError, type ResourceForgedReason } from '@sfe/contract';
 import type { EngineKv } from '../engine/kv.js';
 import type { ResourceAuditState } from './audit.js';
 import { RESOURCE_AUDIT_LIMIT, type ResourceAuditRecord } from './host.js';
@@ -20,6 +22,7 @@ export const RESOURCE_KV_KEYS = Object.freeze({
   audit: 'resource:audit',
   auditState: 'resource:auditState',
   tokenSuspect: 'resource:tokenSuspect',
+  forgedNodes: 'resource:forgedNodes',
 } as const);
 
 export interface ResourceServedPointer {
@@ -35,6 +38,14 @@ export interface ResourceNeedsRefresh {
 export interface ResourceTokenSuspect {
   since: string;
   reason: string;
+}
+
+export type { ResourceForgedReason };
+
+/** Surge 中的节点可能是伪造的（用户决定 D11）：最早记下的时间与原因（按记下的先后，不重复）。 */
+export interface ResourceForgedNodes {
+  since: string;
+  reasons: ResourceForgedReason[];
 }
 
 /** 持久的审计记录：at 为 ISO 时间。 */
@@ -54,6 +65,10 @@ export interface ResourceAuditLog {
 export const UNREADABLE_NEEDS_REFRESH: Readonly<ResourceNeedsRefresh> = Object.freeze({ generation: 0, reason: 'unreadable' });
 /** tokenSuspect 存储值无法识别时的读取结果（fail closed：仍按可能泄露处理）。 */
 export const UNREADABLE_TOKEN_SUSPECT: Readonly<ResourceTokenSuspect> = Object.freeze({ since: '1970-01-01T00:00:00.000Z', reason: 'unreadable' });
+/** forgedNodes 存储值无法识别时的读取结果（fail closed：仍按可能被伪造处理，原因 unreadable）。 */
+export const UNREADABLE_FORGED_NODES: Readonly<ResourceForgedNodes> = Object.freeze({ since: '1970-01-01T00:00:00.000Z', reasons: Object.freeze(['unreadable']) as unknown as ResourceForgedReason[] });
+
+const FORGED_REASONS: readonly ResourceForgedReason[] = ['unexplained_fetch', 'node_detail_mismatch', 'unreadable'];
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isGeneration = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
@@ -220,4 +235,31 @@ export function writeTokenSuspect(kv: EngineKv, value: ResourceTokenSuspect | nu
   }
   if (!isIso(value.since) || !isText(value.reason)) throw invalid('令牌可疑记录');
   kv.set(RESOURCE_KV_KEYS.tokenSuspect, { since: value.since, reason: value.reason });
+}
+
+// ---------- resource:forgedNodes ----------
+
+const isForgedReason = (v: unknown): v is ResourceForgedReason => typeof v === 'string' && (FORGED_REASONS as readonly string[]).includes(v);
+
+/**
+ * 没有这一行时为 null；有这一行而值无法识别（含无法解析、JSON null、原因不认识或为空）时为 UNREADABLE_FORGED_NODES 的副本（仍按
+ * 可能被伪造处理）。
+ */
+export function readForgedNodes(kv: EngineKv): ResourceForgedNodes | null {
+  const v = kv.get<unknown>(RESOURCE_KV_KEYS.forgedNodes);
+  if (isObject(v) && isIso(v.since) && Array.isArray(v.reasons) && v.reasons.length > 0 && v.reasons.every(isForgedReason)) {
+    return { since: v.since, reasons: [...new Set(v.reasons as ResourceForgedReason[])] };
+  }
+  if (v === null && !kv.has(RESOURCE_KV_KEYS.forgedNodes)) return null;
+  return { since: UNREADABLE_FORGED_NODES.since, reasons: [...UNREADABLE_FORGED_NODES.reasons] };
+}
+
+/** 写入（null 删除）。原因必须非空、都是已知的代码。 */
+export function writeForgedNodes(kv: EngineKv, value: ResourceForgedNodes | null): void {
+  if (value === null) {
+    kv.delete(RESOURCE_KV_KEYS.forgedNodes);
+    return;
+  }
+  if (!isIso(value.since) || !Array.isArray(value.reasons) || value.reasons.length === 0 || !value.reasons.every(isForgedReason)) throw invalid('节点可能被伪造的记录');
+  kv.set(RESOURCE_KV_KEYS.forgedNodes, { since: value.since, reasons: [...new Set(value.reasons)] });
 }

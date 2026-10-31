@@ -8,7 +8,7 @@ import { isPublishKind, payloadOf } from '../domain/operations.js';
 import type { Engine } from './context.js';
 import { runDelete, runFrontVerify, runPreflightOp, runUnbind } from './handlers/misc.js';
 import { recoverPublish, runPublish } from './handlers/publish.js';
-import { recoverRoute, resumeRoute, runActivation, runNormal, runProbeSafari, settleAbandonedTransition } from './handlers/route.js';
+import { recoverRoute, resumeRoute, runActivation, runForgedHold, runNormal, runProbeSafari, settleAbandonedTransition } from './handlers/route.js';
 import { runInit, runRemerge } from './maintenance.js';
 
 export interface DispatchHooks {
@@ -58,6 +58,9 @@ function createInnerDispatcher(engine: Engine, hooks: DispatchHooks) {
       case 'route.normal':
         await runNormal(engine, op);
         return;
+      case 'route.hold':
+        await runForgedHold(engine, op);
+        return;
       case 'environment.delete':
         await runDelete(engine, op);
         return;
@@ -84,6 +87,11 @@ function createInnerDispatcher(engine: Engine, hooks: DispatchHooks) {
 
 async function recover(engine: Engine, op: OperationRecord): Promise<void> {
   engine.log('warn', 'operation.recover', { operationId: op.id, kind: op.kind, phase: op.phase });
+  // 节点资源可能被伪造时的 REJECT 保持（用户决定 D11）：按记下的改选意图重新判断（读回 REJECT 即本操作的改选），不重放
+  if (op.kind === 'route.hold') {
+    await runForgedHold(engine, op, { recovering: true });
+    return;
+  }
   // 路由类操作，以及已部署后继续进入切换的活动环境发布（route 参数只在部署完成后写入）
   if (op.kind === 'route.activate' || op.kind === 'probe.safari' || op.kind === 'route.normal' || (isPublishKind(op.kind) && payloadOf(op).route)) {
     await recoverRoute(engine, op);

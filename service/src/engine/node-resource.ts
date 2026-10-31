@@ -9,7 +9,11 @@
 // - 系统强制刷新：工作配置的节点组定义恰好是本服务当前地址、需要刷新、没有进行中的发布、也没有尚未确认的系统刷新时排入一次
 //   （门槛不满足时停泊，无害）；之后只有经确认的读回才重新允许自动排入，从不自动反复更新（系统刷新本身因崩溃中断时，同一
 //   崩溃链最多自动重排一次）。
-// 从不写 Surge：唯一的写入是排入的发布操作（由执行器按发布门槛执行）。令牌、地址与端口从不进入日志、错误、操作说明或视图。
+// - 节点资源可能被伪造（用户决定 D11）：无法解释的下载（unexplained_fetch）或路由不是普通模式时 SFE-ROUTE 选中节点的参数与其
+//   版本不同（node_detail_mismatch）在确定它的同一事务中另记 resource:forgedNodes（markForgedNodes）；标记在时两项警告
+//   （node_resource_unverified、node_resource_forged）都在，任何买家节点都不算已验证的出口，并排入一次 REJECT 保持（route.hold，
+//   maybeEnqueueForgedHold；由执行器改选）。只由经确认的读回清除（confirmNodeResource），从不自动恢复买家节点。
+// 从不写 Surge：唯一的写入是排入的发布与 REJECT 保持操作（由执行器执行）。令牌、地址与端口从不进入日志、错误、操作说明或视图。
 
 import { randomInt } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -23,10 +27,12 @@ import {
   parseNodeResourceUrl,
   type ApiErrorBody,
   type NodeResourceStatusView,
+  type ResourceForgedReason,
   type RouteWarning,
 } from '@sfe/contract';
-import type { OperationRecord } from '../db/index.js';
-import { OPEN_STATUSES, PUBLISH_KINDS } from '../domain/operations.js';
+import type { OperationRecord, RouteStateRecord } from '../db/index.js';
+import { OPEN_STATUSES, PUBLISH_KINDS, payloadOf } from '../domain/operations.js';
+import { routeNotConfirmedNormal } from '../domain/route-rules.js';
 import {
   RESOURCE_KV_KEYS,
   auditResource,
@@ -34,6 +40,7 @@ import {
   loadResourceToken,
   readAuditLog,
   readAuditState,
+  readForgedNodes,
   readNeedsRefresh,
   readServedPointer,
   readTokenSuspect,
@@ -44,6 +51,7 @@ import {
   servedFailureCount,
   tcpBinder,
   writeAuditState,
+  writeForgedNodes,
   writeNeedsRefresh,
   writeServedPointer,
   writeTokenSuspect,
@@ -57,9 +65,22 @@ import type { SurgeExternalResource } from '../ports.js';
 import { isLegacyNodeGroupLine, loopbackGroupBlockLines, resourceBody } from '../surge/generate.js';
 import { findManagedBlock, findSections, parseProfile } from '../surge/profile.js';
 import type { Engine, NodeResourceLine } from './context.js';
+import type { ReconcileKind } from './reconcile.js';
 import { regenerateResourceBody } from './resource.js';
 
 export const NODE_RESOURCE_WARNING: RouteWarning = 'node_resource_unverified';
+/** Surge 中的节点可能是伪造的（用户决定 D11）：与 resource:forgedNodes 同时存在，总是与 NODE_RESOURCE_WARNING 一起。 */
+export const FORGED_WARNING: RouteWarning = 'node_resource_forged';
+
+/**
+ * 节点资源可能被伪造时最近一次失败的 REJECT 保持（engine.kv，用户决定 D11）：{ lastFailedAt: ISO, unreachable: boolean }。Surge
+ * 可连接而改选失败（读回不一致等）之后 5 分钟内周期对账不再自动排入；Surge 不可连接或不是工作配置时不限。改选确认或伪造状态清除时
+ * 删除。
+ */
+export const FORGED_HOLD_KEY = 'resource:forgedHold';
+
+/** 可连接而改选失败之后周期对账不再自动排入 REJECT 保持的间隔。 */
+export const FORGED_HOLD_RETRY_MS = 5 * 60_000;
 
 /** 首次选定端口时最多试这么多次（每次随机选一个范围内的端口）。 */
 export const RESOURCE_PORT_PICK_TRIES = 10;
@@ -394,14 +415,87 @@ function markTokenSuspect(engine: Engine, reason: string): void {
   engine.resource?.setRefuseToken(true);
 }
 
+// ---------- 节点资源可能被伪造（用户决定 D11） ----------
+
+/**
+ * 记下 Surge 中的节点可能是伪造的（resource:forgedNodes）：在调用方的事务中调用（嵌套为 SAVEPOINT），已有这一原因时什么也不做；
+ * 新的原因追加在后、最早的时间保留。只记原因代码（不含令牌、地址或端口）。只由经确认的读回清除（confirmNodeResource）。
+ */
+export function markForgedNodes(engine: Engine, reason: ResourceForgedReason): void {
+  const added = engine.repos.tx(() => {
+    const cur = readForgedNodes(engine.kv);
+    if (cur !== null && cur.reasons.includes(reason)) return false;
+    writeForgedNodes(engine.kv, { since: cur?.since ?? engine.nowIso(), reasons: [...(cur?.reasons ?? []), reason] });
+    return true;
+  });
+  if (added) engine.log('warn', 'resource.forged_nodes', { reason });
+}
+
+const FORGED_REASON_TEXT: Record<ResourceForgedReason, string> = {
+  unexplained_fetch: 'Surge 报告了本服务没有提供过的下载，端口曾被他人占用时 Surge 可能载入了伪造的列表',
+  node_detail_mismatch: 'SFE-ROUTE 选中节点的服务器、端口或前置与其版本不同',
+  unreadable: '节点资源可能被伪造的记录（或令牌可疑记录）无法读取，按可能被伪造处理',
+};
+
+/** 伪造原因的说明（只含原因，不含令牌、地址或端口）。 */
+export function forgedReasonText(reasons: readonly ResourceForgedReason[]): string {
+  return [...new Set(reasons)].map((r) => FORGED_REASON_TEXT[r]).join('、');
+}
+
+/** 清除“节点可能被伪造”这一状态的途径（按此刻是否令牌可疑）。 */
+export function forgedRemedyText(engine: Engine): string {
+  return readTokenSuspect(engine.kv) !== null
+    ? '读取令牌可能已泄露：先进入普通模式，再在维护中重新合并并选择「更换本机资源地址」；之后的节点资源发布经读回确认才清除这一状态，再重新使用环境'
+    : '需要一次经读回确认的节点资源发布才清除这一状态（需要时服务自动排入，发布门槛不满足时保持待部署；也可以在发布页「重新同步节点资源」），之后重新使用环境';
+}
+
+/**
+ * 节点资源未确认或可能被伪造（路由警告，或伪造标记在而警告还没有加上——例如启动对账出错）：切换、提交、回滚恢复与发布回落的
+ * 改回都据此拒绝或保持 REJECT。
+ */
+export function nodeResourceHeld(engine: Engine, route: Pick<RouteStateRecord, 'warnings'>): boolean {
+  return route.warnings.includes(NODE_RESOURCE_WARNING) || readForgedNodes(engine.kv) !== null;
+}
+
+/**
+ * 重建路由警告时要保留的节点资源警告（提交 ACTIVE、回滚、普通模式完成）：路由已带的，以及伪造标记在时两项都带（只由经确认的
+ * 读回清除）。
+ */
+export function nodeResourceStickyWarnings(engine: Engine, warnings: readonly RouteWarning[]): RouteWarning[] {
+  const forged = readForgedNodes(engine.kv) !== null;
+  const out: RouteWarning[] = [];
+  if (forged || warnings.includes(NODE_RESOURCE_WARNING)) out.push(NODE_RESOURCE_WARNING);
+  if (forged || warnings.includes(FORGED_WARNING)) out.push(FORGED_WARNING);
+  return out;
+}
+
+/**
+ * D11 之前的安装：令牌可疑记录的原因是无法解释的下载（或记录无法读取）而没有伪造标记时补记（启动第一步，纯数据库事务，在读取令牌
+ * 之前——令牌读不到时之后的审计都不会进行）。失败只记日志。
+ */
+function backfillForgedNodes(engine: Engine): void {
+  try {
+    engine.repos.tx(() => {
+      const ts = readTokenSuspect(engine.kv);
+      if (ts === null || readForgedNodes(engine.kv) !== null) return;
+      if (ts.reason === 'unexplained_fetch') markForgedNodes(engine, 'unexplained_fetch');
+      else if (ts.reason === 'unreadable') markForgedNodes(engine, 'unreadable');
+    });
+  } catch (err) {
+    engine.log('error', 'resource.forged_backfill_failed', { error: err instanceof Error ? err.name : 'unknown' });
+  }
+}
+
 /**
  * 发布读回发现 Surge 报告的更新时间没有对应本服务的任何一次完整 200（与审计的无法解释的下载相同，handlers/publish.ts）：
- * Surge 载入了不是本服务提供的内容——令牌可能已泄露（tokenSuspect，资源服务对令牌正确的请求也答 404）、需要刷新、设
- * node_resource_unverified。
+ * Surge 载入了不是本服务提供的内容——令牌可能已泄露（tokenSuspect，资源服务对令牌正确的请求也答 404）、节点可能被伪造
+ * （resource:forgedNodes，用户决定 D11）、需要刷新、设 node_resource_unverified 与 node_resource_forged 并排入 REJECT 保持。
  */
 export function flagUnexplainedFetch(engine: Engine): void {
   engine.repos.tx(() => {
     markTokenSuspect(engine, 'unexplained_fetch');
+    // Surge 可能载入了伪造的列表（用户决定 D11）
+    markForgedNodes(engine, 'unexplained_fetch');
     requireRefresh(engine, readServedPointer(engine.kv)?.committed.generation ?? 0, 'unexplained_fetch');
   });
   raiseNodeResourceWarning(engine, ['unexplained_fetch']);
@@ -591,6 +685,8 @@ export async function ensureListeningBeforeInit(engine: Engine): Promise<boolean
  * 保持从不依赖本机资源服务。
  */
 export async function startResourceService(engine: Engine): Promise<void> {
+  // 0. D11 之前的令牌可疑记录（无法解释的下载）补记伪造标记：先于任何可能提前返回的步骤
+  backfillForgedNodes(engine);
   const runtime = engine.resourceRuntime;
   runtime.lastAudit = null;
   runtime.stopped = false;
@@ -635,7 +731,7 @@ export async function startResourceService(engine: Engine): Promise<void> {
   // 5. 令牌可疑：令牌正确的请求也答 404
   if (readTokenSuspect(engine.kv) !== null) host.setRefuseToken(true);
   // 重启之前设下、还没有经确认的读回清除的警告（例如令牌一度读不到、现在已恢复）：补上刷新要求，让它有清除的途径
-  if (engine.repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) requireRefreshForWarning(engine, ['unverified_at_startup']);
+  if (nodeResourceHeld(engine, engine.repos.routeState.get())) requireRefreshForWarning(engine, ['unverified_at_startup']);
   // 6. 监听之前审计：本服务停止期间占用端口的一方可能已让 Surge 下载了它提供的列表，或留下了本服务无法解释的资源错误
   let audited = false;
   if (line === 'ours') audited = await startupAudit(engine, host);
@@ -768,7 +864,8 @@ function servingSinceLastAudit(engine: Engine, host: ResourceHost): boolean {
 /**
  * 审计一次（auditResource）：审计状态这一行存在而无法读取（损坏或缺少 windowSeq）时不审计，按无法解释处理——设 needsRefresh、
  * 返回 audit_state_unreadable，但不设 tokenSuspect，状态只在经确认的读回之后重新初始化；没有这一行时按快照初始化（只记日志）。
- * 无法解释的下载或错误设 tokenSuspect 与 needsRefresh。之后记下本次审计时的监听状态与失败计数。
+ * 无法解释的下载或错误设 tokenSuspect 与 needsRefresh，无法解释的下载另记伪造标记（用户决定 D11）。之后记下本次审计时的监听状态
+ * 与失败计数。
  */
 function runAudit(
   engine: Engine,
@@ -803,6 +900,8 @@ function runAudit(
   if (result.verdict === 'unexplained_fetch' || result.verdict === 'unexplained_error') {
     engine.repos.tx(() => {
       markTokenSuspect(engine, result.verdict);
+      // 无法解释的下载：占用端口的一方可能用读取令牌提供了伪造的列表（用户决定 D11）；无法解释的资源错误只是令牌可疑
+      if (result.verdict === 'unexplained_fetch') markForgedNodes(engine, 'unexplained_fetch');
       requireRefresh(engine, readServedPointer(kv)?.committed.generation ?? 0, result.verdict);
     });
     noteIssue(result.verdict, () => engine.log('warn', 'resource.audit_unexplained', { verdict: result.verdict }));
@@ -854,8 +953,13 @@ export interface NodeResourceCheckOptions {
   /** Surge 可达、当前配置是工作配置时才读 Surge（审计、成员与节点参数）。 */
   reachable: boolean;
   onWorkingProfile: boolean | null;
-  /** 要核对参数的节点（对账：路由不是普通模式时的 SFE-ROUTE 选择；切换前：目标节点）；null/undefined 不核对。 */
+  /** 要核对参数的节点（对账：路由不是经确认的普通模式时的 SFE-ROUTE 选择；切换前：目标节点）；null/undefined 不核对。 */
   detailNode?: string | null;
+  /**
+   * detailNode 就是 SFE-ROUTE 当前的选择（对账，或切换前的目标恰好是路由记录的选择）而路由不是经确认的普通模式：参数不同即节点
+   * 可能被伪造（用户决定 D11，记 resource:forgedNodes）。其余情况参数不同只设警告。
+   */
+  detailNodeIsSelection?: boolean;
 }
 
 /**
@@ -950,6 +1054,8 @@ async function checkOurResource(engine: Engine, host: ResourceHost, opts: NodeRe
   const node = opts.detailNode;
   if (typeof node === 'string' && node.toUpperCase() !== 'REJECT' && node !== EMPTY_PLACEHOLDER_NODE && (await nodeDetailMismatch(engine, node))) {
     out.reasons.push('node_detail_mismatch');
+    // SFE-ROUTE 选中的节点参数与其版本不同（用户决定 D11）：Safari 可能经伪造的节点发出
+    if (opts.detailNodeIsSelection === true) markForgedNodes(engine, 'node_detail_mismatch');
   }
 }
 
@@ -975,8 +1081,9 @@ async function nodeDetailMismatch(engine: Engine, nodeName: string): Promise<boo
 // ---------- 警告 ----------
 
 /**
- * 在对账之外设 node_resource_unverified（切换前检查、启动时撤回的候选版本）：使用中的已验证路由改为 attention（与对账相同）；
- * 过渡中的路由由负责它的操作处理。返回是否新设。
+ * 在对账之外设 node_resource_unverified（切换前检查、启动时撤回的候选版本、发布读回）：伪造标记在时同时设 node_resource_forged；
+ * 使用中的已验证路由改为 attention（与对账相同）；过渡中的路由由负责它的操作处理。之后在需要时排入 REJECT 保持
+ * （maybeEnqueueForgedHold，不论这次是否新设）。返回是否新设了任何一项。
  */
 export function raiseNodeResourceWarning(engine: Engine, reasons: readonly NodeResourceReason[]): boolean {
   const { repos } = engine;
@@ -984,20 +1091,26 @@ export function raiseNodeResourceWarning(engine: Engine, reasons: readonly NodeR
     // 警告总是带着刷新要求（见 requireRefreshForWarning）
     requireRefreshForWarning(engine, reasons);
     const r = repos.routeState.get();
-    if (r.warnings.includes(NODE_RESOURCE_WARNING)) return null;
+    const missing: RouteWarning[] = [];
+    if (!r.warnings.includes(NODE_RESOURCE_WARNING)) missing.push(NODE_RESOURCE_WARNING);
+    if (readForgedNodes(engine.kv) !== null && !r.warnings.includes(FORGED_WARNING)) missing.push(FORGED_WARNING);
+    if (missing.length === 0) return null;
     const toAttention = r.phase === 'active_verified' || r.phase === 'external_change';
-    repos.routeState.update({ warnings: [...r.warnings, NODE_RESOURCE_WARNING], ...(toAttention ? { phase: 'attention' as const } : {}) });
+    repos.routeState.update({ warnings: [...r.warnings, ...missing], ...(toAttention ? { phase: 'attention' as const } : {}) });
     return r;
   });
-  if (route === null) return false;
-  engine.log('warn', 'resource.unverified', { reasons: [...new Set(reasons)] });
-  engine.emit({ route: true, environments: route.activeEnvironmentId ? [route.activeEnvironmentId] : [] });
-  return true;
+  if (route !== null) {
+    engine.log('warn', 'resource.unverified', { reasons: [...new Set(reasons)] });
+    engine.emit({ route: true, environments: route.activeEnvironmentId ? [route.activeEnvironmentId] : [] });
+  }
+  maybeEnqueueForgedHold(engine);
+  return route !== null;
 }
 
 /**
- * 切换前（激活与活动环境发布进入切换的第 2 步）：节点资源未确认的警告已设、或检查发现问题（含目标节点的参数核对）时返回
- * 失败（并设警告），路由未改变；否则 null。从不写 Surge。
+ * 切换前（激活与活动环境发布进入切换的第 2 步）：节点资源未确认的警告已设或伪造标记在（nodeResourceHeld；只有标记时补上两项
+ * 警告并排入 REJECT 保持）、或检查发现问题（含目标节点的参数核对：目标恰好是路由不是经确认的普通模式时记录的 SFE-ROUTE 选择时，
+ * 参数不同即节点可能被伪造，用户决定 D11）时返回失败（并设警告），路由未改变；否则 null。从不写 Surge。
  */
 export async function nodeResourceSwitchFailure(engine: Engine, nodeName: string): Promise<ApiErrorBody | null> {
   const failure = (reasons: readonly NodeResourceReason[]): ApiErrorBody => ({
@@ -1005,12 +1118,101 @@ export async function nodeResourceSwitchFailure(engine: Engine, nodeName: string
     message: `激活失败：节点资源未确认（Surge 中的节点无法证明来自本机资源服务的已提交版本${reasons.length > 0 ? `：${nodeResourceReasonText(reasons)}` : ''}），路由未改变；需要经确认的节点资源发布${reasons.includes('token_suspect') ? '（读取令牌可能已泄露时先在维护中重新合并并轮换资源地址）' : ''}，或进入普通模式`,
     details: { reason: NODE_RESOURCE_WARNING, causes: [...new Set(reasons)] },
   });
-  if (engine.repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) return failure(readTokenSuspect(engine.kv) !== null ? ['token_suspect'] : []);
-  const check = await checkNodeResource(engine, { reachable: engine.facts.reachable, onWorkingProfile: engine.facts.onWorkingProfile, detailNode: nodeName });
+  const forgedFailure = (reasons: readonly NodeResourceReason[]): ApiErrorBody | null => {
+    const forged = readForgedNodes(engine.kv);
+    if (forged === null) return null;
+    return {
+      code: 'NODE_NOT_DEPLOYED',
+      message: `激活失败：Surge 中的节点可能是伪造的（${forgedReasonText(forged.reasons)}），路由未改变；${forgedRemedyText(engine)}，或进入普通模式`,
+      // beforeWrite：切换第一次写入之前的拒绝（准备页据此说「没有选择任何买家节点」；核对时的 forged 失败在写入之后，见 changedDuringCheck）
+      details: { reason: NODE_RESOURCE_WARNING, causes: [...new Set(reasons)], forged: true, forgedReasons: [...forged.reasons], beforeWrite: true },
+    };
+  };
+  const route = engine.repos.routeState.get();
+  if (nodeResourceHeld(engine, route)) {
+    const causes: NodeResourceReason[] = readTokenSuspect(engine.kv) !== null ? ['token_suspect'] : [];
+    // 只有伪造标记（例如启动对账出错没有加上警告）：补上两项警告并排入 REJECT 保持
+    if (readForgedNodes(engine.kv) !== null && (!route.warnings.includes(NODE_RESOURCE_WARNING) || !route.warnings.includes(FORGED_WARNING))) raiseNodeResourceWarning(engine, []);
+    return forgedFailure(causes) ?? failure(causes);
+  }
+  const check = await checkNodeResource(engine, {
+    reachable: engine.facts.reachable,
+    onWorkingProfile: engine.facts.onWorkingProfile,
+    detailNode: nodeName,
+    detailNodeIsSelection: routeNotConfirmedNormal(route) && route.selectedNode === nodeName,
+  });
   if (check.reasons.length === 0) return null;
   raiseNodeResourceWarning(engine, check.reasons);
   maybeEnqueueSystemRefresh(engine, check);
-  return failure(check.reasons);
+  return forgedFailure(check.reasons) ?? failure(check.reasons);
+}
+
+// ---------- 节点可能被伪造时的 REJECT 保持（用户决定 D11） ----------
+
+/**
+ * 需要时排入一次 REJECT 保持（route.hold，发起方 service；由执行器改选 SFE-ROUTE 的首成员 REJECT 并读回，handlers/route.ts
+ * runForgedHold）：伪造标记在、路由不是经确认的普通模式（routeNotConfirmedNormal）、SFE-ROUTE 的选择不是 REJECT（observed.selection
+ * 为这次对账读到的选择，读不到或没有时按路由记录）、Surge 可连接且当前是固定工作配置，并且没有排队或执行中的 route.hold（已有时把
+ * 新增的原因补记到它的排入原因：标记在它执行之前被清除时它据此判断 node_detail_mismatch 是否仍要改选）。Surge
+ * 可连接而上一次改选失败之后 FORGED_HOLD_RETRY_MS 内周期对账不再排入（启动与手动刷新不受限）。从不写 Surge、从不拒绝或延后普通
+ * 模式（执行器在有未完成的普通模式时先领取它）。返回排入的操作；不需要或已有时为 null。
+ */
+export function maybeEnqueueForgedHold(engine: Engine, observed: { selection?: string | null; kind?: ReconcileKind } = {}): OperationRecord | null {
+  const forged = readForgedNodes(engine.kv);
+  if (forged === null) return null;
+  const { repos } = engine;
+  const route = repos.routeState.get();
+  if (!routeNotConfirmedNormal(route)) return null;
+  const sel = observed.selection !== undefined ? observed.selection : route.selectedNode;
+  if (sel !== null && sel.toUpperCase() === 'REJECT') return null;
+  // 只在 Surge 可连接且是固定工作配置时排入（否则改选不可能成功，或会改到其他配置中的同名组）；之后能连接工作配置的对账再排入
+  if (!engine.facts.reachable || engine.facts.onWorkingProfile !== true) return null;
+  const last = engine.kv.get<{ lastFailedAt?: unknown; unreachable?: unknown }>(FORGED_HOLD_KEY);
+  if (
+    observed.kind !== 'startup' &&
+    observed.kind !== 'refresh' &&
+    last !== null &&
+    last.unreachable !== true &&
+    typeof last.lastFailedAt === 'string' &&
+    engine.now().getTime() - Date.parse(last.lastFailedAt) < FORGED_HOLD_RETRY_MS
+  ) {
+    return null;
+  }
+  const op = repos.tx(() => {
+    const open = repos.operations.listByStatus(['queued', 'running'], { kinds: ['route.hold'] });
+    if (open.length > 0) {
+      // 已有的保持：补记之后新增的原因（标记在它执行之前被经确认的读回清除时，它按这些原因判断是否仍要改选，runForgedHold）
+      for (const o of open) {
+        const payload = payloadOf(o);
+        const prev = payload.forgedHold?.reasons ?? [];
+        const missing = forged.reasons.filter((r) => !prev.includes(r));
+        if (missing.length > 0) repos.operations.update(o.id, { payload: { ...payload, forgedHold: { reasons: [...prev, ...missing] } } });
+      }
+      return null;
+    }
+    const inserted = repos.operations.insert({
+      id: engine.ids.next('op'),
+      requestId: `forged-hold:${engine.ids.token(16)}`,
+      requestDigest: 'service',
+      kind: 'route.hold',
+      initiatorKind: 'service',
+      phase: 'SAVED',
+      status: 'queued',
+      payload: { forgedHold: { reasons: [...forged.reasons] } },
+    });
+    repos.operations.appendStep(
+      inserted.id,
+      'SAVED',
+      `Surge 中的节点可能是伪造的（${forgedReasonText(forged.reasons)}）：排入一次 SFE-ROUTE 改选 REJECT（失败即关闭；有排队的普通模式时它先执行）`,
+    );
+    repos.outbox.enqueue(inserted.id, null, engine.now());
+    return inserted;
+  });
+  if (op === null) return null;
+  engine.log('info', 'route.forged_hold_enqueued', { reasons: [...forged.reasons] });
+  engine.emit({ operations: [op.id] });
+  engine.kick();
+  return op;
 }
 
 // ---------- 系统强制刷新 ----------
@@ -1096,6 +1298,11 @@ export interface NodeResourceConfirmation {
   /** 读回完整（或被覆盖声明覆盖）时清除 needsRefresh 并重新允许系统刷新；读回不完整而未覆盖时两者都保留。 */
   clearNeedsRefresh: boolean;
   /**
+   * 读回逐节点核对了服务器、端口与前置（assessResourceReadback level 'full'）。伪造标记的原因含 node_detail_mismatch 时只有它
+   * 为 true 才清除标记（与两项警告）；缺省为 false。
+   */
+  detailsChecked?: boolean;
+  /**
    * 读回开始（第一次读取 Surge）之前取的失败答复计数（servedFailuresNow）：成为新审计点的基线，读回期间与之后本服务的失败答复
    * 都算进下一次审计。缺省为确认时的计数。
    */
@@ -1106,6 +1313,8 @@ export interface NodeResourceConfirmation {
 export interface NodeResourceConfirmed {
   generation: number;
   warningCleared: boolean;
+  /** 伪造标记（resource:forgedNodes）被清除。 */
+  forgedCleared: boolean;
   activeEnvironmentId: string | null;
   failuresBaseline: number | null;
 }
@@ -1116,6 +1325,9 @@ export interface NodeResourceConfirmed {
  * 重新设它）。可以在调用方的事务中调用（嵌套为 SAVEPOINT）。只写数据库：内存中的审计点、日志与事件由调用方在外层事务提交之后
  * 经 applyNodeResourceConfirmation 完成（外层事务回滚时它们都不发生）。tokenSuspect 不变（只能由轮换资源地址清除）。路由仍需要
  * 现有的重新核验或检测流程才能回到已验证。
+ * 伪造标记（用户决定 D11）与 node_resource_unverified 同一条件下清除（令牌不可疑、资源服务在监听），原因含 node_detail_mismatch 时另要
+ * 求逐节点参数的完整读回（detailsChecked）——否则标记、两项警告与刷新要求都保留。清除时一并删除 FORGED_HOLD_KEY；从不改动 SFE-ROUTE
+ * 的选择、路由阶段、buyer_exit_connections_unconfirmed 或持久标记（REJECT 不自动恢复）。
  */
 export function confirmNodeResource(engine: Engine, c: NodeResourceConfirmation): NodeResourceConfirmed {
   const { repos, kv } = engine;
@@ -1134,19 +1346,31 @@ export function confirmNodeResource(engine: Engine, c: NodeResourceConfirmation)
       auditedSeq: Math.max(prev?.auditedSeq ?? 0, c.matchedSeq),
       windowSeq: Math.max(prev?.windowSeq ?? 0, c.matchedSeq),
     });
-    // 只有清除了 needsRefresh（读回完整或被覆盖）才重新允许自动排入：读回不完整而保留刷新要求时，系统刷新不会被反复排入
-    if (c.clearNeedsRefresh) {
+    const forged = readForgedNodes(kv);
+    // 参数不同的伪造原因只能由逐节点参数的完整读回排除
+    const detailUnchecked = forged !== null && forged.reasons.includes('node_detail_mismatch') && c.detailsChecked !== true;
+    const keepForged = forged !== null && (keepWarning || detailUnchecked);
+    const forgedCleared = forged !== null && !keepForged;
+    if (forgedCleared) {
+      writeForgedNodes(kv, null);
+      kv.delete(FORGED_HOLD_KEY);
+    }
+    // 只有清除了 needsRefresh（读回完整或被覆盖）才重新允许自动排入：读回不完整而保留刷新要求时，系统刷新不会被反复排入。
+    // 伪造标记因参数没有逐节点读回而保留时刷新要求同样保留（警告总是带着刷新要求）
+    if (c.clearNeedsRefresh && !detailUnchecked) {
       writeNeedsRefresh(kv, null);
       kv.delete(SYSTEM_REFRESH_KEY);
     }
     const route = repos.routeState.get();
-    if (keepWarning || !route.warnings.includes(NODE_RESOURCE_WARNING)) return { warningCleared: false, route };
-    repos.routeState.update({ warnings: route.warnings.filter((w) => w !== NODE_RESOURCE_WARNING) });
-    return { warningCleared: true, route };
+    const drop: RouteWarning[] = keepWarning || keepForged ? [] : [NODE_RESOURCE_WARNING, FORGED_WARNING];
+    if (!route.warnings.some((w) => drop.includes(w))) return { warningCleared: false, forgedCleared, route };
+    repos.routeState.update({ warnings: route.warnings.filter((w) => !drop.includes(w)) });
+    return { warningCleared: true, forgedCleared, route };
   });
   return {
     generation: c.generation,
     warningCleared: result.warningCleared,
+    forgedCleared: result.forgedCleared,
     activeEnvironmentId: result.route.activeEnvironmentId,
     failuresBaseline: c.failuresBaseline !== undefined && Number.isSafeInteger(c.failuresBaseline) && c.failuresBaseline >= 0 ? c.failuresBaseline : null,
   };
@@ -1156,8 +1380,9 @@ export function confirmNodeResource(engine: Engine, c: NodeResourceConfirmation)
 export function applyNodeResourceConfirmation(engine: Engine, r: NodeResourceConfirmed): void {
   const host = engine.resource;
   if (host !== null) markAuditPoint(engine, host, r.failuresBaseline ?? undefined);
-  engine.log('info', 'resource.confirmed', { generation: r.generation, warningCleared: r.warningCleared });
-  engine.emit({ route: r.warningCleared, surge: true, environments: r.warningCleared && r.activeEnvironmentId ? [r.activeEnvironmentId] : [] });
+  engine.log('info', 'resource.confirmed', { generation: r.generation, warningCleared: r.warningCleared, forgedCleared: r.forgedCleared });
+  const changed = r.warningCleared || r.forgedCleared;
+  engine.emit({ route: changed, surge: true, environments: changed && r.activeEnvironmentId ? [r.activeEnvironmentId] : [] });
 }
 
 // ---------- 视图 ----------
@@ -1169,7 +1394,7 @@ export function nodeResourceStatus(engine: Engine): NodeResourceStatusView | nul
   const line = engine.resourceRuntime.line;
   const state: NodeResourceStatusView['state'] =
     host === null ? 'token_unavailable' : line === 'legacy' ? 'legacy_line' : line !== 'ours' ? 'not_installed' : host.listening() ? 'serving' : 'not_listening';
-  return { state, tokenSuspect: readTokenSuspect(engine.kv) !== null, needsRefresh: readNeedsRefresh(engine.kv) !== null };
+  return { state, tokenSuspect: readTokenSuspect(engine.kv) !== null, needsRefresh: readNeedsRefresh(engine.kv) !== null, forgedNodes: readForgedNodes(engine.kv) !== null };
 }
 
 /** 空闲且普通模式时周期对账是否仍要运行（工作配置引用本机资源服务：重试监听与审计）。 */

@@ -138,6 +138,7 @@ export const KIND_TEXT: Record<OperationKind, string> = {
   'front.verify': '核验前置',
   'route.activate': '切换环境',
   'route.normal': '进入普通模式',
+  'route.hold': '改选 REJECT（节点资源可能被伪造）',
   'probe.preflight': '代理预检',
   'probe.safari': 'Safari 重测',
   'maintenance.init': '初始化工作配置',
@@ -187,6 +188,8 @@ export const WARNING_TEXT: Record<RouteWarning, string> = {
   exit_ip_mismatch: '实测出口与预期出口不一致，已停止自动打开订单与填充',
   buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，再次进入普通模式会再结束其中可能经买家出口的连接（按原规则发出的不受影响）',
   node_resource_unverified: '节点资源未确认：Surge 中的节点无法证明来自本机资源服务的已提交版本',
+  node_resource_forged:
+    'Surge 中的节点可能是伪造的：路由不是经确认的普通模式时，服务尝试把 SFE-ROUTE 改选 REJECT（Surge 可连接且是固定工作配置时；是否已改选以 SFE-ROUTE 的当前选择与「改选 REJECT」操作为准），不会自动恢复',
 };
 
 export const CAPABILITY_STATUS_TEXT: Record<CapabilityStatus, string> = {

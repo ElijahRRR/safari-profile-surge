@@ -19,6 +19,8 @@ import {
   NODE_RESOURCE_NEEDS_REFRESH_TEXT,
   NODE_RESOURCE_STATE_DETAILS,
   NODE_RESOURCE_STATE_LABELS,
+  NODE_RESOURCE_FORGED_RESYNC_TEXT,
+  NODE_RESOURCE_FORGED_TEXT,
   NODE_RESOURCE_TOKEN_SUSPECT_TEXT,
   boolLabel,
 } from '../lib/labels';
@@ -38,6 +40,8 @@ const nodeResourceNotes = computed(() => {
   if (!nr) return [];
   const notes: Array<{ key: string; text: string }> = [];
   if (nr.state !== 'serving') notes.push({ key: 'state', text: NODE_RESOURCE_STATE_DETAILS[nr.state] ?? '本机资源服务状态未知。' });
+  // 节点可能被伪造（用户决定 D11）：令牌可疑时要先更换资源地址，否则一次经确认的节点资源同步即可清除
+  if (nr.forgedNodes) notes.push({ key: 'forgedNodes', text: nr.tokenSuspect ? NODE_RESOURCE_FORGED_TEXT : NODE_RESOURCE_FORGED_RESYNC_TEXT });
   if (nr.tokenSuspect) notes.push({ key: 'tokenSuspect', text: NODE_RESOURCE_TOKEN_SUSPECT_TEXT });
   // “下一次发布会单 key 更新”只在资源服务满足发布前提时成立（仍引用本地节点文件时每次发布都停泊，服务也不自动同步）
   if (nr.needsRefresh) notes.push({ key: 'needsRefresh', text: nodeResourcePublishBlocks(nr).length === 0 ? NODE_RESOURCE_NEEDS_REFRESH_TEXT : NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT });
@@ -46,7 +50,7 @@ const nodeResourceNotes = computed(() => {
 const nodeResourceTone = computed<'info' | 'warning' | 'danger'>(() => {
   const nr = nodeResource.value;
   if (!nr) return 'info';
-  return nr.tokenSuspect || NODE_RESOURCE_STATE_LABELS[nr.state]?.variant === 'danger' ? 'danger' : 'warning';
+  return nr.forgedNodes || nr.tokenSuspect || NODE_RESOURCE_STATE_LABELS[nr.state]?.variant === 'danger' ? 'danger' : 'warning';
 });
 const profileItems = computed(() => [
   { key: 'path', label: '工作配置路径' },
@@ -101,6 +105,7 @@ const description = computed(() =>
               <span class="inline-flex flex-wrap items-center justify-end gap-2" data-test="node-resource-state">
                 <template v-if="nodeResource">
                   <Badge :variant="NODE_RESOURCE_STATE_LABELS[nodeResource.state]?.variant ?? 'danger'">{{ NODE_RESOURCE_STATE_LABELS[nodeResource.state]?.label ?? '状态未知' }}</Badge>
+                  <Badge v-if="nodeResource.forgedNodes" variant="danger" data-test="node-resource-forged">节点可能被伪造</Badge>
                   <Badge v-if="nodeResource.tokenSuspect" variant="danger">令牌可能已泄露</Badge>
                   <Badge v-if="nodeResource.needsRefresh" variant="warning">待重新同步</Badge>
                 </template>

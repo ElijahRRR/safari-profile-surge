@@ -8,12 +8,22 @@ import { CAPABILITY_CRITERIA, EMPTY_PLACEHOLDER_LINE, LEGACY_NODE_GROUP_LINE, Sf
 import { describe, expect, it } from 'vitest';
 import { MATRIX, rowVerdict } from '../src/commands/loopback.js';
 import { SQUAT_EXPECTED_VERDICT, parseLsofNames, parseUid, squatChecks, type SquatObservation, type SquatPhase } from '../src/commands/loopback-auth.js';
-import { REQUIRED, changedContextFields, checkRestartVariant, classifyEmptyCache, restartChecks, restartComparability, type RestartObservation } from '../src/commands/loopback-restart.js';
+import {
+  REQUIRED,
+  changedContextFields,
+  checkRestartVariant,
+  classifyEmptyCache,
+  classifyUncommitted,
+  restartChecks,
+  restartComparability,
+  stagedCandidateText,
+  type RestartObservation,
+} from '../src/commands/loopback-restart.js';
 import { buildContext } from '../src/context.js';
 import { describeKeyForm, discoverIn, errorClass, expectedNames, validateGenerationLines } from '../src/commands/loopback-ops.js';
 import { FAKE_REMOTE_ERRORS, resourceBody, resourceLocationHash, type SurgeAdapter, type SurgeExternalResource } from '../src/deps.js';
 import { RESOURCE_SCENARIOS, emptyServed, paramReplacedC, presentsToken, readServed, scenarioBody, testResourceUrl, updateServed } from '../src/loopback-state.js';
-import { readResult, readResultHistory, writeResult, check, isCurrentCapabilityKey } from '../src/results.js';
+import { readResult, readResultHistory, writeResult, check, isCurrentCapabilityKey, verdictOf } from '../src/results.js';
 import { RunDir, newRunId } from '../src/run-dir.js';
 import { parseLsofPeers } from '../src/servers/resource.js';
 import { createGuardedAdapter, emptyGuard, maskResourceKey, resourcesForUrl, type CallLogEntry } from '../src/surge-access.js';
@@ -328,9 +338,153 @@ describe('restart verdicts', () => {
     expect(without.note).toContain('已暂存候选（可选）未测');
     // Mac 重启的 candidate 不算（重启后服务只提供已提交版本）
     expect(uncommittedCheck(restartChecks([...all, obs('mac', 'candidate')], CURRENT)).name).not.toContain('已暂存候选');
-    const withCandidate = uncommittedCheck(restartChecks([...all, obs('surge', 'candidate')], CURRENT));
-    expect(withCandidate.name).toBe('任何情况下都不会载入本服务未提交的版本（含已暂存候选）');
+    const notDownloaded = { downloaded: false, loaded: false, atLaunch: null, exempt: false };
+    const withCandidate = uncommittedCheck(restartChecks([...all, obs('surge', 'candidate', { stagedCandidate: notDownloaded })], CURRENT));
+    expect(withCandidate.name).toBe('任何情况下都不会载入本服务未提交的版本（含已暂存候选：Surge 重开启动时下载暂存的候选只记录为行为，D12）');
     expect(withCandidate.note).not.toContain('未测');
+    expect(withCandidate.note).toContain('Surge 没有下载暂存的候选');
+  });
+
+  describe('D12: the staged candidate downloaded at a Surge relaunch is recorded, not a failure', () => {
+    const committed = { generation: 4, names: [TEST_NODES.a, TEST_NODES.b, TEST_NODES.c] };
+    const candidate = { generation: 5, names: [TEST_NODES.a, TEST_NODES.b] };
+    const restartAt = 1_800_000_000_000;
+    const rec = (generation: number, dt: number, complete = true) => ({ generation, complete, at: new Date(restartAt + dt) });
+    const classify = (over: Partial<Parameters<typeof classifyUncommitted>[0]> = {}) =>
+      classifyUncommitted({ kind: 'surge', variant: 'candidate', committed, candidate, records: [], members: ['REJECT', ...committed.names], restartAt, preparedAt: restartAt - 60_000, ...over });
+
+    it('regression: a Surge relaunch that downloads and loads the staged candidate at launch is recorded only (loadedUncommitted false)', () => {
+      expect(classify({ records: [rec(5, 300)], members: ['REJECT', TEST_NODES.a, TEST_NODES.b] })).toEqual({
+        loadedUncommitted: false,
+        stagedCandidate: { downloaded: true, loaded: true, atLaunch: true, exempt: true },
+      });
+      // 下载了而成员仍是已提交版本：同样只记录（没有载入）
+      expect(classify({ records: [rec(5, 0)] })).toEqual({ loadedUncommitted: false, stagedCandidate: { downloaded: true, loaded: false, atLaunch: true, exempt: true } });
+      // 没有下载候选：照常
+      expect(classify()).toEqual({ loadedUncommitted: false, stagedCandidate: { downloaded: false, loaded: false, atLaunch: null, exempt: false } });
+    });
+
+    it('every other load of uncommitted content still fails', () => {
+      // 不是暂存的那一代
+      expect(classify({ records: [rec(5, 300), rec(6, 400)], members: ['REJECT', TEST_NODES.a, TEST_NODES.b] }).loadedUncommitted).toBe(true);
+      expect(classify({ records: [rec(6, 400)] }).loadedUncommitted).toBe(true);
+      // 其他变体中的任何未提交下载（包括恰好与候选同一代的）
+      for (const variant of ['server-before', 'server-after', 'down', '503'] as const) {
+        expect(classify({ variant, records: [rec(5, 300)] }).loadedUncommitted, variant).toBe(true);
+        expect(classify({ variant, records: [rec(5, 300)] }).stagedCandidate, variant).toBeNull();
+      }
+      // 成员中出现已提交版本与暂存候选之外的名称
+      expect(classify({ records: [rec(5, 300)], members: ['REJECT', TEST_NODES.a, 'P0-Other'] }).loadedUncommitted).toBe(true);
+      expect(classify({ members: ['REJECT', TEST_NODES.a, 'P0-Other'] }).loadedUncommitted).toBe(true);
+      // 没写完的下载不算下载过候选
+      expect(classify({ records: [rec(5, 300, false)] }).stagedCandidate?.downloaded).toBe(false);
+    });
+
+    it('regression (literal D12): only a download at the launch of a Surge relaunch is exempt', () => {
+      // 重启之前（例如准备之后 Surge 的定时刷新）下载了暂存的候选
+      const before = classify({ records: [rec(5, -5000)], members: ['REJECT', TEST_NODES.a, TEST_NODES.b] });
+      expect(before.loadedUncommitted).toBe(true);
+      expect(before.stagedCandidate).toEqual({ downloaded: true, loaded: true, atLaunch: false, exempt: false });
+      expect(stagedCandidateText('surge', before.stagedCandidate!)).toContain('不属于用户决定 D12 的例外');
+      // 一次在启动时、一次在重启之前：不是例外
+      expect(classify({ records: [rec(5, -5000), rec(5, 300)] }).loadedUncommitted).toBe(true);
+      // 读不到重启的时刻：无法判断下载时间
+      const unknown = classify({ records: [rec(5, 300)], restartAt: null });
+      expect(unknown.loadedUncommitted).toBe(true);
+      expect(unknown.stagedCandidate).toMatchObject({ downloaded: true, atLaunch: null, exempt: false });
+      expect(stagedCandidateText('surge', unknown.stagedCandidate!)).toContain('无法判断下载时间');
+      // Mac 重启的 candidate 变体：重启后服务只提供已提交版本，任何候选下载都不是例外
+      const mac = classify({ kind: 'mac', records: [rec(5, 300)] });
+      expect(mac.loadedUncommitted).toBe(true);
+      expect(mac.stagedCandidate?.exempt).toBe(false);
+      expect(stagedCandidateText('mac', mac.stagedCandidate!)).toContain('Mac 重启不属于用户决定 D12 的例外');
+    });
+
+    it('regression (review D12-2): no exemption when the main Surge process did not start after prepare', () => {
+      // 只是辅助进程变了（指纹不同）而主进程的启动早于准备：准备之后的定时刷新下载了暂存的候选，不能说在启动时
+      const r = classify({ restartAt: restartAt - 3 * 86_400_000, preparedAt: restartAt - 60_000, records: [rec(5, -59_000)], members: ['REJECT', TEST_NODES.a, TEST_NODES.b] });
+      expect(r.loadedUncommitted).toBe(true);
+      expect(r.stagedCandidate).toMatchObject({ downloaded: true, loaded: true, atLaunch: null, exempt: false, restartBeforePrepare: true });
+      const text = stagedCandidateText('surge', r.stagedCandidate!);
+      expect(text).toContain('不晚于准备');
+      expect(text).toContain('不属于用户决定 D12 的例外');
+      expect(text).not.toContain('启动时下载了');
+      // 启动时刻恰好等于准备时刻同样不算
+      expect(classify({ preparedAt: restartAt, records: [rec(5, 300)] }).stagedCandidate?.exempt).toBe(false);
+    });
+
+    it('regression (review D12-3): a restart time derived from engine uptime gets a tolerance, not a false "downloaded before the relaunch"', () => {
+      // 引擎在 restartAt - 300 毫秒真实启动、在 restartAt - 200 毫秒下载了候选；运行时长取整让换算的 restartAt 晚了
+      const strict = classify({ records: [rec(5, -200)], members: ['REJECT', TEST_NODES.a, TEST_NODES.b] });
+      expect(strict.stagedCandidate?.atLaunch).toBe(false);
+      const tolerant = classify({ records: [rec(5, -200)], members: ['REJECT', TEST_NODES.a, TEST_NODES.b], restartToleranceMs: 2000 });
+      expect(tolerant).toEqual({ loadedUncommitted: false, stagedCandidate: { downloaded: true, loaded: true, atLaunch: true, exempt: true } });
+      // 容差之外（重开之前几秒的定时刷新）仍不是例外
+      expect(classify({ records: [rec(5, -5000)], restartToleranceMs: 2000 }).loadedUncommitted).toBe(true);
+    });
+
+    it('members that are exactly the candidate without a complete candidate download cannot be judged (not "recorded only")', () => {
+      const r = classify({ members: ['REJECT', TEST_NODES.a, TEST_NODES.b] });
+      expect(r.loadedUncommitted).toBeNull();
+      expect(r.stagedCandidate).toEqual({ downloaded: false, loaded: false, atLaunch: null, exempt: false });
+      expect(classify({ members: ['REJECT', TEST_NODES.a, TEST_NODES.b], records: [rec(5, 300, false)] }).loadedUncommitted).toBeNull();
+      // 成员读不到：无法判断（有其他代的下载时仍不通过）
+      expect(classify({ members: null, records: [rec(5, 300)] })).toEqual({ loadedUncommitted: null, stagedCandidate: { downloaded: true, loaded: null, atLaunch: true, exempt: true } });
+      expect(classify({ members: null, records: [rec(6, 300)] }).loadedUncommitted).toBe(true);
+    });
+
+    it('regression: the uncommitted check passes with a recorded staged-candidate download and names the exemption', () => {
+      const staged = obs('surge', 'candidate', { loadedUncommitted: false, stagedCandidate: { downloaded: true, loaded: true, atLaunch: true, exempt: true } });
+      const c = uncommittedCheck(restartChecks([...all, staged], CURRENT));
+      expect(c.ok).toBe(true);
+      expect(c.name.endsWith('只记录为行为，D12）')).toBe(true);
+      expect(c.note).toContain('Surge 启动时下载了暂存的候选并载入（只记录为行为，用户决定 D12）');
+      expect(restartChecks([...all, staged], CURRENT).every((x) => x.ok === true)).toBe(true);
+    });
+
+    it('regression (review D12-1): an exempt candidate round must still get back to the committed version after recovery', () => {
+      const exempt = { downloaded: true, loaded: true, atLaunch: true, exempt: true };
+      const recoveryCheck = (checks: ReturnType<typeof restartChecks>) => checks.find((c) => c.name.startsWith('已暂存候选（Surge 重开）'));
+      const failed = restartChecks([...all, obs('surge', 'candidate', { members: ['REJECT', TEST_NODES.a, TEST_NODES.b], stagedCandidate: exempt, recovered: false })], CURRENT);
+      expect(verdictOf(failed)).not.toBe('pass');
+      expect(recoveryCheck(failed)?.ok).toBe(false);
+      expect(recoveryCheck(failed)?.note).toContain('服务恢复后没有回到已提交版本');
+      // 载入的豁免本身不变
+      expect(uncommittedCheck(failed).ok).toBe(true);
+      // 恢复结果无法判断：不完整
+      const unknown = restartChecks([...all, obs('surge', 'candidate', { stagedCandidate: exempt, recovered: null })], CURRENT);
+      expect(recoveryCheck(unknown)?.ok).toBeNull();
+      expect(verdictOf(unknown)).toBe('incomplete');
+      // 没有确认重开
+      expect(recoveryCheck(restartChecks([...all, obs('surge', 'candidate', { stagedCandidate: exempt, restarted: false })], CURRENT))?.ok).toBe(false);
+      // 不计入的豁免一轮没有回到已提交版本：仍不通过（与载入了未提交内容的不计入观察相同）
+      const notCounted = restartChecks([...all, obs('surge', 'candidate', { stagedCandidate: exempt, recovered: false, contextChanged: ['surgeBuild'] })], CURRENT);
+      expect(recoveryCheck(notCounted)?.ok).toBe(false);
+      expect(recoveryCheck(notCounted)?.note).toContain('不计入的观察，仍按不通过');
+      // 回到了已提交版本：通过；没有候选一轮时不列这一项
+      const ok = restartChecks([...all, obs('surge', 'candidate', { stagedCandidate: exempt })], CURRENT);
+      expect(recoveryCheck(ok)?.ok).toBe(true);
+      expect(verdictOf(ok)).toBe('pass');
+      expect(recoveryCheck(restartChecks(all, CURRENT))).toBeUndefined();
+    });
+
+    it('old-format candidate observations that loaded uncommitted content stay failing; a non-exempt staged download says why', () => {
+      const old = uncommittedCheck(restartChecks([...all, obs('surge', 'candidate', { loadedUncommitted: true })], CURRENT));
+      expect(old.ok).toBe(false);
+      expect(old.note).toContain('D12 之前的记录无法区分是否只是暂存的候选，按不通过；在新的运行目录重测');
+      const early = uncommittedCheck(
+        restartChecks([...all, obs('surge', 'candidate', { loadedUncommitted: true, stagedCandidate: { downloaded: true, loaded: true, atLaunch: false, exempt: false } })], CURRENT),
+      );
+      expect(early.ok).toBe(false);
+      expect(early.note).toContain('暂存的候选在 Surge 重开之前已被下载');
+      const other = uncommittedCheck(
+        restartChecks([...all, obs('surge', 'candidate', { loadedUncommitted: true, stagedCandidate: { downloaded: true, loaded: false, atLaunch: true, exempt: true } })], CURRENT),
+      );
+      expect(other.ok).toBe(false);
+      expect(other.note).toContain('暂存候选之外的未提交内容');
+      // 其他变体载入未提交内容：照旧不通过
+      expect(uncommittedCheck(restartChecks([...all, obs('surge', 'down', { loadedUncommitted: true })], CURRENT)).ok).toBe(false);
+    });
   });
 
   it('regression: operator-confirmed restarts and unverifiable start orders are labelled; a mismatching Mac variant is not counted', () => {

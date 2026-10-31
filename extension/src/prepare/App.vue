@@ -81,7 +81,13 @@ const probeStopped = computed(() => {
 });
 // 失败后的说明只写读回确认过的：「不会改用直连或其他环境的出口」只在回滚读回确认 Safari 保持阻断时成立
 const failedNote = computed(() => {
-  if (held.value !== undefined && s.outcome !== 'rolled_back' && s.outcome !== 'superseded') return rejectHeldText(held.value);
+  if (held.value !== undefined && s.outcome !== 'rolled_back' && s.outcome !== 'superseded') return rejectHeldText(held.value, s.operation?.result?.rejectCause);
+  // 切换在第一次写入之前因节点可能被伪造而停止（error.details.forged 与 beforeWrite，用户决定 D11）：没有选择任何买家节点。
+  // 核对时才发现的（已选择目标节点并开放检测之后，按快照回滚）不是这种：按回滚的说明，不否认已选择过节点
+  const details = s.operation?.error?.details;
+  if (held.value === undefined && details?.forged === true && details.beforeWrite === true && !s.operation?.result?.rollback) {
+    return 'Surge 中的节点可能是伪造的：这次切换在写入之前停止，没有选择任何买家节点。请在网页后台处理节点资源（读取令牌可能已泄露时，进入普通模式后在维护中重新合并并更换本机资源地址），节点资源经确认的同步之后再重新使用此环境。';
+  }
   switch (s.outcome) {
     case 'rolled_back':
       return '不会改用直连或其他环境的出口。可以关闭此页面，在扩展弹窗中查看状态与下一步。';

@@ -613,6 +613,30 @@ describe('local resource server status (D10)', () => {
     m.unmount();
   });
 
+  it('D11: shows the forged badge and the remedy matching the token state', async () => {
+    const snap = snapshotWithNodeResource(nodeResource({ tokenSuspect: true, needsRefresh: true, forgedNodes: true }));
+    const { ctx } = testContext(() => NOT_FOUND, snap);
+    const m = await mountWith(PublishView, ctx, {}, '/publish');
+    expect(document.body.querySelector('[data-test="node-resource-forged"]')?.textContent).toContain('节点可能被伪造');
+    const notes = document.body.querySelector('[data-test="node-resource-notes"]')!;
+    expect(notes.textContent).toContain('Surge 中的节点可能是伪造的');
+    expect(notes.textContent).toContain('更换本机资源地址');
+    expect(notes.textContent).not.toContain('服务已把 SFE-ROUTE 改选');
+    expect(notes.className).toContain('bg-red-50');
+    ctx.store.applyEvent({ type: 'surge.status', sequence: 11, surge: { ...snap.surge, nodeResource: nodeResource({ needsRefresh: true, forgedNodes: true }) } });
+    await flush();
+    expect(notes.textContent).toContain('重新同步节点资源');
+    expect(notes.textContent).not.toContain('勾选“更换本机资源地址”');
+    // 令牌不可疑也可能是无法解释的下载之后已更换资源地址（伪造状态待经确认的发布清除）：不把参数不同说成唯一的原因
+    expect(notes.textContent).toContain('出现了本服务没有提供过的下载，或使用中节点的服务器、端口或前置与其版本不同');
+    expect(notes.textContent).not.toContain('伪造的（使用中节点的服务器');
+    ctx.store.applyEvent({ type: 'surge.status', sequence: 12, surge: { ...snap.surge, nodeResource: nodeResource() } });
+    await flush();
+    expect(document.body.querySelector('[data-test="node-resource-forged"]')).toBeNull();
+    expectNoResourceSecrets();
+    m.unmount();
+  });
+
   it('promises the single-key resync only while the resource service can publish', async () => {
     const { ctx } = testContext(() => NOT_FOUND, snapshotWithNodeResource(nodeResource({ needsRefresh: true })));
     const m = await mountWith(PublishView, ctx, {}, '/publish');

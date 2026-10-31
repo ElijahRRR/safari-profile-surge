@@ -17,7 +17,8 @@ import { runResourceServer } from '../src/commands/resource-server.js';
 import { runTestServers } from '../src/commands/test-servers.js';
 import { EXIT } from '../src/errors.js';
 import { createMemoryOutput, createScriptedPrompter, type Prompter } from '../src/io.js';
-import { readAuditRecords, readResourceLog, readServed, readServerStatus, requestsBetween } from '../src/loopback-state.js';
+import { resourceBody } from '../src/deps.js';
+import { readAuditRecords, readResourceLog, readResourceToken, readServed, readServerStatus, requestsBetween, testResourceUrl, updateServed } from '../src/loopback-state.js';
 import type { CapabilityResult } from '../src/results.js';
 import { RunDir } from '../src/run-dir.js';
 import { loadState, saveState } from '../src/state.js';
@@ -633,7 +634,7 @@ describe('loopback-restart (loopback_resource_restart)', () => {
     expect(e.surge.reloadCount).toBe(1);
   }, 60_000);
 
-  it('fails when Surge downloads at launch while an uncommitted candidate is being served', async () => {
+  it('records (does not fail) when Surge downloads the staged candidate at launch (D12)', async () => {
     const e = env!;
     await setupLoopback(e);
     e.surge.remoteCacheOnRestart = 'drop';
@@ -646,10 +647,80 @@ describe('loopback-restart (loopback_resource_restart)', () => {
     expect(await main(['loopback-restart', '--phase', 'prepare', ...e.common()], { ...p, exec })).toBe(EXIT.OK);
     e.surge.restart();
     const a = e.deps();
-    expect(await main(['loopback-restart', '--phase', 'after-surge-restart', ...e.common()], { ...a, exec })).toBe(EXIT.OK);
+    expect(await main(['loopback-restart', '--phase', 'after-surge-restart', ...e.common()], { ...a, exec }), a.out.text()).toBe(EXIT.OK);
+    const obs = e.run().readJson<RestartObservation[]>('loopback-restart/observations.json')!.at(-1)!;
+    // Surge 启动时下载并载入了暂存的候选（只含 A、B）：只记录为行为
+    expect(obs.members).toEqual(['REJECT', TEST_NODES.a, TEST_NODES.b]);
+    expect(obs.loadedUncommitted).toBe(false);
+    expect(obs.stagedCandidate).toEqual({ downloaded: true, loaded: true, atLaunch: true, exempt: true });
+    expect(obs.recovered).toBe(true);
+    expect(a.out.text()).toContain('Surge 启动时下载了暂存的候选并载入（只记录为行为，用户决定 D12）');
     const r = result('loopback_resource_restart');
-    expect(r.checks.find((c) => c.name.startsWith('任何情况下都不会载入'))?.ok).toBe(false);
+    const uncommitted = r.checks.find((c) => c.name.startsWith('任何情况下都不会载入'))!;
+    expect(uncommitted.ok).toBe(true);
+    expect(uncommitted.name).toContain('只记录为行为，D12');
+    expect(uncommitted.note).toContain('只记录为行为');
+    // 其他变体还没有测：不完整，而不是不通过
+    expect(r.verdict).toBe('incomplete');
+  });
+
+  it('regression (D12 scope): a relaunch that downloads an uncommitted generation other than the staged candidate still fails', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    e.surge.remoteCacheOnRestart = 'drop';
+    const exec = async (file: string, args: readonly string[]) => {
+      if (file === '/bin/ps' && args[0] === '-axo') return { stdout: '  404 /Applications/Surge.app/Contents/MacOS/Surge\n', stderr: '', code: 0 };
+      if (file === '/bin/ps' && args[0] === '-o') return { stdout: `${e.surge.startedAt.toISOString()}\n`, stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: -1 };
+    };
+    const p = e.deps({ answers: ['candidate'] });
+    expect(await main(['loopback-restart', '--phase', 'prepare', ...e.common()], { ...p, exec })).toBe(EXIT.OK);
+    // 准备之后服务改为提供另一代未提交的内容（同样只含 A、B，但不是暂存的那一代）
+    const staged = readServed(e.run())!.candidate!;
+    const lines = staged.content.split('\n').filter((l) => l !== '' && !l.startsWith('#'));
+    const next = updateServed(e.run(), new Date(), 'test', (s) => ({ candidate: { generation: s.lastGeneration + 1, content: resourceBody(s.lastGeneration + 1, lines) } }));
+    for (let i = 0; i < 200 && (readServerStatus(e.run())?.appliedRevision ?? 0) < next.revision; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(readServerStatus(e.run())!.appliedRevision).toBeGreaterThanOrEqual(next.revision);
+    e.surge.restart();
+    const a = e.deps();
+    expect(await main(['loopback-restart', '--phase', 'after-surge-restart', ...e.common()], { ...a, exec }), a.out.text()).toBe(EXIT.OK);
+    const obs = e.run().readJson<RestartObservation[]>('loopback-restart/observations.json')!.at(-1)!;
+    expect(obs.downloads.generations).toContain(next.candidate!.generation);
+    expect(obs.loadedUncommitted).toBe(true);
+    expect(obs.stagedCandidate).toMatchObject({ downloaded: false, exempt: false });
+    const r = result('loopback_resource_restart');
+    expect(r.checks.find((c) => c.name.startsWith('任何情况下都不会载入'))!.ok).toBe(false);
     expect(r.verdict).toBe('fail');
+  });
+
+  it('records, without failing, that an updatedAt moved without a matching download would be an unexplained fetch for the product', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    const exec = async (file: string, args: readonly string[]) => {
+      if (file === '/bin/ps' && args[0] === '-axo') return { stdout: '  404 /Applications/Surge.app/Contents/MacOS/Surge\n', stderr: '', code: 0 };
+      if (file === '/bin/ps' && args[0] === '-o') return { stdout: `${e.surge.startedAt.toISOString()}\n`, stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: -1 };
+    };
+    const p = e.deps({ answers: ['server-before'] });
+    expect(await main(['loopback-restart', '--phase', 'prepare', ...e.common()], { ...p, exec }), p.out.text()).toBe(EXIT.OK);
+    // Surge 重开时没有下载，只改写了更新时间（缓存内容仍是已提交版本）
+    const url = testResourceUrl(e.resourcePort, readResourceToken(e.run())!);
+    await new Promise((r) => setTimeout(r, 20));
+    e.surge.seedRemoteCache(url, readServed(e.run())!.committed!.content, { updatedAt: new Date() });
+    e.surge.restart();
+    const a = e.deps();
+    expect(await main(['loopback-restart', '--phase', 'after-surge-restart', ...e.common()], { ...a, exec }), a.out.text()).toBe(EXIT.OK);
+    const obs = e.run().readJson<RestartObservation[]>('loopback-restart/observations.json')!.at(-1)!;
+    expect(obs.updatedAtChanged).toBe(true);
+    expect(obs.downloads.count).toBe(0);
+    expect(obs.updatedAtUnexplained).toBe(true);
+    expect(obs.note).toContain('产品会按无法解释的下载处理（令牌可疑，路由不是普通模式时改选 REJECT）');
+    expect(obs.note).toContain('待用户决定');
+    // 只记录：这一轮不因此不通过
+    expect(obs.loadedUncommitted).toBe(false);
+    const r = result('loopback_resource_restart');
+    expect(r.checks.find((c) => c.name.startsWith('Surge 退出重开 · 服务先于'))!.ok).toBe(true);
+    expect(r.checks.find((c) => c.name.startsWith('任何情况下都不会载入'))!.ok).toBe(true);
   });
 
   it('regression: an observation spanning a Surge update is recorded but not counted, and older observations stop counting under the new version', async () => {

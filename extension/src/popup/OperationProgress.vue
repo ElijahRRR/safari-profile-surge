@@ -32,7 +32,7 @@ const held = computed(() => (props.operation.phase === 'NORMAL_RESTORED' ? undef
       </ol>
       <p v-if="failed && props.operation.error" class="text-sm text-danger" data-test="operation-error">{{ props.operation.error.message }}</p>
       <p v-if="rollback" class="text-sm text-gray-700 dark:text-gray-300" data-test="operation-rollback">{{ rollbackText(rollback) }}</p>
-      <p v-if="held !== undefined" class="text-sm text-warning" data-test="operation-reject-held">{{ rejectHeldText(held) }}</p>
+      <p v-if="held !== undefined" class="text-sm text-warning" data-test="operation-reject-held">{{ rejectHeldText(held, props.operation.result?.rejectCause) }}</p>
     </div>
   </div>
 </template>

@@ -54,6 +54,7 @@ const ALL_WARNINGS: RouteWarning[] = [
   'exit_ip_mismatch',
   'buyer_exit_connections_unconfirmed',
   'node_resource_unverified',
+  'node_resource_forged',
 ];
 
 const ALL_NODE_RESOURCE_STATES: NodeResourceState[] = ['serving', 'not_listening', 'token_unavailable', 'legacy_line', 'not_installed'];
@@ -97,6 +98,16 @@ describe('route warning text', () => {
   it('says what node_resource_unverified means and shows it as danger (D10)', () => {
     expect(warningText('node_resource_unverified')).toBe('节点资源未确认：Surge 中的节点无法证明来自本机资源服务的已提交版本');
     expect(ROUTE_WARNING_TEXT.node_resource_unverified.severity).toBe('danger');
+  });
+
+  it('node_resource_forged (D11) is danger and does not claim the selection already changed', () => {
+    expect(ROUTE_WARNING_TEXT.node_resource_forged.severity).toBe('danger');
+    expect(warningText('node_resource_forged')).toContain('Surge 中的节点可能是伪造的');
+    expect(warningText('node_resource_forged')).toContain('尝试把 SFE-ROUTE 改选 REJECT');
+    expect(warningText('node_resource_forged')).toContain('以 SFE-ROUTE 的当前选择');
+    expect(warningText('node_resource_forged')).not.toContain('已把 SFE-ROUTE 改选');
+    expect(warningText('node_resource_forged')).not.toContain('用户决定');
+    expect(OPERATION_KIND_LABELS['route.hold']).toBe('改选 REJECT（节点可能被伪造）');
   });
 
   it('marks loss-of-control warnings as danger', () => {

@@ -77,6 +77,7 @@ const takeoverText = computed(() => {
           <span class="inline-flex flex-wrap items-center justify-end gap-2">
             <template v-if="surge.nodeResource">
               <Badge :variant="NODE_RESOURCE_STATE_LABELS[surge.nodeResource.state]?.variant ?? 'danger'">{{ NODE_RESOURCE_STATE_LABELS[surge.nodeResource.state]?.label ?? '状态未知' }}</Badge>
+              <Badge v-if="surge.nodeResource.forgedNodes" variant="danger">节点可能被伪造</Badge>
               <Badge v-if="surge.nodeResource.tokenSuspect" variant="danger">令牌可能已泄露</Badge>
               <Badge v-if="surge.nodeResource.needsRefresh" variant="warning">待重新同步</Badge>
             </template>

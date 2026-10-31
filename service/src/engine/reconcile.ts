@@ -3,17 +3,30 @@
 // maintenance.reconcile 操作，避免周期任务刷屏。启动恢复在这里整理未完成的意图行与操作。
 // 本机资源服务（D10，engine/node-resource.ts）：每次对账重试监听、审计、比较组成员与已提交版本、核对使用中节点的参数，发现问题
 // 时设 node_resource_unverified（不论路由是否托管；只由经确认的读回清除），需要时排入一次系统强制刷新发布（唯一的写入经执行器）。
+// 节点资源可能被伪造（用户决定 D11）：标记在时两项警告都在，路由不是经确认的普通模式时排入一次 REJECT 保持（route.hold，由执行器
+// 改选；对账本身仍不写 Surge，只插入这一操作，排在系统强制刷新之前）。
 
 import { readFile } from 'node:fs/promises';
 import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, type EntryMode, type OperationStatus, type RoutePhase, type RouteWarning } from '@sfe/contract';
 import type { RouteStateRecord } from '../db/index.js';
-import { ATTENTION_WARNINGS, evaluateControl, type ControlEvaluation } from '../domain/route-rules.js';
+import { ATTENTION_WARNINGS, evaluateControl, routeNotConfirmedNormal, type ControlEvaluation } from '../domain/route-rules.js';
+import { readForgedNodes } from '../resource/index.js';
 import { buildSurgeStatus } from '../domain/views.js';
 import { entryBlockIsFirstRule, parseProfile } from '../surge/profile.js';
 import { surgeRestartedBetween, type Engine } from './context.js';
 import { checkSegments } from './ownership.js';
 import { expireSafariProbe } from './handlers/probes.js';
-import { NODE_RESOURCE_WARNING, checkNodeResource, classifyGroupLine, maybeEnqueueSystemRefresh, nodeResourceReasonText, nodeResourceStatus, referencesLoopback } from './node-resource.js';
+import {
+  FORGED_WARNING,
+  NODE_RESOURCE_WARNING,
+  checkNodeResource,
+  classifyGroupLine,
+  maybeEnqueueForgedHold,
+  maybeEnqueueSystemRefresh,
+  nodeResourceReasonText,
+  nodeResourceStatus,
+  referencesLoopback,
+} from './node-resource.js';
 
 export type ReconcileKind = 'startup' | 'periodic' | 'refresh' | 'precheck';
 
@@ -134,12 +147,14 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   const owner = before.operationId ? repos.operations.get(before.operationId) : null;
   const managed = before.phase !== 'idle' || before.entryMode !== 'NORMAL';
   const extra = facts.reachable ? await readExtraFacts(engine) : null;
-  // 本机资源服务（只读 Surge）：路由不是普通模式时核对 SFE-ROUTE 当前选择的节点参数
+  // 本机资源服务（只读 Surge）：路由不是经确认的普通模式时核对 SFE-ROUTE 当前选择的节点参数（读不到选择时按记录，失败即关闭）；
+  // 参数不同即节点可能被伪造（用户决定 D11）
   const selectionNow = extra?.selection !== undefined ? extra.selection : before.selectedNode;
   const nodeResource = await checkNodeResource(engine, {
     reachable: facts.reachable,
     onWorkingProfile: facts.onWorkingProfile,
-    detailNode: before.entryMode !== 'NORMAL' ? selectionNow : null,
+    detailNode: routeNotConfirmedNormal(before) ? selectionNow : null,
+    detailNodeIsSelection: true,
   }).catch((err: unknown) => {
     engine.log('warn', 'resource.check_failed', { error: err instanceof Error ? err.name : 'unknown' });
     return null;
@@ -175,6 +190,13 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   if (nodeResource !== null && nodeResource.reasons.length > 0) {
     if (!warnings.has(NODE_RESOURCE_WARNING)) notes.push(`节点资源未确认：${nodeResourceReasonText(nodeResource.reasons)}`);
     add(NODE_RESOURCE_WARNING);
+  }
+  // 节点资源可能被伪造（用户决定 D11）：标记在时两项警告都在（对账从不清除；只有经确认的读回清除），托管时阶段改为 attention
+  // （ATTENTION_WARNINGS）。改选 REJECT 由执行器经排入的 route.hold 进行（见本函数末尾）
+  if (readForgedNodes(engine.kv) !== null) {
+    if (!warnings.has(FORGED_WARNING)) notes.push('Surge 中的节点可能是伪造的：路由不是经确认的普通模式时服务尝试把 SFE-ROUTE 改选 REJECT（Surge 可连接且是固定工作配置时）');
+    add(NODE_RESOURCE_WARNING);
+    add(FORGED_WARNING);
   }
 
   if (managed) {
@@ -334,6 +356,8 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   const envs = before.activeEnvironmentId ? [before.activeEnvironmentId] : [];
   engine.emit({ route: changed, surge: true, environments: changed ? envs : [], fronts: frontChanges.length > 0 });
   if (changed) engine.log('info', 'reconcile.changed', { trigger: kind, added });
+  // 节点资源可能被伪造（用户决定 D11）：需要时排入一次 REJECT 保持（执行器在系统强制刷新之前领取它）
+  maybeEnqueueForgedHold(engine, { selection: extra?.selection, kind });
   // 需要与已提交版本重新核对（needsRefresh、资源错误或未就绪、成员不同）：没有进行中的发布时排入一次系统强制刷新发布
   if (nodeResource !== null) maybeEnqueueSystemRefresh(engine, nodeResource);
   return { changed, route, added };

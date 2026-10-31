@@ -36,6 +36,7 @@ export const WARNING_TEXT: Record<RouteWarning, string> = {
   exit_ip_mismatch: '实测出口与预期出口不一致，已停止自动打开与填充',
   buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，请再次进入普通模式（只结束可能经买家出口的连接）',
   node_resource_unverified: '节点资源未确认：Surge 中的节点无法证明来自本机资源服务的已提交版本',
+  node_resource_forged: 'Surge 中的节点可能是伪造的：路由不是经确认的普通模式时，服务尝试把 SFE-ROUTE 改选 REJECT（不自动恢复，以当前选择为准）；请在网页后台处理节点资源，之后重新使用此环境',
 };
 
 export const PHASE_TEXT: Record<OperationPhase, string> = {
@@ -192,15 +193,21 @@ export function rollbackText(rollback: RollbackResult): string {
 
 /**
  * 路由操作结束时服务改选了 SFE-ROUTE（OperationView.result.rejectSelected；§6.3 第 14 步的结束点）：路由已改变、需要处理。
- * confirmed 为 false 时改选或读回失败。
+ * confirmed 为 false 时改选或读回失败。cause 为 node_resource_forged（result.rejectCause）时按节点可能被伪造写明（服务排入的
+ * REJECT 保持读回确认时结束为成功，不按状态判断）。
  */
-export function rejectHeldText(confirmed: boolean): string {
+export function rejectHeldText(confirmed: boolean, cause?: 'node_resource_forged'): string {
+  if (cause === 'node_resource_forged') {
+    return confirmed
+      ? 'Surge 中的节点可能是伪造的，服务已把 SFE-ROUTE 改选 REJECT：Safari 经本应用出口的新连接被拒绝，已建立的连接不受影响（进入普通模式会结束它们），自动打开订单与填充已停止。REJECT 不会自动恢复：在网页后台处理节点资源之后，重新使用此环境。'
+      : 'Surge 中的节点可能是伪造的，服务未能把 SFE-ROUTE 改选 REJECT：Safari 请求可能仍经当前选中的节点发出，请立即进入普通模式。';
+  }
   return confirmed
     ? '结束时 SFE-ROUTE 已不是使用中环境已验证的出口，服务已把它改选 REJECT：Safari 经本应用出口的新连接被拒绝，自动打开订单与填充已停止。请重新使用此环境，或进入普通模式。'
     : '结束时 SFE-ROUTE 已不是使用中环境已验证的出口，服务未能把它改选 REJECT：Safari 请求可能仍经买家出口发出，请立即进入普通模式。';
 }
 
-/** 使路由不再已验证的警告（失控类、受管理段被修改与节点资源未确认；写入重测结束说明用）。 */
+/** 使路由不再已验证的警告（失控类、受管理段被修改、节点资源未确认与可能被伪造；写入重测结束说明用）。 */
 export const ROUTE_LEFT_WARNINGS: readonly RouteWarning[] = [
   'surge_unreachable',
   'surge_restarted',
@@ -212,6 +219,7 @@ export const ROUTE_LEFT_WARNINGS: readonly RouteWarning[] = [
   'precedence_violation',
   'managed_segments_changed',
   'node_resource_unverified',
+  'node_resource_forged',
 ];
 
 /**

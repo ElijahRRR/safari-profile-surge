@@ -414,6 +414,51 @@ describe('prepare page flow', () => {
         note: '节点资源未确认',
         notNote: '不受这次重新检测影响',
       },
+      // 节点资源可能被伪造（用户决定 D11）：切换在写入之前停止、没有选择任何买家节点（error.details.forged）
+      {
+        op: operation({
+          phase: 'FAILED',
+          status: 'failed',
+          error: {
+            code: 'NODE_NOT_DEPLOYED',
+            message: '激活失败：Surge 中的节点可能是伪造的（…），路由未改变；…，或进入普通模式',
+            details: { reason: 'node_resource_unverified', forged: true, beforeWrite: true },
+          },
+        }),
+        outcome: 'failed',
+        title: '切换未完成',
+        guarantee: false,
+        note: '没有选择任何买家节点',
+        notNote: '用户决定',
+      },
+      // 核对时才发现节点可能被伪造（已选择目标节点、开放检测之后，按快照回滚、保持阻断）：按回滚说明，不说没有选择任何买家节点
+      {
+        op: operation({
+          phase: 'FAILED',
+          status: 'failed',
+          error: { code: 'NODE_NOT_DEPLOYED', message: '切换失败：Surge 中的节点可能是伪造的（…），未进入使用中模式', details: { reason: 'node_resource_unverified', forged: true } },
+          result: { rollback: { ...rollback, restoredSelection: null, needsReverify: false, rejectKept: true } },
+        }),
+        outcome: 'rolled_back',
+        title: '切换未完成',
+        guarantee: true,
+        note: '不会改用直连或其他环境的出口',
+        notNote: '没有选择任何买家节点',
+      },
+      // 结束点因伪造标记改选了 REJECT（result.rejectCause）：按伪造的原因写明，不说「已不是使用中环境已验证的出口」
+      {
+        op: operation({
+          phase: 'BLOCKED_NEEDS_ATTENTION',
+          status: 'needs_attention',
+          error: { code: 'NODE_NOT_DEPLOYED', message: '激活失败：Surge 中的节点可能是伪造的（…）；…SFE-ROUTE 已改选 REJECT（读回确认）', details: { forged: true, rejectSelected: true, rejectCause: 'node_resource_forged' } },
+          result: { rejectSelected: true, rejectCause: 'node_resource_forged' },
+        }),
+        outcome: 'attention',
+        title: '操作已结束，路由需要处理',
+        guarantee: false,
+        note: 'Surge 中的节点可能是伪造的，服务已把 SFE-ROUTE 改选 REJECT',
+        notNote: '使用中环境已验证的出口',
+      },
       // 核对后失败：服务把 probe_failed 加到路由上（result.probeWarning），自动打开订单与填充确实已停止
       {
         op: operation({

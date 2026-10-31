@@ -344,6 +344,41 @@ describe('activation from the environments page', () => {
     m.unmount();
   });
 
+  it('D11: the REJECT hold for forged node content says why (by rejectCause, not by status) and never "verified exit"', async () => {
+    const holdOk = operation({ id: 'op_4', kind: 'route.hold', phase: 'COMPLETED', status: 'succeeded', result: { rejectSelected: true, rejectCause: 'node_resource_forged' } });
+    const holdFail = operation({
+      id: 'op_5',
+      kind: 'route.hold',
+      phase: 'FAILED',
+      status: 'failed',
+      error: { code: 'SURGE_UNREACHABLE', message: 'Surge 中的节点可能是伪造的（…）：SFE-ROUTE 未能改选 REJECT（…）' },
+      result: { rejectSelected: false, rejectCause: 'node_resource_forged' },
+    });
+    const notNeeded = operation({ id: 'op_6', kind: 'route.hold', phase: 'COMPLETED', status: 'succeeded', result: { forgedHold: 'not_needed' } });
+    const { ctx } = testContext((call: Call) => {
+      if (call.url === '/api/operations/op_4') return { status: 200, body: holdOk };
+      if (call.url === '/api/operations/op_5') return { status: 200, body: holdFail };
+      if (call.url === '/api/operations/op_6') return { status: 200, body: notNeeded };
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: '找不到' } } };
+    }, snapshot({ route: route({ operationId: null, phase: 'attention', entryMode: 'ACTIVE', activeEnvironmentId: 'env_1', activeProxyRevision: 1, selectedNode: 'REJECT' }) }));
+    const m = await mountWith(RouteActionHost, ctx);
+    ctx.viewer.open('op_4', 'US-买家01');
+    await flush();
+    let held = document.body.querySelector('[data-test="reject-held"]')?.textContent ?? '';
+    expect(held).toContain('Surge 中的节点可能是伪造的，服务已把 SFE-ROUTE 改选 REJECT');
+    expect(held).toContain('不会自动恢复');
+    expect(held).not.toContain('使用中环境已验证的出口');
+    ctx.viewer.open('op_5', 'US-买家01');
+    await flush();
+    held = document.body.querySelector('[data-test="reject-held"]')?.textContent ?? '';
+    expect(held).toContain('服务未能把 SFE-ROUTE 改选 REJECT');
+    expect(held).toContain('请立即进入普通模式');
+    ctx.viewer.open('op_6', 'US-买家01');
+    await flush();
+    expect(document.body.querySelector('[data-test="reject-held"]')).toBeNull();
+    m.unmount();
+  });
+
   it('a failed first activation (no verified route before the switch) never lists the failed target\'s node as a restored selection, even from an older service that still names it', async () => {
     const failed = operation({
       phase: 'FAILED',

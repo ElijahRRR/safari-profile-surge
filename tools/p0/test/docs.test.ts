@@ -408,6 +408,71 @@ describe('docs/ARCHITECTURE.md D10: loopback node resource (deviation, publish f
   });
 });
 
+describe('D12 (staged candidate downloaded at a Surge relaunch is recorded only) and the D11 acceptance texts', () => {
+  const runbook = read('P0-RUNBOOK.md');
+  const acceptance = read('ACCEPTANCE.md');
+  const checklist = read('P0-CHECKLIST.md');
+  const section = (text: string, start: string, end: string) => text.slice(text.indexOf(start), text.indexOf(end, text.indexOf(start)));
+
+  it('the criteria name the D12 exception literally (only a download at the launch of a Surge relaunch) and the docs quote them', () => {
+    const c = CAPABILITY_CRITERIA.loopback_resource_restart;
+    expect(c).toContain('用户决定 D12');
+    expect(c).toContain('任何情况下都不会载入本服务未提交的版本（例外只记录为行为：发布暂存着候选版本时 Surge 退出重开并在启动时下载了这个候选');
+    expect(runbook).toContain(`**通过条件**：${c}`);
+    expect(acceptance).toContain(`通过条件：${c}`);
+  });
+
+  it('RUNBOOK 3.12 records the decision instead of the open question and keeps every other uncommitted load failing', () => {
+    const s = section(runbook, '### 3.12 loopback_resource_restart', '\n### 3.13');
+    expect(s).not.toContain('这一点是否算作不通过，由用户决定');
+    expect(s).not.toContain('任何变体中 Surge 载入了“已暂存候选”或其他未提交的内容：不通过');
+    for (const t of [
+      '已暂存候选（用户决定 D12，2026-10-31）',
+      '`candidate` 变体中下载了不是暂存那一代的未提交内容',
+      '暂存的候选在 Surge 重开之前',
+      'Mac 重启的 `candidate` 变体中下载了暂存的候选',
+      '其他变体中载入了任何未提交的内容',
+      'D12 之前记录的 `candidate` 观察',
+      '产品会按无法解释的下载处理（令牌可疑，路由不是普通模式时改选 REJECT）',
+    ]) {
+      expect(s).toContain(t);
+    }
+    // 失败处理保持不变：待部署，不自动重载兜底
+    expect(s).toContain('新节点保持「已保存，待部署」');
+    expect(s).toContain('**不自动重载兜底**');
+  });
+
+  it('ACCEPTANCE 1.11 rows, the 3.3 note and the D11 risk row', () => {
+    const s111 = section(acceptance, '### 1.11 loopback_resource_restart', '\n### 1.12');
+    expect(s111).toContain('| 已暂存候选时 Surge 重开：启动时是否下载并载入候选（只记录为行为，用户决定 D12） | 未验证 |');
+    expect(s111).toContain('| 除暂存候选在 Surge 重开启动时被下载之外，任何情况下都不载入本服务未提交的版本 | 未验证 |');
+    expect(s111).not.toContain('| 已暂存候选时重启：不载入本服务未提交的版本 |');
+    expect(section(acceptance, '### 3.3 更新当前节点参数', '\n### 3.4')).toContain('`node_resource_forged`');
+    const risk = acceptance.split('\n').find((l) => l.startsWith('| 节点可能被伪造时的 REJECT 保持（用户决定 D11） |'))!;
+    expect(risk).toBeDefined();
+    for (const t of ['只在路由不是经确认的普通模式、Surge 可连接且是固定工作配置时', '排队的普通模式先执行', '不结束已建立的连接', 'Chrome 与其他应用不受影响', 'REJECT 不自动恢复', '更换资源地址']) expect(risk).toContain(t);
+    // 风险表中这一行紧跟在“读取令牌与端口占用”之后
+    const lines = acceptance.split('\n');
+    expect(lines[lines.findIndex((l) => l.startsWith('| 回环资源的读取令牌与端口占用 |')) + 1]).toBe(risk);
+  });
+
+  it('the checklist stops on uncommitted loads except the D12 exception', () => {
+    expect(checklist).toContain('已暂存候选一轮中 Surge 启动时下载了候选只记录为行为，用户决定 D12');
+    expect(checklist).toContain('任何一次 Surge 载入了测试服务没有提交的内容（Surge 退出重开、启动时下载已暂存的候选除外：只记录，用户决定 D12）');
+  });
+
+  // 依赖 ARCHITECTURE（另一位实现者）中的 D11、D12 记录
+  it('ARCHITECTURE §0 records D11 and D12, and §6.6 no longer leaves the forged-content question open', () => {
+    const arch = read('ARCHITECTURE.md');
+    const s0 = arch.slice(arch.indexOf('## 0.'), arch.indexOf('## 1.'));
+    expect(s0).toMatch(/^\| D11 \| 2026-10-31 \|/m);
+    expect(s0).toMatch(/^\| D12 \| 2026-10-31 \|/m);
+    expect(arch).toContain('**节点可能被伪造时的 REJECT 保持（`node_resource_forged`，用户决定 D11）**');
+    const s66 = arch.slice(arch.indexOf('### 6.6'), arch.indexOf('### 6.7'));
+    expect(s66).not.toContain('待用户决定：确认 Surge 载入了伪造内容时是否由执行器保持 REJECT');
+  });
+});
+
 describe('docs/P0-CHECKLIST.md (D10)', () => {
   const text = read('P0-CHECKLIST.md');
 

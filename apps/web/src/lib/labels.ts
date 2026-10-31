@@ -66,6 +66,10 @@ export const ROUTE_WARNING_TEXT: Record<RouteWarning, { text: string; severity: 
   exit_ip_mismatch: { text: '实测出口与预期出口不一致，已停止自动打开订单与填充', severity: 'danger' },
   buyer_exit_connections_unconfirmed: { text: '未能确认 Safari 已没有经买家出口的连接，再次进入普通模式会再结束其中可能经买家出口的连接（按原规则发出的不受影响）', severity: 'danger' },
   node_resource_unverified: { text: '节点资源未确认：Surge 中的节点无法证明来自本机资源服务的已提交版本', severity: 'danger' },
+  node_resource_forged: {
+    text: 'Surge 中的节点可能是伪造的（出现了本服务没有提供过的下载，或使用中节点的参数与其版本不同）：路由不是经确认的普通模式时，服务尝试把 SFE-ROUTE 改选 REJECT（Surge 可连接且是固定工作配置时；是否已改选以 SFE-ROUTE 的当前选择与「改选 REJECT」操作为准），不会自动恢复；节点资源经确认的同步之后才能重新使用环境',
+    severity: 'danger',
+  },
 };
 
 export function warningText(w: RouteWarning): string {
@@ -151,6 +155,7 @@ export const OPERATION_KIND_LABELS: Record<OperationKind, string> = {
   'front.verify': '核验前置',
   'route.activate': '切换环境',
   'route.normal': '进入普通模式',
+  'route.hold': '改选 REJECT（节点可能被伪造）',
   'probe.preflight': '代理预检',
   'probe.safari': 'Safari 重测',
   'maintenance.init': '初始化工作配置',
@@ -280,6 +285,20 @@ export const NODE_RESOURCE_TOKEN_SUSPECT_TEXT =
  */
 export const NODE_RESOURCE_NEEDS_REFRESH_TEXT =
   'Surge 中的节点可能不是已提交的版本：下一次发布会对本应用这一项资源执行一次单 key 更新并读回。服务自动发起一次同步（同步本身因服务中断而失败时再自动重试一次）；停在待部署或其他失败后不会自动重试，需要时请点「重新同步节点资源」。';
+
+/**
+ * Surge 中的节点可能是伪造的、读取令牌可能已泄露时的说明（NodeResourceStatusView.forgedNodes 与 tokenSuspect，用户决定 D11）。
+ * 是否已改选 REJECT 以 SFE-ROUTE 的当前选择与「改选 REJECT」操作为准，这里不声称。
+ */
+export const NODE_RESOURCE_FORGED_TEXT =
+  'Surge 中的节点可能是伪造的（出现了本服务没有提供过的下载，或使用中节点的服务器、端口或前置与其版本不同）：路由不是经确认的普通模式时，服务尝试把 SFE-ROUTE 改选 REJECT 并保持，不会自动恢复（是否已改选以 SFE-ROUTE 的当前选择为准）。读取令牌可能已泄露：先进入普通模式，再在「重新合并」中勾选“更换本机资源地址”；之后的节点资源发布经读回确认才清除这一状态。清除之后需要重新使用环境。';
+
+/**
+ * 同上，读取令牌不可疑：使用中节点的参数与其版本不同，或无法解释的下载之后已经更换资源地址、而伪造状态尚未由经确认的发布清除
+ * （状态视图不带原因，不声称是哪一种）。
+ */
+export const NODE_RESOURCE_FORGED_RESYNC_TEXT =
+  'Surge 中的节点可能是伪造的（出现了本服务没有提供过的下载，或使用中节点的服务器、端口或前置与其版本不同）：路由不是经确认的普通模式时，服务尝试把 SFE-ROUTE 改选 REJECT 并保持，不会自动恢复（是否已改选以 SFE-ROUTE 的当前选择为准）。需要一次经读回确认的节点资源发布才清除这一状态（需要时服务自动排入，发布门槛不满足时保持待部署；也可以点「重新同步节点资源」），之后重新使用环境。';
 
 /** 同上，但本机资源服务不满足发布前提（例如仍引用本地节点文件、未监听或令牌可疑）：在原因消除之前不会同步。 */
 export const NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT =

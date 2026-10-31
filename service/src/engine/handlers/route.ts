@@ -6,6 +6,9 @@
 // 而 SFE-ROUTE 的选择不是使用中环境已验证的出口（回滚、普通模式失败或撤销未经运行时确认、处理器意外异常，以及其余每条结束
 // 路径——例如对账已把路由改为 attention 之后在写入之前失败的激活，见 holdAtRouteEnd）：一律尽力改选 REJECT 并读回，如实写明
 // 是否确认（selectRejectBestEffort）。
+// 节点资源可能被伪造（用户决定 D11）：执行器领取服务排入的 REJECT 保持（route.hold，runForgedHold）改选 REJECT 并读回；标记在时
+// 任何买家节点都不算已验证的出口（verifiedExitNode），各结束点、普通模式失败与执行器兜底因此一律失败即关闭；回滚不恢复切换前的
+// 买家节点。
 
 import {
   CAPABILITY_GATES,
@@ -23,8 +26,18 @@ import {
 import { isIP } from 'node:net';
 import type { OperationRecord, RouteStateRecord } from '../../db/index.js';
 import { PUBLISH_KINDS, newRoutePayload, payloadOf, type EndHoldIntent, type ProbeVerdict, type RouteEnding, type RoutePayload, type SafariProbeEvidence } from '../../domain/operations.js';
-import { LOSS_OF_CONTROL_WARNINGS, REUSE_BLOCKING_WARNINGS, hasAny, safariProbeCurrent } from '../../domain/route-rules.js';
-import { NODE_RESOURCE_WARNING, nodeResourceSwitchFailure } from '../node-resource.js';
+import { LOSS_OF_CONTROL_WARNINGS, REUSE_BLOCKING_WARNINGS, hasAny, routeNotConfirmedNormal, safariProbeCurrent } from '../../domain/route-rules.js';
+import { readForgedNodes } from '../../resource/index.js';
+import {
+  FORGED_HOLD_KEY,
+  FORGED_WARNING,
+  NODE_RESOURCE_WARNING,
+  forgedReasonText,
+  forgedRemedyText,
+  nodeResourceHeld,
+  nodeResourceStickyWarnings,
+  nodeResourceSwitchFailure,
+} from '../node-resource.js';
 import { labelOf } from '../../domain/naming.js';
 import { probeView } from '../../domain/views.js';
 import type { EntryController, EntryReadback, EntryTransitionOptions } from '../../ports.js';
@@ -134,6 +147,13 @@ interface RejectHold {
    * 按改选（读回确认）记下（recordEndHold、heldEnd），不当作之前已是 REJECT。
    */
   recovered?: EndHoldIntent;
+  /**
+   * 改选的原因是节点资源可能被伪造（用户决定 D11）：REJECT 保持操作的改选，或结束点只因伪造标记而改选（SFE-ROUTE 选着的原本就是
+   * 使用中环境已验证的出口）。recordEndHold 据此带两项节点资源警告而不是 entry_unverified，说明与结果（rejectCause）按此写明。
+   */
+  cause?: 'node_resource_forged';
+  /** 改选或读回失败时 Surge 调用的错误代码（例如 SURGE_UNREACHABLE）；确认时没有。 */
+  errorCode?: string;
 }
 
 /**
@@ -147,14 +167,32 @@ async function selectRejectBestEffort(engine: Engine): Promise<RejectHold> {
   try {
     await engine.surge.selectGroupPolicy(ROUTE_GROUP_NAME, 'REJECT');
   } catch (err) {
-    return { confirmed: false, readback: null, error: holdErrorText(engine, err, '改选失败') };
+    return { confirmed: false, readback: null, error: holdErrorText(engine, err, '改选失败'), ...errorCodeOf(err) };
   }
   try {
     const sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
     return sel === 'REJECT' ? { confirmed: true, readback: sel, error: null } : { confirmed: false, readback: sel, error: '改选后读回不一致' };
   } catch (err) {
-    return { confirmed: false, readback: null, error: holdErrorText(engine, err, '改选后读回失败') };
+    return { confirmed: false, readback: null, error: holdErrorText(engine, err, '改选后读回失败'), ...errorCodeOf(err) };
   }
+}
+
+function errorCodeOf(err: unknown): { errorCode?: string } {
+  return err instanceof SfeError ? { errorCode: err.code } : {};
+}
+
+/** SFE-ROUTE 的选择（读不到为 undefined）。从不抛出。 */
+async function readSelectionSafe(engine: Engine): Promise<string | null | undefined> {
+  try {
+    return await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 结果中记下的改选（rejectSelected，及伪造原因 rejectCause）。 */
+function holdResult(hold: RejectHold): { rejectSelected: boolean; rejectCause?: 'node_resource_forged' } {
+  return { rejectSelected: hold.confirmed, ...(hold.cause ? { rejectCause: hold.cause } : {}) };
 }
 
 function holdErrorText(engine: Engine, err: unknown, fallback: string): string {
@@ -238,8 +276,17 @@ async function selectionIsVerifiedExit(engine: Engine, route: RouteStateRecord):
   }
 }
 
-/** 按路由记录，使用中环境已验证的出口节点（selectionIsVerifiedExit 的记录部分）；记录不能证明时为 null。 */
+/**
+ * 按路由记录，使用中环境已验证的出口节点（selectionIsVerifiedExit 的记录部分）；记录不能证明时为 null。节点资源可能被伪造时
+ * （resource:forgedNodes，用户决定 D11）任何买家节点都不算已验证的出口：为 null（结束点、普通模式失败与执行器兜底因此改选 REJECT）。
+ */
 function verifiedExitNode(engine: Engine, route: RouteStateRecord): string | null {
+  if (readForgedNodes(engine.kv) !== null) return null;
+  return verifiedExitNodeIgnoringForged(engine, route);
+}
+
+/** verifiedExitNode 不看伪造标记的部分：只用于写明结束点的改选是否只因伪造标记（holdAtRouteEnd）。 */
+function verifiedExitNodeIgnoringForged(engine: Engine, route: RouteStateRecord): string | null {
   if (route.activationSnapshot !== null || route.activeEnvironmentId === null || route.activeProxyRevision === null) return null;
   if (route.warnings.includes('external_selection_change')) return null;
   const rev = engine.repos.proxyRevisions.get(route.activeEnvironmentId, route.activeProxyRevision);
@@ -299,13 +346,9 @@ interface EndHoldOptions {
 async function holdAtRouteEnd(engine: Engine, opId: string, opts: EndHoldOptions = {}): Promise<RejectHold | null> {
   const { repos } = engine;
   let externalSelectionBefore = false;
-  const readSelection = async (): Promise<string | null | undefined> => {
-    try {
-      return await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-    } catch {
-      return undefined;
-    }
-  };
+  /** 只因节点资源可能被伪造而改选（选择就是使用中环境已验证的出口，或读不到而记录表明是它；用户决定 D11）。 */
+  let forgedOnly = false;
+  const readSelection = (): Promise<string | null | undefined> => readSelectionSafe(engine);
   try {
     const route = repos.routeState.get();
     if (!entryMayUseRoute(route)) return null;
@@ -318,7 +361,7 @@ async function holdAtRouteEnd(engine: Engine, opId: string, opts: EndHoldOptions
     if (intent) {
       sel = await readSelection();
       selRead = true;
-      if (sel === 'REJECT') return { confirmed: true, readback: 'REJECT', error: null, recovered: intent };
+      if (sel === 'REJECT') return { confirmed: true, readback: 'REJECT', error: null, recovered: intent, ...(intent.cause ? { cause: intent.cause } : {}) };
     }
     const others = repos.operations.listByStatus(['queued', 'running', 'waiting']).filter((o) => o.id !== opId);
     if (others.some((o) => o.kind === 'route.normal' && (o.status === 'queued' || o.status === 'running'))) return null;
@@ -335,11 +378,15 @@ async function holdAtRouteEnd(engine: Engine, opId: string, opts: EndHoldOptions
     // 出口时除外（observedSelection）：那是选择已变的正面证据，一次读取失败不能把它变成「路由未改变」，照样改选
     if (verified !== null && sel === undefined && (opts.observedSelection === undefined || opts.observedSelection === verified)) return null;
     externalSelectionBefore = route.warnings.includes('external_selection_change');
+    // 节点资源可能被伪造（用户决定 D11）：选择本来就是（或按同一规则视为）使用中环境已验证的出口，只因伪造标记而改选
+    const raw = verified === null && readForgedNodes(engine.kv) !== null ? verifiedExitNodeIgnoringForged(engine, route) : null;
+    forgedOnly = raw !== null && (sel === raw || (sel === undefined && (opts.observedSelection === undefined || opts.observedSelection === raw)));
   } catch (err) {
     engine.log('warn', 'route.end_hold_check_failed', { operationId: opId, error: err instanceof Error ? err.name : 'unknown' });
   }
-  markEndHoldIntent(engine, opId, { externalSelectionBefore, ...(opts.ending ? { ending: opts.ending } : {}) });
-  return selectRejectBestEffort(engine);
+  markEndHoldIntent(engine, opId, { externalSelectionBefore, ...(opts.ending ? { ending: opts.ending } : {}), ...(forgedOnly ? { cause: 'node_resource_forged' as const } : {}) });
+  const hold = await selectRejectBestEffort(engine);
+  return forgedOnly ? { ...hold, cause: 'node_resource_forged' } : hold;
 }
 
 /** holdAtRouteEnd 改选 REJECT 之前在操作中记下意图（OperationPayload.endHold）。写入失败只记日志：照样改选（失败即关闭）。 */
@@ -366,6 +413,8 @@ function markEndHoldIntent(engine: Engine, opId: string, intent: EndHoldIntent):
  * 运行时求值确认）保持 idle，由警告与持久标记提供普通模式。
  * 崩溃恢复中记下的改选（RejectHold.recovered）：启动对账在恢复之前读到本操作的 REJECT、把它当作外部修改记下
  * external_selection_change——改选之前路由没有这一警告时去掉它（改选是本应用做的，路由仍因改选需要处理）。
+ * 只因节点资源可能被伪造而改选（hold.cause，用户决定 D11）：入口状态没有变化，不带 entry_unverified，改带 node_resource_unverified 与
+ * node_resource_forged。
  */
 function recordEndHold(engine: Engine, opId: string, hold: RejectHold | null): void {
   if (!hold) return;
@@ -374,7 +423,12 @@ function recordEndHold(engine: Engine, opId: string, hold: RejectHold | null): v
   const warnings = new Set<RouteWarning>(
     fresh.warnings.filter((w) => w !== 'rollback_needs_reverify' && !(w === 'external_selection_change' && hold.recovered && !hold.recovered.externalSelectionBefore)),
   );
-  warnings.add('entry_unverified');
+  if (hold.cause === 'node_resource_forged') {
+    warnings.add(NODE_RESOURCE_WARNING);
+    warnings.add(FORGED_WARNING);
+  } else {
+    warnings.add('entry_unverified');
+  }
   holdExistingConnections(engine, opId, warnings);
   repos.routeState.update({
     ...(fresh.phase === 'idle' ? {} : { phase: 'attention' as const, awaitingDeadline: null }),
@@ -390,6 +444,9 @@ function recordEndHold(engine: Engine, opId: string, hold: RejectHold | null): v
  */
 function endHoldNote(hold: RejectHold | null): string {
   if (!hold) return '';
+  if (hold.cause === 'node_resource_forged') {
+    return `；Surge 中的节点可能是伪造的：SFE-ROUTE 当前的选择（读不到时同样失败即关闭）不再算使用中环境已验证的出口，失败即关闭：${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}；路由需要处理（自动打开订单与填充已停止）：节点资源经确认的同步之后重新使用环境，或进入普通模式`;
+  }
   return `；结束时路由仍未回到已确认的状态（入口可能仍让 Safari 经 SFE-ROUTE，而 SFE-ROUTE 选着的不是使用中环境已验证的出口），失败即关闭：${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}；路由需要处理（自动打开订单与填充已停止）：进入普通模式，或重新使用环境`;
 }
 
@@ -404,7 +461,7 @@ function withoutUnchangedClaim(text: string): string {
 /** 错误说明附上结束点的改选（details.rejectSelected），并去掉「路由未改变」的说法。 */
 function withEndHold(body: ApiErrorBody, hold: RejectHold | null): ApiErrorBody {
   if (!hold) return body;
-  return { ...body, message: `${withoutUnchangedClaim(body.message)}${endHoldNote(hold)}`, details: { ...(body.details ?? {}), rejectSelected: hold.confirmed } };
+  return { ...body, message: `${withoutUnchangedClaim(body.message)}${endHoldNote(hold)}`, details: { ...(body.details ?? {}), ...holdResult(hold) } };
 }
 
 type EndPatch = Parameters<Engine['updateOp']>[1];
@@ -430,6 +487,7 @@ const RETEST_LOST_TEXT: Partial<Record<RouteWarning, string>> = {
   precedence_violation: '有规则排在本应用入口之前',
   managed_segments_changed: '受管理段或本应用文件被外部修改',
   node_resource_unverified: '节点资源未确认（Surge 中的节点无法证明来自本机资源服务的已提交版本）',
+  node_resource_forged: 'Surge 中的节点可能是伪造的（服务尝试把 SFE-ROUTE 改选 REJECT）',
 };
 
 /**
@@ -456,7 +514,7 @@ function retestLostNote(warnings: readonly RouteWarning[]): string {
  */
 function heldEnd(patch: EndPatch, step: string, hold: RejectHold): { patch: EndPatch; step: string } {
   const text = `${withoutUnchangedClaim(step)}${endHoldNote(hold)}`;
-  const error: ApiErrorBody = patch.error ? withEndHold(patch.error, hold) : { code: 'UNKNOWN_STATE', message: text, details: { rejectSelected: hold.confirmed } };
+  const error: ApiErrorBody = patch.error ? withEndHold(patch.error, hold) : { code: 'UNKNOWN_STATE', message: text, details: holdResult(hold) };
   return { patch: { ...patch, phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', error }, step: text };
 }
 
@@ -545,7 +603,7 @@ async function endRouteOp(
       ? {
           result: {
             ...(patch.result ?? cur.result ?? {}),
-            ...(hold ? { rejectSelected: hold.confirmed } : {}),
+            ...(hold ? holdResult(hold) : {}),
             ...(left ? { routeLeftVerified: left } : {}),
             ...(mismatch ? { probeWarning: 'exit_ip_mismatch' as const } : {}),
           },
@@ -614,7 +672,9 @@ export function isActiveEnvironment(engine: Engine, environmentId: string): bool
  */
 function routeSnapshot(route: RouteStateRecord): ActivationSnapshot {
   if (route.activationSnapshot) {
-    return { ...route.activationSnapshot, previousRouteEpoch: route.routeEpoch };
+    // forgedHoldSelected 只说明之前那次切换的等待期间（forgedHeld 沿用：回滚仍不恢复切换前的买家节点）
+    const { forgedHoldSelected: _earlier, ...kept } = route.activationSnapshot;
+    return { ...kept, previousRouteEpoch: route.routeEpoch };
   }
   return {
     previousEnvironmentId: route.activeEnvironmentId,
@@ -796,7 +856,7 @@ async function settleAbandonedRouteOp(engine: Engine, opId: string, err: unknown
       if (!fresh.warnings.includes('managed_windows_on_original_rules')) repos.routeState.update({ warnings: [...fresh.warnings, 'managed_windows_on_original_rules'] });
     }
     const error = end.patch.error ? { ...end.patch.error, message: `${end.patch.error.message}${note}` } : end.patch.error;
-    repos.operations.update(opId, { ...end.patch, error, ...(hold ? { result: { ...(cur.result ?? {}), rejectSelected: hold.confirmed } } : {}) });
+    repos.operations.update(opId, { ...end.patch, error, ...(hold ? { result: { ...(cur.result ?? {}), ...holdResult(hold) } } : {}) });
     repos.operations.appendStep(opId, end.patch.phase!, `${end.step}${note}`);
     repos.outbox.cancelForOperation(opId);
   });
@@ -1702,9 +1762,13 @@ function exitIpMismatch(engine: Engine, p: RoutePayload, suffix: string): ApiErr
 function changedDuringCheck(engine: Engine, p: RoutePayload, where: string): ApiErrorBody | null {
   const replaced = replacedTarget(engine, p);
   if (replaced) return { code: 'NODE_NOT_DEPLOYED', message: `切换失败：${replaced}（核对期间保存），${where}` };
-  // 等待实测期间对账设了节点资源未确认（D10）：Surge 中的节点无法证明来自已提交版本，不写入 ACTIVE、不提交
-  if (engine.repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) {
-    return { code: 'NODE_NOT_DEPLOYED', message: `切换失败：节点资源未确认（Surge 中的节点无法证明来自本机资源服务的已提交版本），${where}`, details: { reason: NODE_RESOURCE_WARNING } };
+  // 等待实测期间对账设了节点资源未确认（D10），或节点可能被伪造（D11，标记在而警告可能还没有加上）：Surge 中的节点无法证明来自
+  // 已提交版本，不写入 ACTIVE、不提交
+  if (nodeResourceHeld(engine, engine.repos.routeState.get())) {
+    const forged = readForgedNodes(engine.kv);
+    return forged !== null
+      ? { code: 'NODE_NOT_DEPLOYED', message: `切换失败：Surge 中的节点可能是伪造的（${forgedReasonText(forged.reasons)}），${where}`, details: { reason: NODE_RESOURCE_WARNING, forged: true } }
+      : { code: 'NODE_NOT_DEPLOYED', message: `切换失败：节点资源未确认（Surge 中的节点无法证明来自本机资源服务的已提交版本），${where}`, details: { reason: NODE_RESOURCE_WARNING } };
   }
   return exitIpMismatch(engine, p, `核对期间预期出口已修改，${where}`);
 }
@@ -1815,7 +1879,7 @@ function finishProbe(
         };
     repos.operations.update(opId, {
       ...end.patch,
-      result: { ...(cur.result ?? {}), probeWarning: w, ...(hold ? { rejectSelected: hold.confirmed } : {}), ...(left ? { routeLeftVerified: left } : {}) },
+      result: { ...(cur.result ?? {}), probeWarning: w, ...(hold ? holdResult(hold) : {}), ...(left ? { routeLeftVerified: left } : {}) },
     });
     repos.operations.appendStep(opId, end.patch.phase!, end.step);
     repos.outbox.cancelForOperation(opId);
@@ -1841,8 +1905,9 @@ function commitActive(engine: Engine, opId: string, p: RoutePayload, evidence: R
   // 普通模式未能确认 Safari 已离开买家出口的警告：只有本次激活第 7 步在已确认的阻断下结束了全部 Safari 连接（含持久标记中
   // 被换掉的进程路径上可能经买家出口的连接）时才清除；否则（升级前已在进行中的激活）之前买家出口上的连接仍可能存在
   if (route.warnings.includes('buyer_exit_connections_unconfirmed') && p.safariConnectionsEnded !== true) warnings.push('buyer_exit_connections_unconfirmed');
-  // 节点资源未确认（D10）不由激活清除：只在经确认的发布或回滚读回之后清除（提交之前的再核对已拒绝它，这里只是纵深防御）
-  if (route.warnings.includes(NODE_RESOURCE_WARNING)) warnings.push(NODE_RESOURCE_WARNING);
+  // 节点资源未确认（D10）与可能被伪造（D11）不由激活清除：只在经确认的发布或回滚读回之后清除（提交之前的再核对已拒绝它们，这里
+  // 只是纵深防御；伪造标记在而警告还没有加上时补上）
+  warnings.push(...nodeResourceStickyWarnings(engine, route.warnings));
   const retired: OperationRecord[] = [];
   repos.tx(() => {
     // WAITING_ROUTE 只针对使用中的环境（§6.3 第 4 步）：另一个环境成为使用中的环境时，停在 WAITING_ROUTE 的其他环境的发布
@@ -1907,6 +1972,21 @@ function previousRouteOf(engine: Engine, snapshot: ActivationSnapshot | null): '
 const RESOURCE_HELD_STEP =
   '切换失败：节点资源未确认（Surge 中的节点无法证明来自本机资源服务的已提交版本），不恢复切换前的买家节点：SFE-ROUTE 改选 REJECT（读回确认），Safari 保持阻断；路由需要处理：节点资源经确认的发布之后重新使用此环境，或进入普通模式';
 
+/** 回滚成功、节点资源可能被伪造（D11，标记在）时的步骤说明：不恢复切换前的买家节点，改选 REJECT。 */
+const FORGED_RESOURCE_HELD_STEP =
+  '切换失败：Surge 中的节点可能是伪造的，不恢复切换前的买家节点：SFE-ROUTE 改选 REJECT（读回确认），Safari 保持阻断；路由需要处理：节点资源经确认的同步之后重新使用此环境，或进入普通模式';
+
+/** 回滚成功、这次切换等待期间服务因节点可能被伪造改选 REJECT 并读回确认（ActivationSnapshot.forgedHoldSelected，D11）时的步骤说明。 */
+const FORGED_HOLD_KEPT_STEP =
+  '切换失败：等待期间 Surge 中的节点可能是伪造的、SFE-ROUTE 已改选 REJECT，不恢复切换前的买家节点：SFE-ROUTE 改选 REJECT（读回确认），Safari 保持阻断；路由需要处理：重新使用环境或进入普通模式';
+
+/**
+ * 回滚成功、这次或之前沿用快照的切换进行中服务因节点可能被伪造尝试过 REJECT 保持（ActivationSnapshot.forgedHeld），而这次等待期间
+ * 没有经读回确认的改选、伪造标记也已不在时的步骤说明（不声称等待期间已改选 REJECT）。
+ */
+const FORGED_HELD_EARLIER_STEP =
+  '切换失败：这次或之前的切换进行中服务发现过 Surge 中的节点可能是伪造的，不恢复切换前的买家节点：SFE-ROUTE 改选 REJECT（读回确认），Safari 保持阻断；路由需要处理：重新使用环境或进入普通模式';
+
 /** 回滚成功、切换前已改选 REJECT（previousRouteOf 为 'held'）时的步骤说明：没有恢复任何买家节点。 */
 function rejectKeptStep(previousSelection: string | null): string {
   const why = previousSelection === 'REJECT' ? '切换前 SFE-ROUTE 已失败即关闭改选 REJECT' : '切换前记录的选择不是使用中环境已验证的出口';
@@ -1960,9 +2040,11 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
     }
     repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
     const previousRoute = previousRouteOf(engine, snapshot);
-    // 节点资源未确认（D10）：SFE-ROUTE 中的节点无法证明来自已提交版本，切换前的买家节点同样不能当作已验证的出口——不恢复它，
-    // 与切换前已改选 REJECT 一样改选 REJECT 并保持阻断（从不回退到其他买家出口）
-    const resourceHeld = previousRoute === 'restorable' && repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING);
+    // 节点资源未确认（D10）或可能被伪造（D11，标记在）：SFE-ROUTE 中的节点无法证明来自已提交版本，切换前的买家节点同样不能当作
+    // 已验证的出口——不恢复它，与切换前已改选 REJECT 一样改选 REJECT 并保持阻断（从不回退到其他买家出口）。这次切换（或沿用快照的
+    // 之前一次）等待期间服务因伪造改选过 REJECT（snapshot.forgedHeld）时，即使伪造状态之后已清除也不恢复（REJECT 从不自动恢复）
+    const forgedHoldKept = snapshot?.forgedHeld === true;
+    const resourceHeld = previousRoute === 'restorable' && (nodeResourceHeld(engine, repos.routeState.get()) || forgedHoldKept);
     const previous = resourceHeld ? 'held' : previousRoute;
     const hasPrevious = previous === 'restorable';
     /** 切换前 SFE-ROUTE 已失败即关闭改选 REJECT（或记录的选择不是使用中环境已验证的出口）：没有可恢复的买家节点，改回 REJECT。 */
@@ -2012,8 +2094,8 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
         .get()
         .warnings.filter((w) => w === 'managed_windows_on_original_rules' || w === 'takeover_unknown' || w === 'buyer_exit_connections_unconfirmed');
       if (segmentsChanged) keep.push('managed_segments_changed');
-      // 节点资源未确认只由经确认的读回清除，回滚保留它
-      if (resourceHeld || repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) keep.push(NODE_RESOURCE_WARNING);
+      // 节点资源未确认与可能被伪造只由经确认的读回清除，回滚保留它们（伪造标记在而警告还没有加上时补上）
+      keep.push(...nodeResourceStickyWarnings(engine, repos.routeState.get().warnings));
       if (written && !keep.includes('managed_windows_on_original_rules')) keep.push('managed_windows_on_original_rules');
       repos.routeState.update({
         // 切换前已改选 REJECT：使用中的环境没有已验证的出口，路由仍需要处理（重新使用环境或进入普通模式），不是「已恢复、需要重新核验」
@@ -2037,7 +2119,13 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
           hasPrevious
             ? '已回滚：恢复切换前的节点，Safari 保持阻断，需要重新核验'
             : resourceHeld
-              ? RESOURCE_HELD_STEP
+              ? snapshot?.forgedHoldSelected === true
+                ? FORGED_HOLD_KEPT_STEP
+                : readForgedNodes(engine.kv) !== null
+                  ? FORGED_RESOURCE_HELD_STEP
+                  : forgedHoldKept
+                    ? FORGED_HELD_EARLIER_STEP
+                    : RESOURCE_HELD_STEP
               : rejectKept
                 ? rejectKeptStep(snapshot!.previousSelectedNode)
                 : '切换失败：切换前没有已验证的路由，Safari 保持阻断'
@@ -2444,7 +2532,8 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
     if (keepOpen || handedOverNote !== null || carriedWindows) warnings.unshift('managed_windows_on_original_rules');
     // 节点资源未确认（D10）不由普通模式清除：撤销本应用入口不改变 SFE-ROUTE 中的节点从哪里来，只有经确认的发布或回滚读回才清除
     // （与 managed_segments_changed 一样跨普通模式保留，之后的激活据此拒绝）
-    if (repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) warnings.push(NODE_RESOURCE_WARNING);
+    // 节点可能被伪造（D11）同样保留（伪造标记在而警告还没有加上时补上）
+    warnings.push(...nodeResourceStickyWarnings(engine, repos.routeState.get().warnings));
     // 之前的普通模式（含交给它的切换已写入 ACTIVE、它失败了）留下的旧窗口警告：完成说明同样写明，不声称 Safari 全部按原规则
     const notes = windowNotes.length === 0 && carriedWindows ? ['之前记下的旧环境窗口未关闭，其后续请求将按 Surge 原规则发出（可能直连）'] : windowNotes;
     repos.routeState.update({
@@ -2681,6 +2770,273 @@ async function killForNormal(engine: Engine, opId: string, entryBlocksSafari: bo
   return killError === null && ok === killResults.length;
 }
 
+// ---------- 节点资源可能被伪造时的 REJECT 保持（用户决定 D11） ----------
+
+/**
+ * 服务排入的 REJECT 保持（route.hold，node-resource.ts maybeEnqueueForgedHold）：Surge 中的节点可能是伪造的（resource:forgedNodes），
+ * 路由不是经确认的普通模式时把 SFE-ROUTE 改选首成员 REJECT 并读回（selectRejectBestEffort），之后经 SFE-ROUTE 的 Safari 新连接都被
+ * 拒绝，不会经 Surge 中的任何买家节点建立。从不碰入口、从不结束连接（已建立的连接由 holdExistingConnections 记下，进入普通模式
+ * 结束它们）、从不恢复买家节点。按序：
+ * 1. 崩溃之前已记下改选意图（OperationPayload.endHold）而读回 REJECT：就是本操作的改选，按改选记下（先于其余判断）；
+ * 2. 有排队的普通模式：不改选 SFE-ROUTE，结束为 SUPERSEDED（进入普通模式永远可用；它失败而入口可能仍让 Safari 经 SFE-ROUTE 时，
+ *    它的失败路径按“任何买家节点都不算已验证的出口”改选 REJECT）；
+ * 3. 伪造标记已清除（排入时的原因含 node_detail_mismatch 的除外：经确认的读回在它执行之前恢复了参数，之前的参数不同仍是证据，
+ *    照样改选，只是不再加两项节点资源警告）、入口是经确认的普通模式：不需要改选；
+ * 4. 重读 Surge 事实：不可连接或当前配置不是固定工作配置时不改选（不改动其他配置中的同名组），结束为失败，之后的对账再排入；
+ * 5. 选择已是 REJECT：崩溃之前已记下改选意图时按本操作的改选记下（同第 1 步，第一次读取失败时由这里重读），否则不需要改选
+ *    （不当作本操作的改选；与记录不一致由对账按外部修改报告）；读不到选择时照样改选（失败即关闭）；
+ * 6. 读取 Surge 事实与选择期间受理的排队普通模式：同第 2 步让给它（SUPERSEDED）；
+ * 7. 记下意图 → 改选并读回 → 一个事务中记下（recordForgedHold）与结束（读回确认为 COMPLETED，否则 FAILED，说明如实写明）。
+ * 意外错误（数据库等）如实结束为 FAILED（不声称改选），标记仍在，之后的对账再排入。从不抛出。
+ */
+export async function runForgedHold(engine: Engine, op: OperationRecord, opts: { recovering?: boolean } = {}): Promise<void> {
+  const { repos, kv } = engine;
+  try {
+    if (!opts.recovering) engine.updateOp(op.id, { status: 'running', phase: 'VALIDATING' }, '开始检查是否需要把 SFE-ROUTE 改选 REJECT（Surge 中的节点可能是伪造的）');
+    const intent = payloadOf(repos.operations.get(op.id) ?? op).endHold;
+    let sel: string | null | undefined;
+    // 崩溃之前已记下改选意图：读回的 REJECT 就是本操作的改选（与 holdAtRouteEnd 相同，先于其余判断）
+    if (intent) {
+      sel = await readSelectionSafe(engine);
+      if (sel === 'REJECT') {
+        finishForgedHold(engine, op.id, { confirmed: true, readback: 'REJECT', error: null, recovered: intent, cause: 'node_resource_forged' });
+        return;
+      }
+    }
+    const queuedNormal = (): OperationRecord | undefined => repos.operations.listByStatus(['queued']).find((o) => o.kind === 'route.normal');
+    const normal = queuedNormal();
+    if (normal) {
+      endForgedHold(engine, op.id, { kind: 'superseded', normalId: normal.id });
+      return;
+    }
+    // 伪造标记已清除：排入时的证据含 SFE-ROUTE 选中节点的参数与其版本不同（D11 (b)）时仍改选——排入它的发布的回滚、或启动时
+    // 先于它恢复的发布可能已经以经确认的读回清除了标记（参数已恢复，但之前 Safari 可能已经经不同的参数连接）；其余原因已清除时
+    // 不需要改选
+    if (readForgedNodes(kv) === null && !detailEvidenceCleared(engine, op.id)) {
+      endForgedHold(engine, op.id, { kind: 'not_needed', step: '节点资源已经确认（可能被伪造的状态已清除），不需要改选' });
+      return;
+    }
+    if (!routeNotConfirmedNormal(repos.routeState.get())) {
+      endForgedHold(engine, op.id, { kind: 'not_needed', step: '入口是经确认的普通模式：Safari 不经 SFE-ROUTE，不需要改选（节点资源经确认之前激活会被拒绝）' });
+      return;
+    }
+    // 只在固定工作配置上改选（否则会改到其他配置中的同名组）
+    const facts = await engine.readBasicFacts().catch(() => null);
+    if (facts === null || !facts.reachable || facts.onWorkingProfile !== true) {
+      const unreachable = facts === null || !facts.reachable;
+      // 标记已清除（D11 (b) 的证据）：之后的对账不会再排入（maybeEnqueueForgedHold 要求标记在），说明不承诺
+      const cleared = readForgedNodes(kv) === null;
+      endForgedHold(engine, op.id, {
+        kind: 'unavailable',
+        code: unreachable ? 'SURGE_UNREACHABLE' : 'EXTERNAL_PROFILE',
+        cleared,
+        message: cleared
+          ? unreachable
+            ? '无法连接 Surge：没有改选 SFE-ROUTE，Safari 请求可能仍经 SFE-ROUTE 当前选中的节点发出（它的参数之前与其版本不同，之后经确认的读回已恢复并清除了可能被伪造的状态），之前建立的连接可能用了不同的参数，请进入普通模式结束它们；伪造状态已清除，之后的对账不会再排入改选'
+            : 'Surge 当前配置不是固定工作配置：没有改选（不改动其他配置中的同名组）；伪造状态已由经确认的读回清除，之后的对账不会再排入改选'
+          : unreachable
+            ? '无法连接 Surge：没有改选 SFE-ROUTE，Safari 请求可能仍经 SFE-ROUTE 当前选中的节点（可能是伪造的）发出，请立即进入普通模式；之后能连接 Surge 的对账会再排入改选'
+            : 'Surge 当前配置不是固定工作配置：没有改选（不改动其他配置中的同名组）；Surge 回到固定工作配置之后的对账会再排入改选',
+      });
+      return;
+    }
+    if (sel === undefined) sel = await readSelectionSafe(engine);
+    if (sel === 'REJECT') {
+      // 崩溃之前已记下改选意图（第一次读取失败而在这里重读到）：就是本操作的改选，按改选记下（同上）
+      if (intent) {
+        finishForgedHold(engine, op.id, { confirmed: true, readback: 'REJECT', error: null, recovered: intent, cause: 'node_resource_forged' });
+        return;
+      }
+      // 已是 REJECT 而不是本操作改选的：不当作本操作的改选（与记录不一致由对账按外部修改报告）
+      endForgedHold(engine, op.id, { kind: 'not_needed', step: 'SFE-ROUTE 已是 REJECT，不需要改选' });
+      return;
+    }
+    // 读取期间受理的普通模式：同样让它先执行
+    const late = queuedNormal();
+    if (late) {
+      endForgedHold(engine, op.id, { kind: 'superseded', normalId: late.id });
+      return;
+    }
+    // 读不到选择时照样改选（失败即关闭）。改选之前记下意图：改选之后、记下之前崩溃时崩溃恢复按本操作的改选记下
+    markEndHoldIntent(engine, op.id, { externalSelectionBefore: repos.routeState.get().warnings.includes('external_selection_change'), cause: 'node_resource_forged' });
+    const hold = await selectRejectBestEffort(engine);
+    // 崩溃之前已记下意图（两次读取都失败而重新改选）：读回确认时同样按崩溃恢复记下——启动对账读到本操作之前的 REJECT 而加上的
+    // 外部修改警告不是外部修改（markEndHoldIntent 保留最早的意图）
+    finishForgedHold(engine, op.id, { ...hold, ...(intent && hold.confirmed ? { recovered: intent } : {}), cause: 'node_resource_forged' });
+  } catch (err) {
+    endForgedHold(engine, op.id, { kind: 'error', cause: holdErrorText(engine, err, '内部错误') });
+  }
+}
+
+/**
+ * 伪造标记已清除，而排入本操作时（或之后补记，maybeEnqueueForgedHold）的原因含 node_detail_mismatch（D11 (b)：路由不是经确认的
+ * 普通模式时 SFE-ROUTE 选中节点的参数与其版本不同）：经确认的读回在本操作执行之前清除了标记（排入它的发布的回滚、启动时先于它
+ * 恢复的发布），参数已恢复，但之前的参数不同仍是证据——照样改选 REJECT。
+ */
+function detailEvidenceCleared(engine: Engine, opId: string): boolean {
+  if (readForgedNodes(engine.kv) !== null) return false;
+  const self = engine.repos.operations.get(opId);
+  return self ? (payloadOf(self).forgedHold?.reasons ?? []).includes('node_detail_mismatch') : false;
+}
+
+/**
+ * 在调用方的事务中记下 REJECT 保持的改选（与 recordEndHold 相同，但入口状态没有变化：不带 entry_unverified）：两项节点资源警告，
+ * 已建立的连接不受改选影响（holdExistingConnections：持久标记与 buyer_exit_connections_unconfirmed），rollback_needs_reverify
+ * （「已恢复原节点」）不再成立；只有读回确认才记为 REJECT。路由需要处理（attention；空闲的普通模式保持 idle）。路由记在另一个未结束
+ * 的操作名下（不论阶段——对账把等待实测的路由改为 attention 时不改负责的操作，与 holdAtRouteEnd 相同；实际只可能是等待实测或排队的
+ * 切换）时不改阶段与负责的操作，由它结算——它之后的核对因选择已不是目标节点而失败并回滚，回滚按激活快照的 forgedHeld 不恢复切换前
+ * 的买家节点（即使伪造状态之后已清除）。激活快照仍在（过渡中或之前的切换中断）时一律记下 forgedHeld（改选是否成功都记，回滚据此
+ * 不恢复切换前的买家节点），读回确认时另记 forgedHoldSelected（只用于回滚说明「等待期间已改选 REJECT」，新的切换沿用快照时去掉）。
+ * 伪造标记已清除（只可能是 D11 (b) 的证据，detailEvidenceCleared）时不再加两项节点资源警告：没有之后的确认会清除它们。返回路由
+ * 是否仍由那个操作负责。
+ */
+function recordForgedHold(engine: Engine, opId: string, hold: RejectHold): boolean {
+  const { repos } = engine;
+  const fresh = repos.routeState.get();
+  const ownerOpen =
+    fresh.operationId !== null && fresh.operationId !== opId && repos.operations.listByStatus(['queued', 'running', 'waiting']).some((o) => o.id === fresh.operationId);
+  const warnings = new Set<RouteWarning>(
+    fresh.warnings.filter((w) => w !== 'rollback_needs_reverify' && !(w === 'external_selection_change' && hold.recovered && !hold.recovered.externalSelectionBefore)),
+  );
+  if (readForgedNodes(engine.kv) !== null) {
+    warnings.add(NODE_RESOURCE_WARNING);
+    warnings.add(FORGED_WARNING);
+  }
+  holdExistingConnections(engine, opId, warnings);
+  repos.routeState.update({
+    ...(ownerOpen || fresh.phase === 'idle' ? {} : { phase: 'attention' as const, awaitingDeadline: null, operationId: opId }),
+    ...(hold.confirmed ? { selectedNode: 'REJECT' } : {}),
+    ...(fresh.activationSnapshot !== null
+      ? { activationSnapshot: { ...fresh.activationSnapshot, forgedHeld: true as const, ...(hold.confirmed ? { forgedHoldSelected: true as const } : {}) } }
+      : {}),
+    warnings: [...warnings],
+  });
+  return ownerOpen;
+}
+
+/**
+ * 说明的开头：伪造标记仍在时「Surge 中的节点可能是伪造的（原因）」；已由经确认的读回清除（D11 (b) 的证据，detailEvidenceCleared）
+ * 时如实写明参数已恢复。
+ */
+function forgedHoldLead(reasons: string, cleared: boolean): string {
+  return cleared
+    ? `Surge 中的节点曾可能是伪造的（${reasons}；之后经确认的读回已恢复已提交版本的参数并清除了这一状态，但之前经 SFE-ROUTE 的 Safari 连接可能用了不同的参数）`
+    : `Surge 中的节点可能是伪造的（${reasons}）`;
+}
+
+/** 伪造标记已清除时 REJECT 的恢复途径。 */
+const FORGED_CLEARED_REMEDY = '节点资源已经确认，重新使用环境即可（或进入普通模式）';
+
+/** REJECT 保持读回确认时的说明。 */
+function forgedHoldConfirmedText(lead: string, remedy: string, ownerOpen: boolean): string {
+  return `${lead}：SFE-ROUTE 已改选 REJECT（读回确认），经 SFE-ROUTE 的 Safari 新连接都被拒绝，不会经 Surge 中的任何买家节点建立；${EXISTING_CONNECTIONS_TEXT}；自动打开订单与填充已停止。REJECT 不会自动恢复：${remedy}${
+    ownerOpen ? '；路由仍由未结束的切换负责：它之后的核对因 SFE-ROUTE 已不是目标节点而失败，回滚保持 REJECT，不恢复切换前的买家节点' : ''
+  }`;
+}
+
+/** REJECT 保持未能确认时的说明。 */
+function forgedHoldFailedText(lead: string, hold: RejectHold, cleared: boolean): string {
+  return cleared
+    ? `${lead}：SFE-ROUTE 未能改选 REJECT（${hold.error ?? '原因未知'}）：Safari 请求仍可能经 SFE-ROUTE 当前选中的节点发出，之前建立的连接可能用了不同的参数，请进入普通模式结束它们；伪造状态已清除，之后的对账不会再排入改选`
+    : `${lead}：SFE-ROUTE 未能改选 REJECT（${hold.error ?? '原因未知'}）：Safari 请求可能仍经 SFE-ROUTE 当前选中的节点（可能是伪造的）发出，请立即进入普通模式；之后能连接 Surge 的对账会再次尝试改选（Surge 可连接而读回不一致时至少间隔 5 分钟；入口回到经确认的普通模式之后不再需要）`;
+}
+
+/** 改选之后在一个事务中记下路由（recordForgedHold）、结束操作与重试间隔记录（FORGED_HOLD_KEY）；操作已结束时什么也不做。 */
+function finishForgedHold(engine: Engine, opId: string, hold: RejectHold): void {
+  const { repos, kv } = engine;
+  const forged = readForgedNodes(kv);
+  const self = repos.operations.get(opId);
+  const reasons = forged?.reasons ?? (self ? (payloadOf(self).forgedHold?.reasons ?? []) : []);
+  // 伪造标记已由经确认的读回清除（D11 (b) 的证据，detailEvidenceCleared）：说明如实写明，失败时不记重试间隔（不会再排入）
+  const cleared = forged === null;
+  const lead = forgedHoldLead(forgedReasonText(reasons), cleared);
+  const remedy = cleared ? FORGED_CLEARED_REMEDY : forgedRemedyText(engine);
+  const unreachable = !hold.confirmed && (hold.errorCode === 'SURGE_UNREACHABLE' || (hold.readback === null && engine.facts.reachable === false));
+  let activeEnv: string | null = null;
+  let target: string | null = null;
+  const done = repos.tx(() => {
+    const cur = repos.operations.get(opId);
+    if (!cur || (cur.status !== 'queued' && cur.status !== 'running' && cur.status !== 'waiting')) return false;
+    const before = repos.routeState.get();
+    activeEnv = before.activeEnvironmentId;
+    // 仍负责过渡的操作的目标环境（等待实测的激活）：视图随之改变
+    const owner = before.operationId ? repos.operations.get(before.operationId) : null;
+    target = owner ? (payloadOf(owner).route?.targetEnvironmentId ?? null) : null;
+    const ownerOpen = recordForgedHold(engine, opId, hold);
+    const result = { ...(cur.result ?? {}), rejectSelected: hold.confirmed, rejectCause: 'node_resource_forged' as const, forgedReasons: [...reasons] };
+    if (hold.confirmed) {
+      const text = forgedHoldConfirmedText(lead, remedy, ownerOpen);
+      repos.operations.update(opId, { phase: 'COMPLETED', status: 'succeeded', result });
+      repos.operations.appendStep(opId, 'COMPLETED', text);
+      kv.delete(FORGED_HOLD_KEY);
+    } else {
+      const text = forgedHoldFailedText(lead, hold, cleared);
+      repos.operations.update(opId, {
+        phase: 'FAILED',
+        status: 'failed',
+        error: { code: unreachable ? 'SURGE_UNREACHABLE' : 'READBACK_MISMATCH', message: text, details: { reason: FORGED_WARNING, rejectSelected: false } },
+        result,
+      });
+      repos.operations.appendStep(opId, 'FAILED', text);
+      if (!cleared) kv.set(FORGED_HOLD_KEY, { lastFailedAt: engine.nowIso(), unreachable });
+    }
+    repos.outbox.cancelForOperation(opId);
+    return true;
+  });
+  if (!done) return;
+  engine.log(hold.confirmed ? 'warn' : 'error', 'route.forged_hold', { confirmed: hold.confirmed });
+  const envs = new Set<string>([...(activeEnv ? [activeEnv] : []), ...(target ? [target] : [])]);
+  engine.emit({ operations: [opId], route: true, environments: [...envs] });
+}
+
+type ForgedHoldEnd =
+  | { kind: 'superseded'; normalId: string }
+  | { kind: 'not_needed'; step: string }
+  | { kind: 'unavailable'; code: 'SURGE_UNREACHABLE' | 'EXTERNAL_PROFILE'; message: string; cleared?: boolean }
+  | { kind: 'error'; cause: string };
+
+/** 不改选地结束 REJECT 保持（让给普通模式、不需要、Surge 不可用、意外错误）：不改路由。从不抛出。 */
+function endForgedHold(engine: Engine, opId: string, end: ForgedHoldEnd): void {
+  const { repos, kv } = engine;
+  try {
+    const done = repos.tx(() => {
+      const cur = repos.operations.get(opId);
+      if (!cur || (cur.status !== 'queued' && cur.status !== 'running' && cur.status !== 'waiting')) return false;
+      switch (end.kind) {
+        case 'superseded':
+          repos.operations.update(opId, { phase: 'SUPERSEDED', status: 'superseded', supersededBy: end.normalId, error: { code: 'SUPERSEDED', message: '已有进入普通模式的请求，由它先执行' } });
+          repos.operations.appendStep(
+            opId,
+            'SUPERSEDED',
+            '已有进入普通模式的请求：没有改选 SFE-ROUTE，由普通模式先撤销本应用入口（之后 Safari 不经 SFE-ROUTE）；普通模式失败而入口可能仍让 Safari 经 SFE-ROUTE 时，它的失败路径改选 REJECT（节点可能被伪造时任何买家节点都不算已验证的出口）；否则之后的对账在需要时再排入改选',
+          );
+          break;
+        case 'not_needed':
+          repos.operations.update(opId, { phase: 'COMPLETED', status: 'succeeded', result: { ...(cur.result ?? {}), forgedHold: 'not_needed' } });
+          repos.operations.appendStep(opId, 'COMPLETED', end.step);
+          break;
+        case 'unavailable':
+          repos.operations.update(opId, { phase: 'FAILED', status: 'failed', error: { code: end.code, message: end.message, details: { reason: FORGED_WARNING, rejectSelected: false } } });
+          repos.operations.appendStep(opId, 'FAILED', end.message);
+          // 不可连接或不是工作配置：之后的对账不受重试间隔限制（标记已清除时不再排入，不记）
+          if (end.cleared !== true) kv.set(FORGED_HOLD_KEY, { lastFailedAt: engine.nowIso(), unreachable: true });
+          break;
+        case 'error': {
+          const message = `出现意外错误（${end.cause}），不能确认 SFE-ROUTE 是否已改选 REJECT：Safari 请求可能仍经 SFE-ROUTE 当前选中的节点（可能是伪造的）发出，请立即进入普通模式；之后的对账在需要时再排入改选`;
+          repos.operations.update(opId, { phase: 'FAILED', status: 'failed', error: { code: 'INTERNAL', message } });
+          repos.operations.appendStep(opId, 'FAILED', message);
+          break;
+        }
+      }
+      repos.outbox.cancelForOperation(opId);
+      return true;
+    });
+    if (done) engine.emit({ operations: [opId] });
+  } catch (err) {
+    engine.log('error', 'route.forged_hold_end_failed', { operationId: opId, error: err instanceof Error ? err.name : 'unknown' });
+  }
+}
+
 // ---------- 崩溃恢复 ----------
 
 /**
@@ -2767,7 +3123,7 @@ async function supersededAfterCrash(engine: Engine, opId: string, ownerId: strin
       status: 'superseded',
       supersededBy: ownerId,
       error: withEndHold({ code: 'SUPERSEDED', message: '已被之后接手路由的操作取代' }, hold),
-      ...(hold ? { result: { ...(cur.result ?? {}), rejectSelected: hold.confirmed } } : {}),
+      ...(hold ? { result: { ...(cur.result ?? {}), ...holdResult(hold) } } : {}),
     });
     repos.operations.appendStep(
       opId,

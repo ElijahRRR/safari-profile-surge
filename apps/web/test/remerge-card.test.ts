@@ -184,10 +184,19 @@ describe('remerge while the profile still references the local node file (legacy
     m.unmount();
   });
 
+  it('D11: a forged state with a suspect token explains that the address must be rotated', async () => {
+    const { m } = await mountCard(withResource(nodeResource({ tokenSuspect: true, forgedNodes: true })));
+    const forged = document.body.querySelector('[data-test="remerge-forged"]')?.textContent ?? '';
+    expect(forged).toContain('节点可能被伪造');
+    expect(forged).toContain('更换本机资源地址');
+    m.unmount();
+  });
+
   it('shows no legacy note while serving', async () => {
     const { m } = await mountCard(withResource(nodeResource()));
     expect(document.body.querySelector('[data-test="remerge-legacy-line"]')).toBeNull();
     expect(document.body.querySelector('[data-test="remerge-token-suspect"]')).toBeNull();
+    expect(document.body.querySelector('[data-test="remerge-forged"]')).toBeNull();
     m.unmount();
   });
 });

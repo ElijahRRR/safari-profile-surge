@@ -73,7 +73,7 @@ export async function commitNodes(h: Harness, envIds: readonly string[]): Promis
   if (!matched) throw new Error('commitNodes: no matching audit record');
   repos.tx(() => {
     writeServedPointer(engine.kv, { committed: { generation }, candidate: null });
-    confirmNodeResource(engine, { generation, matchedSeq: matched.seq, snapshot: { updatedAt: r.lastUpdatedAt, error: r.error }, clearNeedsRefresh: true });
+    confirmNodeResource(engine, { generation, matchedSeq: matched.seq, snapshot: { updatedAt: r.lastUpdatedAt, error: r.error }, clearNeedsRefresh: true, detailsChecked: true });
   });
   engine.resource!.commitCandidate();
   for (const e of entries) repos.environments.update(e.environmentId, { deployedProxyRevision: e.proxyRevision });

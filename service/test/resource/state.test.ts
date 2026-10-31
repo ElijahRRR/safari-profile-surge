@@ -9,6 +9,7 @@ import {
   createResourceHost,
   readAuditLog,
   readAuditState,
+  readForgedNodes,
   readNeedsRefresh,
   readServedPointer,
   readTokenSuspect,
@@ -16,6 +17,7 @@ import {
   setCandidatePointer,
   virtualBinder,
   writeAuditState,
+  writeForgedNodes,
   writeNeedsRefresh,
   writeServedPointer,
   writeTokenSuspect,
@@ -41,6 +43,7 @@ describe('key names', () => {
       audit: 'resource:audit',
       auditState: 'resource:auditState',
       tokenSuspect: 'resource:tokenSuspect',
+      forgedNodes: 'resource:forgedNodes',
     });
     const { kv, rawKeys } = kvFixture();
     writeServedPointer(kv, { committed: { generation: 0 }, candidate: null });
@@ -48,9 +51,11 @@ describe('key names', () => {
     recordAuditEntry(kv, { seq: 1, at: new Date('2026-10-31T00:00:00.000Z'), generation: 0, complete: false });
     writeAuditState(kv, { verifiedUpdatedAt: null, verifiedError: null, auditedSeq: 0, windowSeq: 0 });
     writeTokenSuspect(kv, { since: '2026-10-31T00:00:00.000Z', reason: 'unexplained_fetch' });
+    writeForgedNodes(kv, { since: '2026-10-31T00:00:00.000Z', reasons: ['unexplained_fetch'] });
     expect(rawKeys()).toEqual([
       'engine:resource:audit',
       'engine:resource:auditState',
+      'engine:resource:forgedNodes',
       'engine:resource:needsRefresh',
       'engine:resource:served',
       'engine:resource:tokenSuspect',
@@ -240,5 +245,23 @@ describe('resource:tokenSuspect', () => {
     writeTokenSuspect(kv, null);
     expect(readTokenSuspect(kv)).toBeNull();
     expect(() => writeTokenSuspect(kv, { since: 'now', reason: 'x' })).toThrow();
+  });
+});
+
+describe('resource:forgedNodes (D11)', () => {
+  test('round trip without duplicate reasons; an unrecognised stored value is still forged with the reason unreadable (fail closed)', () => {
+    const { kv, rawSet } = kvFixture();
+    expect(readForgedNodes(kv)).toBeNull();
+    writeForgedNodes(kv, { since: '2026-10-31T00:00:00.000Z', reasons: ['unexplained_fetch', 'node_detail_mismatch', 'unexplained_fetch'] });
+    expect(readForgedNodes(kv)).toEqual({ since: '2026-10-31T00:00:00.000Z', reasons: ['unexplained_fetch', 'node_detail_mismatch'] });
+    for (const bad of ['{"since":"2026-10-31T00:00:00.000Z","reasons":["other"]}', '{"since":"2026-10-31T00:00:00.000Z","reasons":[]}', '{"reasons":["unexplained_fetch"]}', 'null', '', '{"since":']) {
+      rawSet('resource:forgedNodes', bad);
+      expect(readForgedNodes(kv)).toEqual({ since: '1970-01-01T00:00:00.000Z', reasons: ['unreadable'] });
+    }
+    writeForgedNodes(kv, null);
+    expect(readForgedNodes(kv)).toBeNull();
+    expect(() => writeForgedNodes(kv, { since: 'now', reasons: ['unexplained_fetch'] })).toThrow();
+    expect(() => writeForgedNodes(kv, { since: '2026-10-31T00:00:00.000Z', reasons: [] })).toThrow();
+    expect(() => writeForgedNodes(kv, { since: '2026-10-31T00:00:00.000Z', reasons: ['other' as never] })).toThrow();
   });
 });

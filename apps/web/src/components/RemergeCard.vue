@@ -12,7 +12,7 @@ import NoticeBox from './NoticeBox.vue';
 import { useConsole } from '../store/context';
 import { isApiError } from '../api/client';
 import { GATE_LABELS, evaluateGate } from '../lib/gates';
-import { NODE_RESOURCE_TOKEN_SUSPECT_TEXT } from '../lib/labels';
+import { NODE_RESOURCE_FORGED_TEXT, NODE_RESOURCE_TOKEN_SUSPECT_TEXT } from '../lib/labels';
 import { newRequestId } from '../lib/request-id';
 
 const { api, store, toasts, accepted } = useConsole();
@@ -123,6 +123,7 @@ async function rerun() {
     </div>
     <div class="card-body space-y-5">
       <NoticeBox v-if="nodeResource?.tokenSuspect" tone="danger" title="读取令牌可能已泄露" data-test="remerge-token-suspect">{{ NODE_RESOURCE_TOKEN_SUSPECT_TEXT }}</NoticeBox>
+      <NoticeBox v-if="nodeResource?.forgedNodes && nodeResource?.tokenSuspect" tone="danger" title="节点可能被伪造" data-test="remerge-forged">{{ NODE_RESOURCE_FORGED_TEXT }}</NoticeBox>
       <NoticeBox v-if="legacyLine" tone="warning" title="工作配置仍引用本地节点文件" data-test="remerge-legacy-line">
         <p>SFE-ROUTE 仍引用旧版的本地节点文件 sfe-nodes.list，新版本只能经本机资源服务发布。</p>
         <p v-if="resourceServeGate.met">重新合并会把它改为指向本机资源服务，需要重载同一配置一次；之后由本机资源服务提供已提交的节点。</p>

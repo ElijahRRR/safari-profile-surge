@@ -131,7 +131,7 @@ describe('init writes the loopback group line', () => {
     expect(engine.resource!.served()).toMatchObject({ generation: 0, state: 'committed' });
     expect(fetchResource(h).body.toString('utf8')).toContain('SFE-EMPTY = reject');
     expect(engine.resourceRuntime.line).toBe('ours');
-    expect(nodeResourceStatus(engine)).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false });
+    expect(nodeResourceStatus(engine)).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false, forgedNodes: false });
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
     expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
     // 操作说明与日志不含令牌
@@ -293,7 +293,7 @@ describe('remerge converts the legacy local group line only behind the resourceS
     expect(h.fake.updateAllAttempts).toBe(0);
     expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', node]);
     expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
-    expect(nodeResourceStatus(h.app.engine)).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false });
+    expect(nodeResourceStatus(h.app.engine)).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false, forgedNodes: false });
     expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
   });
 
@@ -480,7 +480,7 @@ describe('remerge option rotateResourceUrl', () => {
     expect(h.fake.remoteFetches.filter((f) => f.trigger === 'update').at(-1)!.key).toBe(h.resourceKey());
     expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', 'SFE-EMPTY']);
     expect(readNeedsRefresh(engine.kv)).toBeNull();
-    expect(nodeResourceStatus(engine)).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false });
+    expect(nodeResourceStatus(engine)).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false, forgedNodes: false });
     // 令牌从不进入操作说明或日志
     const all = `${JSON.stringify(steps(acc.operation_id))}\n${h.logs.join('\n')}`;
     expect(all).not.toContain(oldToken);

@@ -36,6 +36,7 @@ import type { OperationRecord } from '../db/index.js';
 import { payloadOf } from '../domain/operations.js';
 import type { SurgeExternalResource } from '../ports.js';
 import {
+  readForgedNodes,
   readNeedsRefresh,
   readServedPointer,
   readTokenSuspect,
@@ -720,6 +721,17 @@ async function buildRemergePlan(engine: Engine, opts: { rotate: boolean }): Prom
     });
   } else if (readTokenSuspect(kv) !== null) {
     checks.push({ name: 'resource_token', ok: true, message: '读取令牌可能已泄露：只有选择“更换本机资源地址”的重新合并才能清除它（在此之前新版本保持待部署）' });
+  }
+  // 节点资源可能被伪造（用户决定 D11）：只作说明，不改变门槛（重新合并本来就要求入口是普通模式）
+  if (readForgedNodes(kv) !== null) {
+    checks.push({
+      name: 'forged_nodes',
+      ok: true,
+      message:
+        readTokenSuspect(kv) !== null
+          ? 'Surge 中的节点可能是伪造的：选择“更换本机资源地址”并提交之后，节点资源发布（提交时服务排入；已有排队的发布时由它进行）经读回确认才清除这一状态；SFE-ROUTE 的 REJECT 不会自动恢复，之后重新使用环境'
+          : 'Surge 中的节点可能是伪造的：在发布页「重新同步节点资源」（不需要更换地址），节点资源发布经读回确认才清除这一状态；SFE-ROUTE 的 REJECT 不会自动恢复，之后重新使用环境',
+    });
   }
   checks.push({ name: 'check', ok: checkOk, message: checkMessage });
   const api = parseHttpApiLine(currentText);

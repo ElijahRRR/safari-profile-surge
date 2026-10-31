@@ -185,7 +185,7 @@ export function snapshot(over: Partial<Snapshot> = {}): Snapshot {
 
 /** 本机资源服务（D10）的状态：默认正在提供，没有标志。只有状态码，从不带地址、端口或令牌。 */
 export function nodeResource(over: Partial<NodeResourceStatusView> = {}): NodeResourceStatusView {
-  return { state: 'serving', tokenSuspect: false, needsRefresh: false, ...over };
+  return { state: 'serving', tokenSuspect: false, needsRefresh: false, forgedNodes: false, ...over };
 }
 
 /** 带本机资源服务状态的快照（null：尚未初始化固定工作配置）。 */

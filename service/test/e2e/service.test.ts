@@ -99,7 +99,7 @@ describe('startService --demo', () => {
     expect(existsSync(join(svc.config.dataDir, 'surge', 'sfe-nodes.list'))).toBe(false);
     expect(readFileSync(demoFake.profilePath, 'utf8')).toContain(`policy-path=${ourUrl}`);
     expect(svc.app.engine.resource!.listening()).toBe(true);
-    expect(snap.surge.nodeResource).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false });
+    expect(snap.surge.nodeResource).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false, forgedNodes: false });
     expect(JSON.stringify(snap)).not.toContain(svc.app.engine.resource!.token);
 
     // HTTP：未登录的接口请求被拒绝（服务在线）

@@ -18,10 +18,12 @@ export const REUSE_BLOCKING_WARNINGS: readonly RouteWarning[] = [
   'front_missing',
   'managed_segments_changed',
   'node_resource_unverified',
+  'node_resource_forged',
 ];
 
 /**
- * 失控类警告：存在时不允许 Safari 重测（需要重新激活或进入普通模式）。受管理段被修改与节点资源未确认（D10）不在其中：
+ * 失控类警告：存在时不允许 Safari 重测（需要重新激活或进入普通模式）。受管理段被修改、节点资源未确认（D10）与节点可能被伪造
+ * （D11）不在其中：
  * 它们不表示入口或 SFE-ROUTE 的选择失去控制，对账已把阶段改为 attention（ATTENTION_WARNINGS），重测只接受已验证的使用中
  * 路由；节点资源未确认只在确认过的发布或回滚读回之后清除，重测不能清除它。
  */
@@ -52,6 +54,7 @@ export const IN_CONTROL_BLOCKING_WARNINGS: readonly RouteWarning[] = [
   'exit_ip_mismatch',
   'rollback_needs_reverify',
   'node_resource_unverified',
+  'node_resource_forged',
 ];
 
 /** 对账把阶段设为 attention 的警告（external_* 设为 external_change）。 */
@@ -64,7 +67,16 @@ export const ATTENTION_WARNINGS: readonly RouteWarning[] = [
   'precedence_violation',
   'managed_segments_changed',
   'node_resource_unverified',
+  'node_resource_forged',
 ];
+
+/**
+ * 路由不是经确认的普通模式（用户决定 D11）：入口记录不是 NORMAL（含 BLOCKED、VERIFY_ONLY、ACTIVE、UNKNOWN），或是 NORMAL 但带
+ * entry_unverified（撤销未经运行时求值确认）——Safari 可能经 SFE-ROUTE。节点资源可能被伪造时据此改选 REJECT。
+ */
+export function routeNotConfirmedNormal(route: Pick<RouteStateRecord, 'entryMode' | 'warnings'>): boolean {
+  return route.entryMode !== 'NORMAL' || route.warnings.includes('entry_unverified');
+}
 
 export function hasAny(warnings: readonly RouteWarning[], set: readonly RouteWarning[]): RouteWarning[] {
   return warnings.filter((w) => set.includes(w));

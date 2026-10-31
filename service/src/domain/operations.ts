@@ -1,7 +1,7 @@
 // 操作的分类与 payload 结构（只含引用与非秘密参数；数据库写入时还会再拒绝秘密字段）。
 // 路由类操作（激活、普通模式、Safari 重测，以及继续进入 WAITING_ROUTE 的活动环境发布）共用一套并发矩阵。
 
-import type { ApiErrorBody, OldSessionPolicy, OperationKind, OperationPhase, OperationStatus } from '@sfe/contract';
+import type { ApiErrorBody, OldSessionPolicy, OperationKind, OperationPhase, OperationStatus, ResourceForgedReason } from '@sfe/contract';
 import type { OperationRecord, VerificationPurpose } from '../db/index.js';
 
 export const PUBLISH_KINDS: readonly OperationKind[] = ['environment.create', 'environment.update', 'deploy.publish', 'front.replace', 'import.batch'];
@@ -123,6 +123,11 @@ export interface EndHoldIntent {
    * 早先的记录、核对已判定的重测（按 RoutePayload.verdict 重新结束）、被取代的切换与普通模式（重新执行）没有这一项。
    */
   ending?: RouteEnding;
+  /**
+   * 改选的原因是节点资源可能被伪造（用户决定 D11）：REJECT 保持操作（route.hold）的改选，或结束点只因伪造标记而改选（SFE-ROUTE
+   * 选着的原本就是使用中环境已验证的出口）。崩溃恢复据此按同一原因记下（不带 entry_unverified，带两项节点资源警告）。
+   */
+  cause?: 'node_resource_forged';
 }
 
 /** RoutePayload.ending：结束点要记下的结束状态（结束点改选 REJECT 时另按 holdAtRouteEnd 改为需要处理）。 */
@@ -157,6 +162,8 @@ export interface OperationPayload {
   normal?: NormalPayload;
   /** 路由操作的结束点即将改选 REJECT（holdAtRouteEnd）：见 EndHoldIntent。 */
   endHold?: EndHoldIntent;
+  /** route.hold（用户决定 D11）：排入时的伪造原因；改选之前的意图记在 endHold（markEndHoldIntent）。 */
+  forgedHold?: { reasons: ResourceForgedReason[] };
   frontProxyId?: string;
   [key: string]: unknown;
 }

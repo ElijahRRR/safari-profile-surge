@@ -30,6 +30,10 @@
 //      响应中的完整路由一致，并与原生调用返回时（结算之前）的服务视图一致——结算会执行调用期间受理的操作（例如在动作前检查的
 //      Surge 调用中受理的普通模式），它们的写入不在这个响应中。调用期间有执行器中的操作在运行（调用 Surge 或写路由记录）时
 //      响应可能早于它们的写入，比较不成立时只计数（覆盖项 popupRaceSkipped），不判违例；弹窗中的 I1 同样。
+//   I7 节点资源可能被伪造（用户决定 D11；forge 事件：Surge 的缓存变成本服务没有提供过的列表，或由本服务答复的、成员同名而参数
+//      不同的列表）时：伪造标记在、路由不是经确认的普通模式、最近一次 REJECT 保持（route.hold）读回确认之后没有 Surge 重启时，
+//      SFE-ROUTE 是 REJECT；对账事件（Surge 可连接、是固定工作配置、没有注入忙碌失败）之后 SFE-ROUTE 是 REJECT，或这次对账排入的
+//      保持如实结束为失败（读回不一致之后 5 分钟内的周期对账除外）。I4（普通模式从不被拒绝）与 L1 在 forge 之后照常检查。
 //   L1 每个受理的普通模式（含 normalDuring 排队受理的）在执行器空闲后都已结束（不停在 queued/running/waiting）；受理时与检查时
 //      文件监视延迟都短时，结束为 NORMAL_RESTORED（进入普通模式永远可用）。唯一的例外是文件监视比等待上限慢（latency 事件）。
 //      L1b：最后受理的路由操作（激活、普通模式、重测，或带路由参数的发布）是一次已 NORMAL_RESTORED 的普通模式时，路由记录仍是
@@ -66,6 +70,10 @@ import {
   type RouteSummaryView,
 } from '@sfe/contract';
 import { processPathsDigest } from '../../src/engine/capabilities.js';
+import { FORGED_HOLD_KEY, FORGED_HOLD_RETRY_MS } from '../../src/engine/node-resource.js';
+import { routeNotConfirmedNormal } from '../../src/domain/route-rules.js';
+import { readForgedNodes } from '../../src/resource/index.js';
+import { nodeLine, resourceBody } from '../../src/surge/generate.js';
 import { retiredSafariPaths, safariMayUseRouteMarked } from '../../src/engine/safari-route-marker.js';
 import { payloadOf } from '../../src/domain/operations.js';
 import type { OperationRecord } from '../../src/db/index.js';
@@ -153,7 +161,12 @@ type Ev =
   | { t: 'report'; p: 0 | 1 | 2; windows: number }
   | { t: 'busy'; rate: number; rs: number }
   /** 下一个事件中，引擎第 nth 次（按 when 计数的）Surge 调用时（切换、回滚、重测等进行中）用户点「进入普通模式」。 */
-  | { t: 'normalDuring'; nth: number; via: 'web' | 'bound' | 'unbound'; when?: When };
+  | { t: 'normalDuring'; nth: number; via: 'web' | 'bound' | 'unbound'; when?: When }
+  /**
+   * 用户决定 D11：fetch——Surge 的缓存变成一份本服务没有提供过的列表（成员同名、参数不同，更新时间为此刻；如同端口被他人占用时
+   * 下载了占用者的列表）；drift——由本服务答复的、成员同名而参数不同的列表（下载可以解释，参数漂移）。
+   */
+  | { t: 'forge'; mode: 'fetch' | 'drift'; host: number };
 
 interface Header {
   strategy: 'ruleset_resource' | 'temp_rule';
@@ -245,6 +258,7 @@ function generate(seed: number): Ev[] {
     [2, 3, () => ({ t: 'busy', rate: pick(rng, [0, 0.15, 0.4]), rs: Math.floor(rng() * 1e9) })],
     [1, 3, () => during(anyWhen())],
   ];
+  // forge 事件（用户决定 D11）在生成之后另用独立的随机数插入：已有种子的其余事件不变
   /**
    * 被换掉的进程路径：故障消除，（普通模式使入口回到 NORMAL，才能确认进程路径）Safari+STP → 激活并实测 → STP 经买家出口的长连接 →
    * 普通模式留下持久标记（结束连接失败；或 rule match 不可用且文件监视慢，撤销入口之前 STP 又经 SFE-ROUTE 建立连接）→ 确认只有
@@ -365,6 +379,15 @@ function generate(seed: number): Ev[] {
     out.push(ev);
   }
   // n 是目标长度：最后一个事件的后续事件与宏完整保留（截断会让它们停在半途）
+  // 用户决定 D11：少数种子在序幕之后插入一次 forge（不插在 crash / normalDuring 之后：它们只对下一个事件生效）
+  const frng = mulberry32(seed * 104_729 + 3);
+  if (frng() < 0.2 && out.length > 3) {
+    const candidates = out.map((_, i) => i).filter((i) => i >= 3 && out[i - 1]!.t !== 'crash' && out[i - 1]!.t !== 'normalDuring');
+    if (candidates.length > 0) {
+      const pos = candidates[Math.floor(frng() * candidates.length)]!;
+      out.splice(pos, 0, { t: 'forge', mode: frng() < 0.6 ? 'fetch' : 'drift', host: Math.floor(frng() * 100) });
+    }
+  }
   return out;
 }
 
@@ -460,6 +483,8 @@ const COVERAGE_KEYS = [
   'crashDuring.probe',
   'crashDuring.normal',
   'popupRaceSkipped',
+  'forge',
+  'forgedHeld',
 ] as const;
 type CoverageKey = (typeof COVERAGE_KEYS)[number];
 type Coverage = Record<CoverageKey, number>;
@@ -515,6 +540,13 @@ class World {
   /** module 事件启用的模块规则（heal 移除）。 */
   moduleRule: { text: string; host: HostKey } | null = null;
   busy = { rate: 0, rng: mulberry32(1) };
+  /** I7：最近一次 Surge 重启（restart 事件）与最近一次排入 route.hold 的事件序号。 */
+  lastRestart = -1;
+  lastHoldEvent = -1;
+  /** I7：本事件开始时 route.hold 操作的个数。 */
+  holdsBefore = 0;
+  /** 正在回放的事件。 */
+  currentEvent: Ev | null = null;
   eventIndex = -1;
   quietVerify = false;
   stats = emptyStats();
@@ -1193,8 +1225,34 @@ async function exec(w: World, ev: Ev): Promise<void> {
     }
     case 'restart':
       h.fake.restart();
+      w.lastRestart = w.eventIndex;
       w.externalDirty = true;
       return;
+    case 'forge': {
+      const url = h.resourceUrl();
+      const host = h.app.engine.resource;
+      if (url === null || host === null || host.served()?.state === 'candidate') return;
+      const members = (await h.fake.getGroupMembers(ROUTE_GROUP_NAME)).slice(1).filter((n) => n !== 'SFE-EMPTY');
+      const lines = members.map((name) => nodeLine({ name, host: `192.0.2.${100 + ev.host}`, port: 1081, username: null, password: null, front: 'Front-A' }));
+      if (ev.mode === 'fetch') {
+        h.clock.set(new Date(h.clock.now().getTime() + 60_000));
+        h.fake.seedRemoteCache(url, resourceBody(99, lines), { updatedAt: h.clock.now() });
+      } else {
+        const generation = h.repos.meta.configurationGeneration() + 1;
+        host.stageCandidate({ generation, content: resourceBody(generation, lines) });
+        try {
+          await h.fake.updateExternalResource(h.resourceKey()!);
+        } catch {
+          // 下载失败：没有漂移
+        } finally {
+          host.revertToCommitted();
+        }
+      }
+      w.cov.forge++;
+      w.externalDirty = true;
+      w.trace.push(`   → Surge 中的节点${ev.mode === 'fetch' ? '换成了本服务没有提供过的列表' : '参数漂移（由本服务答复）'}（${members.length} 个成员）`);
+      return;
+    }
     case 'module':
       // 用户启用模块（不经引擎）：它的规则排在本应用入口之前，Safari 中被它匹配的请求按它发出
       w.moduleRule = { text: `DOMAIN-SUFFIX,${HOSTS[ev.host]},DIRECT`, host: ev.host };
@@ -1339,6 +1397,42 @@ function checkNormals(w: World): void {
   }
 }
 
+/** route.hold 操作（按受理顺序）。 */
+function holdOps(w: World): OperationRecord[] {
+  return w.h.repos.db
+    .all<{ id: string }>("SELECT id FROM operations WHERE kind = 'route.hold' ORDER BY rowid")
+    .map((r) => w.h.repos.operations.get(r.id)!)
+    .filter((o) => o !== null);
+}
+
+/** I7（用户决定 D11）：节点资源可能被伪造时 SFE-ROUTE 改选 REJECT 并保持。 */
+function checkForged(w: World, route: ReturnType<Harness['repos']['routeState']['get']>): void {
+  const { h } = w;
+  const engine = h.app.engine;
+  const holds = holdOps(w);
+  if (holds.length > w.holdsBefore) w.lastHoldEvent = w.eventIndex;
+  if (readForgedNodes(engine.kv) === null || !routeNotConfirmedNormal(route)) return;
+  const selection = (h.fake as unknown as FakeInternals).selection.get(ROUTE_GROUP_NAME) ?? null;
+  const last = holds.at(-1);
+  const lastHeld = last !== undefined && last.status === 'succeeded' && (last.result as { rejectSelected?: boolean } | null)?.rejectSelected === true;
+  if (lastHeld) w.cov.forgedHeld++;
+  if (lastHeld && w.lastRestart < w.lastHoldEvent && selection !== 'REJECT') {
+    w.violate('I7', 'I7|held-then-left', `REJECT 保持 ${last!.id} 读回确认之后伪造标记仍在、路由 ${w.routeDesc()} 不是经确认的普通模式，SFE-ROUTE 却是 ${String(selection)}`);
+  }
+  // 对账事件之后：Surge 可连接、是固定工作配置、没有注入忙碌失败时，要么已是 REJECT，要么这次对账排入的保持如实结束
+  const ev = w.eventIndex >= 0 ? w.currentEvent : null;
+  if (ev?.t !== 'reconcile' || w.busy.rate > 0 || !engine.facts.reachable || engine.facts.onWorkingProfile !== true || selection === 'REJECT') return;
+  const spaced = (() => {
+    const rec = engine.kv.get<{ lastFailedAt?: unknown; unreachable?: unknown }>(FORGED_HOLD_KEY);
+    return ev.kind === 'periodic' && rec !== null && rec.unreachable !== true && typeof rec.lastFailedAt === 'string' && h.clock.now().getTime() - Date.parse(rec.lastFailedAt) < FORGED_HOLD_RETRY_MS;
+  })();
+  if (spaced) return;
+  const attempted = holds.slice(w.holdsBefore);
+  if (attempted.length === 0 || attempted.every((o) => o.status === 'succeeded' && (o.result as { forgedHold?: string } | null)?.forgedHold === 'not_needed')) {
+    w.violate('I7', 'I7|reconcile-did-not-hold', `对账之后伪造标记仍在、路由 ${w.routeDesc()} 不是经确认的普通模式、Surge 可连接且是工作配置，SFE-ROUTE 却是 ${String(selection)}，这次对账也没有排入（或执行）REJECT 保持`);
+  }
+}
+
 function checkIdle(w: World): void {
   const { h } = w;
   const { repos } = h;
@@ -1442,6 +1536,8 @@ function checkIdle(w: World): void {
     }
   }
 
+  checkForged(w, route);
+
   if (route.warnings.includes('buyer_exit_connections_unconfirmed')) w.stats.becWarnings++;
   if (route.phase === 'attention') w.stats.attention++;
 }
@@ -1472,10 +1568,12 @@ async function runSequence(header: Header, events: readonly Ev[], opts: { trace?
     for (let i = 0; i < events.length; i++) {
       const ev = events[i]!;
       w.eventIndex = i;
+      w.currentEvent = ev;
       w.stats.events++;
       w.trace.push(`#${i} ${describeEv(ev)}`);
       const armed = ev.t === 'crash' && ev.nth > 0;
       const normalArmed = ev.t === 'normalDuring';
+      w.holdsBefore = holdOps(w).length;
       await exec(w, ev);
       await w.settle();
       while (w.pending.length > 0) {
