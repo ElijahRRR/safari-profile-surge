@@ -1,6 +1,7 @@
 // AppService 实现：HTTP、agent/maintenance 套接字与原生桥共用的业务入口。受理在请求内同步完成并返回 202；
-// Surge 写入只在唯一执行器中发生。启动顺序：pepper → 主机事实 → 对账 → 恢复未完成操作 → 执行器 → 周期任务。
-// 停止只停执行器与计时器，从不改变入口状态或 SFE-ROUTE 选择。
+// Surge 写入只在唯一执行器中发生。启动顺序：pepper → 本机资源服务（令牌、端口、指针、已提交版本、监听之前的审计、监听，
+// engine/node-resource.ts）→ 主机事实 → 对账（需要时排入一次系统强制刷新发布）→ 恢复未完成操作 → 执行器 → 周期任务。
+// 停止只停执行器与计时器，从不改变入口状态或 SFE-ROUTE 选择；资源服务的监听由 main.ts 在停止之后关闭。
 
 import { basename } from 'node:path';
 import {
@@ -57,10 +58,11 @@ import { Executor } from './executor.js';
 import { failOrphanedOperations } from './handlers/publish.js';
 import { importCommit, importPreview } from './import.js';
 import { initCommit, initPreview, remergeCommit, remergePreview } from './maintenance.js';
-import { resourceOwnershipUnsettled, settleResourceDigests } from './ownership.js';
 import { handleNative } from './native.js';
+import { nodeResourceWatched, startResourceService } from './node-resource.js';
 import { controlAfterReconcile, reconcile, surgeStatus } from './reconcile.js';
 import { createViewService, type ViewService } from './view-service.js';
+import { PUBLISH_KINDS } from '../domain/operations.js';
 import type { PrecheckEvaluation } from '../domain/route-rules.js';
 
 export type { AppServiceDeps } from './context.js';
@@ -93,22 +95,29 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
   const acceptDeps: AcceptDeps = { engine, views, kick };
   const dispatch = createDispatcher(engine, {
     enqueuePublish: () => {
-      const op = engine.repos.tx(() =>
-        insertOperation(engine, {
+      const op = engine.repos.tx(() => {
+        // 已有排队或执行中的发布：needsRefresh 已设，它会单 key 更新并读回，不另排
+        if (engine.repos.operations.listByStatus(['queued', 'running'], { kinds: [...PUBLISH_KINDS] }).length > 0) return null;
+        return insertOperation(engine, {
           kind: 'deploy.publish',
           requestId: `remerge:${engine.ids.token(16)}`,
           digest: 'service',
           actor: { kind: 'admin' },
-          // 恢复的资源名称与上次发布相同：强制写入、等待 Surge 重新读取并逐节点读回，不走“没有修改”的捷径
-          payload: { environmentIds: null, forceRefresh: true },
-          step: '重新合并后发布节点资源',
-        }),
-      );
+          // 重新提供的是已提交版本：强制单 key 更新一次并逐项读回，不走“没有修改”的捷径；没有目标环境（只核对已部署的节点，
+          // 待部署的修改仍需要显式的发布请求）
+          payload: { environmentIds: [], forceRefresh: true },
+          step: '重新合并后核对节点资源（重新提供已提交版本、单 key 更新并读回）',
+        });
+      });
+      if (op === null) return false;
       engine.emit({ operations: [op.id] });
       kick();
+      return true;
     },
   });
   executor = new Executor(engine, dispatch);
+  // 启动与对账排入系统强制刷新发布之后唤醒执行器（node-resource.ts maybeEnqueueSystemRefresh）
+  engine.kick = kick;
   const serviceVersion = deps.serviceVersion ?? '0.0.0-dev';
 
   // ---------- 受控判定（动作前短超时对账） ----------
@@ -190,8 +199,9 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
 
   async function runPeriodicReconcile(): Promise<void> {
     const route = engine.repos.routeState.get();
-    // 只在路由阶段不是 idle 或入口不是 NORMAL 时对账；作为执行器内部任务，写入进行中时自动延后
-    if (route.phase === 'idle' && route.entryMode === 'NORMAL') return;
+    // 只在路由阶段不是 idle 或入口不是 NORMAL 时对账；作为执行器内部任务，写入进行中时自动延后。工作配置引用本机资源服务时
+    // 空闲也对账：重试监听、审计 Surge 报告的资源（D10）
+    if (route.phase === 'idle' && route.entryMode === 'NORMAL' && !nodeResourceWatched(engine)) return;
     try {
       await executor.runInternal('reconcile', () => reconcile(engine, 'periodic'));
     } catch (err) {
@@ -299,7 +309,8 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
     },
     initPreview: (req, actor) => initPreview(acceptDeps, req, actor),
     initCommit: (req, actor) => initCommit(acceptDeps, req, actor),
-    remergePreview: (actor) => remergePreview(acceptDeps, actor),
+    // 选项 rotateResourceUrl（更换本机资源地址）由 maintenance.ts 校验与执行
+    remergePreview: (actor, req) => remergePreview(acceptDeps, actor, req),
     remergeCommit: (req, actor) => remergeCommit(acceptDeps, req, actor),
     async issueLoginCode(actor): Promise<LoginCodeResponse> {
       if (actor.kind !== 'admin') throw new SfeError('BAD_REQUEST', '签发登录链接失败：只能由维护通道签发');
@@ -316,6 +327,14 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
         await engine.keys();
       } catch {
         engine.log('error', 'pepper.unavailable');
+      }
+      // 本机资源服务（D10，loopback-spec §6 第 1–7 步）：惰性读取令牌（读不到时记 resource.token_unavailable，资源服务保持 null，
+      // 发布、初始化与重新合并之后停泊；进入普通模式与 REJECT 保持不受影响）、首次选定端口、初始化指针并撤回候选版本、加载已提交
+      // 版本、令牌可疑时拒绝令牌、监听之前审计、监听。从不写 Surge；第 8 步的系统强制刷新由下面的对账排入
+      try {
+        await startResourceService(engine);
+      } catch (err) {
+        engine.log('error', 'resource.start_failed', { error: err instanceof Error ? err.name : 'unknown' });
       }
       await sweepTempFiles(deps.paths.tmpDir).catch(() => []);
       // 上次进程在 --check 期间被终止时遗留的候选目录（含明文代理凭据的节点资源副本）：执行器开始之前删除
@@ -341,17 +360,6 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
       const released = engine.repos.outbox.releaseClaims(engine.now());
       if (released > 0) engine.log('warn', 'startup.released_claims', { count: released });
       failOrphanedOperations(engine);
-      // 节点资源文件未结算的归属（之前的版本在发布回滚的读回失败时留下未确认的意图与写前摘要 mo_prev；其中的内容可能含之后已
-      // 退役、凭据已清扫的版本的节点行）：按事实确认或清除，只保留当前文件内容的摘要（ownership.ts settleResourceDigests；与
-      // 崩溃恢复 recoverPublish 对写前或写后内容的确认相同）
-      const resourceFiles = engine.profileFiles();
-      if (resourceFiles && resourceOwnershipUnsettled(engine.repos, engine.kv)) {
-        try {
-          settleResourceDigests(engine.repos, engine.kv, await resourceFiles.digest(NODE_RESOURCE_FILE));
-        } catch (err) {
-          engine.log('warn', 'startup.resource_ownership_unsettled', { error: err instanceof Error ? err.name : 'unknown' });
-        }
-      }
       try {
         await reconcile(engine, 'startup');
       } catch (err) {
@@ -364,6 +372,8 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
     },
     async stop() {
       stopped = true;
+      // 之后不再监听本机资源服务（关闭由 main.ts 在执行器停止之后进行）
+      engine.resourceRuntime.stopped = true;
       reconcileTimer?.();
       sweepTimer?.();
       reconcileTimer = null;

@@ -138,12 +138,12 @@ export function activationGate(strategy: EntryStrategy | null): CapabilityKey[] 
 }
 
 /**
- * 读回不完整时，P0 记录覆盖的未核对字段。约定：policy_path_reread、targeted_resource_refresh、
- * external_node_underlying_proxy 的说明中含一行 `readback-covers: server, port, underlying-proxy`
- * （逗号分隔）。三项都声明覆盖的字段才算覆盖；没有声明时一律不覆盖（部署停在 published）。
+ * 读回不完整时，P0 记录覆盖的未核对字段。约定：loopback_resource_update 与 external_node_underlying_proxy 的说明中含一行
+ * `readback-covers: server, port, underlying-proxy`（逗号分隔）。两项都声明覆盖的字段才算覆盖；没有声明时一律不覆盖
+ * （部署停在 published）。
  */
 export const READBACK_COVERAGE_MARKER = 'readback-covers:';
-export const READBACK_COVERAGE_KEYS: readonly CapabilityKey[] = ['policy_path_reread', 'targeted_resource_refresh', 'external_node_underlying_proxy'];
+export const READBACK_COVERAGE_KEYS: readonly CapabilityKey[] = ['loopback_resource_update', 'external_node_underlying_proxy'];
 
 function coveredFields(note: string | null): Set<string> {
   const out = new Set<string>();
@@ -159,7 +159,7 @@ function coveredFields(note: string | null): Set<string> {
   return out;
 }
 
-/** 未核对字段是否全部被三项 P0 记录（有效状态 supported）覆盖。 */
+/** 未核对字段是否全部被这两项 P0 记录（有效状态 supported）覆盖。 */
 export function readbackCovered(views: readonly CapabilityView[], uncheckedFields: readonly string[]): boolean {
   if (uncheckedFields.length === 0) return true;
   for (const key of READBACK_COVERAGE_KEYS) {

@@ -18,6 +18,7 @@ import {
   type ProxyRevisionView,
   type RouteStateView,
   type RouteSummaryView,
+  type NodeResourceStatusView,
   type SurgeStatusView,
   type TakeoverState,
 } from '@sfe/contract';
@@ -228,7 +229,8 @@ export function emptySurgeFacts(): SurgeFacts {
   };
 }
 
-export function buildSurgeStatus(facts: SurgeFacts, configurationGeneration: number): SurgeStatusView {
+/** nodeResource：本机资源服务的状态（engine/node-resource.ts nodeResourceStatus）；不含令牌、地址或端口。 */
+export function buildSurgeStatus(facts: SurgeFacts, configurationGeneration: number, nodeResource: NodeResourceStatusView | null = null): SurgeStatusView {
   return {
     reachable: facts.reachable,
     version: facts.version,
@@ -244,6 +246,7 @@ export function buildSurgeStatus(facts: SurgeFacts, configurationGeneration: num
     precedenceIssues: facts.precedenceIssues.map((i) => ({ ...i })),
     lastCheckedAt: facts.checkedAt,
     message: facts.message,
+    nodeResource: nodeResource === null ? null : { ...nodeResource },
   };
 }
 

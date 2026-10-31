@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { OPERATION_KINDS, OPERATION_PHASES, type EnvironmentReadiness, type RouteWarning } from '@sfe/contract';
+import { OPERATION_KINDS, OPERATION_PHASES, type EnvironmentReadiness, type NodeResourceState, type RouteWarning } from '@sfe/contract';
 import {
   ENTRY_MODE_LABELS,
+  NODE_RESOURCE_NEEDS_REFRESH_TEXT,
+  NODE_RESOURCE_STATE_DETAILS,
+  NODE_RESOURCE_STATE_LABELS,
+  NODE_RESOURCE_TOKEN_SUSPECT_TEXT,
   OPERATION_KIND_LABELS,
   OPERATION_PHASE_LABELS,
   READINESS_LABELS,
@@ -48,7 +52,10 @@ const ALL_WARNINGS: RouteWarning[] = [
   'probe_failed',
   'exit_ip_mismatch',
   'buyer_exit_connections_unconfirmed',
+  'node_resource_unverified',
 ];
+
+const ALL_NODE_RESOURCE_STATES: NodeResourceState[] = ['serving', 'not_listening', 'token_unavailable', 'legacy_line', 'not_installed'];
 
 describe('readiness labels', () => {
   it('cover every readiness with text and a badge variant', () => {
@@ -82,6 +89,15 @@ describe('route warning text', () => {
     expect(warningText('takeover_unknown')).toBe('接管状态无法读取');
   });
 
+  it('lists exactly the contract warnings (a new warning needs its text here)', () => {
+    expect(Object.keys(ROUTE_WARNING_TEXT).sort()).toEqual([...ALL_WARNINGS].sort());
+  });
+
+  it('says what node_resource_unverified means and shows it as danger (D10)', () => {
+    expect(warningText('node_resource_unverified')).toBe('节点资源未确认：Surge 中的节点无法证明来自本机资源服务的已提交版本');
+    expect(ROUTE_WARNING_TEXT.node_resource_unverified.severity).toBe('danger');
+  });
+
   it('marks loss-of-control warnings as danger', () => {
     for (const w of ['takeover_lost', 'surge_unreachable', 'external_selection_change', 'precedence_violation', 'exit_ip_mismatch'] as const) {
       expect(ROUTE_WARNING_TEXT[w].severity).toBe('danger');
@@ -91,6 +107,34 @@ describe('route warning text', () => {
 
   it('falls back to a visible text for an unknown warning', () => {
     expect(warningText('something_new' as RouteWarning)).toContain('something_new');
+  });
+});
+
+describe('local resource server labels (D10)', () => {
+  it('cover every state; only serving is green; texts never carry an address, port or token', () => {
+    expect(Object.keys(NODE_RESOURCE_STATE_LABELS).sort()).toEqual([...ALL_NODE_RESOURCE_STATES].sort());
+    expect(Object.keys(NODE_RESOURCE_STATE_DETAILS).sort()).toEqual([...ALL_NODE_RESOURCE_STATES].sort());
+    expect(ALL_NODE_RESOURCE_STATES.filter((st) => NODE_RESOURCE_STATE_LABELS[st].variant === 'success')).toEqual(['serving']);
+    const texts = [
+      ...ALL_NODE_RESOURCE_STATES.map((st) => NODE_RESOURCE_STATE_LABELS[st].label),
+      ...Object.values(NODE_RESOURCE_STATE_DETAILS),
+      NODE_RESOURCE_TOKEN_SUSPECT_TEXT,
+      NODE_RESOURCE_NEEDS_REFRESH_TEXT,
+    ];
+    for (const t of texts) {
+      expect(t).toMatch(/[一-龥]/);
+      expect(t).not.toMatch(/[!！]/);
+      expect(t).not.toMatch(/127\.0\.0\.1:\d|[0-9a-f]{32,}/i);
+    }
+  });
+
+  it('names the error code and the remerge where the user has to act', () => {
+    expect(NODE_RESOURCE_STATE_DETAILS.not_listening).toContain('RESOURCE_SERVER_UNAVAILABLE');
+    expect(NODE_RESOURCE_STATE_DETAILS.token_unavailable).toContain('SECRET_STORE_FAILED');
+    expect(NODE_RESOURCE_STATE_DETAILS.token_unavailable).toContain('普通模式不受影响');
+    expect(NODE_RESOURCE_STATE_DETAILS.legacy_line).toContain('需要重新合并以改用本机资源服务');
+    expect(NODE_RESOURCE_STATE_DETAILS.not_installed).toContain('需要重新合并');
+    expect(NODE_RESOURCE_TOKEN_SUSPECT_TEXT).toContain('更换本机资源地址');
   });
 });
 

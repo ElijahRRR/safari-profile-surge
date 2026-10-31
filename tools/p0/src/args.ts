@@ -2,6 +2,7 @@
 
 import { CAPABILITY_KEYS, type CapabilityKey } from '@sfe/contract';
 import { usage } from './errors.js';
+import { RESOURCE_SCENARIOS, SQUAT_MODES } from './loopback-state.js';
 
 export type FlagKind = 'string' | 'number' | 'boolean' | 'list';
 
@@ -80,21 +81,59 @@ export const COMMANDS: readonly CommandSpec[] = [
     flags: { 'h3-host': { kind: 'string' }, 'ipv6-host': { kind: 'string' }, skip: { kind: 'list' }, grace: { kind: 'number', min: 0, max: 60 } },
   },
   {
-    name: 'charset',
-    summary: '逐类测试代理凭据字符经 Surge 节点行传到出口服务器后是否保持原样',
-    usage: 'charset [--classes <类别> …] [--reload-wait 10]',
+    name: 'resource-server',
+    summary: '在 127.0.0.1 启动测试资源服务（产品的处理程序；读取令牌只在运行目录中），按状态文件提供测试节点与固定的故障场景；--squat 为端口占用者',
+    usage: 'resource-server [--port N] [--scenario S] [--squat squat200|squat404]',
     positionals: { min: 0, max: 0 },
-    flags: { classes: { kind: 'list' }, wait: { kind: 'number', min: 1, max: 120 }, 'reload-wait': { kind: 'number', min: 1, max: 120 } },
+    flags: {
+      port: PORT,
+      scenario: { kind: 'string', choices: RESOURCE_SCENARIOS },
+      squat: { kind: 'string', choices: SQUAT_MODES },
+    },
+  },
+  {
+    name: 'loopback',
+    summary: '回环节点资源单 key 更新：主配置见证、场景矩阵与读回（--setup 只改写测试配置的 SFE-ROUTE 一行并等你手动重新加载，--rollback 改回原样）',
+    usage: 'loopback [--setup|--rollback]',
+    positionals: { min: 0, max: 0 },
+    flags: { setup: { kind: 'boolean' }, rollback: { kind: 'boolean' } },
+  },
+  {
+    name: 'loopback-auth',
+    summary: '回环资源服务认证与端口占用：拒绝规则、Surge 下载、同一用户与另一系统用户的绑定、服务停止时被占用、Surge 资源缓存',
+    usage: 'loopback-auth',
+    positionals: { min: 0, max: 0 },
+    flags: {},
+  },
+  {
+    name: 'loopback-restart',
+    summary: 'Surge 退出重开与 Mac 重启后回环资源的缓存与恢复（分阶段：准备、Surge 重开后、Mac 重启后）',
+    usage: 'loopback-restart --phase prepare|after-surge-restart|after-mac-restart',
+    positionals: { min: 0, max: 0 },
+    flags: { phase: { kind: 'string', choices: ['prepare', 'after-surge-restart', 'after-mac-restart'] } },
+  },
+  {
+    name: 'loopback-crash',
+    summary: '资源服务在发布中途被中断时 Surge 的行为（候选之后、更新进行中、响应中途、更新进行中再次更新）与恢复',
+    usage: 'loopback-crash',
+    positionals: { min: 0, max: 0 },
+    flags: {},
+  },
+  {
+    name: 'charset',
+    summary: '逐类测试代理凭据字符经 Surge 节点行（经回环测试资源发布）传到出口服务器后是否保持原样',
+    usage: 'charset [--classes <类别> …]',
+    positionals: { min: 0, max: 0 },
+    flags: { classes: { kind: 'list' }, wait: { kind: 'number', min: 1, max: 120 } },
   },
   {
     name: 'refresh',
-    summary: '原子替换测试节点资源与规则集（不调用 update），测量 Surge 自动重新读取的延迟与影响、自动重载与是否发生重载或引擎重启',
-    usage: 'refresh --auto-reload on|off [--wait 8] [--skip-removal-fallback]',
+    summary: '原子替换规则集与配置 canary（不调用 update 刷新），测量文件监视的重新读取、自动重载与是否发生重载或引擎重启，并测固定配置日常切换',
+    usage: 'refresh --auto-reload on|off [--wait 8]',
     positionals: { min: 0, max: 0 },
     flags: {
       'auto-reload': { kind: 'string', choices: ['on', 'off'] },
       wait: { kind: 'number', min: 1, max: 120 },
-      'skip-removal-fallback': { kind: 'boolean' },
     },
   },
   {
@@ -132,10 +171,10 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   {
     name: 'chain',
-    summary: '证明外部节点经 underlying-proxy 前置：前置可达、前置不可达、前置名缺失',
-    usage: 'chain [--reload-wait 10]',
+    summary: '证明外部节点经 underlying-proxy 前置：前置可达、前置不可达、前置名缺失（测试节点经回环测试资源发布）',
+    usage: 'chain',
     positionals: { min: 0, max: 0 },
-    flags: { wait: { kind: 'number', min: 1, max: 120 }, 'reload-wait': { kind: 'number', min: 1, max: 120 } },
+    flags: { wait: { kind: 'number', min: 1, max: 120 } },
   },
   {
     name: 'preflight',

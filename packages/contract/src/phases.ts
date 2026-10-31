@@ -144,7 +144,9 @@ export type EntryStrategy = (typeof ENTRY_STRATEGIES)[number];
 /**
  * P0 能力门槛。每项记录支持/不支持/待验证、实测依据与验证时的上下文；上下文中它依赖的
  * 任一字段变化（Surge 版本/构建、macOS、Safari、入口策略、进程路径、工作配置、自动重载设置、
- * 接管方式、签名身份）都会让它回到待验证。
+ * 接管方式、签名身份）都会让它回到待验证。D10（2026-10-31）删除了本地 policy-path 方案的 targeted_resource_refresh 与
+ * policy_path_reread（自动重载关闭时本地文件不被重新读取，见 docs/verification/2026-10-24-fixed-profile-live.md），改为四项
+ * loopback_*（本机回环资源服务）；旧键的记录由迁移删除，从不解释为新键的结论。
  */
 export const CAPABILITY_KEYS = [
   'safari_process_attribution',
@@ -155,8 +157,10 @@ export const CAPABILITY_KEYS = [
   'runtime_entry_modes',
   'entry_rules_after_restart',
   'safari_udp_quic_handling',
-  'targeted_resource_refresh',
-  'policy_path_reread',
+  'loopback_resource_update',
+  'loopback_resource_auth',
+  'loopback_resource_restart',
+  'loopback_publish_crash',
   'external_node_underlying_proxy',
   'connection_continuity',
   'auto_reload_atomic_replace',
@@ -179,8 +183,10 @@ export const CAPABILITY_LABELS: Record<CapabilityKey, string> = {
   runtime_entry_modes: '运行时入口四种模式',
   entry_rules_after_restart: 'Surge 重启后入口规则生命周期',
   safari_udp_quic_handling: 'Safari UDP/QUIC 处理',
-  targeted_resource_refresh: '节点资源定向重新读取',
-  policy_path_reread: '本地 policy-path 重新读取',
+  loopback_resource_update: '回环节点资源单 key 更新',
+  loopback_resource_auth: '回环资源服务认证与端口占用',
+  loopback_resource_restart: '回环资源重启后的缓存与恢复',
+  loopback_publish_crash: '回环资源并发发布与崩溃恢复',
   external_node_underlying_proxy: '外部节点前置链路',
   connection_continuity: '其他应用连接连续性',
   auto_reload_atomic_replace: '自动重载与原子替换行为',
@@ -224,8 +230,10 @@ export const CAPABILITY_CONTEXT_DEPS: Record<CapabilityKey, readonly CapabilityC
   runtime_entry_modes: ['surgeVersion', 'surgeBuild', 'entryStrategy', 'processPathsDigest', 'autoReload', 'adapterMechanism', 'takeoverMode'],
   entry_rules_after_restart: ['surgeVersion', 'surgeBuild', 'entryStrategy'],
   safari_udp_quic_handling: ['surgeVersion', 'surgeBuild', 'entryStrategy', 'processPathsDigest', 'macosBuild', 'macosVersionExtra', 'macosRestartPending', 'safariVersion', 'takeoverMode'],
-  targeted_resource_refresh: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism', 'autoReload'],
-  policy_path_reread: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism'],
+  loopback_resource_update: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism', 'autoReload'],
+  loopback_resource_auth: ['surgeVersion', 'surgeBuild', 'macosBuild', 'adapterMechanism'],
+  loopback_resource_restart: ['surgeVersion', 'surgeBuild', 'macosBuild', 'workingProfileId'],
+  loopback_publish_crash: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism'],
   external_node_underlying_proxy: ['surgeVersion', 'surgeBuild'],
   connection_continuity: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'adapterMechanism', 'autoReload', 'takeoverMode'],
   auto_reload_atomic_replace: ['surgeVersion', 'surgeBuild', 'workingProfileId', 'autoReload'],
@@ -246,14 +254,24 @@ export const SURGE_BUILD_RE = /^\d{1,10}$/;
 
 /** 动作 → 必需能力（全部 supported 且上下文匹配）。见 docs/ARCHITECTURE.md §5.2。 */
 export const CAPABILITY_GATES = {
-  /** 任何节点资源发布，自动或用户手动发起，要求完全相同。 */
+  /**
+   * 任何节点资源发布，自动或用户手动发起，要求完全相同（D10：本机资源服务提供新版本，只对本应用这一项资源执行一次
+   * external-resource update 并严格读回）。发布不写入 Surge 目录中的本地文件，所以不需要 auto_reload_atomic_replace；
+   * 自动重载条件取自 loopback_resource_update 记录的上下文。
+   */
   publish: [
-    'targeted_resource_refresh',
-    'policy_path_reread',
+    'loopback_resource_update',
+    'loopback_resource_auth',
+    'loopback_resource_restart',
+    'loopback_publish_crash',
     'external_node_underlying_proxy',
     'connection_continuity',
-    'auto_reload_atomic_replace',
   ],
+  /**
+   * 资源服务提供第 0 代（只含占位行）以外的任何版本（其中有买家节点凭据），以及重新合并时把旧版本地 policy-path 行改为
+   * 本机资源服务地址，都要求这三项：满足之前资源服务只提供占位内容或 503，旧版行保持不变。
+   */
+  resourceServe: ['loopback_resource_update', 'loopback_resource_auth', 'loopback_resource_restart'],
   /** 激活与活动环境切换（改变 SFE-ROUTE 选择与入口模式）。 */
   activate: [
     'native_bridge_ipc',
@@ -265,7 +283,7 @@ export const CAPABILITY_GATES = {
     'fixed_profile_no_switch',
   ],
   /**
-   * ruleset_resource 策略额外要求。入口规则集文件由 Surge 的文件监视重新读取（从不调用 external-resource update：
+   * ruleset_resource 策略额外要求。入口规则集文件由 Surge 的文件监视重新读取（入口从不调用 external-resource update：
    * 本地资源被跳过）、经见证规则的 rule match 确认已加载，由 runtime_entry_modes（策略为 ruleset_resource 时）本身证明；
    * 这里只追加自动重载设置下的原子替换行为。
    */
@@ -292,16 +310,19 @@ export const CAPABILITY_MEASURED_GATES = {
 /**
  * 每项能力依赖的 Surge 原语；验证上下文中的 adapterMechanism 记录这些原语当时由哪种实现提供
  * （规范 JSON：{"原语":"cli|http"}），比较时只比较这些原语——映射变化（例如 install.json 中 matchRule 改为 unavailable）
- * 让相应记录过期、门槛在任何写入之前拒绝。只列产品实际调用的原语：外部资源更新跳过本地资源（HTTP API 文档：“Local
- * resources are skipped.”），发布与入口从不调用 updateExternalResource，所以它不在任何一项中；入口的每一步与读回都用
- * rule match（Mac 6.9.0+）确认运行时求值，ruleset_resource 每步写入前读取自动重载设置。
+ * 让相应记录过期、门槛在任何写入之前拒绝。只列产品实际调用的原语：发布节点资源（D10）只对本应用这一项回环资源调用
+ * updateExternalResource（从不 update all），所以它出现在回环各项与 connection_continuity 中；入口从不调用它（外部资源
+ * 更新跳过本地资源，HTTP API 文档：“Local resources are skipped.”），入口的每一步与读回都用 rule match（Mac 6.9.0+）
+ * 确认运行时求值，ruleset_resource 每步写入前读取自动重载设置。
  */
 export const CAPABILITY_PRIMITIVES: Partial<Record<CapabilityKey, readonly string[]>> = {
   fixed_profile_no_switch: ['selectGroupPolicy', 'getGroupSelection', 'getCurrentProfile'],
   runtime_entry_modes: ['listRules', 'matchRule', 'listTempRules', 'addTempRule', 'removeTempRule', 'listExternalResources'],
-  targeted_resource_refresh: ['listExternalResources', 'getGroupMembers', 'getGroupSelection'],
-  policy_path_reread: ['listExternalResources', 'getGroupMembers'],
-  connection_continuity: ['selectGroupPolicy', 'getGroupMembers'],
+  loopback_resource_update: ['listExternalResources', 'updateExternalResource', 'getGroupMembers', 'getGroupSelection'],
+  loopback_resource_auth: ['listExternalResources', 'updateExternalResource', 'getGroupMembers'],
+  loopback_resource_restart: ['listExternalResources', 'getGroupMembers', 'getGroupSelection'],
+  loopback_publish_crash: ['listExternalResources', 'updateExternalResource', 'getGroupMembers'],
+  connection_continuity: ['selectGroupPolicy', 'getGroupMembers', 'updateExternalResource'],
   auto_reload_atomic_replace: ['getAutoReloadSetting', 'matchRule'],
   independent_node_preflight: ['testPolicy'],
   takeover_state_readable: ['getTakeoverState'],
@@ -321,10 +342,16 @@ export const CAPABILITY_CRITERIA: Record<CapabilityKey, string> = {
     '所选策略下四种模式精确生效，运行时读回包括 rule match：Safari 的 TCP、UDP、QUIC 对检测主机与其他主机都得到该模式预期的结果，Chrome 从不命中本应用入口规则或 SFE-ROUTE；每次切换不发生配置重载或引擎重启，其他应用长连接与新请求不受影响；中间状态无放行窗口；本应用入口优先于启用的模块 DIRECT 规则与用户临时规则；AND/NOT 组合（进程、协议、域名）的入口规则在该机制中可用；temp_rule 时新临时规则的插入位置已实测；ruleset_resource 时规则集文件原子替换后不调用 external-resource update，由 Surge 的文件监视在限定时间内重新读取并经见证规则读回。',
   entry_rules_after_restart: 'Surge 重启（退出重开；只重启引擎时按引擎运行时长回落识别）后入口规则的去留已记录，且控制器在一个对账周期内检测到丢失（入口记为 UNKNOWN 并暂停填充与自动打开）。',
   safari_udp_quic_handling: 'VERIFY_ONLY 与 ACTIVE 下 Safari 的 UDP/QUIC（H3 测试主机）被拒绝且从不直连，页面回落 TCP 经 SFE-ROUTE，出口一致。',
-  targeted_resource_refresh: '本应用节点资源（本地 policy-path 文件）原子替换后不调用 external-resource update（本地资源被跳过），经固定原语能读回组成员、资源错误与选择；只有该资源变化，其他外部资源不受影响，不发生整份配置重载或引擎重启；执行器从不写入它无法读回的内容。',
-  policy_path_reread: '本地 policy-path 文件原子替换后不调用 external-resource update，Surge 在限定时间内自动重新读取（延迟已记录）：新增成员可选且实际生效，旧成员与选择保留，选中节点被移除时回落到首成员 REJECT。',
+  loopback_resource_update:
+    '工作配置中 SFE-ROUTE 的 policy-path 指向本机回环资源服务（127.0.0.1，路径带随机读取令牌）；只对该资源执行一次 external-resource update（从不 update all）：磁盘上未加载的主配置不被加载（主配置见证的阴性检查全部通过、显式同配置加载的阳性对照通过），不发生引擎重启，其他外部资源不变；下载失败时保留旧资源、旧节点继续工作；只含占位行 SFE-EMPTY 的列表被接受；退出 0、success 与 ready=true 都不当作成功，经固定原语读回资源错误、更新时间、组成员（REJECT 为首成员）、选择与可读的节点参数，并与本服务记录的下载核对：坏行被跳过、同名参数替换（服务器、端口或前置变化）与删除选中节点都能由读回发现；只差凭据的重名读回无法区分，由发布前严格校验拒绝。',
+  loopback_resource_auth:
+    '资源服务只监听 127.0.0.1，路径令牌错误或缺失、带浏览器请求头（Origin、Referer、Cookie、Sec-Fetch-*）或使用其他方法时一律返回同样的 404，Surge 实际发出的每次下载都由本应用的资源服务处理程序返回 200，其请求头名称与发起下载的进程已记录；服务运行时同一用户与另一系统用户对 127.0.0.1:端口 的第二次绑定都失败，能绑定成功的 0.0.0.0、[::]、[::1] 同端口监听不影响发往 127.0.0.1 的请求（以本服务请求记录为证）；服务停止时端口被他人占用并返回伪造列表或错误的后果（显式更新与定时刷新两种情况）已记录，且下载核对能发现 Surge 载入了不是本服务提供的列表或出现了本服务未产生的资源错误；Surge 资源缓存的位置及其中凭据的保存方式已记录。',
+  loopback_resource_restart:
+    'Surge 退出重开与 Mac 重启后（资源服务先于或晚于 Surge 启动、服务不可用、只返回 503 三种情况）SFE-ROUTE 的成员、选择、资源错误、更新时间与是否重新下载已记录；任何情况下都不会载入本服务未提交的版本，服务恢复后经一次单 key 更新与读回回到已提交版本。',
+  loopback_publish_crash:
+    '在资源服务提供新版本之后、Surge 更新进行中与响应中途中断服务时，Surge 保留的版本、资源错误与更新状态已记录；更新进行中再次更新时 Surge 的行为已记录；服务重启后经一次单 key 更新与读回使 Surge 回到已提交版本。本应用的发布互斥、启动顺序与崩溃恢复由自动化测试覆盖。',
   external_node_underlying_proxy: '外部资源中的节点经 underlying-proxy 引用主配置前置时确实经过前置；前置不可达时连接失败而非直连；前置名缺失时节点被跳过或失败而非直连。',
-  connection_continuity: '发布节点资源期间（写入本地 policy-path 文件并等待 Surge 自动重新读取），其他应用的长连接保持、新请求正常、出口不变，并与未执行变更的对照比较。',
+  connection_continuity: '发布节点资源期间（资源服务提供新版本并对该资源执行一次单 key 更新），其他应用的长连接保持、新请求正常、出口不变，并与未执行变更的对照比较。',
   auto_reload_atomic_replace: '在记录的自动重载设置（开/关）下，原子替换被引用的本地规则集后由 Surge 文件监视重新读取（延迟已记录），不触发整份配置重载或引擎重启，其他应用连接不受影响；主配置被原子替换后是否触发重载也已记录。',
   first_request_and_old_connections: '受控入口下首个业务请求已走新出口；旧环境的长连接、后台请求、恢复的标签页与扩展休眠场景不会继续使用旧出口；限制已写明。',
   independent_node_preflight: '不改变当前选择即可对未选中的候选节点做连通性测试。',

@@ -2,7 +2,8 @@
 // 1. 按值：登记本次读到或收到的每个秘密值，在任何自由文本中替换（压缩前缀树上的字面匹配：登记是一次插入，
 //    从不重新编译；每个位置的匹配代价只取决于匹配到的长度，与登记数量无关；登记表有容量上限）；
 // 2. 按规则：Surge 节点行参数（含位置参数形式的用户名/密码）、http-api、X-Key/Authorization/Cookie、
-//    `<密钥>@127.0.0.1:端口`、URL 用户信息与查询值、Bearer、JSON 中的敏感键、≥40 字符的 base64 串。
+//    `<密钥>@127.0.0.1:端口`、URL 用户信息与查询值、回环 http(s) 地址的整段路径（本机资源服务的读取令牌在路径中）、Bearer、
+//    JSON 中的敏感键、≥40 字符的 base64 串。
 // 规则层是兜底，宁可多遮；任何来自 Surge、子进程或错误的文本都先经过这里再进入日志、步骤、错误或事件。
 
 import type { Scrubber } from '../ports.js';
@@ -31,6 +32,12 @@ export const MAX_REGISTERED_SECRET_LENGTH = 1024;
  */
 export const MAX_REGISTERED_VALUES = 50_000;
 export const MAX_REGISTERED_CHARS = 4_000_000;
+
+/**
+ * 常驻登记（register 的 pinned）的条目上限（按形式计）。常驻条目不受上面的容量淘汰：长期有效、只在启动时读取一次的系统秘密
+ * （例如本机资源服务的读取令牌）在大量导入之后仍按值遮盖。超出上限时按普通登记处理（仍会登记，只是可能被淘汰）。
+ */
+export const MAX_PINNED_VALUES = 64;
 
 /** scrubDeep 中按键名遮盖的字段（值为字符串、数字或对象时遮盖；布尔与 null 不携带秘密，保留）。 */
 export const SENSITIVE_KEY_RE = /pass|secret|token|authorization|cookie|content_base64|login_code|api_?key|private_?key|^code$|auth$/i;
@@ -68,6 +75,11 @@ const JSON_KEY_RE =
   /("[^"\\\r\n]*?(?:pass|secret|token|authorization|cookie|content_base64|login_code|api_?key|private_?key)[^"\\\r\n]*"\s*:\s*)("(?:[^"\\]|\\.)*"|-?\d[\d.eE+-]*)/gi;
 const BASE64_RUN_RE = /(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{40,}={0,2}/g;
 
+/** 回环主机（可带端口）：127.0.0.0/8、localhost、[::1]、[::ffff:127.x.x.x]。 */
+const LOOPBACK_AUTHORITY_RE = /^(?:127(?:\.\d{1,3}){3}|localhost|\[::1\]|\[::ffff:127(?:\.\d{1,3}){3}\])(?::\d{0,5})?$/i;
+/** URL 末尾的标点（句号、逗号、右括号等）：不属于地址，遮盖路径时原样保留。 */
+const URL_TRAILING_PUNCT_RE = /[.,;:!)\]}>]*$/;
+
 function maskUrl(url: string): string {
   const schemeEnd = url.indexOf('://') + 3;
   let rest = url.slice(schemeEnd);
@@ -75,6 +87,14 @@ function maskUrl(url: string): string {
   const authorityEnd = rest.search(/[/?#]/);
   const authority = authorityEnd === -1 ? rest : rest.slice(0, authorityEnd);
   const at = authority.lastIndexOf('@');
+  // 回环 http(s) 地址：整段路径、查询与片段都遮盖（本机资源服务的读取令牌在路径中，D10）；路径只有 “/” 时保留。
+  if (authorityEnd !== -1 && /^https?:\/\/$/i.test(url.slice(0, schemeEnd)) && LOOPBACK_AUTHORITY_RE.test(authority.slice(at + 1))) {
+    const tail = rest.slice(authorityEnd);
+    const trailing = URL_TRAILING_PUNCT_RE.exec(tail)![0];
+    const path = tail.slice(0, tail.length - trailing.length);
+    const head = at === -1 ? authority : `${SCRUB_MASK}${authority.slice(at)}`;
+    return `${url.slice(0, schemeEnd)}${head}${path === '' || path === '/' ? path : `/${SCRUB_MASK}`}${trailing}`;
+  }
   if (at !== -1) rest = `${SCRUB_MASK}${rest.slice(at)}`;
   const q = rest.search(/[?#]/);
   if (q === -1) return url.slice(0, schemeEnd) + rest;
@@ -228,9 +248,19 @@ export function createScrubber(opts: ScrubberOptions = {}): Scrubber & { registe
   let seq = 0;
   let chars = 0;
   const root: TrieNode = { edges: null, terminal: false };
+  // 常驻条目：在前缀树中，但不在 latest/queue 中，因此从不被淘汰。
+  const pinned = new Set<string>();
 
-  function addValue(v: string): void {
+  function addValue(v: string, pin: boolean): void {
     if (v.length < MIN_REGISTERED_SECRET_LENGTH) return;
+    if (pinned.has(v)) return;
+    if (pin && pinned.size < MAX_PINNED_VALUES) {
+      // 已作为普通条目登记：移出淘汰顺序（队列中的旧条目随之过期），前缀树中的条目保留。
+      if (latest.delete(v)) chars -= v.length;
+      else trieInsert(root, v);
+      pinned.add(v);
+      return;
+    }
     const known = latest.has(v);
     latest.set(v, ++seq);
     queue.push({ value: v, seq });
@@ -253,7 +283,7 @@ export function createScrubber(opts: ScrubberOptions = {}): Scrubber & { registe
   }
 
   function replaceRegistered(text: string): string {
-    if (latest.size === 0) return text;
+    if (latest.size === 0 && pinned.size === 0) return text;
     let out = '';
     let last = 0;
     let i = 0;
@@ -328,7 +358,7 @@ export function createScrubber(opts: ScrubberOptions = {}): Scrubber & { registe
   }
 
   return {
-    register(secret: string): void {
+    register(secret: string, opts?: { pinned?: boolean }): void {
       if (typeof secret !== 'string' || secret.length < MIN_REGISTERED_SECRET_LENGTH || secret.length > MAX_REGISTERED_SECRET_LENGTH) return;
       let encoded: string;
       try {
@@ -337,14 +367,14 @@ export function createScrubber(opts: ScrubberOptions = {}): Scrubber & { registe
         // 孤立代理项无法 URL 编码：只登记原值与 JSON 转义形式
         encoded = secret;
       }
-      for (const v of new Set([secret, encoded, JSON.stringify(secret).slice(1, -1)])) addValue(v);
+      for (const v of new Set([secret, encoded, JSON.stringify(secret).slice(1, -1)])) addValue(v, opts?.pinned === true);
     },
     scrub,
     scrubDeep<T>(value: T): T {
       return walk(value, 0, new WeakSet()) as T;
     },
     registeredCount(): number {
-      return latest.size;
+      return latest.size + pinned.size;
     },
   };
 }

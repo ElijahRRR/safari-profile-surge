@@ -2,6 +2,8 @@ import { existsSync, readFileSync, readdirSync, symlinkSync, writeFileSync } fro
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { NODE_RESOURCE_FILE, SfeError, WORKING_PROFILE_NAME } from '@sfe/contract';
+import { loopbackGroupBlockLines, resourceBody } from '../../src/surge/generate.js';
+import { readNeedsRefresh } from '../../src/resource/index.js';
 import { RELOAD_FULL_RESTART_NOTICE } from '../../src/engine/maintenance.js';
 import { ADMIN, AGENT, PROFILE_A, WEB, activeEnv, createEnv, createHarness, envInput, rid, type Harness } from './harness.js';
 
@@ -66,7 +68,12 @@ describe('init (one-time fixed working profile)', () => {
     expect(working).not.toContain('#!MANAGED-CONFIG');
     expect(working).toContain('# SFE-BEGIN group v1');
     expect(working).toContain('# SFE-BEGIN entry v1');
-    expect(existsSync(join(h.surgeDir, NODE_RESOURCE_FILE))).toBe(true);
+    // D10：SFE-ROUTE 指向本机资源服务当前的地址；从不创建本地 sfe-nodes.list
+    expect(working).toContain(loopbackGroupBlockLines(h.app.engine.resourceUrl()!)[0]);
+    expect(working).not.toContain('policy-path=sfe-nodes.list');
+    expect(existsSync(join(h.surgeDir, NODE_RESOURCE_FILE))).toBe(false);
+    expect(preview.managedDiff).toContain('SFE-ROUTE = select, REJECT, policy-path=http://127.0.0.1:');
+    expect(preview.managedDiff).not.toContain(h.app.engine.resource!.token);
     expect(h.repos.settings.get('workingProfilePath')).toBe(workingPath());
     const backups = h.repos.backups.list({ reason: 'init' });
     expect(backups).toHaveLength(1);
@@ -177,7 +184,7 @@ describe('init (one-time fixed working profile)', () => {
 
 describe('remerge (user-confirmed maintenance)', () => {
   const tamperGroup = () => {
-    const text = readFileSync(h.profilePath, 'utf8').replace('SFE-ROUTE = select, REJECT, policy-path=sfe-nodes.list', 'SFE-ROUTE = select, REJECT, DIRECT, policy-path=sfe-nodes.list');
+    const text = readFileSync(h.profilePath, 'utf8').replace(/SFE-ROUTE = select, REJECT, /, 'SFE-ROUTE = select, REJECT, DIRECT, ');
     writeFileSync(h.profilePath, text);
     return text;
   };
@@ -222,12 +229,16 @@ describe('remerge (user-confirmed maintenance)', () => {
     const p = await h.app.remergePreview(WEB);
     expect(p.requiresReload).toBe(true);
     expect(p.managedDiff).toContain('SFE-ROUTE');
+    // 差异中的本机资源服务地址已遮盖（路径中有读取令牌）
+    expect(p.managedDiff).not.toContain(h.app.engine.resource!.token);
     const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
     await h.idle();
     expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
     const text = readFileSync(h.profilePath, 'utf8');
     expect(text).not.toBe(tampered);
-    expect(text).toContain('SFE-ROUTE = select, REJECT, policy-path=sfe-nodes.list');
+    // 恢复为指向本机资源服务当前地址的定义，从不改回本地节点文件的旧定义
+    expect(text).toContain(loopbackGroupBlockLines(h.profileResourceUrl!)[0]);
+    expect(text).not.toContain('policy-path=sfe-nodes.list');
     expect(h.fake.calls.reloadProfile).toBe(1);
     expect(h.repos.backups.list({ reason: 'remerge' })).toHaveLength(1);
     expect((await h.app.refreshSurge(WEB)).managedSectionsIntact).toBe(true);
@@ -261,16 +272,20 @@ describe('remerge (user-confirmed maintenance)', () => {
     expect(RELOAD_FULL_RESTART_NOTICE).toContain('关闭全部连接并清空临时规则');
   });
 
-  test('nothing to merge → no profile write and no reload', async () => {
+  test('nothing to merge → no profile write, no reload and no node resource publish', async () => {
     h = await createHarness();
     const before = readFileSync(h.profilePath, 'utf8');
     const p = await h.app.remergePreview(WEB);
     expect(p.requiresReload).toBe(false);
+    expect(p.checks.find((c) => c.name === 'node_resource')).toEqual({ name: 'node_resource', ok: true, message: '节点资源由本机资源服务提供已提交版本，与 Surge 读回一致' });
+    const ops = h.repos.operations.listRecent(50).length;
     const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
     await h.idle();
     expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
     expect(readFileSync(h.profilePath, 'utf8')).toBe(before);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+    expect(h.repos.operations.listRecent(50)).toHaveLength(ops + 1);
   });
 
   test('stale preview → PREVIEW_STALE', async () => {
@@ -281,22 +296,38 @@ describe('remerge (user-confirmed maintenance)', () => {
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
   });
 
-  test('tampered node resource is restored to the last publish and read back by a publish (Surge re-reads the file; no external-resource update)', async () => {
+  test('Surge holds a node list other than the committed version (e.g. an old cache after a restart): remerge re-serves the committed version, requires a refresh and one forced publish re-reads it by a single-key update; nothing is reloaded and no local file is written', async () => {
     h = await createHarness();
-    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
-    const resourcePath = join(h.surgeDir, NODE_RESOURCE_FILE);
-    const published = readFileSync(resourcePath, 'utf8');
-    writeFileSync(resourcePath, published.replace('203.0.113.10', '198.51.100.77'));
+    const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await h.idle();
+    const node = h.repos.environments.get(envId)!;
+    const committedNode = h.repos.proxyRevisions.get(envId, node.deployedProxyRevision!)!.nodeName;
+    expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', committedNode]);
+    // Surge 带着只有占位节点的旧缓存（不是已提交版本）
+    h.fake.seedRemoteCache(h.resourceUrl()!, resourceBody(0, []), { updatedAt: new Date(h.clock.now().getTime() - 3_600_000) });
+    expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', 'SFE-EMPTY']);
     const p = await h.app.remergePreview(WEB);
-    expect(p.managedFilesDiff).toContain(NODE_RESOURCE_FILE);
-    const deploymentsBefore = h.repos.deployments.list().length;
+    expect(p.requiresReload).toBe(false);
+    expect(p.checks.find((c) => c.name === 'node_resource')).toMatchObject({ ok: true });
+    expect(p.checks.find((c) => c.name === 'node_resource')!.message).toContain('SFE-ROUTE 的成员与已提交版本不同');
+    expect(p.managedFilesDiff).toContain('SFE-ROUTE 成员（已提交版本）');
+    expect(p.managedFilesDiff).toContain(`+${committedNode}`);
+    // 预览只读：没有刷新要求、没有排入发布
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
+    const updates = h.fake.calls.updateExternalResource ?? 0;
     const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
     await h.idle();
     expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
-    expect(readFileSync(resourcePath, 'utf8')).not.toContain('198.51.100.77');
-    expect(h.repos.deployments.list().length).toBeGreaterThanOrEqual(deploymentsBefore);
+    const publishes = h.repos.operations.listRecent(20).filter((o) => o.kind === 'deploy.publish' && o.requestId.startsWith('remerge:'));
+    expect(publishes).toHaveLength(1);
+    expect(publishes[0]!.payload).toMatchObject({ environmentIds: [], forceRefresh: true });
+    expect(publishes[0]).toMatchObject({ status: 'succeeded' });
+    expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(1);
+    expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', committedNode]);
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
-    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+    expect(h.fake.updateAllAttempts).toBe(0);
+    expect(existsSync(join(h.surgeDir, NODE_RESOURCE_FILE))).toBe(false);
   });
 
   test('remerge backups never copy the app\'s generated files: a buyer proxy password replaced and swept later is not left in the data directory', async () => {
@@ -305,7 +336,9 @@ describe('remerge (user-confirmed maintenance)', () => {
     const a = await createEnv(h, 'US-Buyer-A', '203.0.113.10', { username: 'synthBuyerUser01', password: OLD_PW });
     const envId = a.environment_id!;
     const oldRef = h.repos.proxyRevisions.get(envId, 1)!.passwordRef!;
-    expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).toContain(OLD_PW);
+    // 凭据只经本机资源服务进入 Surge 的缓存（D10：Surge 配置目录中没有本地节点文件）
+    expect(h.fake.loadedContent(h.resourceKey()!)).toContain(OLD_PW);
+    expect(existsSync(join(h.surgeDir, NODE_RESOURCE_FILE))).toBe(false);
     const p = await h.app.remergePreview(WEB);
     const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
     await h.idle();

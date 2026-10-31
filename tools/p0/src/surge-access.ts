@@ -1,13 +1,16 @@
 // P0 使用的 Surge 访问：复用服务的 CLI/HTTP/组合适配器（同一受限原语集合与 CLI argv 允许清单，没有切换配置、重载、
 // 重启引擎、flush、接管或出站写入），外加一层写入守卫与调用记录：
 // - 组选择只允许 SFE-ROUTE，且必须确认当前是测试配置；
-// - 外部资源更新只允许本工具创建的测试文件对应的 key（Surge 6.10 跳过本地资源，P0 只用它记录这一点，从不当作刷新）；
+// - 外部资源更新只允许本工具登记过的单个 key（从不 update all）：本地测试文件的 key 只用来记录 Surge 跳过本地资源；
+//   回环测试资源（D10）的 key 经产品的 key 安全检查（resourceUpdateRoute）之后才登记——key 可能含读取令牌时只能经 HTTP；
+// - 调用记录与快照中，含读取令牌或回环地址路径的资源 key 一律遮盖（maskResourceKey）；
 // - 临时规则的增删只允许运行状态中先登记过的精确规则；
 // - 结束请求只允许最近一次列出的、进程路径属于已确认 Safari 路径的请求。
 
 import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ENTRY_PROBE_IPV4, SfeError } from '@sfe/contract';
+import { RESOURCE_UPDATE_TIMEOUT_MS } from './constants.js';
 import {
   INTERACTIVE_BANNER_RE,
   SURGE_PRIMITIVES,
@@ -18,6 +21,8 @@ import {
   createHttpAdapter,
   isAllowedCliArgv,
   isUnsupportedCommandError,
+  redactUrls,
+  resourceLocationHash,
   type MechanismMap,
   type SurgeAdapter,
   type SurgeExternalResource,
@@ -247,8 +252,11 @@ export function proposeMechanism(
   // 能读取只证明输出可以解析；临时规则列表的内容还要由 entry 的插入探测正向确认（刚添加的探测规则必须出现在列表中），
   // 之后 temp_rule 入口、临时规则同步与回退才会据它判断规则已不存在。
   if (mechanism.listTempRules !== 'unavailable') notes.listTempRules = `${notes.listTempRules}；内容需 entry 的插入探测正向确认（--probe-insertion）`;
-  // HTTP API 文档（Mac 6.10.0+）：“Local resources are skipped.”——本应用的资源都是本地文件，更新从不作为刷新机制。
-  if (mechanism.updateExternalResource !== 'unavailable') notes.updateExternalResource = `${notes.updateExternalResource}；本地资源被跳过，只用于记录这一点，从不作为发布或入口的刷新机制`;
+  // HTTP API 文档（Mac 6.10.0+）：“Local resources are skipped.”。节点（D10）由本机回环资源服务提供，单 key 更新是发布原语
+  // （loopback_resource_update 证明之前不算通过）；入口规则集仍是本地文件，更新从不作为入口的刷新机制。
+  if (mechanism.updateExternalResource !== 'unavailable') {
+    notes.updateExternalResource = `${notes.updateExternalResource}；回环节点资源的单 key 发布原语（loopback 系列命令证明；key 可能含读取令牌时只能经 HTTP），本地资源被跳过，从不作为入口的刷新机制`;
+  }
   if (mechanism.getVersion !== 'unavailable') notes.getVersion = `${notes.getVersion}；只用于与运行实例交叉核对（版本、构建号一致且 Controller 协议 ≥ 22 才接受）`;
   mechanism.reloadProfile = 'unavailable';
   notes.reloadProfile = '只在维护端口上；P0 从不重载，由用户在 Surge 中手动触发并测量影响';
@@ -273,6 +281,12 @@ export function resolveLocation(location: string, dir: string): string | null {
 export function resourcesForPath(resources: readonly SurgeExternalResource[], absPath: string, dir: string): SurgeExternalResource[] {
   const target = resolve(absPath);
   return resources.filter((r) => resolveLocation(r.location, dir) === target);
+}
+
+/** 位置摘要等于测试资源地址摘要的外部资源（locationHash 是 Surge 报告的原样位置的 SHA-256；地址含令牌，只在内存中计算）。 */
+export function resourcesForUrl(resources: readonly SurgeExternalResource[], url: string): SurgeExternalResource[] {
+  const hash = resourceLocationHash(url);
+  return resources.filter((r) => r.locationHash === hash);
 }
 
 /** 盘点展示用：本地资源只给文件名，远端只给主机名。 */
@@ -310,10 +324,28 @@ export interface WriteGuard {
   killablePaths: Set<string>;
   /** 允许 testPolicy 的策略名。 */
   testablePolicies: Set<string>;
+  /** 调用记录中要遮盖的值（回环测试资源的读取令牌）：含它或是它一段的资源 key 整体遮盖。 */
+  secrets: Set<string>;
 }
 
 export function emptyGuard(): WriteGuard {
-  return { onTestProfile: false, refreshableKeys: new Set(), tempRules: new Set(), killablePaths: new Set(), testablePolicies: new Set() };
+  return { onTestProfile: false, refreshableKeys: new Set(), tempRules: new Set(), killablePaths: new Set(), testablePolicies: new Set(), secrets: new Set() };
+}
+
+/** 遮盖后的资源 key 中替代整个 key 的写法。 */
+export const MASKED_RESOURCE_KEY = '<resource-key:masked>';
+
+/**
+ * 资源 key 写入调用记录、动作时间线与快照之前的遮盖：含已知秘密（读取令牌）或是它一段（≥ 8 个字符）的 key 整体遮盖；
+ * 其余的回环 http(s) 地址遮盖整段路径（redactUrls），64 位以上的十六进制串遮盖为 <token>（读取令牌的形状，秘密未知时）。
+ * 不透明的 32 位十六进制 key 原样保留（读回与排查需要它）。
+ */
+export function maskResourceKey(key: string, secrets: Iterable<string> = []): string {
+  const k = String(key);
+  for (const s of secrets) {
+    if (s.length > 0 && (k.includes(s) || (k.length >= 8 && s.includes(k)))) return MASKED_RESOURCE_KEY;
+  }
+  return redactUrls(k).replace(/[0-9a-f]{64,}/gi, '<token>');
 }
 
 function guardReason(g: WriteGuard, primitive: string, args: unknown[], lastActive: Map<string, SurgeRequestRecord>): string | null {
@@ -323,7 +355,7 @@ function guardReason(g: WriteGuard, primitive: string, args: unknown[], lastActi
       return args[0] === 'SFE-ROUTE' ? null : '只允许选择 SFE-ROUTE';
     case 'updateExternalResource':
       if (!g.onTestProfile) return '当前不是 P0 测试配置';
-      return g.refreshableKeys.has(String(args[0])) ? null : '只允许刷新本工具创建的测试资源';
+      return g.refreshableKeys.has(String(args[0])) ? null : '只允许对本工具登记过的单个测试资源 key 执行更新';
     case 'addTempRule':
       if (!g.onTestProfile) return '当前不是 P0 测试配置';
       return g.tempRules.has(String(args[0])) ? null : '临时规则未在运行状态中登记';
@@ -341,9 +373,10 @@ function guardReason(g: WriteGuard, primitive: string, args: unknown[], lastActi
   }
 }
 
-function argSummary(primitive: string, args: unknown[]): string[] {
-  // 规则文本、资源 key、组与策略名、检测地址、进程路径都不是秘密；配置路径只记文件名。
+function argSummary(primitive: string, args: unknown[], secrets: ReadonlySet<string>): string[] {
+  // 规则文本、组与策略名、检测地址、进程路径都不是秘密；配置路径只记文件名；资源 key 可能含读取令牌，按 maskResourceKey 遮盖。
   if (primitive === 'checkProfile') return args.map((a) => String(a).slice(String(a).lastIndexOf('/') + 1));
+  if (primitive === 'updateExternalResource') return args.map((a) => maskResourceKey(String(a), secrets).slice(0, 300));
   if (primitive === 'matchRule') {
     const m = (typeof args[0] === 'object' && args[0] !== null ? args[0] : {}) as Record<string, unknown>;
     return [m.host, m.processPath, m.protocol ?? 'TCP', m.port ?? 443].map((v) => String(v).slice(0, 300));
@@ -364,7 +397,7 @@ export function createGuardedAdapter(
       const started = Date.now();
       const reason = guardReason(guard, p, args, lastActive);
       if (reason !== null) {
-        log({ at: now().toISOString(), primitive: p, args: argSummary(p, args), ms: 0, ok: false, code: 'P0_GUARD' });
+        log({ at: now().toISOString(), primitive: p, args: argSummary(p, args, guard.secrets), ms: 0, ok: false, code: 'P0_GUARD' });
         throw new SfeError('CAPABILITY_UNVERIFIED', `P0 写入守卫拒绝 ${p}：${reason}`);
       }
       try {
@@ -373,10 +406,10 @@ export function createGuardedAdapter(
           lastActive.clear();
           for (const r of result as SurgeRequestRecord[]) lastActive.set(r.id, r);
         }
-        log({ at: now().toISOString(), primitive: p, args: argSummary(p, args), ms: Date.now() - started, ok: true, code: null });
+        log({ at: now().toISOString(), primitive: p, args: argSummary(p, args, guard.secrets), ms: Date.now() - started, ok: true, code: null });
         return result;
       } catch (e) {
-        log({ at: now().toISOString(), primitive: p, args: argSummary(p, args), ms: Date.now() - started, ok: false, code: e instanceof SfeError ? e.code : 'ERROR' });
+        log({ at: now().toISOString(), primitive: p, args: argSummary(p, args, guard.secrets), ms: Date.now() - started, ok: false, code: e instanceof SfeError ? e.code : 'ERROR' });
         throw e;
       }
     };
@@ -391,12 +424,13 @@ export interface AdapterParts {
   scrub?: (s: string) => string;
 }
 
-/** 按固定映射组合 CLI 与 HTTP 实现；不在运行时根据成败换用另一种。 */
+/** 按固定映射组合 CLI 与 HTTP 实现；不在运行时根据成败换用另一种。单 key 更新的时限与服务相同（超时是结果不明，从不重放）。 */
 export function createP0Adapter(parts: AdapterParts): SurgeAdapter {
   const scrub = parts.scrub ?? ((s: string) => s);
-  const cli = parts.cliPath ? createCliAdapter({ cliPath: parts.cliPath, mechanism: parts.mechanism, scrub }) : undefined;
+  const timeoutsMs = { updateExternalResource: RESOURCE_UPDATE_TIMEOUT_MS };
+  const cli = parts.cliPath ? createCliAdapter({ cliPath: parts.cliPath, mechanism: parts.mechanism, scrub, timeoutsMs }) : undefined;
   const http = parts.httpApi
-    ? createHttpAdapter({ baseUrl: `http://127.0.0.1:${parts.httpApi.port}`, getKey: async () => parts.httpApi!.key, mechanism: parts.mechanism, scrub })
+    ? createHttpAdapter({ baseUrl: `http://127.0.0.1:${parts.httpApi.port}`, getKey: async () => parts.httpApi!.key, mechanism: parts.mechanism, scrub, timeoutsMs })
     : undefined;
   return createCompositeAdapter({ cli, http, mechanism: parts.mechanism });
 }

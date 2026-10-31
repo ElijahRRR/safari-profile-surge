@@ -1,7 +1,9 @@
 // continuity：工具作为“其他应用”经 Surge HTTP 代理端口保持长连接流、WebSocket 与周期短请求，记录时间线；
-// 操作员在另一个终端执行 refresh/entry 或在 Surge 中手动重载同一配置，在本终端输入事件名标记。
-// 第一个事件之前的时段是对照（本身有重置或失败时结论为不完整）。也合并其他命令写入的动作时间线（文件写入，其中
-// 文件写入仅表示尝试；发布必须另有新成员真实请求成功的证据；选择；入口切换；update 调用）。
+// 操作员在另一个终端执行 loopback/chain/entry 或在 Surge 中手动重载同一配置，在本终端输入事件名标记。
+// 第一个事件之前的时段是对照（本身有重置或失败时结论为不完整）。也合并其他命令写入的动作时间线（测试资源服务提供新版本、
+// 单 key 更新、读回确认、选择、入口切换、文件写入）。节点发布（D10）只接受回环发布的完整序列：同一命令先让测试资源服务提供
+// 第 N 代（resource_generation_served），再对它执行一次单 key 更新，最后读回确认第 N 代（node_publication_verified，
+// detail.resource 'loopback'）；提供或 update 调用本身都不能证明发布成功，本地文件写入不再算发布。
 // 同一配置重载（--reload-test）：先布置配置 canary（原子替换测试配置中的一行，只在配置重载时被读取）作为“重载确实发生”
 // 的证据，整个观察窗口内的中断都计入重载影响（操作员的标记可能晚于实际重载）；没有重载证据时不判定“无影响”。
 // 6.9.0 起 reload 只应用差异，但“Automatically performs a full engine restart if a change requires one.”：引擎运行时长回落
@@ -12,7 +14,6 @@ import { createInterface, type Interface } from 'node:readline';
 import { CAPABILITY_CRITERIA } from '@sfe/contract';
 import { analyzeContinuity, assessReload, formatPeriod, periodImpacted, summarizePeriods, type MarkedEvent, type ReloadSignalEvidence } from '../analysis/continuity.js';
 import { compareSignals, type ReloadSignals } from '../analysis/reload.js';
-import { NODE_RESOURCE_FILE } from '@sfe/contract';
 import { ACTIONS_LOG } from '../constants.js';
 import { refused, type ExitCode } from '../errors.js';
 import { check, logAction, verdictLabel, writeResult, type ActionEntry } from '../results.js';
@@ -26,14 +27,18 @@ const BASELINE_MIN_MS = 30_000;
 const RELOAD_LEAD_MS = 15_000;
 const isReloadLabel = (label: string): boolean => label.startsWith('reload');
 
-/** 只接受本次观察窗口中 refresh 对新成员的实测证据，不能用落盘、update 或旧结果代替。 */
+/** 只接受本次观察窗口中完整的回环发布序列（同一命令、同一代：提供 → 单 key 更新 → 读回确认），不能用提供、update 或旧结果代替。 */
 export function observedNodePublication(actions: readonly ActionEntry[], start: number, end: number): boolean {
-  let written = false;
+  const progress = new Map<string, 'served' | 'updated'>();
   for (const a of [...actions].sort((a, b) => Date.parse(a.at) - Date.parse(b.at))) {
     const t = Date.parse(a.at);
-    if (!Number.isFinite(t) || t < start || t > end || a.command !== 'refresh' || a.detail?.file !== NODE_RESOURCE_FILE) continue;
-    if (a.action === 'test_file_written') written = true;
-    if (a.action === 'node_publication_verified' && written) return true;
+    const generation = a.detail?.generation;
+    if (!Number.isFinite(t) || t < start || t > end || a.detail?.resource !== 'loopback' || !Number.isSafeInteger(generation)) continue;
+    if (a.command === 'continuity' || a.command === 'operator') continue;
+    const id = `${a.command}#${String(generation)}`;
+    if (a.action === 'resource_generation_served') progress.set(id, 'served');
+    else if (a.action === 'resource_update_call' && progress.get(id) === 'served') progress.set(id, 'updated');
+    else if (a.action === 'node_publication_verified' && progress.get(id) === 'updated') return true;
   }
   return false;
 }
@@ -91,8 +96,8 @@ export async function runContinuity(ctx: Ctx, stopSignal: () => Promise<void>): 
     out.line(`先保持至少 ${(BASELINE_MIN_MS + RELOAD_LEAD_MS) / 1000} 秒不做任何变更（对照）；然后在本终端输入 reload 回车，再立即在 Surge 菜单中「重新加载配置」。`);
     out.line('恢复后再观察 30 秒，输入 q 结束。观察期间不要运行 refresh、entry 等其他命令。');
   } else {
-    out.line('先保持至少 30 秒不做任何变更（对照）；之后在另一个终端运行 refresh 或 entry。测量同一配置重载请改用 continuity --reload-test。');
-    out.line('在本终端输入事件名后回车标记（例如 refresh、select），输入 q 结束。');
+    out.line('先保持至少 30 秒不做任何变更（对照）；之后在另一个终端运行 loopback、chain 或 entry（节点发布经回环测试资源）。测量同一配置重载请改用 continuity --reload-test。');
+    out.line('在本终端输入事件名后回车标记（例如 publish、select），输入 q 结束。');
   }
 
   const start = now().getTime();
@@ -133,8 +138,12 @@ export async function runContinuity(ctx: Ctx, stopSignal: () => Promise<void>): 
 
   const recordedActions = dir.readJsonl<ActionEntry>(ACTIONS_LOG);
   const actions = recordedActions
-    .filter((a) => a.command !== 'continuity' && ['resource_update_call', 'select', 'entry_step', 'test_file_written'].includes(a.action))
-    .map((a): MarkedEvent => ({ t: Date.parse(a.at), label: `${a.command}:${a.action}${typeof a.detail?.file === 'string' ? `:${a.detail.file}` : ''}`, source: 'action' }))
+    .filter((a) => a.command !== 'continuity' && ['resource_generation_served', 'resource_update_call', 'select', 'entry_step', 'test_file_written'].includes(a.action))
+    .map((a): MarkedEvent => ({
+      t: Date.parse(a.at),
+      label: `${a.command}:${a.action}${typeof a.detail?.file === 'string' ? `:${a.detail.file}` : ''}${Number.isSafeInteger(a.detail?.generation) ? `:g${String(a.detail!.generation)}` : ''}`,
+      source: 'action',
+    }))
     .filter((e) => e.t >= start && e.t <= end);
   const events = [...marks, ...actions].sort((a, b) => a.t - b.t);
   const analysis = analyzeContinuity(traffic.samples, events, { start, end });
@@ -144,7 +153,7 @@ export async function runContinuity(ctx: Ctx, stopSignal: () => Promise<void>): 
   const profileAfter = (await tryRead(() => session.adapter.getCurrentProfile()))?.name ?? null;
   const baseline = analysis.periods[0]!;
   const changes = analysis.impacts.filter((i) => !isReloadLabel(i.label));
-  const refreshSeen = observedNodePublication(recordedActions, start, end);
+  const publicationSeen = observedNodePublication(recordedActions, start, end);
   const vias = new Set(analysis.periods.flatMap((p) => p.vias));
   const context = await measureContext(ctx, session, state);
   const continuity = writeResult(dir, {
@@ -155,7 +164,11 @@ export async function runContinuity(ctx: Ctx, stopSignal: () => Promise<void>): 
       check('有至少 30 秒的对照时段', baseline.to - baseline.from >= BASELINE_MIN_MS && baseline.shortTotal > 0, `${Math.round((baseline.to - baseline.from) / 1000)} 秒`),
       // 对照本身有中断时无法比较：结论为不完整，而不是把变更期间的结果当作通过或不通过。
       check('对照时段没有重置或失败', periodImpacted(baseline) ? null : true, periodImpacted(baseline) ? '对照时段已有重置、重连失败或短请求失败：测试环境本身不稳定，请重测' : ''),
-      check('期间执行过节点资源发布（refresh）', refreshSeen ? true : null, refreshSeen ? '新成员已自动读取且真实请求经过新节点' : '没有观察到新成员自动读取并实际生效的证据；文件写入或 update 调用不能证明发布成功'),
+      check(
+        '期间执行过节点资源发布（回环测试资源）',
+        publicationSeen ? true : null,
+        publicationSeen ? '测试资源服务提供新版本、对该资源执行一次单 key 更新并经读回确认' : '没有观察到完整的回环发布（提供、单 key 更新、读回确认）；提供或 update 调用本身不能证明发布成功',
+      ),
       check('长连接与 WebSocket 没有重置', changes.length === 0 ? null : changes.every((i) => i.streamResets === 0 && i.wsResets === 0 && i.wsOpenFailures === 0)),
       check('新请求正常', changes.length === 0 ? null : changes.every((i) => i.failedShorts === 0)),
       check('出口不变（始终经过 p0-plain）', vias.size === 0 ? null : vias.size === 1 && vias.has('p0-plain'), [...vias].join('、')),

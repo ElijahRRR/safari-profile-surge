@@ -176,11 +176,11 @@ describe('buildEnvironmentView facets', () => {
         preflight: null,
         operations: [op({ phase: 'WAITING_DEPLOYMENT', status: 'parked', payload: { targets: [{ environmentId: 'env_1', proxyRevision: 1 }] }, error: { code: 'CAPABILITY_UNVERIFIED', message: 'x' } })],
       }),
-      ctx({ publishMissing: ['policy_path_reread'] }),
+      ctx({ publishMissing: ['loopback_resource_update'] }),
     );
     expect(v.facets.deployment).toBe('blocked_by_capability');
     expect(v.readiness).toBe('waiting_deployment');
-    expect(v.nextActions[0]).toMatchObject({ kind: 'verify_capability', capabilities: ['policy_path_reread'] });
+    expect(v.nextActions[0]).toMatchObject({ kind: 'verify_capability', capabilities: ['loopback_resource_update'] });
   });
 
   test('published with unaccepted partial readback → sync_failed', () => {

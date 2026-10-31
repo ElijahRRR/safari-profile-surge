@@ -8,6 +8,7 @@ export * from './profile.js';
 export * from './generate.js';
 export * from './precedence.js';
 export * from './parse-output.js';
+export * from './resource-key.js';
 export * from './cli-commands.js';
 export * from './cli-adapter.js';
 export * from './http-adapter.js';

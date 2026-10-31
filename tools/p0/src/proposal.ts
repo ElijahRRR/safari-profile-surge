@@ -7,7 +7,8 @@
 // 用作证据的测量写入摘要。依赖 Surge 版本/构建的能力在提议时与测量时都必须读到格式正确的版本，读不到即拒绝。
 // 依赖进程归属的能力在提议时与测量时都必须确认没有待重启的后台安全改进、读到补充版本（与服务同一校验 hostContextErrors）。
 // 依赖 Safari 版本的能力：测量时或提议时的 Safari 版本可解析且低于 SAFARI_MINIMUM_VERSION（17.6）即拒绝（服务不按 Safari 版本拒绝）。
-// 摘要不超过服务的 4000 字上限。
+// 测量结果记下的通过条件原文必须等于当前契约的 CAPABILITY_CRITERIA（契约改写了通过条件，例如 D10 改写 connection_continuity，
+// 旧的测量就不能再提议，any 的证据也只看同一通过条件下的测量）。摘要不超过服务的 4000 字上限。
 
 import {
   CAPABILITY_CONTEXT_DEPS,
@@ -86,7 +87,8 @@ function anyEvidence<T extends string>(input: ProposalInput, values: readonly T[
   const agrees = (r: CapabilityResult): boolean => (input.status === 'supported' ? r.verdict === 'pass' : r.verdict !== 'pass');
   const opposes = (r: CapabilityResult): boolean => (input.status === 'supported' ? r.verdict === 'fail' : r.verdict === 'pass');
   const sameContext = (r: CapabilityResult): boolean => contextDrift(input.key, r.context, input.current).every((f: CapabilityContextField) => declared.has(f));
-  const relevant = input.history.filter((r) => r.key === input.key && sameContext(r));
+  // 通过条件与当前契约不同的测量既不是证据，也不算矛盾（它测的是另一件事）
+  const relevant = input.history.filter((r) => r.key === input.key && criteriaMatches(r) && sameContext(r));
   const out: AnyEvidence<T> = { missing: [], conflicting: [], lines: [] };
   for (const v of values) {
     const under = relevant.filter((r) => measured(r) === v);
@@ -97,6 +99,11 @@ function anyEvidence<T extends string>(input: ProposalInput, values: readonly T[
     if (ok.length > 0) out.lines.push(`${label(v)} ${ok.length} 次（最近 ${ok.map((r) => r.at).sort().at(-1)!}）`);
   }
   return out;
+}
+
+/** 测量结果记下的通过条件是否就是当前契约的原文（旧结果没有记下时为 false）。 */
+export function criteriaMatches(r: CapabilityResult): boolean {
+  return typeof r.criteria === 'string' && r.criteria === CAPABILITY_CRITERIA[r.key];
 }
 
 /** any 声明的证据核对结果转成拒绝（缺少或矛盾）或摘要行。 */
@@ -111,6 +118,11 @@ function requireAnyEvidence<T extends string>(flag: string, want: string, ev: An
 export function buildProposal(input: ProposalInput): ProposeCapabilityRequest {
   const { key, status, result } = input;
   if (!result) throw refused(`生成提议失败：本次运行没有 ${key} 的测量结果，请先运行对应的测试命令或检查清单`);
+  if (result.key !== key) throw refused(`生成提议失败：测量结果不属于 ${key}`);
+  // 先于结论检查：通过条件变了，旧结论（不论通过与否）测的不是现在的条件
+  if (!criteriaMatches(result)) {
+    throw refused(`生成提议失败：测量时（${result.at}）的通过条件与当前版本不同（或没有记录），这次测量不能作为依据。请按当前通过条件重测`);
+  }
   if (status === 'supported' && result.verdict !== 'pass') throw refused(`生成提议失败：测量结论为「${verdictLabel(result.verdict)}」，不能提议支持`);
   if (status === 'unsupported' && result.verdict === 'pass') throw refused('生成提议失败：测量结论为「通过」，不能提议不支持');
   // 依赖 Surge 版本/构建的能力：提议时与测量时都必须读到格式正确的具体版本（与服务端同一校验）。读不到版本的

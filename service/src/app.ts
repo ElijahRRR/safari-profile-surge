@@ -31,6 +31,7 @@ import type {
   PublishPendingRequest,
   RegisterFrontProxyRequest,
   RemergeCommitRequest,
+  RemergePreviewRequest,
   RemergePreviewResponse,
   ReplaceFrontCommitRequest,
   ReplaceFrontPreview,
@@ -110,7 +111,8 @@ export interface AppService {
 
   initPreview(req: InitPreviewRequest, actor: Actor): Promise<InitPreviewResponse>;
   initCommit(req: InitCommitRequest, actor: Actor): Promise<Accepted>;
-  remergePreview(actor: Actor): Promise<RemergePreviewResponse>;
+  /** req：重新合并预览的选项（D10 轮换资源地址 rotateResourceUrl）；省略时为普通的重新合并。 */
+  remergePreview(actor: Actor, req?: RemergePreviewRequest): Promise<RemergePreviewResponse>;
   remergeCommit(req: RemergeCommitRequest, actor: Actor): Promise<Accepted>;
 
   /** 只允许 admin（maintenance）角色；HTTP 未绑定时失败。 */

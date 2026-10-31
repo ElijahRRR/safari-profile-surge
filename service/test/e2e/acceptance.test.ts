@@ -2,9 +2,8 @@
 // 这些只证明编排与状态机；真实网络出口、Safari 进程归属、H2/QUIC 与长连接行为必须在测试 Mac 上验收（docs/ACCEPTANCE.md）。
 
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { CAPABILITY_GATES, CAPABILITY_KEYS, NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, SfeError } from '@sfe/contract';
+import { CAPABILITY_GATES, CAPABILITY_KEYS, ROUTE_GROUP_NAME, SfeError } from '@sfe/contract';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
 import { PROFILE_A, PROFILE_B, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, rid, safariOutcome, verify, type Harness } from '../engine/harness.js';
 
@@ -20,16 +19,14 @@ const counts = (keys: string[]) => [...keys.map((k) => h.fake.calls[k] ?? 0), en
 const chrome = (host = 'www.example.test', longLived = false) => h.fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host, protocol: 'tcp', longLived });
 
 /**
- * 写入节点资源之后的下一次读组成员（等待 Surge 重新读取）按 fault 失败或返回假的成员；写入之前的对照读取照常
- * （发布写入前另读一次组成员，用来判断等待读到的成员能否证明 Surge 重新读取了文件）。
+ * 本机资源服务提供候选版本之后（单 key 更新之后的读回）的下一次读组成员按 fault 失败或返回假的成员；提供之前（更新之前的状态）
+ * 与回滚之后的读取照常。
  */
-function onMembersAfterWrite(fault: () => Promise<string[]>): void {
-  const path = join(h.surgeDir, NODE_RESOURCE_FILE);
-  const before = readFileSync(path, 'utf8');
+function onMembersAfterServe(fault: () => Promise<string[]>): void {
   const orig = h.fake.getGroupMembers.bind(h.fake);
   let used = false;
   h.fake.getGroupMembers = async (group: string) => {
-    if (!used && readFileSync(path, 'utf8') !== before) {
+    if (!used && h.app.engine.resource!.served()?.state === 'candidate') {
       used = true;
       return fault();
     }
@@ -47,11 +44,9 @@ async function expectError(p: Promise<unknown>, code: string): Promise<SfeError>
   throw new Error(`expected ${code}`);
 }
 
-function nodeNames(): string[] {
-  return readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')
-    .split(/\r?\n/)
-    .filter((l) => l.trim() !== '' && !l.startsWith('#'))
-    .map((l) => l.split('=')[0]!.trim());
+/** Surge 中 SFE-ROUTE 的节点（不含首位 REJECT 与占位节点）。 */
+async function nodeNames(): Promise<string[]> {
+  return (await h.fake.getGroupMembers(ROUTE_GROUP_NAME)).slice(1).filter((n) => n !== 'SFE-EMPTY');
 }
 
 describe('sync design §11 acceptance (offline equivalents)', () => {
@@ -156,8 +151,8 @@ describe('sync design §11 acceptance (offline equivalents)', () => {
     h.fake.lieOnNext('listPolicies', { proxies: policies.proxies.filter((p) => p !== 'Front-A'), groups: policies.groups });
     op = await update(1082);
     expect(op.error?.code).toBe('FRONT_PROXY_MISSING');
-    // 写入节点资源后等待 Surge 重新读取时读不到组成员（发布从不调用外部资源更新：Surge 6.10 跳过本地资源）
-    onMembersAfterWrite(async () => {
+    // 提供候选并单 key 更新之后，读回时读不到组成员：发布不算成功，回滚
+    onMembersAfterServe(async () => {
       throw new SfeError('SURGE_UNREACHABLE', '调用 Surge 失败：模拟超时');
     });
     op = await update(1083);
@@ -173,7 +168,7 @@ describe('sync design §11 acceptance (offline equivalents)', () => {
     await bind(h, PROFILE_A, id);
     const fake = h.fake as unknown as Record<string, (...a: string[]) => Promise<unknown>>;
     for (const [prim, act] of [
-      // 写入节点资源后、等待 Surge 重新读取（读组成员）时停止
+      // 提供候选并单 key 更新之后、读回（读组成员）时停止
       ['getGroupMembers', async () => {
         const env = h.repos.environments.get(id)!;
         await h.app.updateEnvironment(id, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { port: 1081 } } }, WEB);
@@ -186,6 +181,7 @@ describe('sync design §11 acceptance (offline equivalents)', () => {
       let entered = false;
       fake[prim] = (...a: string[]) => {
         if (prim === 'selectGroupPolicy' && a[1] === 'REJECT') return orig(...a);
+        if (prim === 'getGroupMembers' && h.app.engine.resource!.served()?.state !== 'candidate') return orig(...a);
         entered = true;
         return new Promise(() => undefined);
       };
@@ -196,7 +192,7 @@ describe('sync design §11 acceptance (offline equivalents)', () => {
       fake[prim] = orig;
       await h.crash();
       await h.idle();
-      const names = nodeNames();
+      const names = await nodeNames();
       expect(new Set(names).size).toBe(names.length);
       expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).not.toBe('DIRECT');
       expect(await h.fake.getGroupMembers(ROUTE_GROUP_NAME)).not.toContain('DIRECT');
@@ -277,7 +273,7 @@ describe('sync design §11 acceptance (offline equivalents)', () => {
       if (safariOnly.has(c.key)) expect(c.effectiveStatus, c.key).toBe('supported');
       else expect(c.effectiveStatus, c.key).not.toBe('supported');
     }
-    expect(caps.find((c) => c.key === 'targeted_resource_refresh')!.staleReasons).toEqual(expect.arrayContaining(['surgeVersion', 'surgeBuild']));
+    expect(caps.find((c) => c.key === 'loopback_resource_update')!.staleReasons).toEqual(expect.arrayContaining(['surgeVersion', 'surgeBuild']));
     expect(CAPABILITY_GATES.publish.every((k) => !safariOnly.has(k))).toBe(true);
     const env = h.repos.environments.get(envId)!;
     await expectError(h.app.activate(envId, { request_id: rid() }, WEB), 'CAPABILITY_UNVERIFIED');
@@ -290,14 +286,16 @@ describe('sync design §11 acceptance (offline equivalents)', () => {
     expect(h.repos.operations.get(n.operation_id)!.phase).toBe('NORMAL_RESTORED');
   });
 
-  test('12. publishing a node (Surge re-reads the local resource) keeps Chrome connections and profile identity; plain switch never reloads; bad resource keeps the selection', async () => {
+  test('12. publishing a node (one single-key update of the loopback resource) keeps Chrome connections and profile identity; plain switch never reloads; bad resource keeps the selection', async () => {
     h = await createHarness();
     const { envId: a } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
     const profileBefore = await h.fake.getCurrentProfile();
     const longChrome = chrome('www.example.test', true);
-    // 新增节点：写入本地节点资源，由 Surge 自动重新读取（从不调用外部资源更新或重载）
+    const updates = h.fake.calls.updateExternalResource ?? 0;
+    // 新增节点：本机资源服务提供新版本，只对本应用的资源单 key 更新一次（从不更新全部、从不重载）
     const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
-    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+    expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(1);
+    expect(h.fake.updateAllAttempts).toBe(0);
     expect((await h.fake.listActiveRequests()).map((r) => r.id)).toContain(longChrome.id);
     expect(chrome().policyName).toBe(longChrome.policyName);
     expect(await h.fake.getCurrentProfile()).toEqual(profileBefore);
@@ -310,7 +308,7 @@ describe('sync design §11 acceptance (offline equivalents)', () => {
     expect(h.fake.reloadCount).toBe(0);
     // 坏资源：读回不一致 → 回滚，原选择保留
     const selection = await h.fake.getGroupSelection(ROUTE_GROUP_NAME);
-    onMembersAfterWrite(async () => ['REJECT']);
+    onMembersAfterServe(async () => ['REJECT']);
     const c = await createEnv(h, 'US-Buyer-C', '203.0.113.12');
     const op = h.repos.operations.get(c.operation_id)!;
     expect(op.phase).not.toBe('READY_FOR_NEXT_OPEN');

@@ -10,6 +10,7 @@ import {
   SITE_CODES,
   SfeError,
   VERIFY_ENDPOINTS,
+  nodeResourceUrl,
   type ApiErrorBody,
   type CapabilityContext,
   type CapabilityKey,
@@ -53,6 +54,9 @@ import {
   type RunningInstanceResult,
 } from '../surge/running-instance.js';
 import type { SurgePrimitive } from '../surge/primitives.js';
+import { DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS } from '../resource/audit.js';
+import type { ResourceBinder } from '../resource/binder.js';
+import type { ResourceHost } from '../resource/host.js';
 import { classifyDirectoryRisk } from '../util/secure-files.js';
 import { emptySurgeFacts, type SurgeFacts, type SurgeVersionIssue } from '../domain/views.js';
 import { activationGate, buildCapabilityContext, capabilityViews, missingFrom } from './capabilities.js';
@@ -236,10 +240,21 @@ export interface AppServiceDeps {
   /** 运行实例读取的总时限（毫秒，缺省 DEFAULT_INSTANCE_READ_BUDGET_MS）。 */
   instanceReadBudgetMs?: number;
   /**
-   * 写入本地节点资源后等待 Surge 自动重新读取（文件监视）的时限与轮询间隔（毫秒，缺省 DEFAULT_RESOURCE_RELOAD_WAIT）。
-   * 外部资源更新会跳过本地文件（HTTP API 文档：“Local resources are skipped.”），发布从不把它当作刷新。
+   * 本机资源服务（D10）的绑定方：缺省经 127.0.0.1 套接字（resource/binder.ts tcpBinder）；测试与演示用进程内的 virtualBinder
+   * （不开套接字，FakeSurge 经它发出下载）。只绑定 127.0.0.1，从不改用其他端口。
    */
-  resourceReloadWait?: { timeoutMs: number; pollMs: number };
+  resourceBinder?: ResourceBinder;
+  /**
+   * 对本应用的节点资源执行一次单 key 更新后的等待（毫秒，缺省 DEFAULT_RESOURCE_UPDATE_WAIT）：timeoutMs 是 Surge 报告
+   * updating 时最多等待多久（到达仍在更新时不再更新，按需要处理），pollMs 是轮询间隔，settleMs 是读回前与再次读回之间的
+   * 稳定延迟（测试为 0）。等待在执行器通道上进行，排队的操作（包括进入普通模式）要等它结束。
+   */
+  resourceUpdateWait?: { timeoutMs: number; pollMs: number; settleMs: number };
+  /**
+   * 审计时本服务的下载记录与 Surge 报告的更新时间之间的容差（毫秒，缺省 DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS）。
+   * TODO(P0)：按 loopback_resource_update 实测的更新时间分辨率调整。
+   */
+  resourceAuditToleranceMs?: number;
   /**
    * ruleset_resource 每一步等待文件监视加载入口规则集文件的时限与轮询间隔（毫秒，缺省 DEFAULT_RULESET_WATCH）；撤销入口时
    * rule match 不可用的退路按时限等满（见 ruleset-strategy.ts 的 UnwitnessedUndo）。
@@ -248,10 +263,45 @@ export interface AppServiceDeps {
 }
 
 /**
- * 写入本地节点资源后等待 Surge 重新读取的缺省时限与轮询间隔（毫秒）。等待在执行器通道上进行，排队的操作（包括进入普通
- * 模式）要等它结束：发布与回滚各最多等这么久。TODO(P0)：按 policy_path_reread 实测的监视延迟调整。
+ * 单 key 更新本应用节点资源之后的缺省等待（毫秒）：Surge 报告 updating 时最多等 30 秒（与 updateExternalResource 的适配器
+ * 时限相同），每 0.5 秒读一次，读回前稳定 0.8 秒。发布最坏要等两次更新加两次等待（发布与回滚），执行器通道上排队的普通模式
+ * 要等它结束。TODO(P0)：按 loopback_resource_update / loopback_publish_crash 实测的下载与重试时间调整。
  */
-export const DEFAULT_RESOURCE_RELOAD_WAIT = { timeoutMs: 10_000, pollMs: 500 } as const;
+export const DEFAULT_RESOURCE_UPDATE_WAIT = { timeoutMs: 30_000, pollMs: 500, settleMs: 800 } as const;
+
+/**
+ * 工作配置受管理 group 段中 SFE-ROUTE 的定义（engine/node-resource.ts classifyGroupLine）：ours —— 恰好是指向本服务当前
+ * 地址的回环定义；loopback_other —— 引用了本机资源服务形式的地址，但不是本服务当前地址或段内容被改过；legacy —— D7 的本地
+ * sfe-nodes.list 引用（需要重新合并）；none —— 段缺失、边界不明确或没有这两类定义。
+ */
+export type NodeResourceLine = 'ours' | 'loopback_other' | 'legacy' | 'none';
+
+/** 本机资源服务在本进程内的运行状态（不持久保存；持久状态见 resource/state.ts）。 */
+export interface ResourceRuntime {
+  /** 每次从未监听转为监听加一：两次审计之间换过绑定（关闭后重新监听、换端口）时审计不按“一直在监听”处理。 */
+  listenEpoch: number;
+  /** 上一次审计（启动审计、对账审计或确认过的读回）时的监听状态与 404/503 计数（servedFailureCount），用于下一次审计。 */
+  lastAudit: { epoch: number; port: number | null; listening: boolean; failures: number } | null;
+  /** 最近一次读到的工作配置节点组定义；尚未读到或读不到为 null。 */
+  line: NodeResourceLine | null;
+  /** 最近一次监听失败的原因（成功后清除）。 */
+  listenError: 'port_in_use' | 'other' | null;
+  /**
+   * 服务正在停止或已停止（app.stop 设、app.start 清除）：不再监听。停止时仍在进行的对账可能晚于 main.ts 关闭资源服务才走到
+   * 重试监听，否则会在关闭之后重新占用端口。
+   */
+  stopped: boolean;
+  /** 最近一次没能提供已提交版本的原因（代数:原因；成功提供后清除）：同一原因只记一次日志。 */
+  serveIssue: string | null;
+  /** 最近一次审计的问题（无法解释的结论或审计状态无法读取；审计为 ok 时清除）：无法解释的结论在之后每次审计都会重复，只记一次日志。 */
+  auditIssue: string | null;
+  /**
+   * 启动时推迟了监听（engine/node-resource.ts startResourceService）：启动审计没能进行（Surge 不可达）而已提交版本不能提供（503）。
+   * 这时监听，Surge 启动后的下载得到本服务的 503，之后第一次审计却不能把它与本服务停止期间占用端口的一方区分开；推迟到 Surge
+   * 可达的对账（先按读到的版本重新判定门槛，再监听并审计），期间 Surge 的下载被拒绝（总能解释，Surge 保留旧资源）。
+   */
+  listenDeferred: boolean;
+}
 
 export interface EngineKeys {
   pepper: Buffer;
@@ -299,6 +349,18 @@ export class Engine {
     safariVersion: string | null;
   } = { macosBuild: null, macosVersionExtra: null, macosRestartPending: null, safariVersion: null };
   views: EventViews | null = null;
+  /**
+   * 本机资源服务（D10，resource/host.ts）：在 app.start() 中加载读取令牌之后创建（与 keys() 一样惰性）。令牌读不到或尚未
+   * 创建时为 null——发布、初始化与重新合并停泊，进入普通模式与 REJECT 保持不受影响。
+   */
+  resource: ResourceHost | null = null;
+  /** 本机资源服务的进程内状态（engine/node-resource.ts）。 */
+  resourceRuntime: ResourceRuntime = { listenEpoch: 0, lastAudit: null, line: null, listenError: null, stopped: false, serveIssue: null, auditIssue: null, listenDeferred: false };
+  /**
+   * 唤醒执行器（app-service.ts 创建执行器后注入）：启动与对账排入系统强制刷新发布之后调用。执行器之外排入的操作在下一次唤醒时
+   * 才被领取；尚未注入时什么也不做。
+   */
+  kick: () => void = () => undefined;
   /** 可达性检测原语：创建时静态选定，之后不变。 */
   readonly livenessPrimitive: LivenessPrimitive | null;
   /** 上一次检测与版本读取的结论（只在变化时记日志）；undefined 表示尚未读取。 */
@@ -442,6 +504,45 @@ export class Engine {
     const rec = this.repos.capabilities.get('auto_reload_atomic_replace');
     if (!rec || rec.status === 'unverified') return null;
     return rec.context?.autoReload ?? null;
+  }
+
+  /**
+   * 回环节点资源单 key 更新能力记录（loopback_resource_update）中实测时的自动重载条件：发布（D10）要求当前设置与它一致。
+   * 只认已通过（supported）的记录；没有、待验证或不支持时为 null（发布停泊）。
+   */
+  resourceAutoReloadCondition(): 'on' | 'off' | 'any' | null {
+    const rec = this.repos.capabilities.get('loopback_resource_update');
+    if (!rec || rec.status !== 'supported') return null;
+    return rec.context?.autoReload ?? null;
+  }
+
+  // ---------- 本机资源服务（D10） ----------
+
+  /**
+   * SFE-ROUTE 的 policy-path：由设置中的端口与资源服务的读取令牌得出，与是否已绑定无关（预览、提交与初始化得到同一地址）。
+   * 资源服务尚未创建（令牌读不到）或端口尚未选定时为 null。地址含读取令牌：不写入日志、命令行参数、错误或界面。
+   */
+  resourceUrl(): string | null {
+    const host = this.resource;
+    if (!host) return null;
+    const port = this.repos.settings.get('resourcePort');
+    if (port === null) return null;
+    try {
+      return nodeResourceUrl(port, host.token);
+    } catch {
+      // 端口或令牌格式不对（设置与令牌都已校验，不应出现）：没有地址，依赖它的动作停泊
+      return null;
+    }
+  }
+
+  /** 单 key 更新之后的等待（AppServiceDeps.resourceUpdateWait，缺省 DEFAULT_RESOURCE_UPDATE_WAIT）。 */
+  resourceUpdateWait(): { timeoutMs: number; pollMs: number; settleMs: number } {
+    return this.deps.resourceUpdateWait ?? DEFAULT_RESOURCE_UPDATE_WAIT;
+  }
+
+  /** 审计容差（AppServiceDeps.resourceAuditToleranceMs，缺省 DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS）。 */
+  resourceAuditToleranceMs(): number {
+    return this.deps.resourceAuditToleranceMs ?? DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS;
   }
 
   // ---------- Surge 事实与能力上下文 ----------

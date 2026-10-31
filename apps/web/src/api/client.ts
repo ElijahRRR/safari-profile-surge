@@ -36,6 +36,7 @@ import {
   type PublishPendingRequest,
   type RegisterFrontProxyRequest,
   type RemergeCommitRequest,
+  type RemergePreviewRequest,
   type RemergePreviewResponse,
   type ReplaceFrontCommitRequest,
   type ReplaceFrontPreview,
@@ -253,7 +254,8 @@ export class ApiClient {
   refreshSurge = () => this.call<SurgeStatusView>('refreshSurge', { body: {} });
   initPreview = (req: InitPreviewRequest) => this.call<InitPreviewResponse>('initPreview', { body: req });
   initCommit = (req: InitCommitRequest) => this.call<Accepted>('initCommit', { body: req });
-  remergePreview = () => this.call<RemergePreviewResponse>('remergePreview', { body: {} });
+  /** req：预览选项（更换本机资源地址 rotateResourceUrl）；提交时的选项必须与预览相同。 */
+  remergePreview = (req: RemergePreviewRequest = {}) => this.call<RemergePreviewResponse>('remergePreview', { body: req });
   remergeCommit = (req: RemergeCommitRequest) => this.call<Accepted>('remergeCommit', { body: req });
 }
 

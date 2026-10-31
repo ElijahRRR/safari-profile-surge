@@ -320,7 +320,10 @@ export interface InitPreviewResponse {
   sourceProfilePath: string;
   workingProfilePath: string;
   backupDirectory: string;
-  /** 只含本应用受管理段的差异与被移除的托管头（URL 已脱敏）；不含用户节点凭据。 */
+  /**
+   * 只含本应用受管理段的差异与被移除的托管头（URL 已脱敏；SFE-ROUTE 指向本机资源服务的地址只显示主机与端口，路径中的读取令牌
+   * 遮盖）；不含用户节点凭据。
+   */
   managedDiff: string;
   referencedFiles: Array<{ relativePath: string; present: boolean }>;
   managedConfigDetected: boolean;
@@ -343,16 +346,30 @@ export interface InitCommitRequest {
 }
 
 export interface RemergePreviewResponse extends Omit<InitPreviewResponse, 'sourceProfileName' | 'sourceProfilePath' | 'managedConfigDetected'> {
-  /** 本应用文件（sfe-nodes.list、入口规则集）与上次发布内容的脱敏差异；提交时恢复上次发布内容（受发布门槛约束）。 */
+  /**
+   * 本应用文件（入口规则集）与恢复内容的差异，以及 Surge 中 SFE-ROUTE 成员与本机资源服务已提交版本不同时的成员差异（只有节点名）。
+   * 节点资源不是文件（D10）：提交时重新提供已提交版本并排入一次节点资源发布（单 key 更新并读回，受发布门槛约束）。
+   */
   managedFilesDiff: string;
   /** 写入工作配置后是否需要重载同一配置，以及 P0 测得的影响（用户据此选择维护时间）。 */
   requiresReload: boolean;
   measuredReloadImpact: string | null;
 }
 
+/** 重新合并预览的选项（请求体可以省略）。 */
+export interface RemergePreviewRequest {
+  /**
+   * 轮换本机资源服务的地址（新的读取令牌与端口，D10）：清除“令牌可能已泄露”的唯一方式。预览不生成令牌或端口；提交时创建新令牌、
+   * 选定新端口并改写受管理的节点组定义，之后旧地址的请求一律 404。受维护门槛与用户确认约束。
+   */
+  rotateResourceUrl?: boolean;
+}
+
 export interface RemergeCommitRequest {
   request_id: RequestId;
   preview_digest: string;
+  /** 必须与生成 preview_digest 的预览选项相同（摘要包含它）。 */
+  rotateResourceUrl?: boolean;
 }
 
 // ---------- 路由表 ----------

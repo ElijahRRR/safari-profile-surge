@@ -1,7 +1,7 @@
 // 工作配置的解析与受管理段合并。解析保留每一个字节（含行尾），合并只改动受管理段或明确插入的位置；
 // 受管理段的归属以 managed_objects 为准，这里的注释边界只用于定位与审阅。见 docs/ARCHITECTURE.md §5.3。
 
-import { MANAGED_BEGIN, MANAGED_END, SfeError } from '@sfe/contract';
+import { EMPTY_PLACEHOLDER_NODE, MANAGED_BEGIN, MANAGED_END, SfeError, parseNodeResourceUrl } from '@sfe/contract';
 import { isCommentLine, splitTopLevel } from './rules.js';
 
 export type Eol = '' | '\n' | '\r\n' | '\r';
@@ -362,11 +362,15 @@ export function listRelativeReferences(text: string): ProfileReference[] {
   );
 }
 
-/** 远端来源（#!include URL、远端规则集/节点/脚本）的主机名，去重排序。 */
-export function listRemoteSourceHosts(text: string): string[] {
+/**
+ * 远端来源（#!include URL、远端规则集/节点/脚本）的主机名，去重排序。ownResourceUrl：本应用本机资源服务的地址（D10）——
+ * 与它完全相同的引用不是“源配置的远端来源”，不计入（也就不触发远端更新提示）；其他指向回环地址的引用照常计入。
+ */
+export function listRemoteSourceHosts(text: string, ownResourceUrl?: string | null): string[] {
   const hosts = new Set<string>();
   for (const r of allReferences(parseProfile(text))) {
     if (!isRemote(r.value)) continue;
+    if (ownResourceUrl && r.value === ownResourceUrl) continue;
     const h = urlHost(r.value);
     if (h) hosts.add(h);
   }
@@ -376,22 +380,65 @@ export function listRemoteSourceHosts(text: string): string[] {
 // ---------- 非本应用的 SFE- 对象 ----------
 
 export interface ForeignSfeObject {
-  kind: 'proxy' | 'group' | 'file_reference';
+  /** resource_reference：指向本机资源服务端口的引用（段外），或受管理段内不是本应用地址的远端引用。 */
+  kind: 'proxy' | 'group' | 'file_reference' | 'resource_reference';
+  /** 名称或文件名；resource_reference 只给主机与端口（从不含路径：本机资源服务地址的路径中有读取令牌）。 */
   name: string;
   section: string | null;
   line: number;
 }
 
+export interface OwnedSfeObjects {
+  names: readonly string[];
+  files: readonly string[];
+  /**
+   * 本应用本机资源服务的地址（D10，nodeResourceUrl 的结果）。给出时，受管理 group 段之外任何指向 `127.0.0.1:<该端口>`
+   * （或 localhost、[::1] 的同一端口）的文字都报为 resource_reference（例如另一个组用 policy-path 导入了本应用的节点，
+   * 或把令牌抄到了别处）。受管理段内的远端引用只有与它完全相同的才属于本应用；没有给出时受管理段内的任何远端引用都不属于本应用。
+   */
+  resourceUrl?: string | null;
+}
+
+/** 回环主机加端口（URL 的主机部分、`key@127.0.0.1:端口`、`127.0.0.1:端口` 等写法）。 */
+const LOOPBACK_PORT_RE = /(?<![0-9A-Za-z.-])(127\.0\.0\.1|localhost|\[::1\]):(\d{1,5})(?!\d)/gi;
+
+/** URL 的主机与端口（不含用户信息、路径与查询）；无法解析时为 null。 */
+function urlHostPort(raw: string): string | null {
+  try {
+    const u = new URL(raw);
+    if (!u.hostname) return null;
+    return u.port ? `${u.hostname}:${u.port}` : u.hostname;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * 受管理段之外出现的 SFE- 节点/组定义与指向 sfe-* 文件的引用，以及受管理段内不在清单中的名称或文件。
+ * Surge 读到的策略名（listPolicies 的节点与组）中，属于“外来 SFE- 名称”的那些：以 SFE- 开头、不在 owned 中，且不是本机资源
+ * 列表的占位节点 SFE-EMPTY（D10：没有节点时资源只含 `SFE-EMPTY = reject`，Surge 会把它列为策略）。只用于 Surge 的策略列表：
+ * 配置文本中出现的 SFE-EMPTY 定义仍由 findForeignSfeObjects 报为外来对象（本应用从不把它写进配置；同名定义会让资源中的占位行
+ * 作为重名被跳过）。
+ */
+export function foreignSfePolicyNames(names: readonly string[], owned: ReadonlySet<string>): string[] {
+  return names.filter((n) => /^SFE-/i.test(n) && n !== EMPTY_PLACEHOLDER_NODE && !owned.has(n));
+}
+
+/**
+ * 受管理段之外出现的 SFE- 节点/组定义与指向 sfe-* 文件的引用，以及受管理段内不在清单中的名称或文件；受管理段内不属于本应用的
+ * 远端引用，以及（owned.resourceUrl 给出时）受管理 group 段之外指向本机资源服务端口的文字（见 OwnedSfeObjects.resourceUrl）。
  * 只返回名称、段与行号，不返回行内容。
  */
-export function findForeignSfeObjects(text: string, owned: { names: readonly string[]; files: readonly string[] }): ForeignSfeObject[] {
+export function findForeignSfeObjects(text: string, owned: OwnedSfeObjects): ForeignSfeObject[] {
   const parsed = parseProfile(text);
   const ranges = managedRanges(parsed);
   const out: ForeignSfeObject[] = [];
   const ownedNames = new Set(owned.names);
   const ownedFiles = new Set(owned.files.map((f) => f.toLowerCase()));
+  const ownUrl = owned.resourceUrl ?? null;
+  const own = ownUrl === null ? null : parseNodeResourceUrl(ownUrl);
+  if (ownUrl !== null && own === null) throw new SfeError('VALIDATION_FAILED', '检查配置失败：本机资源服务地址不正确');
+  const groupBlock = findManagedBlock(parsed, 'group');
+  const inGroupBlock = (i: number): boolean => typeof groupBlock === 'object' && i > groupBlock.start && i < groupBlock.end;
   parsed.lines.forEach((l, i) => {
     if (isCommentLine(l.text)) return;
     const section = sectionAt(parsed, i);
@@ -405,7 +452,26 @@ export function findForeignSfeObjects(text: string, owned: { names: readonly str
       }
     }
   });
+  // 受管理 group 段之外指向本机资源服务端口的文字（注释除外；#!include 照常检查）。每行最多报一次。
+  if (own !== null) {
+    parsed.lines.forEach((l, i) => {
+      const t = l.text.trim();
+      if (inGroupBlock(i) || (isCommentLine(t) && !/^#!/.test(t))) return;
+      for (const m of l.text.matchAll(LOOPBACK_PORT_RE)) {
+        if (Number(m[2]) !== own.port) continue;
+        out.push({ kind: 'resource_reference', name: `${m[1]!.toLowerCase()}:${own.port}`, section: sectionAt(parsed, i), line: i + 1 });
+        return;
+      }
+    });
+  }
   for (const r of allReferences(parsed)) {
+    // 受管理段内的远端引用：只有与本应用本机资源服务地址完全相同、且在 group 段内的才属于本应用。
+    if (isRemote(r.value) && inRanges(r.line - 1, ranges) && !(ownUrl !== null && r.value === ownUrl && inGroupBlock(r.line - 1))) {
+      if (!out.some((o) => o.kind === 'resource_reference' && o.line === r.line)) {
+        out.push({ kind: 'resource_reference', name: urlHostPort(r.value) ?? 'URL', section: sectionAt(parsed, r.line - 1), line: r.line });
+      }
+      continue;
+    }
     if (r.kind === 'include' || isRemote(r.value)) continue;
     const base = r.value.slice(r.value.lastIndexOf('/') + 1).toLowerCase();
     if (!base.startsWith('sfe-')) continue;

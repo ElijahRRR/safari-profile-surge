@@ -20,9 +20,12 @@ import {
   type MechanismMap,
   type RunningInstanceReport,
   type RunningInstanceResult,
+  type Logger,
+  type ResourceBinder,
   type SurgeAdapter,
   type SurgeVersionCheck,
 } from '../deps.js';
+import { readResourceToken, type PeerProcess } from '../loopback-state.js';
 import { refused } from '../errors.js';
 import { directGet, parseProxyAddress, type ProxyAddress } from '../http-client.js';
 import type { Output, Prompter } from '../io.js';
@@ -31,7 +34,7 @@ import { RunDir, assertSafeBaseDir, defaultBaseDir, newRunId } from '../run-dir.
 import { emptyState, loadState, saveState, type RunState, type ServersInfo } from '../state.js';
 import { DEFAULT_SURGE_CLI, SAFARI_APP, plistValue, restartPending, surgeStartFingerprint, swVers, type ExecFn } from '../system.js';
 import { CANARY_FILE, TEST_NODES, TEST_PROFILE_NAME } from '../test-profile.js';
-import { createGuardedAdapter, createP0Adapter, describeLocation, emptyGuard, readCliVersion, resourcesForPath, type WriteGuard } from '../surge-access.js';
+import { createGuardedAdapter, createP0Adapter, describeLocation, emptyGuard, maskResourceKey, readCliVersion, resourcesForPath, type WriteGuard } from '../surge-access.js';
 
 export interface Deps {
   exec: ExecFn;
@@ -48,6 +51,12 @@ export interface Deps {
   surgeInstance?: () => Promise<RunningInstanceResult | RunningInstanceReport>;
   /** 只用于离线测试：替代后台安全改进暂存位置的存在检查（缺省与服务同一 lstat 规则）。 */
   pathPresence?: (path: string) => Promise<'present' | 'absent' | 'unknown'>;
+  /** 只用于离线测试：测试资源服务的绑定方（缺省产品的 tcpBinder，只监听 127.0.0.1）。 */
+  resourceBinder?: (logger: Logger) => ResourceBinder;
+  /** 只用于离线测试：找发起连接的进程（缺省 macOS 上经共用执行器运行 lsof）。 */
+  resourcePeerProbe?: (port: number) => Promise<PeerProcess[] | null>;
+  /** 只用于离线测试：读取令牌的随机来源（缺省 32 个随机字节）。 */
+  random?: () => Buffer;
 }
 
 export interface Ctx {
@@ -201,6 +210,13 @@ export async function openSession(ctx: Ctx, dir: RunDir, state: RunState, opts: 
   const guard = emptyGuard();
   guard.testablePolicies = new Set([...Object.values(TEST_NODES), ROUTE_GROUP_NAME]);
   guard.killablePaths = new Set(state.processPaths);
+  // 回环测试资源的读取令牌（有时）：调用记录与快照中含它的资源 key 整体遮盖
+  try {
+    const token = readResourceToken(dir);
+    if (token !== null) guard.secrets.add(token);
+  } catch {
+    /* 令牌文件损坏：使用它的命令自己拒绝 */
+  }
   const adapter = createGuardedAdapter(inner, guard, (e) => dir.appendJsonl(CALLS_LOG, e), ctx.deps.now);
 
   let onTestProfile: boolean | null = currentProfileName === null ? null : currentProfileName === TEST_PROFILE_NAME;
@@ -383,7 +399,7 @@ export async function takeSnapshot(ctx: Ctx, session: Session, dir: RunDir, labe
     routeSelection: await tryRead(() => a.getGroupSelection(ROUTE_GROUP_NAME)),
     routeMembers: await tryRead(() => a.getGroupMembers(ROUTE_GROUP_NAME)),
     resources: resources
-      ? resources.map((r) => ({ key: r.key, type: r.type, location: describeLocation(r.location), lastUpdatedAt: r.lastUpdatedAt?.toISOString() ?? null, error: r.error !== null }))
+      ? resources.map((r) => ({ key: maskResourceKey(r.key, session.guard.secrets), type: r.type, location: describeLocation(r.location), lastUpdatedAt: r.lastUpdatedAt?.toISOString() ?? null, error: r.error !== null }))
       : null,
     surgeStart: await surgeStartFingerprint(ctx.deps.exec),
   };

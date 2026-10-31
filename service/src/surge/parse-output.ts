@@ -4,6 +4,7 @@
 // 失败即关闭：只接受已知的外层结构；列表中任何一项无法识别时整体报“输出格式无法识别”，从不静默跳过
 // （漏掉一条规则、一个资源或一条请求会让读回把“存在”误判为“不存在”）。
 
+import { createHash } from 'node:crypto';
 import { SURGE_BUILD_RE, SURGE_VERSION_RE, SfeError } from '@sfe/contract';
 import type {
   SurgeExternalResource,
@@ -112,6 +113,11 @@ export function parseRequestRecords(json: unknown): SurgeRequestRecord[] {
 const RESOURCE_ENVELOPES = ['defines', 'resources', 'external-resources', 'externalResources', 'items'] as const;
 const RESOURCE_LOCATION_KEYS = ['location', 'path', 'url', 'source'] as const;
 
+/** 不带密钥的 SHA-256 十六进制（只用于外部资源位置的识别，见 SurgeExternalResource.locationHash）。 */
+export function sha256Hex(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
 function nonEmptyString(v: unknown): string | null {
   return typeof v === 'string' && v.trim() !== '' ? v : null;
 }
@@ -130,6 +136,8 @@ function optionalBool(item: Record<string, unknown>, key: string, what: string):
  * Mac 6.10.0 的字段（HTTP API 文档，GET /v1/external_resources 返回 defines[]）：local、updating、fromModule、error；
  * 类型不对时报错。“Local resources have no `updatedAt` field.”：本地资源的更新时间一律为 null，从不据它推断刷新；
  * “`updatedAt` … 0 if the resource has never been downloaded”：0 也是 null。
+ * location 经 redactUrls 遮盖（回环 http(s) 地址的整段路径也遮盖：本机资源服务的读取令牌在路径中）；locationHash 是遮盖之前
+ * 原样位置字符串的 SHA-256（不带密钥），调用方用 sha256(本机资源服务地址) 识别本应用的资源（D10）。
  */
 export function parseExternalResources(json: unknown): SurgeExternalResource[] {
   let items = arrayFrom(json, RESOURCE_ENVELOPES);
@@ -155,6 +163,7 @@ export function parseExternalResources(json: unknown): SurgeExternalResource[] {
       key,
       type: str(pick(item, ['type', 'kind'])) ?? 'unknown',
       location: redactUrls(location),
+      locationHash: sha256Hex(location),
       lastUpdatedAt: local === true ? null : toDate(pick(item, ['lastUpdatedAt', 'lastUpdated', 'last_updated', 'updatedAt', 'updated'])),
       // ready 存在但不是 true（false 或无法识别的值）都按未就绪处理。
       error: errorText !== null ? redactUrls(errorText) : item.ready !== undefined && item.ready !== true ? 'not_ready' : null,
@@ -364,7 +373,10 @@ export function parseRuleMatch(json: unknown, scrub: (s: string) => string): Sur
   return { rule: scrub(rule), policy };
 }
 
-/** 6.10 surge-cli 在没有更新任何远端资源时打印的文字（本地资源被跳过时也是它）。 */
+/**
+ * 6.10 surge-cli 在没有更新任何远端资源时打印的文字（本地资源被跳过时也是它）。D10：对本机资源服务的远端 key 得到它是意外
+ * 结果（文档没有写明远端资源何时被跳过）——解析为 outcome 'skipped'，调用方（发布）按失败处理，从不当作“没有变化”。
+ */
 export const NO_REMOTE_RESOURCE_UPDATED_TEXT = 'No remote external resource needed updating.';
 
 function resourceUpdateFailed(detail: string, scrub: (s: string) => string): SfeError {
@@ -393,7 +405,10 @@ export function parseResourceUpdateText(stdout: string, key: string, scrub: (s: 
   throw unrecognized('外部资源更新结果');
 }
 
-/** POST /v1/external_resources/update 的结果（HTTP API 文档，Mac 6.10.0+）：键到 "success" 或错误文字的映射；空映射为跳过。 */
+/**
+ * POST /v1/external_resources/update 的结果（HTTP API 文档，Mac 6.10.0+）：键到 "success" 或错误文字的映射；空映射为跳过
+ * （outcome 'skipped'，与 CLI 相同：对远端 key 是意外结果，调用方按失败处理）。
+ */
 export function parseResourceUpdateMap(json: unknown, key: string, scrub: (s: string) => string): SurgeResourceUpdateResult {
   if (!isObject(json)) throw unrecognized('外部资源更新结果');
   const keys = Object.keys(json);

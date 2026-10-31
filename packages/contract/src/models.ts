@@ -369,7 +369,13 @@ export type RouteWarning =
   | 'probe_failed'
   | 'exit_ip_mismatch'
   /** 普通模式未能确认 Safari 已没有经买家出口的连接（结束连接失败，或入口未经运行时确认）：下一次普通模式再结束。 */
-  | 'buyer_exit_connections_unconfirmed';
+  | 'buyer_exit_connections_unconfirmed'
+  /**
+   * Surge 中 SFE-ROUTE 的节点无法证明来自本机资源服务的已提交版本（D10）：资源服务未监听、出现无法解释的下载或资源错误、
+   * 成员或参数与已提交版本不同、令牌可能泄露。活动路由转为需要处理并停止复用、填充、自动打开与激活；普通模式与 REJECT
+   * 保持从不因它被拒绝。只在一次核对一致的发布或回滚读回之后清除。
+   */
+  | 'node_resource_unverified';
 
 export interface RouteStateView {
   routeEpoch: number;
@@ -520,6 +526,25 @@ export interface PrecedenceIssue {
   severity: 'blocking' | 'warning';
 }
 
+/**
+ * 本机资源服务（D10）的状态（不含令牌、地址或端口）：
+ * - serving：工作配置的 SFE-ROUTE 指向本服务当前地址，且正在已设置的端口监听；
+ * - not_listening：工作配置指向本服务当前地址，但没有在监听（端口被占用、尚未选定端口或绑定失败；对账时重试）；
+ * - token_unavailable：读取令牌读不到或格式不对，资源服务没有创建（发布、初始化与重新合并停泊）；
+ * - legacy_line：工作配置仍是 D7 的本地 sfe-nodes.list 引用，需要重新合并改用本机资源服务（resourceServe 门槛满足之后；在此之前
+ *   重新合并保持原有引用）；
+ * - not_installed：工作配置中没有指向本服务当前地址的节点组定义（尚未初始化写入、受管理段被修改或地址已变）。
+ */
+export type NodeResourceState = 'serving' | 'not_listening' | 'token_unavailable' | 'legacy_line' | 'not_installed';
+
+export interface NodeResourceStatusView {
+  state: NodeResourceState;
+  /** 读取令牌可能已泄露（出现无法解释的下载或资源错误、端口被他人占用）：只能经重新合并的“轮换资源地址”清除。 */
+  tokenSuspect: boolean;
+  /** Surge 可能载入了未提交的版本或与已提交版本不一致：下一次发布单 key 更新并读回。 */
+  needsRefresh: boolean;
+}
+
 export interface SurgeStatusView {
   reachable: boolean;
   version: string | null;
@@ -537,6 +562,8 @@ export interface SurgeStatusView {
   precedenceIssues: PrecedenceIssue[];
   lastCheckedAt: IsoTime | null;
   message: string | null;
+  /** 本机资源服务的状态（D10）；尚未初始化固定工作配置时为 null。旧版服务不带这一项。 */
+  nodeResource?: NodeResourceStatusView | null;
 }
 
 export interface VerifyEndpoint {

@@ -1,9 +1,32 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { CAPABILITY_GATES, GATING_COVERAGE_ITEMS, type CapabilityProposalView, type ProtocolCoverage } from '@sfe/contract';
+import {
+  CAPABILITY_GATES,
+  CAPABILITY_KEYS,
+  GATING_COVERAGE_ITEMS,
+  type CapabilityKey,
+  type CapabilityProposalView,
+  type CapabilityStatus,
+  type NodeResourceState,
+  type ProtocolCoverage,
+} from '@sfe/contract';
 import PendingDeployCard from '../src/components/PendingDeployCard.vue';
 import CapabilitiesView from '../src/views/CapabilitiesView.vue';
-import { coverageBlockReason, evaluateGate, hostBlockReason, staleReasonText, versionBlockReason } from '../src/lib/gates';
-import { allSupported, byText, capabilities, click, environment, flush, mountWith, revision, snapshot, testContext, type Call } from './fixtures';
+import { coverageBlockReason, evaluateGate, hostBlockReason, nodeResourcePublishBlocks, staleReasonText, versionBlockReason } from '../src/lib/gates';
+import {
+  allSupported,
+  byText,
+  capabilities,
+  click,
+  environment,
+  flush,
+  mountWith,
+  nodeResource,
+  revision,
+  snapshot,
+  snapshotWithNodeResource,
+  testContext,
+  type Call,
+} from './fixtures';
 
 afterEach(() => {
   document.body.innerHTML = '';
@@ -16,9 +39,9 @@ const pendingEnv = environment({
 
 describe('evaluateGate', () => {
   it('lists every missing capability of the publish gate', () => {
-    const r = evaluateGate(capabilities({ targeted_resource_refresh: 'supported' }), 'publish');
+    const r = evaluateGate(capabilities({ loopback_resource_update: 'supported' }), 'publish');
     expect(r.met).toBe(false);
-    expect(r.missing.map((m) => m.key)).toEqual(CAPABILITY_GATES.publish.filter((k) => k !== 'targeted_resource_refresh'));
+    expect(r.missing.map((m) => m.key)).toEqual(CAPABILITY_GATES.publish.filter((k) => k !== 'loopback_resource_update'));
   });
 
   it('adds auto_reload_atomic_replace to activation under ruleset_resource', () => {
@@ -35,8 +58,8 @@ describe('evaluateGate', () => {
   });
 
   it('uses the effective status, not the recorded one', () => {
-    const caps = capabilities(allSupported()).map((c) => (c.key === 'policy_path_reread' ? { ...c, effectiveStatus: 'unverified' as const, staleReasons: ['surgeBuild' as const] } : c));
-    expect(evaluateGate(caps, 'publish').missing.map((m) => m.key)).toEqual(['policy_path_reread']);
+    const caps = capabilities(allSupported()).map((c) => (c.key === 'loopback_resource_update' ? { ...c, effectiveStatus: 'unverified' as const, staleReasons: ['surgeBuild' as const] } : c));
+    expect(evaluateGate(caps, 'publish').missing.map((m) => m.key)).toEqual(['loopback_resource_update']);
   });
 });
 
@@ -56,21 +79,25 @@ describe('publish button', () => {
     m.unmount();
   });
 
-  it('explains why new nodes stay pending while local policy-path re-reading is unproven (Surge 6.10 skips local resources)', async () => {
-    const { ctx } = testContext(() => ({ status: 500 }), snapshot({ environments: [pendingEnv], capabilities: capabilities({ ...allSupported(), policy_path_reread: 'unverified' }) }));
+  it('explains why new nodes stay pending while the loopback resource checks are unproven (D10)', async () => {
+    const { ctx } = testContext(() => ({ status: 500 }), snapshot({ environments: [pendingEnv], capabilities: capabilities({ ...allSupported(), loopback_resource_auth: 'unverified' }) }));
     const m = await mountWith(PendingDeployCard, ctx);
-    const note = document.body.querySelector('[data-test="policy-path-note"]')!;
-    expect(note.textContent).toContain('Local resources are skipped.');
-    expect(note.textContent).toContain('已部署的节点不受影响');
+    const note = document.body.querySelector('[data-test="node-resource-note"]')!;
+    expect(note.textContent).toContain('127.0.0.1');
+    expect(note.textContent).toContain('已保存，待部署');
+    expect(note.textContent).toContain('Surge 或 Mac 重启后的行为尚待补测');
+    // 旧的本地文件模型的说法不再出现，也不无条件承诺已部署的节点不受影响
+    for (const stale of ['Local resources are skipped.', '本地 policy-path', '自动重新读取', '已部署的节点不受影响', 'sfe-nodes.list']) expect(note.textContent).not.toContain(stale);
+    expect(document.body.querySelector('[data-test="policy-path-note"]')).toBeNull();
     expect(document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!.disabled).toBe(true);
     m.unmount();
   });
 
-  it('shows no policy-path note when only other publish capabilities are missing', async () => {
+  it('shows no loopback note when only other publish capabilities are missing', async () => {
     const { ctx } = testContext(() => ({ status: 500 }), snapshot({ environments: [pendingEnv], capabilities: capabilities({ ...allSupported(), connection_continuity: 'unverified' }) }));
     const m = await mountWith(PendingDeployCard, ctx);
     expect(document.body.querySelector('[data-test="publish-gate"]')).not.toBeNull();
-    expect(document.body.querySelector('[data-test="policy-path-note"]')).toBeNull();
+    expect(document.body.querySelector('[data-test="node-resource-note"]')).toBeNull();
     m.unmount();
   });
 
@@ -88,6 +115,134 @@ describe('publish button', () => {
     const call = calls.find((c) => c.url === '/api/deployments/publish');
     expect(call?.method).toBe('POST');
     expect(call?.body).toEqual({ request_id: expect.stringMatching(/^web-/) });
+    m.unmount();
+  });
+});
+
+describe('publish preconditions on the local resource server (D10)', () => {
+  const accepted = { status: 202, body: { operation_id: 'op_7', environment_id: null, revision: null, duplicate: false } };
+  /** 页面上不能出现资源地址、端口或令牌的样子。 */
+  function expectNoResourceSecrets() {
+    const text = document.body.textContent ?? '';
+    expect(text).not.toMatch(/127\.0\.0\.1:\d/);
+    expect(text).not.toMatch(/[0-9a-f]{32,}/i);
+    expect(text).not.toContain('/sfe-nodes.list');
+  }
+
+  it('lists the same park reasons as the service, failing closed on unknown states', () => {
+    expect(nodeResourcePublishBlocks(undefined)).toEqual([]);
+    expect(nodeResourcePublishBlocks(nodeResource())).toEqual([]);
+    // 待重新同步不阻止发布：发布正是让 Surge 回到已提交版本的办法
+    expect(nodeResourcePublishBlocks(nodeResource({ needsRefresh: true }))).toEqual([]);
+    expect(nodeResourcePublishBlocks(null)).toEqual(['尚未初始化固定工作配置']);
+    for (const state of ['not_listening', 'token_unavailable', 'legacy_line', 'not_installed'] as const) {
+      expect(nodeResourcePublishBlocks(nodeResource({ state }))).toHaveLength(1);
+    }
+    expect(nodeResourcePublishBlocks(nodeResource({ state: 'not_listening' }))[0]).toContain('本机资源服务不可用');
+    expect(nodeResourcePublishBlocks(nodeResource({ state: 'legacy_line' }))[0]).toContain('需要重新合并以改用本机资源服务');
+    expect(nodeResourcePublishBlocks(nodeResource({ state: 'not_installed' }))[0]).toContain('需要重新合并');
+    expect(nodeResourcePublishBlocks(nodeResource({ tokenSuspect: true }))).toEqual(['读取令牌可能已泄露：需要重新合并并更换本机资源地址']);
+    expect(nodeResourcePublishBlocks(nodeResource({ state: 'not_listening', tokenSuspect: true }))).toHaveLength(2);
+    expect(nodeResourcePublishBlocks(nodeResource({ state: 'future_state' as NodeResourceState }))).toEqual(['本机资源服务状态未知']);
+  });
+
+  it('enables publishing with exactly the D10 publish gate (auto_reload_atomic_replace and the other keys are not required)', async () => {
+    expect(CAPABILITY_GATES.publish).not.toContain('auto_reload_atomic_replace');
+    const only: Partial<Record<CapabilityKey, CapabilityStatus>> = Object.fromEntries(CAPABILITY_GATES.publish.map((k) => [k, 'supported']));
+    const { ctx, calls } = testContext(
+      (c: Call) => (c.url === '/api/deployments/publish' ? accepted : { status: 404 }),
+      snapshotWithNodeResource(nodeResource(), { environments: [pendingEnv], capabilities: capabilities(only) }),
+    );
+    const m = await mountWith(PendingDeployCard, ctx);
+    const button = document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!;
+    expect(button.disabled).toBe(false);
+    expect(document.body.querySelector('[data-test="publish-gate"]')).toBeNull();
+    expect(document.body.querySelector('[data-test="node-resource-block"]')).toBeNull();
+    click(button);
+    await flush();
+    expect(calls.find((c) => c.url === '/api/deployments/publish')?.body).toEqual({ request_id: expect.any(String) });
+    m.unmount();
+  });
+
+  it.each([
+    ['not_listening', '本机资源服务不可用'],
+    ['token_unavailable', '读取令牌不可用'],
+    ['legacy_line', '需要重新合并以改用本机资源服务'],
+    ['not_installed', '需要重新合并'],
+  ] as const)('is disabled with the reason while the resource server is %s, and offers no override', async (state, reason) => {
+    const { ctx, calls } = testContext(
+      (c: Call) => (c.url === '/api/deployments/publish' ? accepted : { status: 404 }),
+      snapshotWithNodeResource(nodeResource({ state }), { environments: [pendingEnv], capabilities: capabilities(allSupported()) }),
+    );
+    const m = await mountWith(PendingDeployCard, ctx);
+    const button = document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!;
+    expect(button.disabled).toBe(true);
+    const block = document.body.querySelector('[data-test="node-resource-block"]')!;
+    expect(block.textContent).toContain(reason);
+    expect(block.textContent).toContain('已保存，待部署');
+    click(button);
+    await flush();
+    expect(calls.some((c) => c.url === '/api/deployments/publish')).toBe(false);
+    const labels = Array.from(document.body.querySelectorAll('button')).map((b) => b.textContent ?? '');
+    for (const forbidden of ['忽略', '仍然', '强制', '重载', '跳过检查']) expect(labels.some((l) => l.includes(forbidden))).toBe(false);
+    expectNoResourceSecrets();
+    m.unmount();
+  });
+
+  it('is disabled while the read token may have leaked, pointing at the address change', async () => {
+    const { ctx } = testContext(() => ({ status: 404 }), snapshotWithNodeResource(nodeResource({ tokenSuspect: true }), { environments: [pendingEnv], capabilities: capabilities(allSupported()) }));
+    const m = await mountWith(PendingDeployCard, ctx);
+    expect(document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!.disabled).toBe(true);
+    expect(document.body.querySelector('[data-test="node-resource-block"]')?.textContent).toContain('更换本机资源地址');
+    m.unmount();
+  });
+
+  it('is disabled before the working profile is initialised (nodeResource null), like the service', async () => {
+    const { ctx } = testContext(() => ({ status: 404 }), snapshotWithNodeResource(null, { environments: [pendingEnv], capabilities: capabilities(allSupported()) }));
+    const m = await mountWith(PendingDeployCard, ctx);
+    expect(document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!.disabled).toBe(true);
+    expect(document.body.querySelector('[data-test="node-resource-block"]')?.textContent).toContain('尚未初始化固定工作配置');
+    m.unmount();
+  });
+
+  it('offers to re-sync the node resource when Surge may hold an uncommitted version and nothing is pending', async () => {
+    const { ctx, calls } = testContext(
+      (c: Call) => (c.url === '/api/deployments/publish' ? accepted : { status: 404 }),
+      snapshotWithNodeResource(nodeResource({ needsRefresh: true }), { environments: [environment()], capabilities: capabilities(allSupported()) }),
+    );
+    const m = await mountWith(PendingDeployCard, ctx);
+    expect(document.body.querySelector('[data-test="node-resource-refresh"]')?.textContent).toContain('单 key 更新并读回');
+    const button = document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!;
+    expect(button.textContent).toContain('重新同步节点资源');
+    expect(button.disabled).toBe(false);
+    click(button);
+    await flush();
+    // 不带环境的发布：服务对本应用这一项资源执行一次单 key 更新并读回
+    expect(calls.find((c) => c.url === '/api/deployments/publish')?.body).toEqual({ request_id: expect.any(String) });
+    expect(ctx.toasts.items.map((t) => t.message).join('')).toContain('重新同步节点资源');
+    m.unmount();
+  });
+
+  it('keeps the re-sync disabled while the publish gate is not met', async () => {
+    const { ctx } = testContext(
+      () => ({ status: 404 }),
+      snapshotWithNodeResource(nodeResource({ needsRefresh: true }), { environments: [environment()], capabilities: capabilities({ ...allSupported(), loopback_publish_crash: 'unverified' }) }),
+    );
+    const m = await mountWith(PendingDeployCard, ctx);
+    const button = document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!;
+    expect(button.textContent).toContain('重新同步节点资源');
+    expect(button.disabled).toBe(true);
+    expect(document.body.querySelector('[data-test="node-resource-note"]')?.textContent).toContain('已保存，待部署');
+    m.unmount();
+  });
+
+  it('nothing pending and nothing to re-sync keeps the button disabled', async () => {
+    const { ctx } = testContext(() => ({ status: 404 }), snapshotWithNodeResource(nodeResource(), { environments: [environment()], capabilities: capabilities(allSupported()) }));
+    const m = await mountWith(PendingDeployCard, ctx);
+    const button = document.body.querySelector<HTMLButtonElement>('[data-test="publish-button"]')!;
+    expect(button.textContent).toContain('发布全部待部署');
+    expect(button.disabled).toBe(true);
+    expect(document.body.querySelector('[data-test="node-resource-refresh"]')).toBeNull();
     m.unmount();
   });
 });
@@ -215,7 +370,7 @@ describe('coverageBlockReason', () => {
   });
 
   it('does not require coverage for other capabilities', () => {
-    expect(coverageBlockReason(proposal({ key: 'policy_path_reread', protocolCoverage: null }))).toBeNull();
+    expect(coverageBlockReason(proposal({ key: 'loopback_resource_update', protocolCoverage: null }))).toBeNull();
   });
 });
 
@@ -306,7 +461,7 @@ describe('staleReasonText', () => {
 describe('capabilities page', () => {
   it('explains a stale reason caused by an unreadable Surge version without saying it changed', async () => {
     const caps = capabilities(allSupported()).map((c) =>
-      c.key === 'policy_path_reread' ? { ...c, effectiveStatus: 'unverified' as const, staleReasons: ['surgeVersion' as const, 'surgeBuild' as const], context: proposal().context } : c,
+      c.key === 'loopback_resource_update' ? { ...c, effectiveStatus: 'unverified' as const, staleReasons: ['surgeVersion' as const, 'surgeBuild' as const], context: proposal().context } : c,
     );
     const base = snapshot();
     const { ctx } = testContext(() => ({ status: 404 }), snapshot({ capabilities: caps, surge: { ...base.surge, version: null, build: null } }));
@@ -321,7 +476,7 @@ describe('capabilities page', () => {
   it('shows pass criteria for every capability and disables 确认 with the reason when coverage is incomplete', async () => {
     const { ctx } = testContext(() => ({ status: 404 }), snapshot({ capabilityProposals: [proposal({ protocolCoverage: { ...coverage('pass'), ipv6: { result: 'not_tested', note: null } } })] }));
     const m = await mountWith(CapabilitiesView, ctx, {}, '/capabilities');
-    expect(document.body.querySelectorAll('[data-test="criteria"]')).toHaveLength(19);
+    expect(document.body.querySelectorAll('[data-test="criteria"]')).toHaveLength(CAPABILITY_KEYS.length);
     // 不使用钥匙串：没有「原生桥读取钥匙串」这一项
     expect(document.body.textContent).not.toContain('钥匙串');
     const confirm = document.body.querySelector<HTMLButtonElement>('[data-test="confirm-proposal"]')!;
@@ -407,9 +562,9 @@ describe('capabilities page', () => {
   });
 
   it('resets a capability to unverified with an optional note', async () => {
-    const caps = capabilities({ policy_path_reread: 'supported' });
+    const caps = capabilities({ loopback_resource_update: 'supported' });
     const { ctx, calls } = testContext(
-      (c: Call) => (c.url === '/api/capabilities' && c.method === 'POST' ? { status: 200, body: { ...caps.find((x) => x.key === 'policy_path_reread'), status: 'unverified', effectiveStatus: 'unverified' } } : { status: 404 }),
+      (c: Call) => (c.url === '/api/capabilities' && c.method === 'POST' ? { status: 200, body: { ...caps.find((x) => x.key === 'loopback_resource_update'), status: 'unverified', effectiveStatus: 'unverified' } } : { status: 404 }),
       snapshot({ capabilities: caps }),
     );
     const m = await mountWith(CapabilitiesView, ctx, {}, '/capabilities');
@@ -419,7 +574,7 @@ describe('capabilities page', () => {
     await flush();
     click(document.body.querySelector('.modal-footer [data-test="confirm"]'));
     await flush();
-    expect(calls.find((c) => c.method === 'POST')?.body).toEqual({ request_id: expect.any(String), action: 'reset', key: 'policy_path_reread', note: null });
+    expect(calls.find((c) => c.method === 'POST')?.body).toEqual({ request_id: expect.any(String), action: 'reset', key: 'loopback_resource_update', note: null });
     m.unmount();
   });
 });

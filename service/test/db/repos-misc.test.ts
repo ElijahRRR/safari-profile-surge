@@ -212,7 +212,8 @@ describe('capabilities and proposals', () => {
   test('proposal summary and capability note are scrubbed before storage', () => {
     const { repos } = makeRepos();
     const p = repos.proposals.insert({ id: 'prop_s', key: 'native_bridge_ipc', proposedStatus: 'supported', context: ctx, summary: 'ok via http://u:pw@127.0.0.1:61848/x', evidenceDigest: 'e', submittedBy: 'agent' });
-    expect(p.summary).toBe('ok via http://‹已隐藏›@127.0.0.1:61848/x');
+    // 回环 http(s) 地址的路径整段遮盖（本机资源服务的读取令牌在路径中，D10）
+    expect(p.summary).toBe('ok via http://‹已隐藏›@127.0.0.1:61848/‹已隐藏›');
     const c = repos.capabilities.upsert({ key: 'native_bridge_ipc', status: 'supported', note: 'Bearer abc' });
     expect(c.note).toBe('Bearer ‹已隐藏›');
   });
@@ -323,6 +324,7 @@ describe('settings', () => {
       safariVerifyTimeoutSec: 120,
       probeTtlSec: 900,
       reconcileIntervalSec: 30,
+      resourcePort: null,
     });
     expect(repos.settings.view(null)).toEqual({
       surgeCliPath: null,

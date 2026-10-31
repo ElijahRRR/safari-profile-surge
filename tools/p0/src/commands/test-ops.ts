@@ -1,7 +1,8 @@
 // 测试配置上的受控写入：只写本工具创建并登记过摘要的测试文件（摘要不符即拒绝，视为外部修改）、只选择 SFE-ROUTE。
-// 本地文件写入后不调用 external-resource update（Surge 6.10：“Local resources are skipped.”）：节点资源与规则集由
-// Surge 的文件监视自动重新读取，这里只做有界的轮询读回（waitForMembers、waitForRuleSetCanary）。update 只用于记录
-// 它对本地资源的实际结果（recordUpdate），从不当作刷新。每个写入都记入动作时间线（continuity 据此标注）。
+// 本地规则集写入后不调用 external-resource update（Surge 6.10：“Local resources are skipped.”）：由 Surge 的文件监视自动
+// 重新读取，这里只做有界的轮询读回（waitForRuleSetCanary）。测试节点（D10）由回环测试资源服务提供，发布是一次单 key 更新加
+// 读回（loopback-ops.ts publishGeneration）；recordUpdate 是唯一的 update 调用点，资源 key 在动作时间线中按 maskResourceKey
+// 遮盖。每个写入都记入动作时间线（continuity 据此标注）。
 
 import { ROUTE_GROUP_NAME } from '@sfe/contract';
 import type { ReloadSignals } from '../analysis/reload.js';
@@ -12,6 +13,7 @@ import { proxyGet, type ProxyAddress } from '../http-client.js';
 import { logAction } from '../results.js';
 import type { RunDir } from '../run-dir.js';
 import { createdFile, saveState, upsertCreatedFile, type RunState } from '../state.js';
+import { maskResourceKey } from '../surge-access.js';
 import { surgeStartFingerprint } from '../system.js';
 import { CANARY_FILE, CHAIN_HOST, TEST_PROFILE_FILE, TEST_PROXIES, armProfileCanary, canaryContent, canaryHost, profileCanaryHost } from '../test-profile.js';
 import { tryRead, type Ctx, type Session } from './common.js';
@@ -21,7 +23,7 @@ import { tryRead, type Ctx, type Session } from './common.js';
  */
 export const SYNTHETIC_PROCESS_PATH = '/usr/bin/true';
 
-/** 轮询读回的间隔：写入后等待 Surge 文件监视重新读取。 */
+/** 轮询读回的间隔：写入规则集后等待 Surge 文件监视重新读取，或等待 Surge 结束更新。 */
 export const WATCH_POLL_MS = 500;
 
 export interface WaitResult<T> {
@@ -38,8 +40,10 @@ export interface UpdateRecord {
   ok: boolean;
   ms: number;
   code: string | null;
-  /** Surge 报告的结果；本地资源应为 skipped（不算刷新）。 */
+  /** Surge 报告的结果（本地资源应为 skipped；远端资源的 downloaded 也只是必要条件，从不当作发布成功）。 */
   result: SurgeResourceUpdateResult | null;
+  /** 失败时适配器给出的原因（例如 update_timeout：结果不明，从不重放）。 */
+  reason: string | null;
 }
 
 export class TestOps {
@@ -90,17 +94,19 @@ export class TestOps {
   }
 
   /**
-   * 只用于测量：对单个本工具资源 key 调用一次 external-resource update，记录 Surge 报告的结构化结果。HTTP API 文档
-   * （Mac 6.10.0+）：“Local resources are skipped.”——对本地资源这从不算刷新，调用方也从不据它判断文件已被读取。
+   * 对单个本工具登记过的资源 key 调用一次 external-resource update（从不 update all），记录 Surge 报告的结构化结果。本地资源
+   * （HTTP API 文档，Mac 6.10.0+：“Local resources are skipped.”）只用于记录这一点；回环测试资源的结果也只是必要条件，成败只看
+   * 读回。时间线中的 key 已遮盖（可能含读取令牌）；detail 给出发布的代等。
    */
-  async recordUpdate(key: string, label: string): Promise<UpdateRecord> {
+  async recordUpdate(key: string, label: string, detail: Record<string, unknown> = {}): Promise<UpdateRecord> {
     const t0 = Date.now();
-    this.action('resource_update_call', { key, label });
+    this.action('resource_update_call', { ...detail, key: maskResourceKey(key, this.session.guard.secrets), label });
     try {
       const result = await this.session.adapter.updateExternalResource(key);
-      return { ok: true, ms: Date.now() - t0, code: null, result };
+      return { ok: true, ms: Date.now() - t0, code: null, result, reason: null };
     } catch (e) {
-      return { ok: false, ms: Date.now() - t0, code: (e as { code?: string }).code ?? 'ERROR', result: null };
+      const reason = (e as { details?: { reason?: unknown } }).details?.reason;
+      return { ok: false, ms: Date.now() - t0, code: (e as { code?: string }).code ?? 'ERROR', result: null, reason: typeof reason === 'string' ? reason : null };
     }
   }
 
@@ -116,11 +122,6 @@ export class TestOps {
       if (i < polls - 1) await sleep(pollMs);
     }
     return { ok: false, value, ms: now().getTime() - t0, polls };
-  }
-
-  /** 写入节点资源后等待 Surge 自动重新读取（不调用 update）：轮询 SFE-ROUTE 的成员直到 accept 为真。 */
-  async waitForMembers(accept: (members: readonly string[]) => boolean, timeoutMs: number): Promise<WaitResult<string[]>> {
-    return this.poll(() => tryRead(() => this.session.adapter.getGroupMembers(ROUTE_GROUP_NAME)), accept, timeoutMs);
   }
 
   /**

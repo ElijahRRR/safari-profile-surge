@@ -27,10 +27,14 @@ export interface Logger {
 
 /**
  * 按值脱敏：登记本次操作中读到或收到的每个秘密值，再对任何来自 Surge、子进程或错误的
- * 自由文本做替换；另外按规则遮盖节点行参数、http-api、URL 用户信息与查询、长 base64。
+ * 自由文本做替换；另外按规则遮盖节点行参数、http-api、URL 用户信息与查询、回环 http(s) 地址的路径、长 base64。
  */
 export interface Scrubber {
-  register(secret: string): void;
+  /**
+   * 登记一个秘密值（原值、URL 编码与 JSON 转义形式）。pinned：长期有效、只读取一次的系统秘密（例如本机资源服务的读取令牌）
+   * 常驻，不受登记表容量淘汰（常驻条目有上限，见 util/scrubber.ts MAX_PINNED_VALUES）。
+   */
+  register(secret: string, opts?: { pinned?: boolean }): void;
   scrub(text: string): string;
   scrubDeep<T>(value: T): T;
 }
@@ -127,8 +131,16 @@ export interface SurgeExternalResource {
   key: string;
   /** 资源类型，按 Surge 返回原样记录（HTTP API 文档，Mac 6.10.0+：ruleset、domainset、script、policy-group、data）。 */
   type: string;
-  /** 本地路径或 URL（URL 的用户信息与查询已遮盖）；只用于识别本应用资源。 */
+  /**
+   * 本地路径或 URL（URL 的用户信息、查询与片段已遮盖；回环 http(s) 地址的整段路径也已遮盖，本机资源服务的读取令牌在路径中，
+   * 见 redact-profile.ts redactUrls）。只用于展示；识别本机资源服务的资源用 locationHash。
+   */
   location: string;
+  /**
+   * Surge 报告的原始位置字符串（遮盖之前，原样）的 SHA-256 十六进制（不带密钥）。本机资源服务的资源满足
+   * locationHash === sha256(nodeResourceUrl(端口, 令牌))：令牌有 256 位，摘要不泄露它。没有位置时为 null。
+   */
+  locationHash: string | null;
   /** 远端资源的上次下载时间；本地资源没有（文档：“Local resources have no `updatedAt` field.”），从未下载过为 null。 */
   lastUpdatedAt: Date | null;
   error: string | null;
@@ -143,6 +155,8 @@ export interface SurgeExternalResource {
 /**
  * 单个外部资源的更新结果。refreshed 为 true 只表示 Surge 对该 key 报告了 success（远端资源已重新下载）；
  * 本地资源被跳过、或 Surge 说明没有需要更新的远端资源时为 false——这从不算作刷新（文档：“Local resources are skipped.”）。
+ * D10：本机资源服务的资源是远端资源，对它的 key 得到 skipped 是意外结果，发布按失败处理，从不当作“没有变化”；
+ * success 也只说明发生了一次下载（回环矩阵：部分行无效时同样报告 success），之后仍须读回。
  */
 export interface SurgeResourceUpdateResult {
   key: string;
@@ -228,7 +242,10 @@ export interface SurgeAdapter {
   killRequest(id: string): Promise<void>;
 
   listExternalResources(): Promise<SurgeExternalResource[]>;
-  /** 只按单个 key（从不 all）；结果区分“已重新下载”与“被跳过”（本地资源总是被跳过）。 */
+  /**
+   * 只按单个 key（从不 all）；结果区分“已重新下载”与“被跳过”（本地资源总是被跳过）。超时抛
+   * SURGE_COMMAND_FAILED（details.reason 'update_timeout'）：请求已发出，Surge 可能仍在下载或已经载入——结果未知，不是“无法连接”。
+   */
   updateExternalResource(key: string): Promise<SurgeResourceUpdateResult>;
 
   listTempRules(): Promise<string[]>;

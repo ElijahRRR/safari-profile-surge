@@ -2,8 +2,8 @@
 // 经受控序列化生成每一行。生成错误按条目返回，调用方决定排除该条目还是整体失败。
 
 import { SfeError, type ApiErrorBody } from '@sfe/contract';
-import type { FrontProxyRecord, NodeManifestEntry, ProxyRevisionRecord } from '../db/index.js';
-import { nodeLine, resourceFile } from '../surge/generate.js';
+import type { DeploymentRecord, FrontProxyRecord, NodeManifestEntry, ProxyRevisionRecord } from '../db/index.js';
+import { nodeLine, resourceBody, resourceFile } from '../surge/generate.js';
 import { parseProxyLine } from '../surge/proxy-line.js';
 import { isCommentLine } from '../surge/rules.js';
 import type { Engine } from './context.js';
@@ -78,4 +78,29 @@ export function manifestMatches(content: string, manifest: readonly NodeManifest
   if (names.length !== manifest.length) return false;
   if (new Set(names).size !== names.length) return false;
   return names.every((n, i) => n === manifest[i]!.nodeName);
+}
+
+/**
+ * 按某次发布的清单重建本机资源服务提供的内容（D10，resourceBody：没有节点时只含占位行），并与发布记录的摘要核对
+ * （工作配置目录文件密钥下的 HMAC，profileFiles().digestContent；D10 的发布按 resourceBody 的内容记录）。没有节点的 D7 发布
+ * 记下的是不含占位行的 resourceFile 内容：同样接受，提供的仍是带占位行的 resourceBody（不含任何凭据）。版本或凭据已回收、
+ * 前置不可用、摘要不一致（含已清除的 'scrubbed'）、工作配置未初始化或 pepper 未加载时为 null——调用方不提供这一代
+ * （503）并要求刷新，从不提供与记录不一致的内容。读到的凭据登记到脱敏器（generateResource）。
+ */
+export async function regenerateResourceBody(engine: Engine, d: DeploymentRecord): Promise<string | null> {
+  const files = engine.profileFiles();
+  if (!files) return null;
+  const fronts = new Map<string, FrontProxyRecord>(engine.repos.frontProxies.list().map((f) => [f.id, f]));
+  const entries: ResourceEntry[] = [];
+  for (const m of d.nodeManifest) {
+    const rev = engine.repos.proxyRevisions.get(m.environmentId, m.proxyRevision);
+    if (!rev) return null;
+    entries.push({ environmentId: m.environmentId, proxyRevision: m.proxyRevision, revision: rev });
+  }
+  const g = await generateResource(engine, d.generation, entries, fronts);
+  if (g.errors.size > 0 || !manifestMatches(resourceFile(d.generation, g.lines), d.nodeManifest)) return null;
+  const body = resourceBody(d.generation, g.lines);
+  if (files.digestContent(body) === d.resourceDigest) return body;
+  if (g.lines.length === 0 && files.digestContent(resourceFile(d.generation, [])) === d.resourceDigest) return body;
+  return null;
 }

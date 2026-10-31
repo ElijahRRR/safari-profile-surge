@@ -12,7 +12,7 @@ import { FakeSurge } from '../../src/surge/fake.js';
 import { payloadOf } from '../../src/domain/operations.js';
 
 const FakeSurgeProto = FakeSurge.prototype;
-import { AGENT, PROFILE_A, PROFILE_B, PROFILE_C, WEB, TEST_ENDPOINT, activeEnv, bind, createEnv, createHarness, grantForCurrentHost, instanceContext, rid, safariOutcome, verify, type Harness } from './harness.js';
+import { AGENT, PROFILE_A, PROFILE_B, PROFILE_C, WEB, TEST_ENDPOINT, activeEnv, bind, createEnv, createHarness, failMembersReadOnceIn, grantForCurrentHost, instanceContext, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -39,6 +39,7 @@ describe('step 13: gates re-checked before ACTIVE', () => {
     expect(h.repos.operations.get(opId)!.phase).toBe('VERIFY_ONLY');
     h.revoke(['safari_process_attribution']);
     const updates = entryReloads();
+    const resourceUpdates = h.fake.calls.updateExternalResource ?? 0;
     await verify(h, PROFILE_A, opId);
     const op = h.repos.operations.get(opId)!;
     expect(op.phase).toBe('FAILED');
@@ -49,7 +50,8 @@ describe('step 13: gates re-checked before ACTIVE', () => {
     expect(h.repos.environments.get(env)!.lastVerifiedProxyRevision).toBeNull();
     // 只写回阻断（verify 位），从不写入 ACTIVE；Safari 全部拒绝
     expect(entryReloads() - updates).toBe(1);
-    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+    // 激活与回滚从不更新外部资源（之前的发布更新过一次）
+    expect((h.fake.calls.updateExternalResource ?? 0) - resourceUpdates).toBe(0);
     expect(safariOutcome(h).failed).toBe(true);
     expect(safariOutcome(h, FAKE_VERIFY_HOST).failed).toBe(true);
   });
@@ -93,8 +95,9 @@ describe('step 13: gates re-checked before ACTIVE', () => {
     const env = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await bind(h, PROFILE_A, env);
     const opId = await startSwitch(env);
-    // 等待期间受管理段被外部修改（对账会标记 managed_segments_changed；提交按设计清除警告）
-    const text = readFileSync(h.profilePath, 'utf8').replace('SFE-ROUTE = select, REJECT, policy-path=sfe-nodes.list', 'SFE-ROUTE = select, REJECT, DIRECT, policy-path=sfe-nodes.list');
+    // 等待期间受管理段被外部修改（对账会标记 managed_segments_changed；提交按设计清除警告）。改的是入口段里的一行注释：节点组段
+    // 被改时节点资源也无法确认（node_resource_unverified，提交被拒绝，见 resource-reconcile.test.ts），那是另一回事
+    const text = readFileSync(h.profilePath, 'utf8').replace('# SFE-BEGIN entry v1\n', '# SFE-BEGIN entry v1\n# 用户的注释\n');
     writeFileSync(h.profilePath, text);
     await h.app.runPeriodicReconcile();
     expect(h.repos.routeState.get().warnings).toContain('managed_segments_changed');
@@ -314,7 +317,7 @@ describe('superseding a waiting activation, then failing before any write', () =
     const nodeA = h.repos.proxyRevisions.get(a, 1)!.nodeName;
     const first = await startSwitch(b);
     expect(h.repos.routeState.get()).toMatchObject({ phase: 'awaiting_safari_verify', entryMode: 'VERIFY_ONLY' });
-    h.fake.failNext('getGroupMembers');
+    failMembersReadOnceIn(h, 'checkSwitchPreconditions');
     const second = await startSwitch(c, { confirmed_environment_id: a });
     expect(h.repos.operations.get(first)!.phase).toBe('SUPERSEDED');
     const op = h.repos.operations.get(second)!;
@@ -337,7 +340,7 @@ describe('superseding a waiting activation, then failing before any write', () =
     const b = (await createEnv(h, 'US-Buyer-B', '203.0.113.11')).environment_id!;
     await bind(h, PROFILE_B, b);
     const before = h.repos.routeState.get();
-    h.fake.failNext('getGroupMembers');
+    failMembersReadOnceIn(h, 'checkSwitchPreconditions');
     const opId = await startSwitch(b, { confirmed_environment_id: a });
     expect(h.repos.operations.get(opId)!.phase).toBe('FAILED');
     const route = h.repos.routeState.get();

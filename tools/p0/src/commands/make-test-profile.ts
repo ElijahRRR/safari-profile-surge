@@ -117,7 +117,7 @@ export async function runMakeTestProfile(ctx: Ctx): Promise<ExitCode> {
   out.line(`2. 在 Surge 菜单「配置」中选择「${TEST_PROFILE_NAME}」。`);
   out.line(`3. 确认增强模式/系统代理与切换前一致，出站模式为规则模式。`);
   out.line(`4. 运行 inventory --run ${dir.id} --profile "${state.testProfilePath}"，按测试配置（含回环 http-api）更新原语映射。`);
-  out.line(`5. 运行 attribution 开始测试。`);
+  out.line(`5. 运行 attribution 开始测试；测试节点由回环测试资源提供：另开终端运行 resource-server，再运行 loopback --setup（只改写 SFE-ROUTE 一行，之后手动重新加载一次）。`);
   out.heading('回退');
   out.line(`在 Surge 菜单「配置」中切回「${profileNameOf(sourcePath)}」；之后运行 rollback 查看需要删除的文件与临时规则。`);
   return 0;

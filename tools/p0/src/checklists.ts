@@ -1,5 +1,6 @@
 // 人工检查清单：原生桥、场景 ID、签名持久性、首请求与旧连接，以及只作记录的批量创建/按 ID 打开。
-// 由自动测试命令测量的能力不走清单。答案：y 通过、n 不通过、空 未完成。
+// 由自动测试命令测量的能力不走清单（AUTOMATED_BY 给出命令；命令中需要操作员亲自做的步骤在命令的提示中完成）。
+// 答案：y 通过、n 不通过、空 未完成。
 
 import type { CapabilityKey } from '@sfe/contract';
 import { check, type CheckItem } from './results.js';
@@ -22,8 +23,12 @@ export const AUTOMATED_BY: Partial<Record<CapabilityKey, string>> = {
   runtime_entry_modes: 'entry',
   entry_rules_after_restart: 'entry --restart-test',
   safari_udp_quic_handling: 'entry',
-  targeted_resource_refresh: 'refresh',
-  policy_path_reread: 'refresh',
+  // 回环节点资源（D10）：resource-server 在另一个终端运行，loopback --setup 接入之后测量
+  loopback_resource_update: 'loopback',
+  // 另一系统用户的占用与 Surge 资源缓存位置由操作员在命令的提示中完成并记录
+  loopback_resource_auth: 'loopback-auth',
+  loopback_resource_restart: 'loopback-restart --phase prepare|after-surge-restart|after-mac-restart',
+  loopback_publish_crash: 'loopback-crash',
   external_node_underlying_proxy: 'chain',
   connection_continuity: 'continuity',
   auto_reload_atomic_replace: 'refresh',

@@ -1,11 +1,12 @@
 // --raw 输出解析的失败即关闭：未知的外层结构与无法识别的项一律报错，从不静默跳过或按行拆分人类可读输出。
 // 合成数据；dump temp-rule / dump rule 的 --raw 项格式没有写入文档，尚未在 Surge Mac 6.10 上实测（P0 用 entry --probe-insertion 正向确认）。
 
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
-import { ENTRY_MODE_BITS } from '@sfe/contract';
+import { ENTRY_MODE_BITS, nodeResourceUrl } from '@sfe/contract';
 import type { SurgeAdapter } from '../../src/ports.js';
 import { createCliAdapter, type ExecFn } from '../../src/surge/cli-adapter.js';
 import { cliArgvs } from '../../src/surge/cli-commands.js';
@@ -86,12 +87,14 @@ describe('parseRuleList fails closed (--raw dump rule)', () => {
   });
 });
 
+const sha = (s: string): string => createHash('sha256').update(s).digest('hex');
+
 describe('parseExternalResources', () => {
   const LOC = '/tmp/sfe-fixture/sfe-entry-block.list';
 
   test('a resource reported ready:false without error text is not healthy', () => {
     expect(parseExternalResources({ defines: [{ key: 'k', type: 'ruleset', path: LOC, local: true, ready: false }] })).toEqual([
-      { key: 'k', type: 'ruleset', location: LOC, lastUpdatedAt: null, error: 'not_ready', local: true, updating: null, fromModule: null },
+      { key: 'k', type: 'ruleset', location: LOC, locationHash: sha(LOC), lastUpdatedAt: null, error: 'not_ready', local: true, updating: null, fromModule: null },
     ]);
     expect(parseExternalResources({ defines: [{ key: 'k', type: 'ruleset', path: LOC, local: true, ready: true }] })[0]!.error).toBeNull();
     expect(parseExternalResources({ defines: [{ key: 'k', path: LOC, ready: 'no' }] })[0]!.error).toBe('not_ready');
@@ -126,11 +129,30 @@ describe('parseExternalResources', () => {
   test('Mac 6.10 fields: local, updating and fromModule are kept; a local resource never carries an update time; 0 means never downloaded', () => {
     // 文档的响应示例：{"path", "type": "ruleset", "key", "local": false, "ready": true, "updatedAt": 1759800000, "updating": false, "fromModule": null}
     expect(parseExternalResources({ defines: [{ path: 'https://rules.example.test/a.list', type: 'ruleset', key: 'r', local: false, ready: true, updatedAt: 1759800000, updating: false, fromModule: null }] })).toEqual([
-      { key: 'r', type: 'ruleset', location: 'https://rules.example.test/a.list', lastUpdatedAt: new Date(1759800000 * 1000), error: null, local: false, updating: false, fromModule: null },
+      { key: 'r', type: 'ruleset', location: 'https://rules.example.test/a.list', locationHash: sha('https://rules.example.test/a.list'), lastUpdatedAt: new Date(1759800000 * 1000), error: null, local: false, updating: false, fromModule: null },
     ]);
     const local = parseExternalResources({ defines: [{ path: LOC, type: 'ruleset', key: 'l', local: true, ready: true, updatedAt: 1759800000, updating: true, fromModule: 'Mod' }] })[0]!;
     expect(local).toMatchObject({ lastUpdatedAt: null, local: true, updating: true, fromModule: 'Mod' });
     expect(parseExternalResources({ defines: [{ path: 'https://rules.example.test/a.list', key: 'r', local: false, updatedAt: 0 }] })[0]!.lastUpdatedAt).toBeNull();
+  });
+
+  test('locationHash is the unkeyed SHA-256 of the raw location; the loopback token never appears in location (D10)', () => {
+    // 合成令牌与端口
+    const token = 'ef'.repeat(32);
+    const url = nodeResourceUrl(20001, token);
+    const [ours, other] = parseExternalResources({
+      defines: [
+        { key: 'k1', type: 'policy-group', path: url, local: false, ready: true, updatedAt: 1759800000, updating: false, fromModule: null },
+        { key: 'k2', type: 'policy-group', path: nodeResourceUrl(20001, 'e0'.repeat(32)), local: false, ready: true },
+      ],
+    });
+    expect(ours).toMatchObject({ location: 'http://127.0.0.1:20001/***', locationHash: sha(url) });
+    expect(JSON.stringify(ours)).not.toContain(token);
+    expect(other!.location).toBe(ours!.location);
+    expect(other!.locationHash).not.toBe(ours!.locationHash);
+    // 摘要按 Surge 报告的原样计算（遮盖之前）：带用户信息与查询的地址也一样
+    const raw = 'https://u:p@sub.example.test/x?token=1';
+    expect(parseExternalResources({ defines: [{ key: 'k', path: raw }] })[0]).toMatchObject({ location: 'https://***@sub.example.test/x?***', locationHash: sha(raw) });
   });
 
   test.each([
@@ -273,5 +295,21 @@ describe('Surge Mac 6.10 read parsers fail closed', () => {
     expect(() => parseResourceUpdateMap({ k: true }, 'k', id)).toThrow(/无法识别/);
     expect(() => parseResourceUpdateMap({ k: 'success', other: 'success' }, 'k', id)).toThrow(/无法识别/);
     expect(() => parseResourceUpdateMap('success', 'k', id)).toThrow(/无法识别/);
+  });
+
+  test('a skip for the remote loopback resource key stays distinguishable from a download (publish treats it as a failure, D10)', () => {
+    // 本机资源服务的资源是远端资源：skipped 是意外结果，调用方必须能把它与 downloaded 区分开，从不当作“没有变化”的成功
+    const key = '0123456789abcdef0123456789abcdef';
+    const outcomes = [
+      parseResourceUpdateText(NO_REMOTE_RESOURCE_UPDATED_TEXT, key, id),
+      parseResourceUpdateMap({}, key, id),
+    ];
+    for (const r of outcomes) {
+      expect(r).toEqual({ key, refreshed: false, outcome: 'skipped' });
+      expect(r.outcome).not.toBe('downloaded');
+    }
+    expect(parseResourceUpdateText(`${key}: success`, key, id).outcome).toBe('downloaded');
+    // 下载失败（回环矩阵：退出 0、保留旧资源）不是跳过，而是失败
+    expect(() => parseResourceUpdateText(`${key}: 服务器未返回任何数据。`, key, id)).toThrow(/更新外部资源失败/);
   });
 });

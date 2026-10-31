@@ -12,8 +12,8 @@ import { recoverRoute, resumeRoute, runActivation, runNormal, runProbeSafari, se
 import { runInit, runRemerge } from './maintenance.js';
 
 export interface DispatchHooks {
-  /** 重新合并恢复节点资源后发起一次发布。 */
-  enqueuePublish: () => void;
+  /** 重新合并重新提供节点资源的已提交版本之后排入一次强制刷新的发布；已有排队或执行中的发布时不另排。返回是否排入。 */
+  enqueuePublish: () => boolean;
 }
 
 const WRITE_PHASES = new Set(['DEPLOYING', 'RECONCILING', 'ROLLING_BACK']);

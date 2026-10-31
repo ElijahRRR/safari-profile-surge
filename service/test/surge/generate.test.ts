@@ -1,13 +1,16 @@
 import { describe, expect, test } from 'vitest';
 import {
+  EMPTY_PLACEHOLDER_LINE,
   ENTRY_PLACEHOLDER_PROCESS_PATH,
   ENTRY_PLACEHOLDER_RULE,
   ENTRY_PROBE_IPV4,
   ENTRY_WITNESS_PROCESS_PREFIX,
   LEGACY_ENTRY_PLACEHOLDER_RULE,
   LEGACY_ENTRY_WITNESS_PROCESS_PATH,
+  LEGACY_NODE_GROUP_LINE,
   PREVIOUS_ENTRY_PLACEHOLDER_RULE,
   SfeError,
+  nodeResourceUrl,
 } from '@sfe/contract';
 import {
   entryRuleSetBlockLines,
@@ -16,15 +19,20 @@ import {
   entryWitnessProcessPath,
   entryWitnessRule,
   groupBlockLines,
+  isLegacyNodeGroupLine,
   legacyTempRuleText,
+  loopbackGroupBlockLines,
   nodeLine,
   parseEntryRuleSetFile,
+  resourceBody,
   resourceFile,
+  rewriteLoopbackForCheck,
   tempEntryRuleTexts,
   tempRuleText,
   validateSafariProcessPaths,
 } from '../../src/surge/generate.js';
 import { evaluateCondition, parseCondition, parseRule, processNameMayMatch, type RuleCondition } from '../../src/surge/rules.js';
+import { insertInitialBlocks, listRelativeReferences } from '../../src/surge/profile.js';
 
 const SAFARI = '/Applications/Safari.app/Contents/MacOS/Safari';
 const SAFARI_TP = '/Applications/Safari Technology Preview.app/Contents/MacOS/Safari Technology Preview';
@@ -128,8 +136,96 @@ describe('resourceFile and group block', () => {
     expect(() => resourceFile(-1, [])).toThrow(SfeError);
   });
 
-  test('group block has REJECT as first member and the node resource', () => {
+  test('legacy group block (detection only) has REJECT as first member and the local node file', () => {
     expect(groupBlockLines()).toEqual(['SFE-ROUTE = select, REJECT, policy-path=sfe-nodes.list']);
+    expect(groupBlockLines()).toEqual([LEGACY_NODE_GROUP_LINE]);
+    expect(isLegacyNodeGroupLine(LEGACY_NODE_GROUP_LINE)).toBe(true);
+    expect(isLegacyNodeGroupLine(`  ${LEGACY_NODE_GROUP_LINE}  `)).toBe(true);
+    expect(isLegacyNodeGroupLine(loopbackGroupBlockLines(nodeResourceUrl(20001, 'a'.repeat(64)))[0]!)).toBe(false);
+    expect(isLegacyNodeGroupLine('SFE-ROUTE = select, REJECT, policy-path=other.list')).toBe(false);
+  });
+});
+
+describe('loopback node resource (D10)', () => {
+  // 合成令牌与端口（运行时拼出）
+  const TOKEN = 'a'.repeat(64);
+  const URL = nodeResourceUrl(20001, TOKEN);
+  const NODE = 'SFE-N-E0001-US01-v001 = socks5, 203.0.113.10, 1080, underlying-proxy=Front-A';
+
+  test('group block points SFE-ROUTE at the loopback URL with REJECT first and no group-level modifiers', () => {
+    const lines = loopbackGroupBlockLines(URL);
+    expect(lines).toEqual([`SFE-ROUTE = select, REJECT, policy-path=http://127.0.0.1:20001/${TOKEN}/sfe-nodes.list`]);
+    expect(lines[0]).not.toMatch(/underlying-proxy|external-policy-modifier|policy-regex-filter|external-policy-name-prefix|update-interval/);
+  });
+
+  test.each([
+    ['a local file', 'sfe-nodes.list'],
+    ['localhost', `http://localhost:20001/${TOKEN}/sfe-nodes.list`],
+    ['an upper-case token', nodeResourceUrl(20001, TOKEN).replace(TOKEN, TOKEN.toUpperCase())],
+    ['a query', `${URL}?x=1`],
+    ['another basename', URL.replace('sfe-nodes.list', 'other.list')],
+    ['a line break', `${URL}\nSFE-X = direct`],
+  ])('refuses %s', (_name, url) => {
+    expect(() => loopbackGroupBlockLines(url)).toThrow(/本机资源服务地址不正确/);
+  });
+
+  test('resource body: generation header, nodes, and the placeholder line only when there are no nodes', () => {
+    expect(resourceBody(3, [NODE])).toBe(resourceFile(3, [NODE]));
+    expect(resourceBody(3, [NODE])).not.toContain(EMPTY_PLACEHOLDER_LINE);
+    expect(resourceBody(0, [])).toBe(`# SFE managed resource · generation 0\n${EMPTY_PLACEHOLDER_LINE}\n`);
+    expect(EMPTY_PLACEHOLDER_LINE).toBe('SFE-EMPTY = reject');
+    expect(() => resourceBody(-1, [])).toThrow(SfeError);
+    expect(() => resourceBody(1, ['a\nb'])).toThrow(SfeError);
+  });
+
+  const PROFILE = (group: readonly string[]): string =>
+    insertInitialBlocks(
+      ['[General]', 'loglevel = notify', '', '[Proxy]', 'Front-A = socks5, 192.0.2.10, 1080', '', '[Proxy Group]', 'Daily = select, Front-A, DIRECT', '', '[Rule]', 'FINAL,DIRECT', ''].join('\r\n'),
+      { group, entry: ['RULE-SET,sfe-entry-udp.list,REJECT'], general: null },
+    );
+
+  test('rewriteLoopbackForCheck replaces only the SFE-ROUTE policy-path value and supplies the candidate body', () => {
+    const text = PROFILE(loopbackGroupBlockLines(URL));
+    const body = resourceBody(4, [NODE]);
+    const out = rewriteLoopbackForCheck(text, body, URL);
+    expect(out.text).toBe(text.replace(URL, 'sfe-nodes.list'));
+    expect(out.text).toContain(`${LEGACY_NODE_GROUP_LINE}\r\n`);
+    expect(out.text).not.toContain(TOKEN);
+    expect([...out.overrides]).toEqual([['sfe-nodes.list', body]]);
+    // --check 的候选目录据此为 sfe-nodes.list 准备候选副本（listRelativeReferences 只列相对路径）
+    expect(listRelativeReferences(out.text).map((r) => r.value)).toEqual(['sfe-nodes.list', 'sfe-entry-udp.list']);
+    // 不给 expectedUrl 时接受任何格式正确的本机资源服务地址
+    expect(rewriteLoopbackForCheck(text, body).text).toBe(out.text);
+  });
+
+  test.each([
+    ['the legacy local line', () => PROFILE(groupBlockLines())],
+    ['no SFE-ROUTE definition', () => PROFILE(['SFE-OTHER = select, REJECT'])],
+    ['two SFE-ROUTE definitions', () => PROFILE([...loopbackGroupBlockLines(URL), ...loopbackGroupBlockLines(URL)])],
+    ['two policy-path parameters', () => PROFILE([`${loopbackGroupBlockLines(URL)[0]}, policy-path=${URL}`])],
+    ['a different URL than expected', () => PROFILE(loopbackGroupBlockLines(nodeResourceUrl(20002, TOKEN)))],
+    ['a non-loopback URL', () => PROFILE(['SFE-ROUTE = select, REJECT, policy-path=https://nodes.example.test/a.list'])],
+  ])('rewriteLoopbackForCheck fails with %s', (_name, make) => {
+    const err = (() => {
+      try {
+        rewriteLoopbackForCheck(make(), resourceBody(1, [NODE]), URL);
+      } catch (e) {
+        return e as SfeError;
+      }
+      throw new Error('expected a failure');
+    })();
+    expect(err).toBeInstanceOf(SfeError);
+    expect(err.code).toBe('VALIDATION_FAILED');
+    expect(err.message).not.toContain(TOKEN);
+  });
+
+  test('rewriteLoopbackForCheck fails when the group segment is missing or the URL is referenced elsewhere', () => {
+    const noSegment = ['[Proxy Group]', ...loopbackGroupBlockLines(URL), '[Rule]', 'FINAL,DIRECT'].join('\n');
+    expect(() => rewriteLoopbackForCheck(noSegment, '')).toThrow(expect.objectContaining({ code: 'BASELINE_CHANGED' }));
+    const elsewhere = PROFILE(loopbackGroupBlockLines(URL)).replace('Daily = select, Front-A, DIRECT', `Daily = select, Front-A, DIRECT, policy-path=${URL}`);
+    expect(() => rewriteLoopbackForCheck(elsewhere, '', URL)).toThrow(/之外也引用了本机资源服务地址/);
+    const commented = PROFILE(loopbackGroupBlockLines(URL)).replace('[Rule]', `# ${TOKEN}\r\n[Rule]`);
+    expect(() => rewriteLoopbackForCheck(commented, '', URL)).toThrow(/之外也引用了本机资源服务地址/);
   });
 });
 

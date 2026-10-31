@@ -8,7 +8,16 @@ import type { SurgeAdapter } from '../ports.js';
 import { execFixed } from '../util/exec-fixed.js';
 import { CLI_COMMANDS, isAllowedCliArgv, type CliCommand, type CliOutput, type CliParseContext, type CliSequence } from './cli-commands.js';
 import { parseJsonLoose } from './parse-output.js';
-import { SURGE_PRIMITIVES, capabilityUnverified, truncate, type MechanismMap, type SurgePrimitive } from './primitives.js';
+import {
+  SURGE_PRIMITIVES,
+  capabilityUnverified,
+  resourceUpdateTimeoutError,
+  truncate,
+  validatePrimitiveTimeouts,
+  type MechanismMap,
+  type PrimitiveTimeouts,
+  type SurgePrimitive,
+} from './primitives.js';
 import { redactFreeText } from './redact-profile.js';
 
 export interface ExecResult {
@@ -24,6 +33,8 @@ export interface CliAdapterOptions {
   mechanism: MechanismMap;
   exec?: ExecFn;
   timeoutMs?: number;
+  /** 单个原语的超时，覆盖 timeoutMs（例如 updateExternalResource，见 primitives.ts SURGE_RESOURCE_UPDATE_TIMEOUT_MS）。 */
+  timeoutsMs?: PrimitiveTimeouts;
   maxBuffer?: number;
   scrub: (s: string) => string;
   now?: () => Date;
@@ -125,6 +136,7 @@ type AnyCommand = CliCommand<unknown[], unknown> | CliSequence<unknown[], unknow
 export function createCliAdapter(opts: CliAdapterOptions): SurgeAdapter {
   const exec = opts.exec ?? defaultExec;
   const timeout = opts.timeoutMs ?? 15_000;
+  const timeouts = validatePrimitiveTimeouts(opts.timeoutsMs);
   const maxBuffer = opts.maxBuffer ?? 8 * 1024 * 1024;
   const mechanism = { ...opts.mechanism };
   const now = opts.now ?? (() => new Date());
@@ -133,7 +145,7 @@ export function createCliAdapter(opts: CliAdapterOptions): SurgeAdapter {
   async function execOne(primitive: SurgePrimitive, argv: string[], nonZeroExitIsResult: boolean): Promise<CliOutput> {
     let out: CliOutput;
     try {
-      const r = await exec(opts.cliPath, argv, { timeout, maxBuffer });
+      const r = await exec(opts.cliPath, argv, { timeout: timeouts[primitive] ?? timeout, maxBuffer });
       out = { stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''), exitCode: 0 };
     } catch (raw) {
       const err = (raw ?? {}) as ExecError;
@@ -145,7 +157,10 @@ export function createCliAdapter(opts: CliAdapterOptions): SurgeAdapter {
         throw new SfeError('SURGE_UNREACHABLE', '连接 Surge 失败：命令行工具不可用');
       }
       if (err.killed || (err.signal !== undefined && err.signal !== null)) {
-        throw new SfeError('SURGE_UNREACHABLE', '连接 Surge 失败：命令超时');
+        if (primitive !== 'updateExternalResource') throw new SfeError('SURGE_UNREACHABLE', '连接 Surge 失败：命令超时');
+        // 更新单个外部资源的命令已经发出：被结束时 Surge 可能仍在下载或已经载入——结果未知，不是“无法连接”。
+        // 输出超限也会结束子进程：落到下面的“输出超过上限”（同样是结果未知的命令失败）。
+        if (err.code !== 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') throw resourceUpdateTimeoutError();
       }
       if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
         throw new SfeError('SURGE_COMMAND_FAILED', '执行 Surge 命令失败：输出超过上限');

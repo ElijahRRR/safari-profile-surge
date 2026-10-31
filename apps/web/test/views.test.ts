@@ -11,7 +11,7 @@ import InitWizardCard from '../src/components/InitWizardCard.vue';
 import RouteActionHost from '../src/components/RouteActionHost.vue';
 import RouteCard from '../src/components/RouteCard.vue';
 import AppLayout from '../src/components/AppLayout.vue';
-import { byText, click, environment, flush, mountWith, operation, route, snapshot, testContext, type Call } from './fixtures';
+import { byText, click, environment, flush, mountWith, nodeResource, operation, route, snapshot, snapshotWithNodeResource, testContext, type Call } from './fixtures';
 
 afterEach(() => {
   document.body.innerHTML = '';
@@ -575,6 +575,72 @@ describe('init wizard', () => {
     expect(document.body.querySelector('[data-test="init-failed"]')?.textContent).toContain('初始化失败：目标文件已存在');
     expect(document.body.querySelector('[data-test="init-commit"]')).not.toBeNull();
     expect(byText('button', '生成预览')).not.toBeNull();
+    m.unmount();
+  });
+});
+
+describe('local resource server status (D10)', () => {
+  /** 页面上不能出现资源地址、端口或令牌的样子。 */
+  function expectNoResourceSecrets() {
+    const text = document.body.textContent ?? '';
+    expect(text).not.toMatch(/127\.0\.0\.1:\d/);
+    expect(text).not.toMatch(/[0-9a-f]{32,}/i);
+    expect(text).not.toContain('/sfe-nodes.list');
+  }
+
+  it('shows the state and both flags on the publish page with the explanation, and follows surge.status events', async () => {
+    const snap = snapshotWithNodeResource(nodeResource());
+    const { ctx } = testContext(() => NOT_FOUND, snap);
+    const m = await mountWith(PublishView, ctx, {}, '/publish');
+    const state = document.body.querySelector('[data-test="node-resource-state"]')!;
+    expect(state.textContent).toContain('正在提供');
+    expect(state.querySelector('.badge-success')).not.toBeNull();
+    expect(document.body.querySelector('[data-test="node-resource-notes"]')).toBeNull();
+    ctx.store.applyEvent({ type: 'surge.status', sequence: 11, surge: { ...snap.surge, nodeResource: nodeResource({ state: 'not_listening', tokenSuspect: true, needsRefresh: true }) } });
+    await flush();
+    expect(state.textContent).toContain('未监听');
+    expect(state.textContent).toContain('令牌可能已泄露');
+    expect(state.textContent).toContain('待重新同步');
+    expect(state.querySelector('.badge-success')).toBeNull();
+    const notes = document.body.querySelector('[data-test="node-resource-notes"]')!;
+    expect(notes.textContent).toContain('RESOURCE_SERVER_UNAVAILABLE');
+    expect(notes.textContent).toContain('更换本机资源地址');
+    expect(notes.textContent).toContain('单 key 更新并读回');
+    expect(notes.className).toContain('bg-red-50');
+    expectNoResourceSecrets();
+    m.unmount();
+  });
+
+  it('explains the legacy local-file line as needing a remerge', async () => {
+    const { ctx } = testContext(() => NOT_FOUND, snapshotWithNodeResource(nodeResource({ state: 'legacy_line' })));
+    const m = await mountWith(PublishView, ctx, {}, '/publish');
+    expect(document.body.querySelector('[data-test="node-resource-state"]')?.textContent).toContain('仍引用本地节点文件');
+    const notes = document.body.querySelector('[data-test="node-resource-notes"]')!;
+    expect(notes.textContent).toContain('需要重新合并以改用本机资源服务');
+    expect(notes.textContent).toContain('已保存，待部署');
+    expect(notes.className).toContain('bg-amber-50');
+    expectNoResourceSecrets();
+    m.unmount();
+  });
+
+  it('shows no row for an older service that reports no resource status', async () => {
+    const { ctx } = testContext(() => NOT_FOUND, snapshot());
+    const m = await mountWith(PublishView, ctx, {}, '/publish');
+    expect(document.body.querySelector('[data-test="node-resource-state"]')).toBeNull();
+    const labels = Array.from(document.body.querySelectorAll('[data-test="working-profile"] dt')).map((d) => d.textContent);
+    expect(labels).toContain('受管理段');
+    expect(labels).not.toContain('本机资源服务');
+    expect(document.body.querySelector('[data-test="node-resource-notes"]')).toBeNull();
+    m.unmount();
+  });
+
+  it('the overview Surge card shows the state without address details', async () => {
+    const { ctx } = testContext(() => NOT_FOUND, snapshotWithNodeResource(nodeResource({ state: 'token_unavailable' })));
+    const m = await mountWith(OverviewView, ctx);
+    const card = document.body.querySelector('[data-test="surge-card"]')!;
+    expect(card.textContent).toContain('本机资源服务');
+    expect(card.textContent).toContain('读取令牌不可用');
+    expectNoResourceSecrets();
     m.unmount();
   });
 });

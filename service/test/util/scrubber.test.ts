@@ -1,5 +1,13 @@
 import { describe, expect, test } from 'vitest';
-import { createScrubber, MAX_REGISTERED_CHARS, MAX_REGISTERED_SECRET_LENGTH, MAX_REGISTERED_VALUES, SCRUB_MASK, scrubText } from '../../src/util/scrubber.js';
+import {
+  createScrubber,
+  MAX_PINNED_VALUES,
+  MAX_REGISTERED_CHARS,
+  MAX_REGISTERED_SECRET_LENGTH,
+  MAX_REGISTERED_VALUES,
+  SCRUB_MASK,
+  scrubText,
+} from '../../src/util/scrubber.js';
 
 const M = SCRUB_MASK;
 // 测试夹具中的“秘密”用插值拼接，避免仓库秘密扫描把测试文本当作真实凭据
@@ -103,7 +111,47 @@ describe('URLs', () => {
     const code = 'Q2hhbmdlTWVQbGVhc2UxMjM0NTY3ODkw';
     const out = scrubText(`open http://127.0.0.1:61847/auth/exchange?code=${code}`);
     expect(out).not.toContain(code);
-    expect(out).toContain('/auth/exchange?code=');
+    // 回环地址的整段路径（含查询）都遮盖，只留主机与端口
+    expect(out).toBe(`open http://127.0.0.1:61847/${M}`);
+  });
+});
+
+describe('loopback URLs (D10: the resource read token is in the path)', () => {
+  // 合成令牌：运行时拼出，仓库扫描不会把它当作真实令牌
+  const TOKEN = 'ab'.repeat(32);
+  const url = (host: string, scheme = 'http') => `${scheme}://${host}/${TOKEN}/sfe-nodes.list`;
+
+  test.each(['127.0.0.1:20001', 'localhost:20001', '[::1]:20001', '127.0.0.1', 'LOCALHOST:20001', '127.1.2.3:20001'])('masks the whole path for %s', (host) => {
+    for (const scheme of ['http', 'https']) {
+      const out = scrubText(`policy-path=${url(host, scheme)}, update`);
+      expect(out).toBe(`policy-path=${scheme}://${host}/${M}, update`);
+      expect(out).not.toContain(TOKEN);
+      expect(out).not.toContain('sfe-nodes.list');
+    }
+  });
+
+  test('also masks query and fragment, keeps userinfo masking and trailing punctuation', () => {
+    expect(scrubText(`(see ${url('127.0.0.1:20001')}).`)).toBe(`(see http://127.0.0.1:20001/${M}).`);
+    expect(scrubText('GET http://127.0.0.1:1/a?b=c#d ok')).toBe(`GET http://127.0.0.1:1/${M} ok`);
+    expect(scrubText(`http://u:p@127.0.0.1:20001/${TOKEN}/x`)).toBe(`http://${M}@127.0.0.1:20001/${M}`);
+  });
+
+  test('keeps a bare or root loopback address', () => {
+    expect(scrubText('listening on http://127.0.0.1:61847/')).toBe('listening on http://127.0.0.1:61847/');
+    expect(scrubText('listening on http://127.0.0.1:61847')).toBe('listening on http://127.0.0.1:61847');
+  });
+
+  test('other hosts and non-http schemes keep the existing behaviour', () => {
+    expect(scrubText('see http://192.0.2.1:8080/a/b')).toBe('see http://192.0.2.1:8080/a/b');
+    expect(scrubText('see https://127.example.test/a/b')).toBe('see https://127.example.test/a/b');
+    expect(scrubText('socks5://127.0.0.1:1080/x')).toBe('socks5://127.0.0.1:1080/x');
+  });
+
+  test('the registered scrubber masks the token even outside a URL', () => {
+    const s = createScrubber();
+    s.register(TOKEN, { pinned: true });
+    expect(s.scrub(`key ${TOKEN}:x`)).toBe(`key ${M}:x`);
+    expect(s.scrub(`127.0.0.1:20001/${TOKEN}/sfe-nodes.list`)).not.toContain(TOKEN);
   });
 });
 
@@ -294,6 +342,35 @@ describe('createScrubber: value registry', () => {
     expect(s.scrub(`auth rejected (${keep})`)).toBe(`auth rejected (${M})`);
     expect(s.scrub('<Fill-0-value>')).toBe('<Fill-0-value>');
     expect(s.scrub(`<Fill-${MAX_REGISTERED_VALUES}-value>`)).toBe(`<${M}>`);
+  });
+
+  test('a pinned value (a long-lived system secret read once) is never evicted', () => {
+    const s = createScrubber({ maxValues: 100 });
+    const token = 'Res0urce-Read-T0ken';
+    s.register(token, { pinned: true });
+    for (let i = 0; i < 1000; i++) s.register(`Fill-${i}-value`);
+    expect(s.registeredCount()).toBe(101);
+    expect(s.scrub(`fetch /${token}/x`)).toBe(`fetch /${M}/x`);
+    expect(s.scrub('<Fill-0-value>')).toBe('<Fill-0-value>');
+    // 已作为普通值登记、之后常驻：不重复计数，也不会再被淘汰
+    const s2 = createScrubber({ maxValues: 3 });
+    s2.register('Earlier-Normal');
+    s2.register('Earlier-Normal', { pinned: true });
+    expect(s2.registeredCount()).toBe(1);
+    for (let i = 0; i < 10; i++) s2.register(`Fill-${i}-value`);
+    expect(s2.scrub('x Earlier-Normal y')).toBe(`x ${M} y`);
+    expect(s2.registeredCount()).toBe(4);
+  });
+
+  test('pinned entries are capped; beyond the cap they are registered as ordinary values', () => {
+    const s = createScrubber({ maxValues: 10 });
+    for (let i = 0; i < MAX_PINNED_VALUES + 5; i++) s.register(`Pinned-${i}-secret`, { pinned: true });
+    expect(s.registeredCount()).toBe(MAX_PINNED_VALUES + 5);
+    for (let i = 0; i < 50; i++) s.register(`Fill-${i}-value`);
+    expect(s.registeredCount()).toBe(MAX_PINNED_VALUES + 10);
+    expect(s.scrub('<Pinned-0-secret>')).toBe(`<${M}>`);
+    expect(s.scrub(`<Pinned-${MAX_PINNED_VALUES - 1}-secret>`)).toBe(`<${M}>`);
+    expect(s.scrub(`<Pinned-${MAX_PINNED_VALUES}-secret>`)).toBe(`<Pinned-${MAX_PINNED_VALUES}-secret>`);
   });
 
   test('the registry is bounded by total characters as well', () => {

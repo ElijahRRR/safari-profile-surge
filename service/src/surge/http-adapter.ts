@@ -12,7 +12,16 @@ import { SfeError, type TakeoverState } from '@sfe/contract';
 import type { SurgeAdapter, SurgePolicyDetail, SurgePolicyTestResult, SurgeRuleRecord } from '../ports.js';
 import { safeConnectionId, safeResourceKey, safeRouteSelection } from './cli-commands.js';
 import { parseExternalResources, parseMetricsUptime, parsePolicyNames, parseRequestRecords, parseResourceUpdateMap, unrecognized } from './parse-output.js';
-import { capabilityUnverified, maskKnown, truncate, type MechanismMap, type SurgePrimitive } from './primitives.js';
+import {
+  capabilityUnverified,
+  maskKnown,
+  resourceUpdateTimeoutError,
+  truncate,
+  validatePrimitiveTimeouts,
+  type MechanismMap,
+  type PrimitiveTimeouts,
+  type SurgePrimitive,
+} from './primitives.js';
 import { parseProxyLine } from './proxy-line.js';
 import { redactFreeText, redactProxyLine } from './redact-profile.js';
 import { parseProfile, findSections } from './profile.js';
@@ -23,6 +32,8 @@ export interface HttpAdapterOptions {
   mechanism: MechanismMap;
   fetch?: typeof fetch;
   timeoutMs?: number;
+  /** 单个原语的超时，覆盖 timeoutMs（例如 updateExternalResource，见 primitives.ts SURGE_RESOURCE_UPDATE_TIMEOUT_MS）。 */
+  timeoutsMs?: PrimitiveTimeouts;
   scrub: (s: string) => string;
   now?: () => Date;
 }
@@ -66,6 +77,7 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
   const base = assertLoopbackBase(opts.baseUrl);
   const doFetch = opts.fetch ?? globalThis.fetch;
   const timeoutMs = opts.timeoutMs ?? 10_000;
+  const timeouts = validatePrimitiveTimeouts(opts.timeoutsMs);
   const mechanism = { ...opts.mechanism };
   const now = opts.now ?? (() => new Date());
 
@@ -73,11 +85,16 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
     if (mechanism[p] !== 'http') throw capabilityUnverified(p);
   }
 
-  async function request(method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
+  /** primitive 决定超时（timeoutsMs 覆盖缺省值）与超时的分类。 */
+  async function request(primitive: SurgePrimitive, method: 'GET' | 'POST', path: string, body?: unknown): Promise<unknown> {
     const key = await opts.getKey();
     const clean = (s: string): string => opts.scrub(redactFreeText(maskKnown(s, [key])));
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeouts[primitive] ?? timeoutMs);
     let res: Response;
     try {
       res = await doFetch(new URL(path, base), {
@@ -88,6 +105,8 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
         redirect: 'error',
       });
     } catch {
+      // 更新单个外部资源的请求已经发出：超时之后 Surge 可能仍在下载或已经载入——结果未知，不是“无法连接”。
+      if (timedOut && primitive === 'updateExternalResource') throw resourceUpdateTimeoutError();
       throw new SfeError('SURGE_UNREACHABLE', '连接 Surge HTTP API 失败：无响应或超时');
     } finally {
       clearTimeout(timer);
@@ -113,7 +132,7 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
 
   async function feature(path: string): Promise<boolean | null> {
     try {
-      const json = await request('GET', path);
+      const json = await request('getTakeoverState', 'GET', path);
       return isObject(json) && typeof json.enabled === 'boolean' ? json.enabled : null;
     } catch (e) {
       if (e instanceof SfeError && e.code === 'SURGE_UNREACHABLE') throw e;
@@ -132,7 +151,7 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
     async getRuntimeInfo() {
       guard('getRuntimeInfo');
       // Prometheus 文本（“`/v1/metrics` returns plain text instead of JSON”）：surge_uptime_seconds “Engine uptime”。
-      const body = await request('GET', '/v1/metrics');
+      const body = await request('getRuntimeInfo', 'GET', '/v1/metrics');
       if (typeof body !== 'string') throw unrecognized('引擎运行时长');
       const uptimeSeconds = parseMetricsUptime(body);
       const at = now().getTime();
@@ -151,7 +170,7 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
       guard('getCurrentProfile');
       // sensitive=0；只取名称，配置正文立即丢弃。文档只说明该端点返回配置正文（“Obtain the text content of the current
       // profile.”），name 字段未写入文档，也没有路径——TODO(P0)：确认有 name 字段才保留这个实现；路径用 CLI 的 status。
-      const json = await request('GET', '/v1/profiles/current?sensitive=0');
+      const json = await request('getCurrentProfile', 'GET', '/v1/profiles/current?sensitive=0');
       const name = isObject(json) && typeof json.name === 'string' ? json.name : null;
       if (name === null) throw unrecognized('当前配置');
       return { name, path: null };
@@ -163,7 +182,7 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
       const systemProxy = await feature('/v1/features/system_proxy');
       let outboundMode: TakeoverState['outboundMode'] = null;
       try {
-        const json = await request('GET', '/v1/outbound');
+        const json = await request('getTakeoverState', 'GET', '/v1/outbound');
         const mode = isObject(json) ? json.mode : null;
         outboundMode = mode === 'rule' || mode === 'direct' || mode === 'proxy' ? mode : null;
       } catch (e) {
@@ -174,12 +193,12 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
 
     async listPolicies() {
       guard('listPolicies');
-      return parsePolicyNames(await request('GET', '/v1/policies'));
+      return parsePolicyNames(await request('listPolicies', 'GET', '/v1/policies'));
     },
 
     async getPolicyDetail(name: string): Promise<SurgePolicyDetail> {
       guard('getPolicyDetail');
-      const json = await request('GET', `/v1/policies/detail?policy_name=${q(name)}`);
+      const json = await request('getPolicyDetail', 'GET', `/v1/policies/detail?policy_name=${q(name)}`);
       const line = findProxyLine(json, name);
       if (line === null) return { name, type: null, server: null, port: null, underlyingProxy: null, redactedRaw: null };
       const parsed = parseProxyLine(line);
@@ -197,7 +216,7 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
     async getGroupMembers(group: string) {
       guard('getGroupMembers');
       // “List all policy groups and their options.”——结构未写入文档（TODO(P0)）。
-      const json = await request('GET', '/v1/policy_groups');
+      const json = await request('getGroupMembers', 'GET', '/v1/policy_groups');
       const members = isObject(json) ? json[group] : undefined;
       if (!Array.isArray(members)) throw new SfeError('SURGE_COMMAND_FAILED', '读取策略组失败：组不存在', { details: { group } });
       // 无法识别的成员不能静默丢弃：读回会把缺少的成员当作不存在。
@@ -210,7 +229,7 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
 
     async getGroupSelection(group: string) {
       guard('getGroupSelection');
-      const json = await request('GET', `/v1/policy_groups/select?group_name=${q(group)}`);
+      const json = await request('getGroupSelection', 'GET', `/v1/policy_groups/select?group_name=${q(group)}`);
       return isObject(json) && typeof json.policy === 'string' ? json.policy : null;
     },
 
@@ -218,12 +237,12 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
       guard('selectGroupPolicy');
       // 只选择 SFE-ROUTE，选项不能是 auto（与 CLI 相同的限制）。
       const [g, p] = safeRouteSelection(group, policy);
-      await request('POST', '/v1/policy_groups/select', { group_name: g, policy: p });
+      await request('selectGroupPolicy', 'POST', '/v1/policy_groups/select', { group_name: g, policy: p });
     },
 
     async testPolicy(policy: string, url: string): Promise<SurgePolicyTestResult> {
       guard('testPolicy');
-      const json = await request('POST', '/v1/policies/test', { policy_names: [policy], url });
+      const json = await request('testPolicy', 'POST', '/v1/policies/test', { policy_names: [policy], url });
       const r = isObject(json) ? json[policy] : undefined;
       if (!isObject(r)) return { ok: false, latencyMs: null, error: '没有返回测试结果' };
       const latency = [r.receive, r.tcp, r.latency].find((v) => typeof v === 'number' && v >= 0) as number | undefined;
@@ -233,7 +252,7 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
 
     async listRules(): Promise<SurgeRuleRecord[]> {
       guard('listRules');
-      const json = await request('GET', '/v1/rules');
+      const json = await request('listRules', 'GET', '/v1/rules');
       const rules = isObject(json) ? json.rules : Array.isArray(json) ? json : null;
       // 与 CLI 解析一致：空列表（总有 FINAL）或无法识别的条目都是误读，不能静默丢弃（被丢弃的规则可能排在入口之前）。
       if (!Array.isArray(rules) || rules.length === 0) throw unrecognized('规则列表');
@@ -246,18 +265,18 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
 
     async listActiveRequests() {
       guard('listActiveRequests');
-      return parseRequestRecords(await request('GET', '/v1/requests/active'));
+      return parseRequestRecords(await request('listActiveRequests', 'GET', '/v1/requests/active'));
     },
     async listRecentRequests() {
       guard('listRecentRequests');
-      return parseRequestRecords(await request('GET', '/v1/requests/recent'));
+      return parseRequestRecords(await request('listRecentRequests', 'GET', '/v1/requests/recent'));
     },
     async killRequest(id: string) {
       guard('killRequest');
       // 文档：POST /v1/requests/kill，{"id": 100}——只结束一个请求，只接受数字 id。
       const n = Number(safeConnectionId(id));
       if (!Number.isSafeInteger(n)) throw new SfeError('VALIDATION_FAILED', '执行 Surge 命令失败：连接编号不合法');
-      await request('POST', '/v1/requests/kill', { id: n });
+      await request('killRequest', 'POST', '/v1/requests/kill', { id: n });
     },
 
     async matchRule() {
@@ -269,14 +288,14 @@ export function createHttpAdapter(opts: HttpAdapterOptions): SurgeAdapter {
     async listExternalResources() {
       guard('listExternalResources');
       // Mac 6.10.0+：GET /v1/external_resources → {"defines": [...]}（与 CLI 用同一解析）。
-      return parseExternalResources(await request('GET', '/v1/external_resources'));
+      return parseExternalResources(await request('listExternalResources', 'GET', '/v1/external_resources'));
     },
     async updateExternalResource(key: string) {
       guard('updateExternalResource');
       // Mac 6.10.0+：POST /v1/external_resources/update {"key": …}。“Local resources are skipped.”；结果是键到 "success"
       // 或错误文字的映射，键不存在时 400（request 按命令失败抛出）。从不使用 "all"。
       const k = safeResourceKey(key);
-      return parseResourceUpdateMap(await request('POST', '/v1/external_resources/update', { key: k }), k, (t) => opts.scrub(redactFreeText(t)));
+      return parseResourceUpdateMap(await request('updateExternalResource', 'POST', '/v1/external_resources/update', { key: k }), k, (t) => opts.scrub(redactFreeText(t)));
     },
     // HTTP API 没有临时规则端点（任何版本）：只能经 CLI 的 rule temp。
     async listTempRules() {

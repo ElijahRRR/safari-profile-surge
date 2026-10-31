@@ -1,11 +1,12 @@
 <script setup lang="ts">
-// Surge 状态卡：版本、工作配置、接管与出站、自动重载、HTTP API、配置目录风险、优先级问题。
+// Surge 状态卡：版本、工作配置、接管与出站、自动重载、HTTP API、配置目录风险、本机资源服务（只有状态，不含地址、端口或令牌）、
+// 优先级问题。
 import { computed } from 'vue';
 import { Badge, StatusBadge } from '@sfe/easyquick';
 import KeyValueList from './KeyValueList.vue';
 import NoticeBox from './NoticeBox.vue';
 import { useConsole } from '../store/context';
-import { DIRECTORY_RISK_LABELS, TAKEOVER_OUTBOUND_LABELS, boolLabel } from '../lib/labels';
+import { DIRECTORY_RISK_LABELS, NODE_RESOURCE_STATE_LABELS, TAKEOVER_OUTBOUND_LABELS, boolLabel } from '../lib/labels';
 import { formatNumber, formatRelative } from '../lib/format';
 import { WORKING_PROFILE_NAME } from '@sfe/contract';
 
@@ -24,6 +25,8 @@ const items = computed(() => {
     { key: 'autoReload', label: '自动重载', value: boolLabel(s?.autoReload) },
     { key: 'httpApi', label: 'HTTP API' },
     { key: 'dirRisk', label: '配置目录' },
+    // 旧版服务不带本机资源服务的状态：不显示这一行
+    ...(s?.nodeResource !== undefined ? [{ key: 'nodeResource', label: '本机资源服务' }] : []),
   ];
 });
 
@@ -69,6 +72,16 @@ const takeoverText = computed(() => {
         <template #v-dirRisk>
           <Badge v-if="surge.profileDirectoryRisk" :variant="DIRECTORY_RISK_LABELS[surge.profileDirectoryRisk].variant">{{ DIRECTORY_RISK_LABELS[surge.profileDirectoryRisk].label }}</Badge>
           <span v-else>无法读取</span>
+        </template>
+        <template #v-nodeResource>
+          <span class="inline-flex flex-wrap items-center justify-end gap-2">
+            <template v-if="surge.nodeResource">
+              <Badge :variant="NODE_RESOURCE_STATE_LABELS[surge.nodeResource.state]?.variant ?? 'danger'">{{ NODE_RESOURCE_STATE_LABELS[surge.nodeResource.state]?.label ?? '状态未知' }}</Badge>
+              <Badge v-if="surge.nodeResource.tokenSuspect" variant="danger">令牌可能已泄露</Badge>
+              <Badge v-if="surge.nodeResource.needsRefresh" variant="warning">待重新同步</Badge>
+            </template>
+            <span v-else>未初始化</span>
+          </span>
         </template>
       </KeyValueList>
       <div v-if="surge.precedenceIssues.length" class="space-y-2">

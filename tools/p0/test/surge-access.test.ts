@@ -203,9 +203,9 @@ describe('resource locations', () => {
 
   it('finds resources pointing at a path', () => {
     const res: SurgeExternalResource[] = [
-      { key: 'k1', type: 'policy-group', location: 'sfe-nodes.list', lastUpdatedAt: null, error: null, local: true, updating: false, fromModule: null },
-      { key: 'k2', type: 'ruleset', location: 'https://rules.example.test/sfe-nodes.list', lastUpdatedAt: null, error: null, local: false, updating: false, fromModule: null },
-      { key: 'k3', type: 'ruleset', location: '/Users/t/Surge/sfe-nodes.list', lastUpdatedAt: null, error: null, local: true, updating: false, fromModule: null },
+      { key: 'k1', type: 'policy-group', location: 'sfe-nodes.list', locationHash: null, lastUpdatedAt: null, error: null, local: true, updating: false, fromModule: null },
+      { key: 'k2', type: 'ruleset', location: 'https://rules.example.test/sfe-nodes.list', locationHash: null, lastUpdatedAt: null, error: null, local: false, updating: false, fromModule: null },
+      { key: 'k3', type: 'ruleset', location: '/Users/t/Surge/sfe-nodes.list', locationHash: null, lastUpdatedAt: null, error: null, local: true, updating: false, fromModule: null },
     ];
     expect(resourcesForPath(res, '/Users/t/Surge/sfe-nodes.list', dir).map((r) => r.key)).toEqual(['k1', 'k3']);
   });

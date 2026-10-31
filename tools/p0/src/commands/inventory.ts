@@ -23,6 +23,7 @@ import {
   type SurgeVersionCheck,
 } from '../deps.js';
 import { refused, type ExitCode } from '../errors.js';
+import { readResourceToken, testResourceUrl } from '../loopback-state.js';
 import { check, writeResult } from '../results.js';
 import { classifyLocationRisk, findGitWorkTree } from '../run-dir.js';
 import { saveState, type InventorySummary } from '../state.js';
@@ -40,6 +41,7 @@ import {
   emptyGuard,
   errorCode,
   helpTopicFile,
+  maskResourceKey,
   parseCliHelp,
   proposeMechanism,
   unionHelpWords,
@@ -101,8 +103,11 @@ async function probe(adapter: SurgeAdapter, p: ReadPrimitive, c: ProbeContext): 
   }
 }
 
-/** 盘点结果中只保留识别所需的信息（不保存策略详情原文、规则全文与请求主机）。 */
-function summarizeValue(p: ReadPrimitive, v: unknown): unknown {
+/**
+ * 盘点结果中只保留识别所需的信息（不保存策略详情原文、规则全文与请求主机）。资源 key 可能含回环测试资源的读取令牌：按
+ * maskResourceKey 遮盖（secrets 为本次运行已知的令牌）。
+ */
+function summarizeValue(p: ReadPrimitive, v: unknown, secrets: readonly string[] = []): unknown {
   if (v === null || v === undefined) return null;
   switch (p) {
     case 'listRules':
@@ -119,7 +124,7 @@ function summarizeValue(p: ReadPrimitive, v: unknown): unknown {
     }
     case 'listExternalResources':
       return (v as Array<{ key: string; type: string; location: string; lastUpdatedAt: Date | null; error: string | null }>).map((r) => ({
-        key: r.key,
+        key: maskResourceKey(r.key, secrets),
         type: r.type,
         location: describeLocation(r.location),
         lastUpdatedAtAvailable: r.lastUpdatedAt !== null,
@@ -142,6 +147,15 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
   const { out, exec, now, home } = ctx.deps;
   const { dir, state: initial } = ctx.args.strings.run ? openRun(ctx) : createRun(ctx);
   let state = initial;
+  // 回环测试资源（本运行已有令牌与端口时）：它的地址不是外来对象，它的令牌在 key 中出现时遮盖
+  let ownToken: string | null = null;
+  try {
+    ownToken = readResourceToken(dir);
+  } catch {
+    ownToken = null;
+  }
+  const ownSecrets = ownToken === null ? [] : [ownToken];
+  const ownResourceUrl = ownToken !== null && state.loopback ? testResourceUrl(state.loopback.port, ownToken) : null;
   out.heading(`P0 盘点（只读） · 运行 ${dir.id}`);
   out.line(`原始证据目录：${dir.path}（0700，文件 0600，不在仓库内）`);
 
@@ -211,10 +225,10 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
       directoryRisk: ((r) => (r === 'unknown' ? null : r))(classifyLocationRisk(profileDir, home)),
       inGitWorkTree: findGitWorkTree(profileDir) !== null,
       managedConfigHeader: detectManagedConfigHeader(text) !== null,
-      sfeObjects: findForeignSfeObjects(text, { names: [], files: [] }).length,
+      sfeObjects: findForeignSfeObjects(text, { names: [], files: [], resourceUrl: ownResourceUrl }).length,
       sfeFilesInDirectory: sfeFiles,
       relativeReferences: listRelativeReferences(text).map((r) => ({ kind: r.kind, file: r.value.slice(r.value.lastIndexOf('/') + 1) })),
-      remoteSourceHosts: listRemoteSourceHosts(text),
+      remoteSourceHosts: listRemoteSourceHosts(text, ownResourceUrl),
       httpApi: httpApiInfo,
     };
     dir.writeJson('inventory/profile-structure.json', profileInfo);
@@ -310,7 +324,7 @@ export async function runInventory(ctx: Ctx): Promise<ExitCode> {
     cliHelpTopics: helpTopics,
     surgeInstance: { ok: svc.ok, reason: svc.ok ? null : svc.reason, cached: instance.cached, serviceLimitsExceeded: serviceLimitsExceeded(instance), evidence: 'inventory/surge-instance.json' },
     probes: { cli: cliProbes, http: httpProbes },
-    values: Object.fromEntries(Object.entries(values).map(([k, v]) => [k, summarizeValue(k as ReadPrimitive, v)])),
+    values: Object.fromEntries(Object.entries(values).map(([k, v]) => [k, summarizeValue(k as ReadPrimitive, v, ownSecrets)])),
     proposedMechanism: proposal.mechanism,
     mechanismNotes: proposal.notes,
     unproven: proposal.unproven,

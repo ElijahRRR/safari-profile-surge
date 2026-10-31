@@ -61,3 +61,34 @@ describe('free text', () => {
     expect(redactProxyLine('N = socks5, 192.0.2.1, 1080, u1, p1')).toBe('N = socks5, 192.0.2.1, 1080, ***, ***');
   });
 });
+
+describe('loopback URLs (D10: the resource read token is in the path)', () => {
+  // 合成令牌与地址：运行时拼出
+  const TOKEN = 'cd'.repeat(32);
+  const LINE = `SFE-ROUTE = select, REJECT, policy-path=http://127.0.0.1:20001/${TOKEN}/sfe-nodes.list`;
+
+  test.each(['127.0.0.1:20001', 'localhost:20001', '[::1]:20001', '127.0.0.1', 'LocalHost'])('redactUrls masks the whole path for %s', (host) => {
+    expect(redactUrls(`policy-path=http://${host}/${TOKEN}/sfe-nodes.list`)).toBe(`policy-path=http://${host}/***`);
+    expect(redactUrls(`see https://${host}/${TOKEN}/x?q=1#f end`)).toBe(`see https://${host}/*** end`);
+  });
+
+  test('userinfo stays masked; a bare or root loopback address is kept', () => {
+    expect(redactUrls(`http://u:p@127.0.0.1:20001/${TOKEN}/sfe-nodes.list`)).toBe('http://***@127.0.0.1:20001/***');
+    expect(redactUrls('http://127.0.0.1:6171')).toBe('http://127.0.0.1:6171');
+    expect(redactUrls('http://127.0.0.1:6171/')).toBe('http://127.0.0.1:6171/');
+  });
+
+  test('other hosts and schemes keep the path', () => {
+    expect(redactUrls('https://nodes.example.test/a/b.list?t=1')).toBe('https://nodes.example.test/a/b.list?***');
+    expect(redactUrls('http://192.0.2.1:8080/a/b')).toBe('http://192.0.2.1:8080/a/b');
+    expect(redactUrls('socks5://127.0.0.1:1080/x')).toBe('socks5://127.0.0.1:1080/x');
+  });
+
+  test('profile redaction and free text never show the token (managed diff, Surge errors)', () => {
+    const profile = ['[Proxy Group]', '# SFE-BEGIN group v1', LINE, '# SFE-END group', '[Rule]', 'FINAL,DIRECT'].join('\n');
+    const out = redactProfileText(profile);
+    expect(out).not.toContain(TOKEN);
+    expect(out).toContain('SFE-ROUTE = select, REJECT, policy-path=http://127.0.0.1:20001/***');
+    expect(redactFreeText(`下载 http://127.0.0.1:20001/${TOKEN}/sfe-nodes.list 失败`)).toBe('下载 http://127.0.0.1:20001/*** 失败');
+  });
+});

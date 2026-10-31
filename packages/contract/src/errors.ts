@@ -40,6 +40,8 @@ export const ERROR_CODES = [
   'IMPORT_REJECTED',
   'FILL_NOT_ALLOWED',
   'SECRET_STORE_FAILED',
+  /** 本机资源服务（D10）未监听或端口被占用，默认消息「本机资源服务不可用」；details.reason：port_in_use | other。 */
+  'RESOURCE_SERVER_UNAVAILABLE',
   'AUTH_REQUIRED',
   'CSRF_FAILED',
   'FORBIDDEN_ORIGIN',
@@ -102,6 +104,7 @@ export const HTTP_STATUS_BY_CODE: Partial<Record<ErrorCode, number>> = {
   RATE_LIMITED: 429,
   BAD_REQUEST: 400,
   SURGE_UNREACHABLE: 503,
+  RESOURCE_SERVER_UNAVAILABLE: 503,
   INTERNAL: 500,
 };
 

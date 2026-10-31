@@ -35,6 +35,7 @@ export const WARNING_TEXT: Record<RouteWarning, string> = {
   probe_failed: 'Safari 实测失败，已停止自动打开与填充',
   exit_ip_mismatch: '实测出口与预期出口不一致，已停止自动打开与填充',
   buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，请再次进入普通模式（只结束可能经买家出口的连接）',
+  node_resource_unverified: '节点资源未确认：Surge 中的节点无法证明来自本机资源服务的已提交版本',
 };
 
 export const PHASE_TEXT: Record<OperationPhase, string> = {
@@ -83,6 +84,12 @@ export const DEPLOYMENT_TEXT: Record<EnvironmentFacets['deployment'], string> = 
   readback_partial: '已部署，读回不完整',
   failed: '同步失败',
 };
+
+/**
+ * 保存环境之后的提示：保存会排一次发布，但发布能力（回环资源补测等）未通过或本机资源服务未就绪时新版本停在待部署，
+ * 所以不说「正在同步」；是否已发布到 Surge 以「Surge 同步」一栏为准。
+ */
+export const SAVED_NOTICE = '已保存；是否已发布到 Surge 以「Surge 同步」一栏为准';
 
 export const ENTRY_MODE_TEXT: Record<EntryMode, string> = {
   NORMAL: '普通模式',
@@ -193,8 +200,8 @@ export function rejectHeldText(confirmed: boolean): string {
     : '结束时 SFE-ROUTE 已不是使用中环境已验证的出口，服务未能把它改选 REJECT：Safari 请求可能仍经买家出口发出，请立即进入普通模式。';
 }
 
-/** 使路由不再已验证的警告（失控类与受管理段被修改；写入重测结束说明用）。 */
-const ROUTE_LEFT_WARNINGS: readonly RouteWarning[] = [
+/** 使路由不再已验证的警告（失控类、受管理段被修改与节点资源未确认；写入重测结束说明用）。 */
+export const ROUTE_LEFT_WARNINGS: readonly RouteWarning[] = [
   'surge_unreachable',
   'surge_restarted',
   'entry_unverified',
@@ -204,6 +211,7 @@ const ROUTE_LEFT_WARNINGS: readonly RouteWarning[] = [
   'external_profile_change',
   'precedence_violation',
   'managed_segments_changed',
+  'node_resource_unverified',
 ];
 
 /**

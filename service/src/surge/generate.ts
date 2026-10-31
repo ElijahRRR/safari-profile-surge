@@ -3,18 +3,22 @@
 
 import { isIP } from 'node:net';
 import {
+  EMPTY_PLACEHOLDER_LINE,
   ENTRY_PLACEHOLDER_RULE,
   ENTRY_RULESET_FILES,
   ENTRY_WITNESS_PROCESS_PREFIX,
   LEGACY_ENTRY_WITNESS_PROCESS_PATH,
+  LEGACY_NODE_GROUP_LINE,
   NODE_RESOURCE_FILE,
   ROUTE_GROUP_NAME,
   SfeError,
   isSfeName,
+  parseNodeResourceUrl,
   type EntryBits,
   type FieldError,
 } from '@sfe/contract';
 import { isSurgeReferenceName, isSurgeSafeCredential, validateHost, validatePort } from '../domain/validate.js';
+import { findManagedBlock, parseProfile, serializeProfile } from './profile.js';
 import { BUILTIN_POLICIES, isCommentLine, normalizeRuleText } from './rules.js';
 
 export type EntryBit = keyof EntryBits;
@@ -87,9 +91,91 @@ export function resourceFile(generation: number, lines: readonly string[]): stri
   return [`# SFE managed resource · generation ${generation}`, ...lines, ''].join('\n');
 }
 
-/** [Proxy Group] 受管理段内容：首成员明确为 REJECT，选择失效时不会落到其他买家出口。 */
+/**
+ * 本机资源服务提供的节点列表（D10）：没有节点时只含占位行 EMPTY_PLACEHOLDER_LINE——Surge 对空内容（“服务器未返回任何数据。”）
+ * 与没有有效行的内容（“Failed to parse remote resource data”）都报错并保留旧资源（docs/verification/
+ * 2026-10-25-loopback-main-witness-matrix.md）。占位行从不是清单条目、不计为买家节点。TODO(P0)：只含占位行的列表被接受。
+ */
+export function resourceBody(generation: number, lines: readonly string[]): string {
+  return resourceFile(generation, lines.length > 0 ? lines : [EMPTY_PLACEHOLDER_LINE]);
+}
+
+/**
+ * 旧版（D7）[Proxy Group] 受管理段内容：本地 policy-path 文件；首成员同样是 REJECT。D10 起服务从不写入它（初始化与重新合并
+ * 写入 loopbackGroupBlockLines；仍引用本地文件而 resourceServe 门槛未满足时，重新合并保持 LEGACY_NODE_GROUP_LINE 原样），
+ * 只用于识别（isLegacyNodeGroupLine）、旧版假环境与迁移测试，以及 P0 测试配置接入回环资源服务之前的起点（tools/p0）。
+ */
 export function groupBlockLines(): string[] {
-  return [`${ROUTE_GROUP_NAME} = select, REJECT, policy-path=${NODE_RESOURCE_FILE}`];
+  return [LEGACY_NODE_GROUP_LINE];
+}
+
+/** 受管理段中的这一行是旧版（D7）本地文件引用：需要重新合并才能改用本机资源服务。只按全文比较（段内容由本应用生成）。 */
+export function isLegacyNodeGroupLine(line: string): boolean {
+  return typeof line === 'string' && line.trim() === LEGACY_NODE_GROUP_LINE;
+}
+
+/**
+ * [Proxy Group] 受管理段内容（D10）：SFE-ROUTE 的 policy-path 指向本机资源服务。首成员明确为 REJECT：选择失效或选中的节点被
+ * 删除时落到 REJECT，不会落到其他买家出口（回环矩阵：删除选中成员后落到 REJECT 只因为它排在首位）。从不加组级
+ * underlying-proxy、external-policy-modifier、policy-regex-filter、external-policy-name-prefix 或 update-interval：
+ * 前四者会改名（“Name (via Relay)”）、覆盖每行的前置或过滤导入的节点（policy-groups/parameters.html、policy-including.html），
+ * update-interval 对 policy-path 的取值范围没有写入文档。url 必须是 nodeResourceUrl 的结果；这一行含读取令牌，只写入工作配置，
+ * 不进入日志、错误或界面（脱敏见 redact-profile.ts redactUrls）。
+ */
+export function loopbackGroupBlockLines(url: string): string[] {
+  if (typeof url !== 'string' || parseNodeResourceUrl(url) === null) {
+    throw new SfeError('VALIDATION_FAILED', '生成受管理段失败：本机资源服务地址不正确');
+  }
+  return [`${ROUTE_GROUP_NAME} = select, REJECT, policy-path=${url}`];
+}
+
+export interface LoopbackCheckRewrite {
+  /** --check 用的候选配置全文：只有受管理 group 段中 SFE-ROUTE 的 policy-path 值换成相对的 sfe-nodes.list。 */
+  text: string;
+  /** 交给 checkCandidate 的 overrides（engine/candidate.ts CandidateInput.overrides）：sfe-nodes.list → 候选节点列表。 */
+  overrides: Map<string, string>;
+}
+
+const ROUTE_DEFINITION_RE = new RegExp(`^\\s*${ROUTE_GROUP_NAME}\\s*=`);
+const POLICY_PATH_PARAM_RE = /(\bpolicy-path\s*=\s*)([^,\s]+)/gi;
+
+/**
+ * 候选 --check（init、remerge、publish 共用）：checkCandidate 只为相对路径引用准备候选副本（listRelativeReferences 不计 URL），
+ * 指向本机资源服务的 policy-path 会被忽略，--check 因此看不到候选节点，或者去下载正在提供的版本。这里把 SFE-ROUTE 的
+ * policy-path 值换成相对的 sfe-nodes.list，并给出 { sfe-nodes.list → body } 的覆盖，--check 从不接触本机资源服务。
+ * TODO(P0)：记录 `surge-cli --check` 是否下载远端 policy-path。
+ * 受管理 group 段必须恰好有一条 SFE-ROUTE 定义、其中恰好一个 policy-path 且是本机资源服务地址（expectedUrl 给出时必须等于它），
+ * 否则失败（失败即关闭，从不改写段外的内容）；改写后的全文仍含读取令牌（段外或其他位置也引用了该地址）时同样失败。
+ * 错误信息不含地址或令牌。
+ */
+export function rewriteLoopbackForCheck(profileText: string, body: string, expectedUrl?: string): LoopbackCheckRewrite {
+  if (typeof profileText !== 'string' || typeof body !== 'string') throw new SfeError('VALIDATION_FAILED', '校验候选配置失败：候选内容不正确');
+  const parsed = parseProfile(profileText);
+  const block = findManagedBlock(parsed, 'group');
+  if (typeof block !== 'object') {
+    throw new SfeError('BASELINE_CHANGED', '校验候选配置失败：节点组受管理段缺失或边界不明确', { details: { block: 'group', state: block } });
+  }
+  const notFound = (): SfeError =>
+    new SfeError('VALIDATION_FAILED', '校验候选配置失败：节点组受管理段中没有恰好一条指向本机资源服务的 SFE-ROUTE 定义');
+  const routeLines: number[] = [];
+  for (let i = block.start + 1; i < block.end; i++) if (ROUTE_DEFINITION_RE.test(parsed.lines[i]!.text)) routeLines.push(i);
+  if (routeLines.length !== 1) throw notFound();
+  const at = routeLines[0]!;
+  const lineText = parsed.lines[at]!.text;
+  const params = [...lineText.matchAll(POLICY_PATH_PARAM_RE)];
+  if (params.length !== 1) throw notFound();
+  const m = params[0]!;
+  const url = m[2]!;
+  const target = parseNodeResourceUrl(url);
+  if (target === null || (expectedUrl !== undefined && url !== expectedUrl)) throw notFound();
+  const start = m.index + m[1]!.length;
+  const lines = parsed.lines.map((l, i) => (i === at ? { ...l, text: lineText.slice(0, start) + NODE_RESOURCE_FILE + lineText.slice(start + url.length) } : l));
+  const text = serializeProfile(lines);
+  // 令牌出现在别处（段外的引用、注释或其他参数）：--check 仍可能接触本机资源服务，候选副本也会带出令牌。
+  if (text.includes(target.token)) {
+    throw new SfeError('VALIDATION_FAILED', '校验候选配置失败：工作配置在节点组受管理段之外也引用了本机资源服务地址');
+  }
+  return { text, overrides: new Map([[NODE_RESOURCE_FILE, body]]) };
 }
 
 // 进程路径里出现这些字符会破坏规则语法或带来歧义。

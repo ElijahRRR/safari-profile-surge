@@ -17,9 +17,14 @@ export const REUSE_BLOCKING_WARNINGS: readonly RouteWarning[] = [
   'precedence_violation',
   'front_missing',
   'managed_segments_changed',
+  'node_resource_unverified',
 ];
 
-/** 失控类警告：存在时不允许 Safari 重测（需要重新激活或进入普通模式）。 */
+/**
+ * 失控类警告：存在时不允许 Safari 重测（需要重新激活或进入普通模式）。受管理段被修改与节点资源未确认（D10）不在其中：
+ * 它们不表示入口或 SFE-ROUTE 的选择失去控制，对账已把阶段改为 attention（ATTENTION_WARNINGS），重测只接受已验证的使用中
+ * 路由；节点资源未确认只在确认过的发布或回滚读回之后清除，重测不能清除它。
+ */
 export const LOSS_OF_CONTROL_WARNINGS: readonly RouteWarning[] = [
   'surge_unreachable',
   'surge_restarted',
@@ -46,6 +51,7 @@ export const IN_CONTROL_BLOCKING_WARNINGS: readonly RouteWarning[] = [
   'probe_failed',
   'exit_ip_mismatch',
   'rollback_needs_reverify',
+  'node_resource_unverified',
 ];
 
 /** 对账把阶段设为 attention 的警告（external_* 设为 external_change）。 */
@@ -57,6 +63,7 @@ export const ATTENTION_WARNINGS: readonly RouteWarning[] = [
   'outbound_mode_changed',
   'precedence_violation',
   'managed_segments_changed',
+  'node_resource_unverified',
 ];
 
 export function hasAny(warnings: readonly RouteWarning[], set: readonly RouteWarning[]): RouteWarning[] {

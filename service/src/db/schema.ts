@@ -362,4 +362,18 @@ export const MIGRATIONS: readonly string[] = [
   -- 清除旧值（它只用于「工作配置在受管理段之外有修改」的提示，清除后升级后的第一次发布不显示这条提示）。
   UPDATE deployments SET working_profile_digest = NULL WHERE working_profile_digest IS NOT NULL;
   `,
+  /* 7 */ `
+  -- D10（2026-10-31）：节点资源改由本机回环资源服务提供，SFE-ROUTE 的 policy-path 指向 http://127.0.0.1:<端口>/<读取令牌>/
+  -- sfe-nodes.list，发布只对该资源执行一次单 key 更新并读回。设备实测证明 D7 的本地 policy-path 文件在自动重新加载关闭时不会被
+  -- 重新读取（docs/verification/2026-10-24-fixed-profile-live.md），本地文件模型的两个能力项随之删除；connection_continuity
+  -- 是按本地文件发布测得的，发布方式变了，记录的含义也变了，需要按回环发布重新测量。删除旧的能力记录与提议。
+  DELETE FROM capabilities WHERE key IN ('targeted_resource_refresh', 'policy_path_reread', 'connection_continuity');
+  DELETE FROM capability_proposals WHERE key IN ('targeted_resource_refresh', 'policy_path_reread', 'connection_continuity');
+  -- 本地节点文件的写前摘要（engine/ownership.ts 的 mo_prev）与发布的写入对照（engine/handlers/publish.ts 的
+  -- resource:writeBaseline）只属于本地文件模型，且按 pepper 派生的密钥覆盖含明文代理凭据的节点行（同迁移 3 的理由）：删除。
+  -- GLOB 区分大小写且下划线不是通配符。managed_objects 中 resource_file 的记录不在这里改：旧的 sfe-nodes.list 可能仍在磁盘上，
+  -- 由重新合并在确认改用本机资源服务之后删除文件并清除摘要。
+  DELETE FROM meta WHERE key GLOB 'engine:mo_prev:resource_file:*';
+  DELETE FROM meta WHERE key = 'engine:resource:writeBaseline';
+  `,
 ];

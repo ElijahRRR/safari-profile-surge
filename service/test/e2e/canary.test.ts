@@ -1,10 +1,11 @@
 // 秘密金丝雀（docs/ARCHITECTURE.md §11）：标记秘密经所有入口进入后，扫描日志、SQLite 文件字节、
-// 事件流、接口响应与数据目录，均不得出现。Surge 配置目录中的节点资源文件按设计包含代理凭据，不在扫描范围内。
+// 事件流、接口响应与数据目录，均不得出现。节点资源（D10）只经本机资源服务从内存提供给 Surge（Surge 自己缓存它）：Surge 配置
+// 目录中同样不得出现买家凭据。本机资源服务的读取令牌只在工作配置中，同样不得出现在日志、事件、响应与数据目录中。
 
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, expect, test } from 'vitest';
-import { NODE_RESOURCE_FILE, type ImportPreviewRequest, type NativeRequest } from '@sfe/contract';
+import { type ImportPreviewRequest, type NativeRequest } from '@sfe/contract';
 import { AGENT, PROFILE_A, PROFILE_C, WEB, activeEnv, createEnv, createHarness, envInput, rid, type Harness } from '../engine/harness.js';
 
 const MARK = 'CanaryZq9x7Marker';
@@ -104,7 +105,9 @@ test('marker secrets never reach logs, SQLite bytes, events, responses or data f
   // 对照：秘密确实经所有入口进入了秘密存储与 Surge 节点资源（测试本身有效）
   expect(h.store.size).toBeGreaterThanOrEqual(10);
   expect(h.repos.environments.list().map((e) => e.displayName).sort()).toEqual(['US-Canary-A', 'US-Canary-Check', 'US-Canary-Csv', 'US-Canary-Json', 'US-Canary-Native']);
-  expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).toContain(secret('Pass7'));
+  expect(h.fake.loadedContent(h.resourceKey()!)).toContain(secret('Pass7'));
+  const token = h.app.engine.resource!.token;
+  expect(readFileSync(h.profilePath, 'utf8')).toContain(token);
 
   // ---- 扫描 ----
   const leaks: string[] = [];
@@ -114,6 +117,18 @@ test('marker secrets never reach logs, SQLite bytes, events, responses or data f
   const marker = Buffer.from(MARK, 'utf8');
   for (const file of walk(h.dir, h.surgeDir)) {
     if (readFileSync(file).includes(marker)) leaks.push(`file: ${file.slice(h.dir.length)}`);
+  }
+  // Surge 配置目录：没有本地节点文件，任何文件都不含买家凭据
+  for (const file of walk(h.surgeDir, '')) {
+    if (readFileSync(file).includes(marker)) leaks.push(`surge file: ${file.slice(h.dir.length)}`);
+  }
+  // 读取令牌：不在日志、事件、响应与数据目录中
+  const tokenBytes = Buffer.from(token, 'utf8');
+  for (const line of h.logs) if (line.includes(token)) leaks.push(`token in log: ${line.slice(0, 60)}`);
+  for (const e of h.events) if (JSON.stringify(e).includes(token)) leaks.push(`token in event: ${e.type}`);
+  for (const r of h.responses) if (serialize(r).includes(token)) leaks.push('token in response');
+  for (const file of walk(h.dir, h.surgeDir)) {
+    if (readFileSync(file).includes(tokenBytes)) leaks.push(`token in file: ${file.slice(h.dir.length)}`);
   }
   expect(leaks).toEqual([]);
   // SQLite 文件存在且被扫描到

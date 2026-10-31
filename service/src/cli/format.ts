@@ -186,6 +186,7 @@ export const WARNING_TEXT: Record<RouteWarning, string> = {
   probe_failed: '最近一次 Safari 实测失败，已停止自动打开订单与填充',
   exit_ip_mismatch: '实测出口与预期出口不一致，已停止自动打开订单与填充',
   buyer_exit_connections_unconfirmed: '未能确认 Safari 已没有经买家出口的连接，再次进入普通模式会再结束其中可能经买家出口的连接（按原规则发出的不受影响）',
+  node_resource_unverified: '节点资源未确认：Surge 中的节点无法证明来自本机资源服务的已提交版本',
 };
 
 export const CAPABILITY_STATUS_TEXT: Record<CapabilityStatus, string> = {

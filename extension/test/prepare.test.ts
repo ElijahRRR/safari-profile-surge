@@ -399,6 +399,21 @@ describe('prepare page flow', () => {
         note: '自动打开订单与填充已停止',
         notNote: '不受这次重新检测影响',
       },
+      // 等待期间节点资源未确认（D10）：同样写明路由已需要处理及原因
+      {
+        op: operation({
+          phase: 'FAILED',
+          status: 'failed',
+          probeKind: 'safari',
+          error: { code: 'SAFARI_VERIFY_TIMEOUT', message: 'Safari 实测超时：绑定场景未在截止时间内到达；这次重新检测等待期间路由已不在已验证的使用中状态（…）' },
+          result: { routeLeftVerified: ['node_resource_unverified'] },
+        }),
+        outcome: 'probe_failed',
+        title: '重新检测已结束，路由需要处理',
+        guarantee: false,
+        note: '节点资源未确认',
+        notNote: '不受这次重新检测影响',
+      },
       // 核对后失败：服务把 probe_failed 加到路由上（result.probeWarning），自动打开订单与填充确实已停止
       {
         op: operation({

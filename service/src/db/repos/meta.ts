@@ -1,4 +1,4 @@
-// 元数据计数器：环境编号、站内序号、配置代数、事件序号、pepper 是否已创建。
+// 元数据计数器：环境编号、站内序号、配置代数、事件序号、pepper 是否已创建，以及本机资源服务当前读取令牌的引用。
 // 计数器单调递增、从不回收（删除环境后编号也不复用），每次递增是一条原子语句。
 
 import type { RepoContext } from './common.js';
@@ -16,8 +16,17 @@ export interface MetaRepo {
   /** 本机秘密资料中的 pepper 是否曾经创建过：为 true 而读不到时必须 fail closed，不能重新生成。 */
   pepperCreated(): boolean;
   markPepperCreated(): void;
+  /**
+   * 本机资源服务（D10）当前读取令牌在秘密存储中的引用（sfe.resource-token.<n>）；从未创建为 null。为非 null 而读不到值时
+   * 必须 fail closed，不能重新生成（resource/token.ts）。轮换创建新引用，由调用方在工作配置改写提交之后改写这里。
+   */
+  resourceTokenRef(): string | null;
+  setResourceTokenRef(ref: string): void;
   schemaVersion(): number;
 }
+
+const RESOURCE_TOKEN_REF_KEY = 'resource_token_ref';
+const RESOURCE_TOKEN_REF_RE = /^sfe\.resource-token\.[1-9][0-9]{0,8}$/;
 
 export function createMetaRepo(ctx: RepoContext): MetaRepo {
   const { db } = ctx;
@@ -53,6 +62,11 @@ export function createMetaRepo(ctx: RepoContext): MetaRepo {
     setEventSequence: (n) => setInt('event_sequence', n),
     pepperCreated: () => getInt('pepper_created') === 1,
     markPepperCreated: () => setInt('pepper_created', 1),
+    resourceTokenRef: () => db.get<{ value: string }>('SELECT value FROM meta WHERE key = ?', [RESOURCE_TOKEN_REF_KEY])?.value ?? null,
+    setResourceTokenRef: (ref) => {
+      if (typeof ref !== 'string' || !RESOURCE_TOKEN_REF_RE.test(ref)) throw new RangeError('invalid resource token ref');
+      db.run('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', [RESOURCE_TOKEN_REF_KEY, ref]);
+    },
     schemaVersion: () => db.schemaVersion(),
   };
 }

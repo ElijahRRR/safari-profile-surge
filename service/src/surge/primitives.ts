@@ -41,6 +41,38 @@ type ExtraInList = Exclude<SurgePrimitive, AdapterPrimitive>;
 const primitivesComplete: [MissingFromList, ExtraInList] extends [never, never] ? true : never = true;
 void primitivesComplete;
 
+/** 适配器的单个原语超时（毫秒）：覆盖该适配器的缺省超时（CLI 15 秒、HTTP 10 秒）。 */
+export type PrimitiveTimeouts = Partial<Record<SurgePrimitive, number>>;
+
+/**
+ * 更新本机节点资源的超时（D10，main.ts 对 CLI 与 HTTP 都用它）。回环矩阵（docs/verification/
+ * 2026-10-25-loopback-main-witness-matrix.md）：服务器不响应时一次更新约 12.9 秒才返回（NSURLErrorDomain -1001），连接被重置时
+ * Surge 重试到 6 次；缺省的 15 秒会让仍在下载的更新被判为超时。TODO(P0)：按回环补测记录的耗时调整。
+ */
+export const SURGE_RESOURCE_UPDATE_TIMEOUT_MS = 30_000;
+
+/** 校验单个原语超时：只接受正的安全整数，否则构造适配器失败（不静默改用缺省值）。 */
+export function validatePrimitiveTimeouts(timeouts: PrimitiveTimeouts | undefined): PrimitiveTimeouts {
+  const out: PrimitiveTimeouts = {};
+  for (const [p, ms] of Object.entries(timeouts ?? {})) {
+    if (!(SURGE_PRIMITIVES as readonly string[]).includes(p) || typeof ms !== 'number' || !Number.isSafeInteger(ms) || ms <= 0) {
+      throw new SfeError('VALIDATION_FAILED', '创建 Surge 适配器失败：原语超时设置不正确', { details: { primitive: p } });
+    }
+    out[p as SurgePrimitive] = ms;
+  }
+  return out;
+}
+
+/**
+ * updateExternalResource 超时：请求已经发给 Surge，它可能仍在下载、已经载入或没有收到——结果未知（不是“无法连接”）。
+ * 调用方不能据此判断资源是否变化，必须等更新结束后读回；从不重放这次更新。
+ */
+export function resourceUpdateTimeoutError(): SfeError {
+  return new SfeError('SURGE_COMMAND_FAILED', '更新外部资源失败：等待 Surge 返回结果超时，资源是否已更新未知', {
+    details: { primitive: 'updateExternalResource', reason: 'update_timeout' },
+  });
+}
+
 export function capabilityUnverified(primitive: string): SfeError {
   return new SfeError('CAPABILITY_UNVERIFIED', `调用 Surge 失败：原语 ${primitive} 在当前实现中尚未通过实测`, {
     details: { primitive },

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -158,7 +159,18 @@ describe('output parsing', () => {
   });
   test('resources as a key map, URL locations redacted', () => {
     expect(parseExternalResources({ 'k1': { type: 'policy-path', url: 'https://u:p@sub.example.test/x?token=1', error: 'timeout' } })).toEqual([
-      { key: 'k1', type: 'policy-path', location: 'https://***@sub.example.test/x?***', lastUpdatedAt: null, error: 'timeout', local: null, updating: null, fromModule: null },
+      {
+        key: 'k1',
+        type: 'policy-path',
+        location: 'https://***@sub.example.test/x?***',
+        // 原样位置（遮盖之前）的 SHA-256
+        locationHash: createHash('sha256').update('https://u:p@sub.example.test/x?token=1').digest('hex'),
+        lastUpdatedAt: null,
+        error: 'timeout',
+        local: null,
+        updating: null,
+        fromModule: null,
+      },
     ]);
   });
   test('request leaf from notes when no leaf field exists', () => {

@@ -227,6 +227,7 @@ describe('Surge below the minimum supported version (6.10.0 / 12500 / Controller
 
   test('ruleset_resource: after a downgrade (entry files survive; rule match answers Unknown command) normal mode still completes, reported as not runtime-confirmed', async () => {
     await activated('ruleset_resource');
+    const resourceUpdates = h.fake.calls.updateExternalResource ?? 0;
     expect(safariOutcome(h).rule).toMatch(/^RULE-SET,sfe-entry-/);
     h.fake.changeVersion({ version: '6.8.1', build: '12030', controllerProtocol: 18 });
     // 入口文件在重启后照样加载：Safari 仍被本应用入口规则拦下
@@ -243,7 +244,8 @@ describe('Surge below the minimum supported version (6.10.0 / 12500 / Controller
     expect(safariOutcome(h).rule).toBe('FINAL,DIRECT');
     expect(safariOutcome(h, 'www.example.test', 'udp').rule).toBe('FINAL,DIRECT');
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
-    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+    // 普通模式从不更新外部资源（激活之前的发布更新过一次）
+    expect((h.fake.calls.updateExternalResource ?? 0) - resourceUpdates).toBe(0);
   });
 });
 
@@ -275,7 +277,7 @@ describe('matchRule not mapped (an install.json written before the primitive exi
     expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', activeEnvironmentId: null });
     for (const w of ['selectGroupPolicy', 'addTempRule', 'removeTempRule']) expect(h.fake.calls[w] ?? 0, w).toBe(before[w] ?? 0);
     expect(h.fake.watcherReloads.filter((r) => r.key.startsWith('ruleset:sfe-entry-'))).toEqual([]);
-    // 只改 updateExternalResource 的映射：没有任何能力过期（发布与入口从不调用它）
+    // 只改 updateExternalResource 的映射：入口能力的原语清单不含它（只有发布与回环资源补测用它），入口记录不过期
     h.fake.mechanism = () => ({ ...orig(), updateExternalResource: 'unavailable' });
     await h.app.refreshSurge(WEB);
     expect((await h.app.listCapabilities()).filter((c) => c.staleReasons.includes('adapterMechanism'))).toEqual([]);

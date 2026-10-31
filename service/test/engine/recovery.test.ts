@@ -6,7 +6,7 @@ import { FAKE_CHROME_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
 import { capabilityUnverified } from '../../src/surge/primitives.js';
 import { payloadOf } from '../../src/domain/operations.js';
 import type { SurgeAdapter } from '../../src/ports.js';
-import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, envInput, rid, safariOutcome, verify, type Harness } from './harness.js';
+import { PROFILE_A, PROFILE_B, PROFILE_C, WEB, activeEnv, bind, createEnv, createHarness, failMembersReadOnceIn, entryWrites, envInput, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -61,41 +61,45 @@ async function until(cond: () => boolean): Promise<void> {
   expect(cond()).toBe(true);
 }
 
-function nodeNames(): string[] {
-  return readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')
-    .split(/\r?\n/)
-    .filter((l) => l.trim() !== '' && !l.startsWith('#'))
-    .map((l) => l.split('=')[0]!.trim());
+/** Surge 中 SFE-ROUTE 的节点（不含首位 REJECT 与占位节点）。 */
+async function nodeNames(): Promise<string[]> {
+  return (await h.fake.getGroupMembers(ROUTE_GROUP_NAME)).slice(1).filter((n) => n !== 'SFE-EMPTY');
 }
 
 describe('crash recovery (same SQLite file, same Surge)', () => {
-  test('crash while waiting for Surge to re-read the resource → FAILED UNKNOWN_STATE; next publish converges without duplicate nodes', async () => {
+  test('crash between the single-key update and the readback → FAILED UNKNOWN_STATE, never replayed; startup reverts the candidate, one system refresh brings Surge back to the committed nodes, the pending change converges on the next publish without duplicate nodes', async () => {
     h = await createHarness({ dbFile: true });
     const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
-    // 写入节点资源之后第一次读组成员就是等待重新读取（写入之前另读一次组成员作为对照）；发布从不调用外部资源更新
-    // （Surge 6.10 跳过本地资源）
-    const resourceBefore = readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8');
-    const stuck = hang('getGroupMembers', () => readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8') !== resourceBefore);
+    const committedNodes = await nodeNames();
+    const updatesBefore = h.fake.calls.updateExternalResource ?? 0;
+    // 更新之后的读回（候选版本仍在提供时读组成员）挂起：Surge 已下载候选，提交之前进程退出
+    const stuck = hang('getGroupMembers', () => h.app.engine.resource!.served()?.state === 'candidate');
     const env = h.repos.environments.get(envId)!;
     const upd = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { port: 1081 } } }, WEB);
     await until(stuck.entered);
     expect(h.repos.operations.get(upd.operation_id)!.phase).toBe('DEPLOYING');
+    expect((h.fake.calls.updateExternalResource ?? 0) - updatesBefore).toBe(1);
     stuck.restore();
+    // Surge 已载入候选（未提交）
+    expect(await nodeNames()).not.toEqual(committedNodes);
     await h.crash();
     await h.idle();
     const op = h.repos.operations.get(upd.operation_id)!;
     expect(op.phase).toBe('FAILED');
     expect(op.error?.code).toBe('UNKNOWN_STATE');
     expect(h.repos.environments.get(envId)!.deployedProxyRevision).toBe(1);
-    // 待部署的修改保留，由一次发布收敛
+    // 恢复从不重放；启动撤回候选，系统强制刷新把 Surge 带回已提交版本（不顺带部署待部署的修改）
+    expect((h.fake.calls.updateExternalResource ?? 0) - updatesBefore).toBe(2);
+    expect(await nodeNames()).toEqual(committedNodes);
+    // 待部署的修改保留，由一次显式发布收敛
     const pub = await h.app.publishPending({ request_id: rid() }, WEB);
     await h.idle();
     expect(h.repos.operations.get(pub.operation_id)!.phase).toBe('READY_FOR_NEXT_OPEN');
     expect(h.repos.environments.get(envId)!.deployedProxyRevision).toBe(2);
-    const names = nodeNames();
+    const names = await nodeNames();
     expect(new Set(names).size).toBe(names.length);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
-    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+    expect(h.fake.updateAllAttempts).toBe(0);
   });
 
   test('crash mid-switch → rollback from the activation snapshot; selection never left on an unverified exit', async () => {
@@ -188,7 +192,7 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
     await h.idle();
     expect(h.repos.operations.get(first.operation_id)!.phase).toBe('VERIFY_ONLY');
     const stuck = hangEntryWrite();
-    h.fake.failNext('getGroupMembers');
+    failMembersReadOnceIn(h, 'checkSwitchPreconditions');
     const second = await h.app.activate(c, { request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
     await until(stuck.entered);
     const op = h.repos.operations.get(second.operation_id)!;
@@ -229,7 +233,7 @@ describe('crash recovery (same SQLite file, same Surge)', () => {
   test('…and when the resumed rollback cannot restore the previous node, the entry still ends BLOCKED (never VERIFY_ONLY on an unverified exit)', async () => {
     h = await createHarness({ dbFile: true });
     const { opId } = await crashDuringSupersedingRollback();
-    h.fake.failNext('getGroupMembers');
+    failMembersReadOnceIn(h, 'rollbackActivation');
     await h.crash();
     await h.idle();
     const op = h.repos.operations.get(opId)!;

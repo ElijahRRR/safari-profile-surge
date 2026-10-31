@@ -101,7 +101,7 @@ onBeforeUnmount(wipeSecrets);
   <form class="card" data-test="create-form" autocomplete="off" @submit.prevent="submit">
     <div class="card-header px-4 py-3">
       <h3 class="text-base font-semibold text-gray-900 dark:text-white">在此创建环境</h3>
-      <p class="mt-0.5 text-xs text-gray-500 dark:text-dark-400">保存后关联当前 Safari 场景，并开始同步到 Surge。</p>
+      <p class="mt-0.5 text-xs text-gray-500 dark:text-dark-400">保存后关联当前 Safari 场景，并发布到 Surge；发布能力尚未通过实测时保持待部署。</p>
     </div>
     <div class="card-body space-y-3 p-4">
       <p v-if="formError" role="alert" class="rounded-xl bg-danger-soft px-3 py-2 text-sm text-danger" data-test="form-error">{{ formError }}</p>

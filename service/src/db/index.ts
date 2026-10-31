@@ -71,7 +71,15 @@ export type {
 export type { ProbeRecord, ProbesRepo, VerificationPurpose, VerificationTestRecord, VerificationTestsRepo } from './repos/probes.js';
 export { defaultRouteState, type RouteStateRecord, type RouteStateRepo } from './repos/route-state.js';
 export type { SecretKind, SecretRefRecord, SecretRefState, SecretRefsRepo } from './repos/secret-refs.js';
-export { SETTING_DEFAULTS, type SettingKey, type SettingValues, type SettingsRepo } from './repos/settings.js';
+export {
+  SETTING_DEFAULTS,
+  isResourcePort,
+  type InternalSettingKey,
+  type SettingKey,
+  type SettingValues,
+  type SettingsRepo,
+  type WritableSettingKey,
+} from './repos/settings.js';
 export type { LoginCodeRecord, LoginCodesRepo, WebSessionRecord, WebSessionsRepo } from './repos/web-auth.js';
 
 export interface Repositories {

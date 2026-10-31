@@ -1,6 +1,8 @@
 // 演示模式（docs/ARCHITECTURE.md §11）：独立临时数据目录、FakeSurge、内存秘密存储与合成数据。演示中的
 // “已生效”不代表任何网络事实。能力记录在这里直接写为 supported（说明“DEMO：FakeSurge 演示，不代表真实网络”）——
 // 这个绕过只存在于本目录，且只在 --demo 时被调用；确认能力的接口在演示模式下仍然拒绝。
+// 节点资源（D10）：演示的本机资源服务经进程内的 virtualBinder 提供（不开任何套接字），工作配置的 SFE-ROUTE 指向它，演示
+// FakeSurge 的单 key 更新经 binder.request 到达资源服务的真实处理程序；发布与真实服务相同（提供候选、单 key 更新、读回）。
 
 import { join } from 'node:path';
 import {
@@ -9,6 +11,7 @@ import {
   NATIVE_PROTOCOL_VERSION,
   VERIFY_ENDPOINTS,
   WORKING_PROFILE_NAME,
+  nodeResourceUrl,
   type CapabilityContext,
   type NativeRequest,
   type NativeResponse,
@@ -17,21 +20,29 @@ import type { Actor } from '../app.js';
 import type { Repositories } from '../db/index.js';
 import type { DemoHooks } from '../engine/context.js';
 import type { EngineAppService } from '../engine/app-service.js';
+import { createEngineKv } from '../engine/kv.js';
 import { registerInitialObjects } from '../engine/ownership.js';
+import { loadResourceToken, readServedPointer, virtualBinder, writeServedPointer, type ResourceTokenMeta, type VirtualResourceBinder } from '../resource/index.js';
 import { MemorySecretStore } from '../secrets/memory-store.js';
 import { FAKE_SAFARI_PATH, FakeSurge, createFakeSurgeEnvironment } from '../surge/fake.js';
 import { createProfileFiles } from '../surge/files.js';
+import { resourceBody } from '../surge/generate.js';
 import { pepperKey } from '../secrets/pepper.js';
 import { readFileSync } from 'node:fs';
 
 export const DEMO_CAPABILITY_NOTE = 'DEMO：FakeSurge 演示，不代表真实网络';
 
-/** 演示 FakeSurge 的本地文件监视延迟（毫秒）：发布写入后等待一次轮询即读到新成员。演示专用，不代表真实 Surge。 */
+/** 演示 FakeSurge 的本地文件监视延迟（毫秒，只用于入口规则集文件）：写入后等待一次轮询即读到。演示专用，不代表真实 Surge。 */
 export const DEMO_LOCAL_WATCH_LATENCY_MS = 100;
 
-/** 演示的发布等待与入口规则集等待：按演示监视延迟轮询，演示启动（经真实流程发布并激活）约一秒完成。 */
-export const DEMO_RESOURCE_RELOAD_WAIT = { timeoutMs: 5_000, pollMs: DEMO_LOCAL_WATCH_LATENCY_MS } as const;
+/** 演示的入口规则集等待：按演示监视延迟轮询，演示启动（经真实流程发布并激活）约一秒完成。 */
 export const DEMO_RULESET_WATCH = { timeoutMs: 5_000, pollMs: DEMO_LOCAL_WATCH_LATENCY_MS } as const;
+
+/** 演示本机资源服务的端口（[RESOURCE_PORT_MIN, RESOURCE_PORT_MAX) 内的固定值；经进程内绑定方，不占用任何真实端口）。 */
+export const DEMO_RESOURCE_PORT = 27_181;
+
+/** 演示的单 key 更新等待：演示 FakeSurge 立即完成下载，只轮询一次；稳定延迟很短，演示启动不被拖慢。 */
+export const DEMO_RESOURCE_UPDATE_WAIT = { timeoutMs: 5_000, pollMs: 100, settleMs: 50 } as const;
 
 /** 演示场景（/dev/native 使用的场景编号）。 */
 export const DEMO_PROFILES = {
@@ -46,26 +57,46 @@ export interface DemoSurge {
   surgeDirectory: string;
   profilePath: string;
   hooks: DemoHooks;
+  /** 演示本机资源服务的进程内绑定方（交给 AppServiceDeps.resourceBinder；FakeSurge 的下载经它到达资源服务）。 */
+  binder: VirtualResourceBinder;
 }
 
-/** 演示用的 Surge：合成工作配置（用户节点为文档地址占位）、受管理段与占位资源。 */
-export function createDemoSurge(dataDir: string): DemoSurge {
+/**
+ * 演示用的 Surge：合成工作配置（用户节点为文档地址占位）、受管理段，SFE-ROUTE 指向演示本机资源服务（读取令牌按产品的
+ * loadResourceToken 在内存秘密存储中生成，与引擎启动时读到的相同）。演示 Surge 已缓存第 0 代（只含占位行），如同初始化时的重载
+ * 已下载过。
+ */
+export async function createDemoSurge(dataDir: string, meta: ResourceTokenMeta): Promise<DemoSurge> {
   const surgeDirectory = join(dataDir, 'surge');
   const verifyHost = VERIFY_ENDPOINTS[0]!.host;
-  const env = createFakeSurgeEnvironment(surgeDirectory, { entryStrategy: 'ruleset_resource', processPaths: [FAKE_SAFARI_PATH], verifyHost });
-  // 只用于演示：假定 Surge 会监视本地 policy-path 文件（延迟很短），与演示中写为 supported 的 policy_path_reread 记录一致。
-  // 真实 Surge 是否监视没有写入文档，需要 P0 实测；没有该记录时发布停在待部署。
-  const fake = new FakeSurge({ directory: surgeDirectory, watchLocalPolicyPaths: true, localWatchLatencyMs: DEMO_LOCAL_WATCH_LATENCY_MS });
+  const store = new MemorySecretStore();
+  const binder = virtualBinder();
+  const url = nodeResourceUrl(DEMO_RESOURCE_PORT, await loadResourceToken(store, meta));
+  const env = createFakeSurgeEnvironment(surgeDirectory, {
+    entryStrategy: 'ruleset_resource',
+    processPaths: [FAKE_SAFARI_PATH],
+    verifyHost,
+    resource: { url, request: (port, req) => binder.request(port, req) },
+  });
+  const fake = new FakeSurge({
+    directory: surgeDirectory,
+    localWatchLatencyMs: DEMO_LOCAL_WATCH_LATENCY_MS,
+    remoteSource: env.remoteSource!,
+    remoteCache: [{ url, body: resourceBody(0, []) }],
+  });
   const hooks: DemoHooks = {
     // 演示扩展不访问外部检测服务：在 FakeSurge 中模拟 Safari 访问检测服务的连接，供核对使用
     beforeVerificationCheck: ({ verifyHost: host, processPaths }) => {
       fake.simulateRequest({ processPath: processPaths[0] ?? FAKE_SAFARI_PATH, host, protocol: 'tcp' });
     },
   };
-  return { fake, store: new MemorySecretStore(), surgeDirectory, profilePath: env.profilePath, hooks };
+  return { fake, store, surgeDirectory, profilePath: env.profilePath, hooks, binder };
 }
 
-/** 只在演示模式调用：写入工作配置设置、能力记录（supported + DEMO 说明）、本应用对象清单与默认前置。 */
+/**
+ * 只在演示模式调用：写入工作配置设置、本机资源服务端口与已提交第 0 代的指针（如同初始化已完成）、能力记录（supported + DEMO
+ * 说明）、本应用对象清单与默认前置。
+ */
 export async function prepareDemoState(repos: Repositories, demo: DemoSurge, pepper: Buffer): Promise<void> {
   // Surge 版本与构建号记为演示 FakeSurge 运行实例报告的值：门槛中 any 不匹配任何版本（依赖版本的能力会一直待验证）；
   // 后台安全改进待重启状态同样没有 any，记为 'no'（演示本机事实也是 'no'）
@@ -80,6 +111,9 @@ export async function prepareDemoState(repos: Repositories, demo: DemoSurge, pep
     repos.settings.set('workingProfileName', WORKING_PROFILE_NAME);
     repos.settings.set('entryStrategy', 'ruleset_resource');
     repos.settings.set('safariProcessPaths', [FAKE_SAFARI_PATH]);
+    repos.settings.setResourcePort(DEMO_RESOURCE_PORT);
+    const kv = createEngineKv(repos.db);
+    if (readServedPointer(kv) === null) writeServedPointer(kv, { committed: { generation: 0 }, candidate: null });
     for (const key of CAPABILITY_KEYS) {
       repos.capabilities.upsert({ key, status: 'supported', context: demoContext, verifiedAt: new Date().toISOString(), note: DEMO_CAPABILITY_NOTE });
     }

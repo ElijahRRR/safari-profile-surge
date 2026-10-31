@@ -10,6 +10,7 @@ import type {
   EnvironmentReadiness,
   FrontProxyState,
   ImportRowStatus,
+  NodeResourceState,
   OperationKind,
   OperationPhase,
   OperationStatus,
@@ -64,6 +65,7 @@ export const ROUTE_WARNING_TEXT: Record<RouteWarning, { text: string; severity: 
   probe_failed: { text: '最近一次 Safari 实测失败，已停止自动打开订单与填充', severity: 'danger' },
   exit_ip_mismatch: { text: '实测出口与预期出口不一致，已停止自动打开订单与填充', severity: 'danger' },
   buyer_exit_connections_unconfirmed: { text: '未能确认 Safari 已没有经买家出口的连接，再次进入普通模式会再结束其中可能经买家出口的连接（按原规则发出的不受影响）', severity: 'danger' },
+  node_resource_unverified: { text: '节点资源未确认：Surge 中的节点无法证明来自本机资源服务的已提交版本', severity: 'danger' },
 };
 
 export function warningText(w: RouteWarning): string {
@@ -248,6 +250,33 @@ export const IMPORT_STATUS_LABELS: Record<ImportRowStatus | 'skipped' | 'revisio
   skipped: { label: '已跳过', variant: 'gray' },
   revision_conflict: { label: '版本冲突', variant: 'danger' },
 };
+
+/** 本机资源服务（D10）的状态：只有 serving 是绿色。说明从不包含地址、端口或读取令牌。 */
+export const NODE_RESOURCE_STATE_LABELS: Record<NodeResourceState, StatusLabel> = {
+  serving: { label: '正在提供', variant: 'success' },
+  not_listening: { label: '未监听', variant: 'danger' },
+  token_unavailable: { label: '读取令牌不可用', variant: 'danger' },
+  legacy_line: { label: '仍引用本地节点文件', variant: 'warning' },
+  not_installed: { label: '未接入工作配置', variant: 'danger' },
+};
+
+export const NODE_RESOURCE_STATE_DETAILS: Record<NodeResourceState, string> = {
+  serving: '工作配置的 SFE-ROUTE 指向本机资源服务的当前地址，服务只监听 127.0.0.1，地址带随机读取令牌。',
+  not_listening:
+    '本机资源服务不可用（RESOURCE_SERVER_UNAVAILABLE）：没有在已设置的端口监听，可能是端口被其他程序占用、尚未选定端口，或等 Surge 可连接后再监听；每次对账都会重试。在此期间发布停在待部署。',
+  token_unavailable: '读取令牌读不到或格式不对，本机资源服务没有启动：发布、初始化与重新合并都会暂停（SECRET_STORE_FAILED）。普通模式不受影响。',
+  legacy_line:
+    '工作配置的 SFE-ROUTE 仍引用旧版的本地节点文件 sfe-nodes.list：需要重新合并以改用本机资源服务。本机资源服务补测通过之前，重新合并保持原有引用，新版本保持“已保存，待部署”。',
+  not_installed: '工作配置中没有指向本机资源服务当前地址的节点组定义（尚未写入、受管理段被修改或地址已变）：需要重新合并。在此之前发布停在待部署。',
+};
+
+/** 读取令牌可能已泄露时的说明（NodeResourceStatusView.tokenSuspect）。 */
+export const NODE_RESOURCE_TOKEN_SUSPECT_TEXT =
+  '读取令牌可能已泄露（出现了无法解释的下载或资源错误，或端口曾被其他程序占用）：发布暂停，只能经重新合并并勾选“更换本机资源地址”清除。';
+
+/** Surge 中的节点可能不是已提交版本时的说明（NodeResourceStatusView.needsRefresh）。 */
+export const NODE_RESOURCE_NEEDS_REFRESH_TEXT =
+  'Surge 中的节点可能不是已提交的版本：下一次发布会对本应用这一项资源执行一次单 key 更新并读回。服务只自动发起一次同步，停在待部署或失败后不会自动重试。';
 
 export const TAKEOVER_OUTBOUND_LABELS: Record<'rule' | 'direct' | 'proxy', string> = {
   rule: '规则模式',

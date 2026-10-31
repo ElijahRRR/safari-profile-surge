@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NeedsConfirmationDetails } from '@sfe/contract';
 import { createPopupController } from '../src/popup/controller';
+import { SAVED_NOTICE } from '../src/shared/text';
 import { accepted, currentState, environment, flush, mockBrowser, mockClient, ok, operation, route } from './fixtures';
 
 const NEEDS_CONFIRMATION: NeedsConfirmationDetails = {
@@ -348,6 +349,8 @@ describe('other actions', () => {
     await c.refresh();
     const r = await c.updateEnvironment({ displayName: '新名称' }, 4);
     expect(r).toEqual({ ok: true });
+    // 保存不等于已发布：发布能力未通过或本机资源服务未就绪时新版本停在待部署
+    expect(c.state.notice).toBe(SAVED_NOTICE);
     // 带的是表单打开时的版本，而不是轮询读到的最新版本。
     expect(calls.find((m) => m.type === 'updateCurrentEnvironment')).toEqual({
       type: 'updateCurrentEnvironment',

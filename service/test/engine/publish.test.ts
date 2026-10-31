@@ -1,9 +1,14 @@
+// 发布（D10）：门槛、成功路径、读回级别、基线检查、读回不一致的回滚与保留集。节点资源由本机资源服务提供，发布只对本应用的
+// 资源单 key 更新一次并读回；断言看资源服务提供的版本、Surge 缓存的内容与写原语的调用次数，从不看本地节点文件。只用合成数据。
+
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
-import { CAPABILITY_GATES, NODE_RESOURCE_FILE, SfeError, WORKING_PROFILE_NAME, type CapabilityKey } from '@sfe/contract';
+import { CAPABILITY_GATES, NODE_RESOURCE_FILE, WORKING_PROFILE_NAME, type CapabilityKey } from '@sfe/contract';
 import { profileMatches } from '../../src/engine/context.js';
-import { anyContext, ADMIN, PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, envInput, rid, safariOutcome, type Harness } from './harness.js';
+import { ADMIN, PROFILE_A, WEB, activeEnv, bind, createEnv, createHarness, entryWrites, envInput, rid, safariOutcome, type Harness } from './harness.js';
+import { dropNodesOnNextUpdate, loaded, nodes, pointer, served, updates } from './publish-helpers.js';
+import { fetchResource } from './resource-fixtures.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -13,7 +18,8 @@ afterEach(async () => {
 const WRITE_PRIMITIVES = ['updateExternalResource', 'selectGroupPolicy', 'addTempRule', 'removeTempRule', 'killRequest', 'reloadProfile'];
 // 写原语的调用次数之外还看入口规则集文件（ruleset_resource 的入口写入是文件写入加文件监视，不经适配器写原语）
 const writes = (hh: Harness) => ({ ...Object.fromEntries(WRITE_PRIMITIVES.map((k) => [k, hh.fake.calls[k] ?? 0])), ...entryWrites(hh.fake) });
-const resource = (hh: Harness) => readFileSync(join(hh.surgeDir, NODE_RESOURCE_FILE), 'utf8');
+/** 本机资源服务提供的版本与 Surge 缓存的本应用节点资源：门槛不足或失败时两者都不变。 */
+const resource = (hh: Harness) => ({ served: served(hh), loaded: loaded(hh), pointer: pointer(hh) });
 
 describe('publish gate (identical for automatic and manual publish)', () => {
   test.each(CAPABILITY_GATES.publish.map((k) => [k]))('missing %s → WAITING_DEPLOYMENT, nothing written', async (key) => {
@@ -28,7 +34,7 @@ describe('publish gate (identical for automatic and manual publish)', () => {
     expect(op.error?.code).toBe('CAPABILITY_UNVERIFIED');
     expect(JSON.stringify(op.error?.details)).toContain(key);
     expect(writes(h)).toEqual(before);
-    expect(resource(h)).toBe(fileBefore);
+    expect(resource(h)).toEqual(fileBefore);
     // 手动发布的门槛完全相同，没有“确认后强制发布”的参数
     const manual = await h.app.publishPending({ request_id: rid('pub'), force: true } as never, WEB);
     await h.idle();
@@ -44,19 +50,19 @@ describe('publish gate (identical for automatic and manual publish)', () => {
 
   test('after the capability is confirmed, publishPending deploys', async () => {
     h = await createHarness();
-    h.revoke(['policy_path_reread']);
+    h.revoke(['loopback_resource_update']);
     const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10');
-    h.grant(['policy_path_reread']);
+    h.grant(['loopback_resource_update']);
     const p = await h.app.publishPending({ request_id: rid('pub') }, WEB);
     await h.idle();
     expect(h.repos.operations.get(p.operation_id)!.phase).toBe('READY_FOR_NEXT_OPEN');
     expect(h.repos.environments.get(a.environment_id!)!.deployedProxyRevision).toBe(1);
   });
 
-  test('auto-reload setting differing from the verified condition parks the publish', async () => {
+  test('auto-reload setting differing from the condition the loopback update was measured under parks the publish', async () => {
     h = await createHarness();
-    // 实测时自动重载为关；当前读到开
-    const cap = h.repos.capabilities.get('auto_reload_atomic_replace')!;
+    // 实测时自动重载为关；当前读到开（回环资源单 key 更新的记录，不是 auto_reload_atomic_replace）
+    const cap = h.repos.capabilities.get('loopback_resource_update')!;
     h.repos.capabilities.upsert({ ...cap, context: { ...cap.context!, autoReload: 'off' } });
     h.fake.reportedAutoReload = true;
     const before = writes(h);
@@ -65,6 +71,13 @@ describe('publish gate (identical for automatic and manual publish)', () => {
     expect(op.phase).toBe('WAITING_DEPLOYMENT');
     expect(op.error?.code).toBe('CAPABILITY_UNVERIFIED');
     expect(writes(h)).toEqual(before);
+    // auto_reload_atomic_replace 的条件不参与发布门槛
+    h.repos.capabilities.upsert({ ...cap, context: { ...cap.context!, autoReload: 'on' } });
+    const other = h.repos.capabilities.get('auto_reload_atomic_replace')!;
+    h.repos.capabilities.upsert({ ...other, context: { ...other.context!, autoReload: 'off' } });
+    const p = await h.app.publishPending({ request_id: rid('pub') }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(p.operation_id)!.phase).toBe('READY_FOR_NEXT_OPEN');
   });
 });
 
@@ -80,12 +93,16 @@ describe('publish happy path', () => {
     expect(d.nodeManifest.map((m) => m.nodeName)).toEqual(['SFE-N-E0001-US01-v001']);
     expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', 'SFE-N-E0001-US01-v001']);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
+    expect(updates(h)).toBe(1);
+    expect(served(h)).toMatchObject({ generation: 1, state: 'committed' });
+    expect(pointer(h)).toEqual({ committed: { generation: 1 }, candidate: null });
     // 预检不返回出口 IP
     const p = h.repos.probes.latest(a.environment_id!, 'preflight')!;
     expect(p.outcome).toBe('ok');
     expect(p.exitIp).toBeNull();
-    // 资源文件头只含代数，不含摘要
-    expect(resource(h).split('\n')[0]).toBe('# SFE managed resource · generation 1');
+    // 提供的内容的首行只含代数，不含摘要；Surge 的配置目录中没有本地节点文件
+    expect(fetchResource(h).body.toString('utf8').split('\n')[0]).toBe('# SFE managed resource · generation 1');
+    expect(readdirSync(h.surgeDir)).not.toContain(NODE_RESOURCE_FILE);
     // 候选副本已删除
     expect(readdirSync(join(h.dir, 'tmp'))).toEqual([]);
   });
@@ -190,7 +207,9 @@ describe('baseline checks', () => {
 
   test('managed-segment edit stops with BASELINE_CHANGED and nothing is written', async () => {
     h = await createHarness();
-    const text = readFileSync(h.profilePath, 'utf8').replace('SFE-ROUTE = select, REJECT, policy-path=sfe-nodes.list', 'SFE-ROUTE = select, DIRECT, policy-path=sfe-nodes.list');
+    const original = readFileSync(h.profilePath, 'utf8');
+    const text = original.replace(/SFE-ROUTE = select, REJECT, /, 'SFE-ROUTE = select, DIRECT, ');
+    expect(text).not.toBe(original);
     writeFileSync(h.profilePath, text);
     const before = writes(h);
     const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10');
@@ -201,12 +220,27 @@ describe('baseline checks', () => {
     expect(writes(h)).toEqual(before);
   });
 
-  test('externally edited resource file → BASELINE_CHANGED', async () => {
+  test('a reference to the resource service port outside the managed group segment → NAME_COLLISION, nothing served or updated', async () => {
+    h = await createHarness();
+    const port = h.resourcePort;
+    const text = readFileSync(h.profilePath, 'utf8').replace('Daily = select, Front-A, Front-B, DIRECT', `Daily = select, Front-A, Front-B, DIRECT\nUser-Import = select, policy-path=http://127.0.0.1:${port}/x/list`);
+    writeFileSync(h.profilePath, text);
+    const before = writes(h);
+    const fileBefore = resource(h);
+    const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10');
+    const op = h.repos.operations.get(a.operation_id)!;
+    expect(op.error?.code).toBe('NAME_COLLISION');
+    expect(JSON.stringify(op.error)).toContain('resource_reference');
+    expect(writes(h)).toEqual(before);
+    expect(resource(h)).toEqual(fileBefore);
+  });
+
+  test('a stray sfe-nodes.list in the Surge directory is never read or written', async () => {
     h = await createHarness();
     writeFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), '# edited by hand\n');
     const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10');
-    expect(h.repos.operations.get(a.operation_id)!.error?.code).toBe('BASELINE_CHANGED');
-    expect(resource(h)).toBe('# edited by hand\n');
+    expect(h.repos.operations.get(a.operation_id)!.phase).toBe('READY_FOR_NEXT_OPEN');
+    expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).toBe('# edited by hand\n');
   });
 
   test('foreign SFE- object in the profile → NAME_COLLISION', async () => {
@@ -222,11 +256,13 @@ describe('baseline checks', () => {
     const fileBefore = resource(h);
     const pw = 'synthpass99';
     h.fake.checkProfile = async () => ({ ok: false, message: `line 3: SFE-N-E0001-US01-v001 = socks5, 203.0.113.10, 1080, password=${pw} invalid` });
+    const before = writes(h);
     const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10', { password: pw });
     const op = h.repos.operations.get(a.operation_id)!;
     expect(op.error?.code).toBe('SURGE_CHECK_FAILED');
     expect(JSON.stringify(op)).not.toContain('synthpass99');
-    expect(resource(h)).toBe(fileBefore);
+    expect(resource(h)).toEqual(fileBefore);
+    expect(writes(h)).toEqual(before);
     expect(readdirSync(join(h.dir, 'tmp'))).toEqual([]);
   });
 
@@ -255,17 +291,18 @@ describe('baseline checks', () => {
     const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10');
     expect(h.repos.operations.get(a.operation_id)!.error?.code).toBe('EXTERNAL_PROFILE');
     expect(writes(h)).toEqual(before);
-    expect(resource(h)).toBe(fileBefore);
-    // 写入之后的读回读到同名、无路径的当前配置：EXTERNAL_PROFILE，按同一路径回滚
+    expect(resource(h)).toEqual(fileBefore);
+    // 提供候选之后的读回读到同名、无路径的当前配置：EXTERNAL_PROFILE，按同一路径回滚
     h.fake.currentProfile = working;
     const orig = h.fake.getCurrentProfile.bind(h.fake);
-    h.fake.getCurrentProfile = async () => (resource(h) === fileBefore ? orig() : { name: WORKING_PROFILE_NAME, path: null });
+    h.fake.getCurrentProfile = async () => (served(h)?.state === 'candidate' ? { name: WORKING_PROFILE_NAME, path: null } : orig());
     const b = await createEnv(h, 'US-Buyer-02', '203.0.113.11');
     const op = h.repos.operations.get(b.operation_id)!;
     expect(op.error?.code).toBe('EXTERNAL_PROFILE');
     expect((op.error?.details as { checks: string[] }).checks).toContain('profile');
     expect(h.repos.deployments.latest()!.state).toBe('rolled_back');
     expect(h.repos.environments.get(b.environment_id!)!.deployedProxyRevision).toBeNull();
+    expect(served(h)).toMatchObject({ generation: 0, state: 'committed' });
   });
 
   test('front missing in Surge → FRONT_PROXY_MISSING for that environment only', async () => {
@@ -277,37 +314,38 @@ describe('baseline checks', () => {
     expect(op.error?.code).toBe('FRONT_PROXY_MISSING');
   });
 
-  test('no resource pointing at the node file → RESOURCE_MISSING', async () => {
+  test('no resource pointing at the resource service in Surge → parked RESOURCE_MISSING (remerge needed), nothing served or updated', async () => {
     h = await createHarness();
     h.fake.lieOnNext('listExternalResources', []);
+    const before = writes(h);
     const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10');
-    expect(h.repos.operations.get(a.operation_id)!.error?.code).toBe('RESOURCE_MISSING');
+    expect(h.repos.operations.get(a.operation_id)!).toMatchObject({ phase: 'WAITING_DEPLOYMENT', status: 'parked', error: { code: 'RESOURCE_MISSING' } });
+    expect(h.repos.operations.get(a.operation_id)!.error?.message).toContain('需要重新合并');
+    expect(writes(h)).toEqual(before);
+    expect(served(h)).toMatchObject({ generation: 0, state: 'committed' });
   });
 });
 
 describe('readback mismatch → rollback through the same path', () => {
-  test('selection lost when Surge re-reads the resource is restored; previous resource restored', async () => {
+  test('Surge drops the selected node from the candidate and the selection falls to REJECT: one rollback update restores the committed nodes and the selection', async () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-01', '203.0.113.10', PROFILE_A);
     const node = h.repos.routeState.get().selectedNode!;
     const prevManifest = h.repos.deployments.latest()!.nodeManifest;
-    const orig = h.fake.getGroupMembers.bind(h.fake);
-    let first = true;
-    h.fake.getGroupMembers = async (group: string) => {
-      const r = await orig(group);
-      if (first) {
-        first = false;
-        // 模拟 Surge 重新读取节点资源后组选择回落到首成员
-        await h.fake.selectGroupPolicy('SFE-ROUTE', 'REJECT');
-      }
-      return r;
-    };
+    const committed = pointer(h)!.committed.generation;
+    const updatesBefore = updates(h);
+    // Surge 下载候选时跳过了选中节点的行：选择回落到首成员 REJECT
+    dropNodesOnNextUpdate(h, [node]);
     const b = await createEnv(h, 'US-Buyer-02', '203.0.113.11');
     const op = h.repos.operations.get(b.operation_id)!;
     expect(op.phase).toBe('FAILED');
     expect(op.error?.code).toBe('READBACK_MISMATCH');
+    expect((op.error?.details as { checks: string[] }).checks).toEqual(expect.arrayContaining(['members', 'selection']));
+    // 发布一次 + 回滚一次
+    expect(updates(h) - updatesBefore).toBe(2);
     expect(await h.fake.getGroupSelection('SFE-ROUTE')).toBe(node);
-    expect((await h.fake.getGroupMembers('SFE-ROUTE')).slice(1)).toEqual(prevManifest.map((m) => m.nodeName));
+    expect(await nodes(h)).toEqual(prevManifest.map((m) => m.nodeName));
+    expect(pointer(h)).toEqual({ committed: { generation: committed }, candidate: null });
     expect(h.repos.deployments.latest()!.state).toBe('rolled_back');
     expect(h.repos.environments.get(b.environment_id!)!.deployedProxyRevision).toBeNull();
     expect(safariOutcome(h).leafPolicyName).toBe(node);
@@ -366,20 +404,10 @@ describe('retention', () => {
     expect(h.repos.proxyRevisions.get(env.id, 1)!.state).toBe('retired');
   });
 
-  /** 下一次发布：Surge 重新读取后组选择回落到首成员 → 读回不一致 → 回滚到最近一次 verified 的发布。 */
+  /** 下一次发布：Surge 下载候选时跳过选中节点的行、选择回落到首成员 → 读回不一致 → 回滚到已提交版本。 */
   async function publishWithSelectionDrop(name: string, host: string): Promise<string> {
-    const orig = h.fake.getGroupMembers.bind(h.fake);
-    let first = true;
-    h.fake.getGroupMembers = async (group: string) => {
-      const r = await orig(group);
-      if (first) {
-        first = false;
-        await h.fake.selectGroupPolicy('SFE-ROUTE', 'REJECT');
-      }
-      return r;
-    };
+    dropNodesOnNextUpdate(h, [h.repos.routeState.get().selectedNode!]);
     const c = await createEnv(h, name, host);
-    h.fake.getGroupMembers = orig;
     return c.operation_id;
   }
 
@@ -438,61 +466,65 @@ describe('retention', () => {
     expect(h.repos.deployments.list(50).find((d) => d.generation === gen2.generation)!.resourceDigest).toBe('scrubbed');
   });
 
-  test('deleting an environment while the node resource cannot be read keeps every revision superseded (no retirement, no secret reclaim): a failed read is not evidence the node is gone; the next publish removes and retires it', async () => {
+  test('deleting an environment while SFE-ROUTE members cannot be read retires nothing that might still be loaded (no secret reclaim); the next publish removes and retires it', async () => {
     h = await createHarness();
-    await activeEnv(h, 'US-Buyer-02', '203.0.113.11', PROFILE_A);
     const pw = ['syn', 'th', 'pw', 'D'].join('');
-    // A 的节点经一次读回不完整的发布写入资源（published）：它不在回滚目标（最近一次 verified 的发布）中
-    const origDetail = h.fake.getPolicyDetail.bind(h.fake);
-    let failOnce = true;
-    h.fake.getPolicyDetail = async (n: string) => {
-      if (failOnce) {
-        failOnce = false;
-        throw new Error('transient');
-      }
-      return origDetail(n);
-    };
     const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10', { password: `${pw}9` });
-    h.fake.getPolicyDetail = origDetail;
-    expect(h.repos.deployments.latest()!.state).toBe('published');
     const envA = h.repos.environments.get(a.environment_id!)!;
     const a1 = h.repos.proxyRevisions.get(envA.id, 1)!;
-    expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).toContain(a1.nodeName);
-    // 删除时读取节点资源失败一次（与 createProfileFiles 对非 ENOENT 错误抛出的相同）
-    const engine = h.app.engine as unknown as { profileFiles: () => ReturnType<Harness['app']['engine']['profileFiles']> };
-    const origPF = engine.profileFiles.bind(engine);
-    let failures = 1;
-    engine.profileFiles = () => {
-      const f = origPF();
-      if (!f) return f;
-      return {
-        ...f,
-        async read(name: string) {
-          if (name === NODE_RESOURCE_FILE && failures > 0) {
-            failures--;
-            throw new SfeError('UNSAFE_LOCATION', '读取文件失败：无法访问配置目录');
-          }
-          return f.read(name);
-        },
-      };
-    };
-    const del = await h.app.deleteEnvironment(envA.id, { request_id: rid(), expected_revision: envA.revision }, ADMIN);
+    // A 的新版本只保存、没有发布（门槛不足而停泊）：它从未进入任何已提交版本，只有 Surge 的成员能说明它不在其中
+    h.revoke(['loopback_publish_crash']);
+    await h.app.updateEnvironment(envA.id, { request_id: rid(), expected_revision: envA.revision, changes: { proxy: { password: { action: 'replace', value: `${pw}8` } } } }, WEB);
     await h.idle();
-    engine.profileFiles = origPF;
-    expect(failures).toBe(0);
+    h.grant(['loopback_publish_crash']);
+    const a2 = h.repos.proxyRevisions.get(envA.id, 2)!;
+    expect(a2.state).toBe('desired');
+    // 删除时读取 SFE-ROUTE 成员失败（只在删除操作执行期间）
+    const orig = h.fake.getGroupMembers.bind(h.fake);
+    let failures = 0;
+    h.fake.getGroupMembers = async (group: string) => {
+      if (h.repos.operations.listByStatus(['running'], { kinds: ['environment.delete'] }).length > 0) {
+        failures++;
+        throw new Error('synthetic read failure');
+      }
+      return orig(group);
+    };
+    const cur = h.repos.environments.get(envA.id)!;
+    const del = await h.app.deleteEnvironment(envA.id, { request_id: rid(), expected_revision: cur.revision }, ADMIN);
+    await h.idle();
+    h.fake.getGroupMembers = orig;
+    expect(failures).toBeGreaterThan(0);
     expect(h.repos.operations.get(del.operation_id)!.phase).toBe('COMPLETED');
-    // 节点仍在资源中、Surge 仍加载着它：不退役，凭据不回收
-    expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).toContain(a1.nodeName);
-    expect(h.repos.proxyRevisions.get(envA.id, 1)!.state).toBe('superseded');
-    expect(h.repos.secretRefs.get(a1.passwordRef!)?.state).toBe('committed');
     expect(h.repos.operations.listSteps(del.operation_id).map((st) => st.message).join('\n')).toContain('读取节点资源失败');
+    // 已提交版本中的 A1 与无法确认的 A2 都不退役，凭据不回收
+    expect(h.repos.proxyRevisions.get(envA.id, 1)!.state).toBe('superseded');
+    expect(h.repos.proxyRevisions.get(envA.id, 2)!.state).toBe('superseded');
+    expect(h.repos.secretRefs.get(a1.passwordRef!)?.state).toBe('committed');
+    expect(h.repos.secretRefs.get(a2.passwordRef!)?.state).toBe('committed');
     await h.app.engine.secrets.sweep();
     expect(h.store.has(a1.passwordRef!)).toBe(true);
+    expect(h.store.has(a2.passwordRef!)).toBe(true);
     // 之后的发布按保留规则移除并退役
     await h.app.publishPending({ request_id: rid('pub') }, WEB);
     await h.idle();
-    expect(readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8')).not.toContain(a1.nodeName);
+    expect(await nodes(h)).toEqual(['SFE-EMPTY']);
     expect(h.repos.proxyRevisions.get(envA.id, 1)!.state).toBe('retired');
+    expect(h.repos.proxyRevisions.get(envA.id, 2)!.state).toBe('retired');
     expect(h.repos.secretRefs.get(a1.passwordRef!)?.state).toBe('orphaned');
+  });
+
+  test('deleting an environment whose node is in the committed generation keeps it until a later publish (with members read); a never-deployed revision is retired at once', async () => {
+    h = await createHarness();
+    const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10', { password: 'synthpassC1' });
+    const envA = h.repos.environments.get(a.environment_id!)!;
+    h.revoke(['loopback_publish_crash']);
+    await h.app.updateEnvironment(envA.id, { request_id: rid(), expected_revision: envA.revision, changes: { proxy: { password: { action: 'replace', value: 'synthpassC2' } } } }, WEB);
+    await h.idle();
+    h.grant(['loopback_publish_crash']);
+    const cur = h.repos.environments.get(envA.id)!;
+    await h.app.deleteEnvironment(envA.id, { request_id: rid(), expected_revision: cur.revision }, ADMIN);
+    await h.idle();
+    expect(h.repos.proxyRevisions.get(envA.id, 1)!.state).toBe('superseded');
+    expect(h.repos.proxyRevisions.get(envA.id, 2)!.state).toBe('retired');
   });
 });

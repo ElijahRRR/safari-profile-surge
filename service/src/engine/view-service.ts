@@ -18,6 +18,7 @@ import { buildEnvironmentView, buildFrontProxyViews, buildOperationView, buildRo
 import { missingFrom } from './capabilities.js';
 import type { EmitSpec, Engine } from './context.js';
 import { normalModeOffered } from './safari-route-marker.js';
+import { nodeResourceStatus } from './node-resource.js';
 
 export interface ViewService {
   environmentView(id: string): EnvironmentView | null;
@@ -156,7 +157,7 @@ export function createViewService(engine: Engine): ViewService {
         route: service.routeView(),
         capabilities: engine.capabilityViews(),
         capabilityProposals: service.proposalViews(),
-        surge: buildSurgeStatus(engine.facts, repos.meta.configurationGeneration()),
+        surge: buildSurgeStatus(engine.facts, repos.meta.configurationGeneration(), nodeResourceStatus(engine)),
         frontProxies: service.frontProxyViews(),
         settings: service.settingsView(),
         pendingOperations: service.operationViews(repos.operations.listByStatus([...OPEN_STATUSES])),
@@ -186,7 +187,7 @@ export function createViewService(engine: Engine): ViewService {
       }
       for (const id of deleted) out.push({ type: 'environment.deleted', environmentId: id });
       if (spec.route) out.push({ type: 'route.updated', route: service.routeView() });
-      if (spec.surge) out.push({ type: 'surge.status', surge: buildSurgeStatus(engine.facts, repos.meta.configurationGeneration()) });
+      if (spec.surge) out.push({ type: 'surge.status', surge: buildSurgeStatus(engine.facts, repos.meta.configurationGeneration(), nodeResourceStatus(engine)) });
       if (spec.capabilities) out.push({ type: 'capabilities.updated', capabilities: engine.capabilityViews(), proposals: service.proposalViews() });
       if (spec.fronts) out.push({ type: 'frontProxies.updated', frontProxies: service.frontProxyViews() });
       if (spec.settings) out.push({ type: 'settings.updated', settings: service.settingsView() });

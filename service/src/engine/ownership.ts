@@ -1,8 +1,11 @@
 // 本应用对象的归属记录（managed_objects）：入口策略使用的 EntryOwnership 实现、受管理段摘要，
 // 以及初始化（与演示、测试夹具）登记全部本应用对象。归属只看记录，从不按前缀或注释判断。
 // 意图行的“写前摘要”存放在引擎键值记录中（managed_objects 没有该列），用于崩溃后区分写前与写后。
+// 节点资源（D10）不再是本应用写入的文件：它由本机资源服务提供，归属与恢复以 resource:served 指针为准（resource/state.ts），
+// 不登记 resource_file。D7 留下的 resource_file 记录只用于对仍引用本地节点文件的旧工作配置的修改检查（engine/reconcile.ts），
+// 由重新合并改用本机资源服务时清除。
 
-import { ENTRY_RULESET_FILES, NODE_RESOURCE_FILE } from '@sfe/contract';
+import { ENTRY_RULESET_FILES } from '@sfe/contract';
 import type { ManagedObjectKind, Repositories } from '../db/index.js';
 import type { EntryOwnedKind, EntryOwnedRecord, EntryOwnership } from '../surge/entry/ownership.js';
 import { findManagedBlock, parseProfile, type ParsedProfile } from '../surge/profile.js';
@@ -65,66 +68,6 @@ export function createDbEntryOwnership(repos: Repositories, kv: EngineKv): Entry
   };
 }
 
-/** 资源文件意图（发布路径）：写前摘要同样记在键值记录中。 */
-export function recordResourceIntent(repos: Repositories, kv: EngineKv, newDigest: string, operationId: string): void {
-  repos.tx(() => {
-    const prev = repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
-    const storedPrev = kv.get<{ digest: string | null }>(prevKey('resource_file', NODE_RESOURCE_FILE));
-    const previousDigest = prev?.state === 'pending_add' ? (storedPrev?.digest ?? null) : (prev?.contentDigest ?? null);
-    repos.managedObjects.upsertIntent({ kind: 'resource_file', identity: NODE_RESOURCE_FILE, contentDigest: newDigest, state: 'pending_add', createdByOperation: operationId });
-    kv.set(prevKey('resource_file', NODE_RESOURCE_FILE), { digest: previousDigest });
-  });
-}
-
-export function confirmResource(repos: Repositories, kv: EngineKv, digest: string): void {
-  repos.tx(() => {
-    if (!repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)) {
-      repos.managedObjects.upsertIntent({ kind: 'resource_file', identity: NODE_RESOURCE_FILE, contentDigest: digest, state: 'pending_add' });
-    }
-    repos.managedObjects.setState('resource_file', NODE_RESOURCE_FILE, 'present', { contentDigest: digest });
-    kv.delete(prevKey('resource_file', NODE_RESOURCE_FILE));
-  });
-}
-
-/**
- * 退役代理版本（删除环境按节点资源文件的当前内容立即退役，handlers/misc.ts runDelete）之后：节点资源文件的归属记录只保留当前文件
- * 内容的摘要。意图摘要（pending_add 的 content_digest）与写前摘要（mo_prev）不是当前文件内容时，就是不在磁盘上的内容的 pepper
- * 派生摘要，可能含刚退役的版本的凭据行——凭据被清扫之后它们仍能离线核对猜测的旧值（docs/ARCHITECTURE.md §0「秘密的存放」）。
- * current 为当前文件的摘要（文件不存在为 null）。文件仍是意图或写前内容 → 按事实确认（与崩溃恢复 recoverPublish 相同）；
- * 否则删除写前摘要，与文件不一致的意图或记录摘要清除（SCRUBBED_RESOURCE_DIGEST）——与文件不一致的记录本来就按被外部修改
- * 处理（发布的基线检查失败、对账报告被修改），需要重新合并，清除不改变这一点。服务启动时对之前的版本留下的未结算归属同样
- * 处理（engine/app-service.ts）。
- */
-export function settleResourceDigests(repos: Repositories, kv: EngineKv, current: string | null): void {
-  repos.tx(() => {
-    const rec = repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
-    const prev = kv.get<{ digest: string | null }>(prevKey('resource_file', NODE_RESOURCE_FILE));
-    if (rec?.state === 'pending_add' && current !== null && (current === rec.contentDigest || current === (prev?.digest ?? null))) {
-      confirmResource(repos, kv, current);
-      return;
-    }
-    kv.delete(prevKey('resource_file', NODE_RESOURCE_FILE));
-    // 置为不是任何摘要的占位（不置空：文件不存在时空摘要会与“读不到”相等，对账就不再报告文件被删除）
-    if (rec && rec.contentDigest !== null && rec.contentDigest !== current && rec.contentDigest !== SCRUBBED_RESOURCE_DIGEST) {
-      repos.managedObjects.setState('resource_file', NODE_RESOURCE_FILE, rec.state, { contentDigest: SCRUBBED_RESOURCE_DIGEST });
-    }
-  });
-}
-
-/** 清除后的摘要占位（与发布记录的 SCRUBBED_DIGEST 相同）：不等于任何文件的摘要，记录按与文件不一致处理。 */
-export const SCRUBBED_RESOURCE_DIGEST = 'scrubbed';
-
-/** 节点资源文件的归属尚未结算：未确认的意图，或留有写前摘要（settleResourceDigests 启动时按事实结算）。 */
-export function resourceOwnershipUnsettled(repos: Repositories, kv: EngineKv): boolean {
-  const rec = repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
-  return rec?.state === 'pending_add' || kv.get(prevKey('resource_file', NODE_RESOURCE_FILE)) !== null;
-}
-
-/** 资源文件意图的写前摘要（崩溃恢复：文件仍是写前内容时可安全回到 present）。 */
-export function resourcePreviousDigest(kv: EngineKv): string | null {
-  return kv.get<{ digest: string | null }>(prevKey('resource_file', NODE_RESOURCE_FILE))?.digest ?? null;
-}
-
 // ---------- 受管理段 ----------
 
 export type SegmentName = 'group' | 'entry' | 'general';
@@ -167,8 +110,8 @@ export function checkSegments(
 }
 
 /**
- * 登记初始化写入的全部本应用对象（present）：受管理段与本应用文件。maintenance.init、演示数据与测试夹具使用。
- * fileDigest(name) 返回文件当前的带密钥摘要（不存在为 null）。
+ * 登记初始化写入的全部本应用对象（present）：受管理段与入口规则集文件（节点资源不是文件，不登记）。maintenance.init、演示
+ * 数据与测试夹具使用。fileDigest(name) 返回文件当前的带密钥摘要（不存在为 null）。
  */
 export async function registerInitialObjects(
   repos: Repositories,
@@ -186,8 +129,6 @@ export async function registerInitialObjects(
     if (typeof block === 'object') segments.push({ name, digest: segmentDigest(opts.digestContent, name, block.version, block.lines) });
   }
   const files: Array<{ kind: ManagedObjectKind; name: string; digest: string }> = [];
-  const resourceDigest = await opts.fileDigest(NODE_RESOURCE_FILE);
-  if (resourceDigest !== null) files.push({ kind: 'resource_file', name: NODE_RESOURCE_FILE, digest: resourceDigest });
   for (const name of Object.values(ENTRY_RULESET_FILES)) {
     const d = await opts.fileDigest(name);
     if (d !== null) files.push({ kind: 'entry_ruleset_file', name, digest: d });

@@ -154,7 +154,7 @@ describe('periodic reconcile is read-only and sticky', () => {
 
   test('managed segment edited → managed_segments_changed, never auto-repaired', async () => {
     await activeHarness();
-    const text = readFileSync(h.profilePath, 'utf8').replace('SFE-ROUTE = select, REJECT, policy-path=sfe-nodes.list', 'SFE-ROUTE = select, REJECT, DIRECT, policy-path=sfe-nodes.list');
+    const text = readFileSync(h.profilePath, 'utf8').replace(/SFE-ROUTE = select, REJECT, /, 'SFE-ROUTE = select, REJECT, DIRECT, ');
     writeFileSync(h.profilePath, text);
     await h.app.runPeriodicReconcile();
     expect(h.repos.routeState.get().warnings).toContain('managed_segments_changed');

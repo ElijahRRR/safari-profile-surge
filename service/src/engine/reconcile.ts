@@ -1,6 +1,8 @@
 // 对账（docs/ARCHITECTURE.md §6.6）：只读 Surge 事实，按规则设置路由警告与阶段；从不写 Surge、从不抢回控制。
 // 失控类警告是粘性的：恢复需要用户显式激活或进入普通模式。只有改变了路由状态或警告时才记录一条
 // maintenance.reconcile 操作，避免周期任务刷屏。启动恢复在这里整理未完成的意图行与操作。
+// 本机资源服务（D10，engine/node-resource.ts）：每次对账重试监听、审计、比较组成员与已提交版本、核对使用中节点的参数，发现问题
+// 时设 node_resource_unverified（不论路由是否托管；只由经确认的读回清除），需要时排入一次系统强制刷新发布（唯一的写入经执行器）。
 
 import { readFile } from 'node:fs/promises';
 import { NODE_RESOURCE_FILE, ROUTE_GROUP_NAME, type EntryMode, type OperationStatus, type RoutePhase, type RouteWarning } from '@sfe/contract';
@@ -11,6 +13,7 @@ import { entryBlockIsFirstRule, parseProfile } from '../surge/profile.js';
 import { surgeRestartedBetween, type Engine } from './context.js';
 import { checkSegments } from './ownership.js';
 import { expireSafariProbe } from './handlers/probes.js';
+import { NODE_RESOURCE_WARNING, checkNodeResource, classifyGroupLine, maybeEnqueueSystemRefresh, nodeResourceReasonText, nodeResourceStatus, referencesLoopback } from './node-resource.js';
 
 export type ReconcileKind = 'startup' | 'periodic' | 'refresh' | 'precheck';
 
@@ -57,16 +60,21 @@ export async function managedSegmentsChanged(engine: Engine): Promise<boolean | 
   const files = engine.profileFiles();
   if (!wp || !files) return null;
   let changed = false;
+  /** 节点组定义引用本机资源服务（D10）：本地 sfe-nodes.list 已不被工作配置引用，它的摘要不再参与判断。 */
+  let loopbackLine = false;
   try {
     const text = await readFile(wp.path, 'utf8');
     const parsed = parseProfile(text);
     const segs = checkSegments(repos, parsed, files.digestContent);
     if (segs.some((s) => s.state !== 'ok')) changed = true;
     if (repos.settings.get('entryStrategy') === 'ruleset_resource' && repos.managedObjects.get('entry_segment', 'entry') && !entryBlockIsFirstRule(parsed)) changed = true;
+    loopbackLine = referencesLoopback(classifyGroupLine(text, engine.resourceUrl()));
   } catch {
     changed = true;
   }
-  const rec = repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
+  // D7 留下的本地节点文件：只对仍引用它的旧工作配置（本地 policy-path 组行，重新合并改用本机资源服务之前）检查是否被改过——
+  // Surge 重启或重载时仍会读取它。引用本机资源服务时节点由资源服务提供，由 checkNodeResource 核对（D10 不再登记这一记录）
+  const rec = loopbackLine ? null : repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE);
   if (rec && rec.state === 'present') {
     const d = await files.digest(NODE_RESOURCE_FILE).catch(() => null);
     if (d !== rec.contentDigest) changed = true;
@@ -126,6 +134,16 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   const owner = before.operationId ? repos.operations.get(before.operationId) : null;
   const managed = before.phase !== 'idle' || before.entryMode !== 'NORMAL';
   const extra = facts.reachable ? await readExtraFacts(engine) : null;
+  // 本机资源服务（只读 Surge）：路由不是普通模式时核对 SFE-ROUTE 当前选择的节点参数
+  const selectionNow = extra?.selection !== undefined ? extra.selection : before.selectedNode;
+  const nodeResource = await checkNodeResource(engine, {
+    reachable: facts.reachable,
+    onWorkingProfile: facts.onWorkingProfile,
+    detailNode: before.entryMode !== 'NORMAL' ? selectionNow : null,
+  }).catch((err: unknown) => {
+    engine.log('warn', 'resource.check_failed', { error: err instanceof Error ? err.name : 'unknown' });
+    return null;
+  });
   const now = engine.nowIso();
 
   const warnings = new Set<RouteWarning>(before.warnings);
@@ -150,6 +168,13 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
       if (extra.frontsMissing.has(f.id) && f.state !== 'missing') frontChanges.push({ id: f.id, state: 'missing' });
       if (extra.frontsPresent.has(f.id) && f.state === 'missing') frontChanges.push({ id: f.id, state: 'ok' });
     }
+  }
+
+  // 节点资源未确认（D10）：不论路由是否托管都设（阻断之后的激活、复用、填充与自动打开订单）；托管时与受管理段被修改一样把阶段
+  // 改为 attention（ATTENTION_WARNINGS）。对账从不清除它：只有经确认的发布或回滚读回（node-resource.ts confirmNodeResource）
+  if (nodeResource !== null && nodeResource.reasons.length > 0) {
+    if (!warnings.has(NODE_RESOURCE_WARNING)) notes.push(`节点资源未确认：${nodeResourceReasonText(nodeResource.reasons)}`);
+    add(NODE_RESOURCE_WARNING);
   }
 
   if (managed) {
@@ -309,11 +334,13 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   const envs = before.activeEnvironmentId ? [before.activeEnvironmentId] : [];
   engine.emit({ route: changed, surge: true, environments: changed ? envs : [], fronts: frontChanges.length > 0 });
   if (changed) engine.log('info', 'reconcile.changed', { trigger: kind, added });
+  // 需要与已提交版本重新核对（needsRefresh、资源错误或未就绪、成员不同）：没有进行中的发布时排入一次系统强制刷新发布
+  if (nodeResource !== null) maybeEnqueueSystemRefresh(engine, nodeResource);
   return { changed, route, added };
 }
 
 export function surgeStatus(engine: Engine) {
-  return buildSurgeStatus(engine.facts, engine.repos.meta.configurationGeneration());
+  return buildSurgeStatus(engine.facts, engine.repos.meta.configurationGeneration(), nodeResourceStatus(engine));
 }
 
 /** “受控”判定（复用、填充、自动打开订单共用）：先做一次对账，再按状态判定。 */

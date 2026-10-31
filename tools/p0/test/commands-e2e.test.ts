@@ -1,14 +1,13 @@
 // 命令编排的离线端到端测试：真实的本机测试服务（回显、SOCKS5 出口与前置）+ FakeSurge 规则求值 +
-// 迷你代理端口。证明 refresh / chain / preflight / charset / entry --to 的写入守卫、恢复与结论推导；
-// 不证明真实 Surge 的任何行为（那必须在测试 Mac 上实测）。FakeSurge 按 Surge Mac 6.10 的文档建模：update 跳过本地资源，
-// 本地规则集由文件监视重新读取；本地 policy-path 是否被监视没有写入文档——缺省按“被监视”的假设运行，不被监视的
-// 情形另有用例（结论必须失败或不完整，且从不靠 update 或重载补救）。
+// 迷你代理端口。证明 refresh / preflight / entry --to / propose 的写入守卫、恢复与结论推导；不证明真实 Surge 的任何行为
+// （那必须在测试 Mac 上实测）。FakeSurge 按 Surge Mac 6.10 的文档建模：update 跳过本地资源，本地规则集由文件监视重新读取，
+// 本地 policy-path 不被重新读取（2026-10-24 实测）。经回环测试资源发布测试节点的命令（loopback 系列、chain、charset）在
+// loopback-e2e.test.ts。
 
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { NODE_RESOURCE_FILE } from '@sfe/contract';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseArgs } from '../src/args.js';
 import { main } from '../src/cli.js';
@@ -95,8 +94,7 @@ beforeEach(async () => {
   const serversDone = runTestServers(ctx, () => stopped);
   for (let i = 0; i < 100 && !loadState(dir, new Date()).servers; i++) await new Promise((r) => setTimeout(r, 10));
   expect(await main(['make-test-profile', '--raw-dir', base, '--profile', sourcePath, '--no-http-api', '--yes'], baseDeps())).toBe(EXIT.OK);
-  // 假设本地 policy-path 被 Surge 自动重新读取（TODO(P0)：文档没有写明，refresh 的 policy_path_reread 测量它）。
-  const surge = new MiniSurge({ directory: profileDir, profileFileName: TEST_PROFILE_FILE, watchLocalPolicyPaths: true });
+  const surge = new MiniSurge({ directory: profileDir, profileFileName: TEST_PROFILE_FILE });
   const proxy = await startMiniSurgeProxy(surge);
   env = {
     base,
@@ -128,7 +126,7 @@ function common(): string[] {
 }
 
 describe('P0 commands end to end (offline harness)', () => {
-  it('refresh measures the watcher re-read of the local rule set and node resource without update(key), then restores everything', async () => {
+  it('refresh measures the watcher re-read of the local rule set without update(key), then restores the selection', async () => {
     const d = env!.deps();
     const surge = env!.surge;
     expect(await main(['refresh', '--auto-reload', 'off', ...common()], d)).toBe(EXIT.OK);
@@ -138,14 +136,10 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(auto.checks.find((c) => c.name.startsWith('原子替换的规则集由文件监视重新读取'))?.note).toMatch(/ms 后经 rule match 读到新内容.*实际请求同样命中新内容/);
     // update 只对规则集 canary 调用一次（记录结果）：本地资源被跳过，从不算刷新
     expect(auto.summary.join('\n')).toContain('报告跳过（与文档“Local resources are skipped.”一致；不算刷新）');
-    expect(result('targeted_resource_refresh').verdict).toBe('pass');
-    // 写入前、读回成员后与 1 秒后各记录一次资源状态（ready=false 解析为未就绪）。
-    expect(result('targeted_resource_refresh').checks.find((c) => c.name === '资源没有错误')?.note).toBe('写入前 正常，读回成员后 正常，1 秒后 正常');
-    expect(result('targeted_resource_refresh').checks.find((c) => c.name.startsWith('恰好一个 key'))?.note).toBe('local=true，来自配置');
-    const reread = result('policy_path_reread');
-    expect(reread.verdict).toBe('pass');
-    expect(env!.run().readJsonl<{ action: string }>('actions.jsonl').some((a) => a.action === 'node_publication_verified')).toBe(true);
-    expect(reread.checks[0]!.note).toMatch(/ms 后成员与清单相等/);
+    // 本地 policy-path 的旧对照实验已移除：refresh 不写测试节点，也不产生回环发布的记录
+    expect(env!.run().readJsonl<{ action: string }>('actions.jsonl').some((a) => a.action === 'node_publication_verified' || a.action === 'test_file_written' && JSON.stringify(a).includes('sfe-nodes.list'))).toBe(false);
+    expect(env!.run().listFiles('refresh').some((f) => f.includes('legacy-local-reread'))).toBe(false);
+    for (const removed of ['targeted_resource_refresh', 'policy_path_reread']) expect(env!.run().readJson(`results/${removed}.json`)).toBeNull();
     const fixed = result('fixed_profile_no_switch');
     expect(fixed.checks.find((c) => c.name.includes('实际经过'))?.ok).toBe(true);
     // Chrome 测试页没有上报 → 不完整，而不是通过
@@ -154,29 +148,10 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(await surge.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
     expect(surge.reloadCount).toBe(0);
     expect(surge.calls.reloadProfile ?? 0).toBe(0);
-    // 节点资源从不经 update 刷新：唯一一次 update 是对规则集 canary 的记录调用
+    // 唯一一次 update 是对规则集 canary 的记录调用（本地资源被跳过）
     expect(surge.calls.updateExternalResource).toBe(1);
     const keys = new Set(surge.watcherReloads.map((w) => w.key));
-    expect(keys.size).toBe(2);
-  });
-
-  it('refresh fails closed when Surge does not re-read the local policy-path: update is recorded as skipped and never counted', async () => {
-    const surge = env!.surge;
-    surge.watchLocalPolicyPaths = false;
-    expect(await main(['refresh', '--auto-reload', 'off', ...common()], env!.deps())).toBe(EXIT.OK);
-    const reread = result('policy_path_reread');
-    expect(reread.verdict).toBe('fail');
-    expect(env!.run().readJsonl<{ action: string }>('actions.jsonl').some((a) => a.action === 'node_publication_verified')).toBe(false);
-    expect(reread.checks[0]).toMatchObject({ ok: false });
-    expect(reread.checks[0]!.note).toContain('随后调用一次 update：报告跳过');
-    expect(reread.checks[0]!.note).toContain('之后成员仍未变化');
-    expect(result('targeted_resource_refresh').verdict).toBe('fail');
-    // 规则集仍由文件监视读取（文档写明），自动重载测量本身通过
-    expect(result('auto_reload_atomic_replace').verdict).toBe('pass');
-    // 从不重载兜底；成员与选择保持原样
-    expect(surge.reloadCount).toBe(0);
-    expect(await surge.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', TEST_NODES.a, TEST_NODES.b]);
-    expect(surge.calls.updateExternalResource).toBe(2);
+    expect(keys.size).toBe(1);
   });
 
   it('with auto-reload on, replacing the main profile reloads it, so the rule-set watcher cannot be told apart from a full reload: never pass', async () => {
@@ -188,7 +163,6 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(auto.checks.find((c) => c.name === '原子替换主配置后的行为已测得')).toMatchObject({ ok: true, note: '触发了配置重载' });
     expect(auto.checks.find((c) => c.name === '规则集重新读取没有触发整份配置重载')?.ok).toBeNull();
     expect(auto.summary.join('\n')).toContain('重新读取了主配置');
-    expect(result('targeted_resource_refresh').verdict).not.toBe('pass');
   });
 
   it('refresh fails when the rule-set watcher reloads the whole profile (detected by the profile canary)', async () => {
@@ -315,60 +289,11 @@ describe('P0 commands end to end (offline harness)', () => {
     expect(env!.surge.reloadCount).toBe(0);
   });
 
-  it('chain proves the front hop and that dead or missing fronts never connect', async () => {
-    expect(await main(['chain', ...common()], env!.deps())).toBe(EXIT.OK);
-    const r = result('external_node_underlying_proxy');
-    expect(r.checks.map((c) => c.ok)).toEqual([true, true, true]);
-    expect(r.verdict).toBe('pass');
-    const resource = await env!.run().readText('state.json');
-    expect(resource).toBeTruthy();
-    expect(await env!.surge.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', TEST_NODES.a, TEST_NODES.b]);
-    // 测试节点资源只由 Surge 的文件监视重新读取：从不调用 update
-    expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
-    expect(r.summary.join('\n')).toContain('测试节点资源由 Surge 自动重新读取');
-  });
-
-  it('chain is incomplete (never forced by update or reload) when Surge does not re-read the local node resource', async () => {
-    env!.surge.watchLocalPolicyPaths = false;
-    const d = env!.deps();
-    expect(await main(['chain', ...common()], d)).toBe(EXIT.OK);
-    const r = result('external_node_underlying_proxy');
-    expect(r.verdict).toBe('incomplete');
-    expect(r.checks.map((c) => c.ok)).toEqual([null, null, null]);
-    expect(d.out.text()).toContain('没有被 Surge 自动重新读取');
-    expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
-    expect(env!.surge.reloadCount).toBe(0);
-    expect(env!.surge.calls.selectGroupPolicy ?? 0).toBe(1);
-  });
-
   it('preflight shows testPolicy reached the unselected node without changing the selection', async () => {
     expect(await main(['preflight', ...common()], env!.deps())).toBe(EXIT.OK);
     const r = result('independent_node_preflight');
     expect(r.verdict).toBe('pass');
     expect(r.summary.join('\n')).toContain('测的是当前选择');
-  });
-
-  it('charset proves the baseline and detects altered characters', async () => {
-    const d = env!.deps();
-    expect(await main(['charset', '--classes', 'baseline,comma', ...common()], d)).toBe(EXIT.OK);
-    const outcome = env!.run().readJson<{ outcome: Array<{ id: string; result: string }> }>('charset/result.json')!.outcome;
-    expect(outcome.find((o) => o.id === 'baseline')?.result).toBe('safe');
-    expect(outcome.find((o) => o.id === 'comma')?.result).not.toBe('safe');
-    expect(d.out.text()).toContain('已证明安全的类别');
-    const files = await import('node:fs').then((fs) => fs.readFileSync(join(env!.profileDir, NODE_RESOURCE_FILE), 'utf8'));
-    expect(files).not.toContain('p0cs');
-    expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
-  });
-
-  it('charset tests no class when Surge does not re-read the local node resource (not reported as skipped by Surge)', async () => {
-    env!.surge.watchLocalPolicyPaths = false;
-    const d = env!.deps();
-    expect(await main(['charset', '--classes', 'baseline,comma', ...common()], d)).toBe(EXIT.OK);
-    const res = env!.run().readJson<{ reread: boolean; outcome: Array<{ id: string; result: string }> }>('charset/result.json')!;
-    expect(res.reread).toBe(false);
-    expect(res.outcome.map((o) => o.result)).toEqual(['not_tested', 'not_tested']);
-    expect(d.out.text()).toContain('已证明安全的类别：无');
-    expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
   });
 
   it('entry --to switches the ruleset entry with readback and back to NORMAL', async () => {
@@ -650,7 +575,7 @@ describe('P0 commands end to end (offline harness)', () => {
   it('refuses writes when Surge is not on the test profile', async () => {
     env!.surge.currentProfile = { name: '我的配置', path: null };
     const d = env!.deps();
-    expect(await main(['chain', ...common()], d)).toBe(EXIT.REFUSED);
+    expect(await main(['refresh', '--auto-reload', 'off', ...common()], d)).toBe(EXIT.REFUSED);
     expect(d.out.text()).toContain('SFE-P0-测试');
     expect(env!.surge.calls.selectGroupPolicy ?? 0).toBe(0);
     expect(env!.surge.calls.updateExternalResource ?? 0).toBe(0);
@@ -658,7 +583,7 @@ describe('P0 commands end to end (offline harness)', () => {
 });
 
 describe('resourceHealth', () => {
-  const res = (error: string | null, updating = false) => ({ key: 'k', type: 'policy-group', location: '/x/sfe-nodes.list', lastUpdatedAt: null, error, local: true, updating, fromModule: null });
+  const res = (error: string | null, updating = false) => ({ key: 'k', type: 'policy-group', location: '/x/sfe-nodes.list', locationHash: null, lastUpdatedAt: null, error, local: true, updating, fromModule: null });
   it('classifies without echoing Surge error text', () => {
     expect(resourceHealth([res(null, true)])).toBe('正在更新');
     expect(resourceHealth([res(null)])).toBe('正常');

@@ -10,11 +10,11 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { openDatabase } from '../../src/db/index.js';
 import { MIGRATIONS } from '../../src/db/schema.js';
 import { PEPPER_REF, pepperKey } from '../../src/secrets/pepper.js';
-import { entryRuleSetBlockLines, groupBlockLines, nodeLine, resourceFile } from '../../src/surge/generate.js';
+import { entryRuleSetBlockLines, loopbackGroupBlockLines, nodeLine, resourceBody, resourceFile } from '../../src/surge/generate.js';
 import { findManagedBlock, parseProfile, replaceManagedBlock } from '../../src/surge/profile.js';
 import { deriveKey, hmacHex, keyedRequestDigest, requestDigestParts } from '../../src/util/keyed-digest.js';
 import { AGENT, WEB, createEnv, createHarness, envInput, rid, type Harness } from '../engine/harness.js';
-import { NODE_RESOURCE_FILE } from '@sfe/contract';
+import { dropNodesOnNextUpdate } from '../engine/publish-helpers.js';
 
 let h: Harness | undefined;
 const cleanup: string[] = [];
@@ -119,7 +119,7 @@ describe('replaced and swept passwords cannot be verified offline from a copy of
     h = await createHarness({ dbFile: true });
     const envId = (await createEnv(h, 'US-Buyer-01', '203.0.113.10', { username: OLD_USER, password: OLD_PW })).environment_id!;
     // 用户在 Surge 中改动了受管理段，之后在网页中重新合并（预览、确认）
-    const tampered = readFileSync(h.profilePath, 'utf8').replace('SFE-ROUTE = select, REJECT, policy-path=sfe-nodes.list', 'SFE-ROUTE = select, REJECT, DIRECT, policy-path=sfe-nodes.list');
+    const tampered = readFileSync(h.profilePath, 'utf8').replace(/SFE-ROUTE = select, REJECT, /, 'SFE-ROUTE = select, REJECT, DIRECT, ');
     writeFileSync(h.profilePath, tampered);
     const preview = await h.app.remergePreview(WEB);
     const acc = await h.app.remergeCommit({ request_id: rid('remerge'), preview_digest: preview.preview_digest }, WEB);
@@ -154,7 +154,8 @@ describe('replaced and swept passwords cannot be verified offline from a copy of
       const currentText = readFileSync(join(backupDir, readdirSync(backupDir)[0]!), 'utf8');
       expect(currentText).toBe(tampered);
       const settings = Object.fromEntries((db.prepare('SELECT key, value FROM settings').all() as Array<{ key: string; value: string }>).map((r) => [r.key, JSON.parse(r.value) as unknown]));
-      let candidate = replaceManagedBlock(currentText, 'group', groupBlockLines());
+      // 重新合并恢复的是指向本机资源服务当前地址的定义（D10）
+      let candidate = replaceManagedBlock(currentText, 'group', loopbackGroupBlockLines(h.profileResourceUrl!));
       if (settings.entryStrategy === 'ruleset_resource' && typeof findManagedBlock(parseProfile(candidate), 'entry') === 'object') {
         candidate = replaceManagedBlock(candidate, 'entry', entryRuleSetBlockLines());
       }
@@ -183,10 +184,11 @@ describe('replaced and swept passwords cannot be verified offline from a copy of
             } catch {
               continue; // 节点行不接受的字符：不可能是发布过的凭据
             }
-            const resource = resourceFile(g, [line]);
-            tries++;
-            const digest = keyedRequestDigest(previewKey, { kind: 'maintenance.remerge', current: fd(currentText), candidate: fd(candidate), resource: fd(resource), restoreResource: null, restoreEntry: [] });
-            if (persisted.has(digest) || persisted.has(fd(resource))) hits.push(`${u}/${pw}@${g}`);
+            for (const resource of [resourceFile(g, [line]), resourceBody(g, [line])]) {
+              tries++;
+              const digest = keyedRequestDigest(previewKey, { kind: 'maintenance.remerge', current: fd(currentText), candidate: fd(candidate), resource: fd(resource), restoreResource: null, restoreEntry: [] });
+              if (persisted.has(digest) || persisted.has(fd(resource))) hits.push(`${u}/${pw}@${g}`);
+            }
           }
         }
       }
@@ -288,19 +290,9 @@ describe('replaced and swept passwords cannot be verified offline from a copy of
     }
   });
 
-  describe('the publish write baseline (resource:writeBaseline) never outlives the node lines it was computed from', () => {
-    const BASELINE = 'resource:writeBaseline';
-    async function driveUntilSettled(opId: string): Promise<void> {
-      for (let i = 0; i < 2_000; i++) {
-        const op = h!.repos.operations.get(opId)!;
-        if (op.status !== 'queued' && op.status !== 'running') break;
-        await new Promise((r) => setTimeout(r, 2));
-        if (op.phase === 'DEPLOYING' || op.phase === 'ROLLING_BACK') await h!.clock.advanceAsync(250);
-      }
-      await h!.idle();
-    }
-    /** 删除环境（版本不在节点资源中，立即退役）并清扫，返回数据目录副本中写入对照那一行（没有为 undefined）。 */
-    async function deleteSweepAndReadCopy(envId: string): Promise<string | undefined> {
+  describe('the node resource keeps no pepper-keyed digest outside the deployment records, and those are scrubbed when their revisions retire (D10)', () => {
+    /** 删除环境、清扫，返回数据目录副本中 meta（含引擎键值）的全部行与发布记录的资源摘要。 */
+    async function deleteSweepAndReadCopy(envId: string): Promise<{ meta: Array<{ key: string; value: string }>; digests: string[] }> {
       const env = h!.repos.environments.get(envId)!;
       const del = await h!.app.deleteEnvironment(envId, { request_id: rid('del'), expected_revision: env.revision }, WEB);
       await h!.idle();
@@ -311,68 +303,62 @@ describe('replaced and swept passwords cannot be verified offline from a copy of
       expect(await h!.store.get(rev.passwordRef!)).toBeNull();
       const db = new DatabaseSync(snapshotCopy(join(h!.dir, 'sfe.sqlite')), { readOnly: true });
       try {
-        return (db.prepare('SELECT value FROM meta WHERE key = ?').get(`engine:${BASELINE}`) as { value: string } | undefined)?.value;
+        return {
+          meta: db.prepare('SELECT key, value FROM meta').all() as Array<{ key: string; value: string }>,
+          digests: (db.prepare('SELECT resource_digest FROM deployments').all() as Array<{ resource_digest: string }>).map((r) => r.resource_digest),
+        };
       } finally {
         db.close();
       }
     }
 
-    test('a publish rolled back because Surge did not re-read the file in time: the baseline of the rolled-back node lines is dropped with the rollback, and nothing about the deleted environment\'s swept credentials stays in the copy', async () => {
-      h = await createHarness({ dbFile: true, watchLocalPolicyPaths: false, resourceReloadWait: { timeoutMs: 2_000, pollMs: 500 } });
-      const before = readFileSync(join(h.surgeDir, 'sfe-nodes.list'), 'utf8');
+    /** 候选发布的内容（按发布记录与真实凭据重建）在工作配置目录文件密钥下的摘要；与记录的摘要一致，说明重建的就是提供的那一份。 */
+    async function candidateDigest(generation: number): Promise<string> {
+      const d = h!.repos.deployments.get(generation)!;
+      const pepper = Buffer.from((await h!.store.get(PEPPER_REF))!, 'base64url');
+      const lines: string[] = [];
+      for (const m of d.nodeManifest) {
+        const r = h!.repos.proxyRevisions.get(m.environmentId, m.proxyRevision)!;
+        const front = h!.repos.frontProxies.get(r.frontProxyId!)!.surgeName;
+        lines.push(nodeLine({ name: r.nodeName, host: r.host, port: r.port, username: await h!.store.get(r.usernameRef!), password: await h!.store.get(r.passwordRef!), front }));
+      }
+      const digest = hmacHex(pepperKey(pepper, 'file'), `sfe-file\0${resourceBody(generation, lines)}`);
+      expect(d.resourceDigest).toBe(digest);
+      return digest;
+    }
+
+    test('a publish rolled back because Surge dropped the node from the candidate: once the deleted environment\'s revision retires, the copy keeps no digest of the candidate and the engine state keeps only generations and sequence numbers', async () => {
+      h = await createHarness({ dbFile: true });
       const a = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-01', '203.0.113.10', { username: 'synthUserA1', password: 'Summer2025' }) }, WEB);
-      await driveUntilSettled(a.operation_id);
-      expect(h.repos.deployments.latest()!.state).toBe('rolled_back');
-      expect(readFileSync(join(h.surgeDir, 'sfe-nodes.list'), 'utf8')).toBe(before);
-      // 文件已恢复为上一份内容：那组节点行的写入对照再也用不上
-      expect(h.app.engine.kv.get(BASELINE)).toBeNull();
-      expect(await deleteSweepAndReadCopy(a.environment_id!)).toBeUndefined();
+      const op = h.repos.operations.get(a.operation_id)!;
+      // 下载候选时 Surge 跳过了新节点的行：读回不一致 → 回滚（Surge 重新载入已提交的第 0 代）
+      dropNodesOnNextUpdate(h, [h.repos.proxyRevisions.get(a.environment_id!, 1)!.nodeName]);
+      await h.idle();
+      expect(h.repos.operations.get(op.id)!.phase).toBe('FAILED');
+      const candidate = h.repos.deployments.latest()!;
+      expect(candidate.state).toBe('rolled_back');
+      const written = await candidateDigest(candidate.generation);
+      const copy = await deleteSweepAndReadCopy(a.environment_id!);
+      expect(copy.digests).not.toContain(written);
+      expect(copy.meta.filter((r) => r.value.includes(written)).map((r) => r.key)).toEqual([]);
+      // 本机资源服务的持久状态（engine:resource:*）只有代数、序号、时间与原因代码：没有任何 64 位十六进制摘要
+      const resourceRows = copy.meta.filter((r) => r.key.startsWith('engine:resource:'));
+      expect(resourceRows.length).toBeGreaterThan(0);
+      for (const r of resourceRows) expect(r.value).not.toMatch(/[0-9a-f]{64}/);
+      expect(copy.meta.some((r) => r.key === 'engine:resource:writeBaseline' || r.key.startsWith('engine:mo_prev:resource_file:'))).toBe(false);
     });
 
-    test('a failed atomic write leaves the file unchanged: the baseline of node lines never written is dropped', async () => {
+    test('a publish refused before anything is served (--check fails) persists nothing derived from the new credentials', async () => {
       h = await createHarness({ dbFile: true });
-      const engine = h.app.engine;
-      const orig = engine.profileFiles.bind(engine);
-      engine.profileFiles = () => {
-        const files = orig();
-        if (!files) return files;
-        return new Proxy(files, {
-          get(target, prop, receiver) {
-            if (prop === 'writeAtomic') return async () => {
-              throw new Error('模拟：写入失败');
-            };
-            const v = Reflect.get(target, prop, receiver) as unknown;
-            return typeof v === 'function' ? (v as (...args: unknown[]) => unknown).bind(target) : v;
-          },
-        });
-      };
+      h.fake.checkProfile = async () => ({ ok: false, message: 'line 1: 合成错误' });
+      const deploymentsBefore = h.repos.deployments.list().length;
       const a = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-01', '203.0.113.10', { username: 'synthUserA1', password: 'Summer2025' }) }, WEB);
       await h.idle();
-      engine.profileFiles = orig;
-      expect(h.repos.operations.get(a.operation_id)!.status).toBe('failed');
-      expect(readFileSync(join(h.surgeDir, 'sfe-nodes.list'), 'utf8')).not.toContain('Summer2025');
-      expect(h.app.engine.kv.get(BASELINE)).toBeNull();
-    });
-
-    test('a baseline whose node lines include a revision that retires (or an older baseline that does not list its revisions) is dropped when it retires; a baseline of other revisions is kept', async () => {
-      for (const leftover of ['lists the revision', 'legacy', 'other revisions'] as const) {
-        h = await createHarness({ dbFile: true, watchLocalPolicyPaths: false, resourceReloadWait: { timeoutMs: 2_000, pollMs: 500 } });
-        const a = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-01', '203.0.113.10', { username: 'synthUserA1', password: 'Summer2025' }) }, WEB);
-        await driveUntilSettled(a.operation_id);
-        expect(h.repos.deployments.latest()!.state).toBe('rolled_back');
-        const envId = a.environment_id!;
-        // 之前版本的回滚留下的对照（回滚时不删除；早先记下的不列出其中的版本）
-        const value =
-          leftover === 'legacy'
-            ? { bodyDigest: 'e'.repeat(64), membersBefore: ['REJECT'] }
-            : { bodyDigest: 'e'.repeat(64), membersBefore: ['REJECT'], revisions: leftover === 'lists the revision' ? [`${envId}:1`] : ['env_other:3'] };
-        h.app.engine.kv.set(BASELINE, value);
-        const row = await deleteSweepAndReadCopy(envId);
-        if (leftover === 'other revisions') expect(JSON.parse(row!)).toEqual(value);
-        else expect(row).toBeUndefined();
-        await h.close();
-        h = undefined;
-      }
+      expect(h.repos.operations.get(a.operation_id)!).toMatchObject({ status: 'failed', error: { code: 'SURGE_CHECK_FAILED' } });
+      // 没有候选发布记录，资源服务从未提供它，Surge 中没有它
+      expect(h.repos.deployments.list().length).toBe(deploymentsBefore);
+      expect(h.app.engine.resource!.served()).toMatchObject({ generation: 0, state: 'committed' });
+      expect(h.fake.loadedContent(h.resourceKey()!)).not.toContain('Summer2025');
     });
   });
 
@@ -420,38 +406,24 @@ describe('replaced and swept passwords cannot be verified offline from a copy of
   });
 });
 
-describe('a publish rollback whose Surge readback fails keeps no pepper-keyed digest of the rolled-back node resource (§0, INSTALL §6)', () => {
-  /** 推进到发布结束：写入后等待 Surge 重新读取用假时钟计时。 */
-  async function drive(opId: string): Promise<void> {
-    for (let i = 0; i < 4000; i++) {
-      const op = h!.repos.operations.get(opId)!;
-      if (op.status !== 'queued' && op.status !== 'running') break;
-      await new Promise((r) => setTimeout(r, 2));
-      if (op.phase === 'DEPLOYING' || op.phase === 'ROLLING_BACK' || op.phase === 'RECONCILING') await h!.clock.advanceAsync(250);
-    }
-    await h!.idle();
-  }
-
-  type Mode = 'members_throw' | 'reload_stalls' | 'earlier_version_residue';
+describe('a publish whose rollback cannot be confirmed keeps no pepper-keyed digest of the candidate once its revision retires (§0, INSTALL §6)', () => {
+  type Mode = 'rollback_update_fails' | 'rollback_members_throw';
 
   /**
-   * 环境 A 已发布、已核对；创建环境 B（代理密码 pwB）的发布 N 写入含 B 节点行（明文凭据）的节点资源，读回不一致而回滚；回滚的
-   * 写入成功，但之后的读回失败（Surge 不可达，或还没有重新读取恢复的文件）。用户随后删除 B：它的版本立即退役、凭据被清扫。
-   * earlier_version_residue：回滚照常，但数据目录来自之前的版本——它在这时留下了写前摘要（发布 N 写入内容的摘要）与未确认的意图。
+   * 环境 A 已发布、已核对；创建环境 B（代理密码 pwB）的发布 N 提供含 B 节点行（明文凭据）的候选，Surge 载入后逐节点读回不一致
+   * （端口）→ 回滚；回滚的单 key 更新失败（或之后读不到组成员）→ 需要处理，Surge 可能仍载入着候选。用户随后删除 B：Surge 可能
+   * 仍有它，先不退役；之后一次发布收敛（Surge 回到不含 B 的版本）时退役、凭据被清扫。
    */
   async function scenario(mode: Mode) {
-    h = await createHarness({ dbFile: true, resourceReloadWait: { timeoutMs: 2_000, pollMs: 500 } });
-    const userA = ['synth', 'UserA'].join('');
-    const pwA = ['synth', 'PwdA', '1'].join('');
-    const a = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-01', '203.0.113.10', { username: userA, password: pwA }) }, WEB);
-    await drive(a.operation_id);
-    expect(h.repos.deployments.latest()!.state).toBe('verified');
-    const fake = h.fake as unknown as { getPolicyDetail: (n: string) => Promise<Record<string, unknown>>; getGroupMembers: (g: string) => Promise<string[]> };
+    h = await createHarness({ dbFile: true });
+    const a = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-01', '203.0.113.10', { username: ['synth', 'UserA'].join(''), password: ['synth', 'PwdA', '1'].join('') }) }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(a.operation_id)!.phase).toBe('READY_FOR_NEXT_OPEN');
+    const fake = h.fake as unknown as { getPolicyDetail: (n: string) => Promise<Record<string, unknown>>; getGroupMembers: (g: string) => Promise<string[]>; updateExternalResource: (k: string) => Promise<unknown> };
     const origDetail = fake.getPolicyDetail.bind(h.fake);
     const origMembers = fake.getGroupMembers.bind(h.fake);
+    const origUpdate = fake.updateExternalResource.bind(h.fake);
     let inRollback = false;
-    let lastMembers: string[] | null = null;
-    // 发布 N 的逐节点读回不一致（端口）→ 回滚；回滚之后 Surge 不可达或不重新读取
     fake.getPolicyDetail = async (name: string) => {
       const d = await origDetail(name);
       if (!name.includes('E0002')) return d;
@@ -459,76 +431,58 @@ describe('a publish rollback whose Surge readback fails keeps no pepper-keyed di
       return { ...d, port: 1 };
     };
     fake.getGroupMembers = async (g: string) => {
-      if (inRollback && mode === 'members_throw') throw new Error('模拟：Surge 不可达');
-      if (inRollback && mode === 'reload_stalls') return lastMembers!;
-      lastMembers = await origMembers(g);
-      return lastMembers;
+      if (inRollback && mode === 'rollback_members_throw' && h!.app.engine.resource!.served()?.state === 'committed' && (h!.fake.calls.updateExternalResource ?? 0) >= 3) throw new Error('模拟：Surge 不可达');
+      return origMembers(g);
     };
-    const userB = ['synth', 'UserB'].join('');
+    fake.updateExternalResource = async (k: string) => {
+      if (inRollback && mode === 'rollback_update_fails') throw new Error('模拟：更新失败');
+      return origUpdate(k);
+    };
     const pwB = ['Sum', 'mer', '2025'].join('');
-    const b = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-02', '203.0.113.20', { username: userB, password: pwB }) }, WEB);
-    await drive(b.operation_id);
+    const b = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-02', '203.0.113.20', { username: ['synth', 'UserB'].join(''), password: pwB }) }, WEB);
+    await h.idle();
     fake.getGroupMembers = origMembers;
     fake.getPolicyDetail = origDetail;
+    fake.updateExternalResource = origUpdate;
     const depN = h.repos.deployments.latest()!;
-    // 发布 N 写入的内容：按发布记录（代数与清单）与真实凭据重建；与记录的摘要一致，说明重建的就是写入的那一份
+    expect(h.repos.operations.get(b.operation_id)!).toMatchObject({ status: 'needs_attention', phase: 'BLOCKED_NEEDS_ATTENTION' });
+    expect(depN.state).toBe('failed');
+    // 候选的内容：按发布记录与真实凭据重建，与记录的摘要一致
     const pepper = Buffer.from((await h.store.get(PEPPER_REF))!, 'base64url');
-    const fileKey = pepperKey(pepper, 'file');
-    const digestOf = (c: string) => hmacHex(fileKey, `sfe-file\0${c}`);
     const lines: string[] = [];
     for (const m of depN.nodeManifest) {
       const r = h.repos.proxyRevisions.get(m.environmentId, m.proxyRevision)!;
       const front = h.repos.frontProxies.get(r.frontProxyId!)!.surgeName;
       lines.push(nodeLine({ name: r.nodeName, host: r.host, port: r.port, username: await h.store.get(r.usernameRef!), password: await h.store.get(r.passwordRef!), front }));
     }
-    const writtenN = digestOf(resourceFile(depN.generation, lines));
+    const writtenN = hmacHex(pepperKey(pepper, 'file'), `sfe-file\0${resourceBody(depN.generation, lines)}`);
     expect(depN.resourceDigest).toBe(writtenN);
-    const opB = h.repos.operations.get(b.operation_id)!;
-    if (mode === 'earlier_version_residue') {
-      expect(opB.phase).toBe('FAILED');
-      const cur = h.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)!;
-      h.repos.managedObjects.setState('resource_file', NODE_RESOURCE_FILE, 'pending_add', { contentDigest: cur.contentDigest });
-      h.app.engine.kv.set(`mo_prev:resource_file:${NODE_RESOURCE_FILE}`, { digest: writtenN });
-    } else {
-      expect(opB).toMatchObject({ status: 'needs_attention', phase: 'BLOCKED_NEEDS_ATTENTION' });
-      // 回滚的写入成功即确认归属：读回失败不留写前摘要（发布 N 写入的内容的摘要）
-      expect(h.app.engine.kv.get(`mo_prev:resource_file:${NODE_RESOURCE_FILE}`)).toBeNull();
-      expect(h.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)).toMatchObject({ state: 'present', contentDigest: await h.app.engine.profileFiles()!.digest(NODE_RESOURCE_FILE) });
-    }
-    expect(depN.state).toBe(mode === 'earlier_version_residue' ? 'rolled_back' : 'failed');
     const envB = h.repos.environments.get(b.environment_id!)!;
+    const revB = h.repos.proxyRevisions.get(envB.id, 1)!;
     const del = await h.app.deleteEnvironment(envB.id, { request_id: rid('del'), expected_revision: envB.revision }, WEB);
     await h.idle();
     expect(h.repos.operations.get(del.operation_id)!.status).toBe('succeeded');
-    const revB = h.repos.proxyRevisions.get(envB.id, 1)!;
-    expect(revB.state).toBe('retired');
+    // Surge 仍可能载入着含 B 的候选：先不退役
+    if (mode === 'rollback_update_fails') expect(h.repos.proxyRevisions.get(envB.id, 1)!.state).not.toBe('retired');
+    // 一次发布收敛：Surge 回到不含 B 的版本，B 退役、凭据被清扫
+    const pub = await h.app.publishPending({ request_id: rid('pub') }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(pub.operation_id)!.status).toBe('succeeded');
+    expect(h.repos.proxyRevisions.get(envB.id, 1)!.state).toBe('retired');
     await h.app.engine.secrets.sweep();
     expect(await h.store.get(revB.passwordRef!)).toBeNull();
     return { writtenN };
   }
 
-  for (const mode of ['members_throw', 'reload_stalls', 'earlier_version_residue', 'residue_found_at_startup'] as const) {
-    test(`${mode}: after deleting the environment and sweeping its credentials, no row of a data-directory copy equals the digest of the rolled-back content`, async () => {
-      const { writtenN } = await scenario(mode === 'residue_found_at_startup' ? 'members_throw' : mode);
-      if (mode === 'residue_found_at_startup') {
-        // 升级前的版本删除环境时没有结算归属：数据目录里仍有未确认的意图与写前摘要；新版本启动时按事实结算
-        const cur = h!.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)!;
-        h!.repos.managedObjects.setState('resource_file', NODE_RESOURCE_FILE, 'pending_add', { contentDigest: cur.contentDigest });
-        h!.app.engine.kv.set(`mo_prev:resource_file:${NODE_RESOURCE_FILE}`, { digest: writtenN });
-        await h!.crash();
-        await h!.idle();
-      }
+  for (const mode of ['rollback_update_fails', 'rollback_members_throw'] as const) {
+    test(`${mode}: after deleting the environment, converging and sweeping its credentials, no row of a data-directory copy equals the digest of the candidate`, async () => {
+      const { writtenN } = await scenario(mode);
       const db = new DatabaseSync(snapshotCopy(join(h!.dir, 'sfe.sqlite')), { readOnly: true });
       try {
         const meta = db.prepare('SELECT key, value FROM meta').all() as Array<{ key: string; value: string }>;
         expect(meta.filter((r) => r.value.includes(writtenN)).map((r) => r.key)).toEqual([]);
-        expect(meta.some((r) => r.key.startsWith('engine:mo_prev:resource_file:'))).toBe(false);
-        const mos = db.prepare('SELECT kind, identity, content_digest, state FROM managed_objects').all() as Array<{ content_digest: string | null; state: string; kind: string }>;
+        const mos = db.prepare('SELECT content_digest FROM managed_objects').all() as Array<{ content_digest: string | null }>;
         expect(mos.filter((r) => r.content_digest === writtenN)).toEqual([]);
-        // 节点资源文件的归属记录只保留当前文件内容的摘要（已确认）
-        const file = mos.find((r) => r.kind === 'resource_file')!;
-        expect(file.state).toBe('present');
-        expect(file.content_digest).toBe(await h!.app.engine.profileFiles()!.digest(NODE_RESOURCE_FILE));
         const deps = db.prepare('SELECT resource_digest FROM deployments').all() as Array<{ resource_digest: string }>;
         expect(deps.filter((r) => r.resource_digest === writtenN)).toEqual([]);
       } finally {

@@ -78,10 +78,10 @@ xcodebuild -scheme SafariProfileSurge test     # 运行 XCTest
 2. App 每次启动都会（幂等地）：
    - 在 App Group 容器（`~/Library/Group Containers/<Team ID>.sfe/`）写入 `bridge.json`（`{"port":61848,"transport":"tcp"}`）与 `bridge.token`（32 字节随机数的 base64url，0600），已有且有效时沿用。macOS 上即使 App Group 无效 `containerURL` 也会返回 URL（“In macOS, a URL of the expected form is always returned, even if the app group is invalid, so be sure to test that you can access the underlying directory before attempting to use it.”，https://developer.apple.com/documentation/foundation/filemanager/containerurl(forsecurityapplicationgroupidentifier:)），所以写入前先打开容器目录、写入后按扩展的读取方式读回；目录不存在与系统拒绝访问分开提示，不自行创建容器目录；
    - 创建数据目录 `~/Library/Application Support/SafariProfileSurge`（0700），写入令牌副本 `bridge.token`（0600），服务从这里读取（每个连接重新检查，App 改写令牌后无需重启服务），从不访问 App Group 容器；
-   - 合并写入 `install.json`（0600）：`surgeCliPath`（只有 `/Applications/Surge.app/Contents/Applications/surge-cli` 存在时）、`nodeVersionPin`、`bridge`、`webRoot`（App 内的 `service/web`），以及首次创建时全部为 `unavailable` 的 `adapterMechanism`（之后由 P0 填写，App 从不覆盖）。合并从不删除字段：旧版本写入的 `keychainHelperPath`（指向旧版本 App 中的 sfe-keychain）原样保留——本版本的服务读取时忽略它，装回旧版本时旧服务需要它（docs/INSTALL.md §7 第 1 步）。新建的 `install.json` 不写这个字段。`install.json` 不含任何秘密。
+   - 合并写入 `install.json`（0600）：`surgeCliPath`（只有 `/Applications/Surge.app/Contents/Applications/surge-cli` 存在时）、`nodeVersionPin`、`bridge`、`webRoot`（App 内的 `service/web`），以及首次创建时全部为 `unavailable` 的 `adapterMechanism`（之后由 P0 填写，App 从不覆盖）。本机资源服务（用户决定 D10）的端口与读取令牌由服务自己保存在数据库中，App 不写也不读它们，`install.json` 中没有。合并从不删除字段：旧版本写入的 `keychainHelperPath`（指向旧版本 App 中的 sfe-keychain）原样保留——本版本的服务读取时忽略它，装回旧版本时旧服务需要它（docs/INSTALL.md §7 第 1 步）。新建的 `install.json` 不写这个字段。`install.json` 不含任何秘密。
 3. 菜单「注册后台服务」：以 `SMAppService.agent(plistName: "com.sfe.service.plist")` 注册。系统可能要求在「系统设置 → 通用 → 登录项与扩展」（macOS 14 为「登录项」）中允许；菜单会显示状态并提供「打开登录项与扩展设置」（macOS 14 为「打开登录项设置」，按运行中的系统版本显示）。服务不带演示参数，不含任何秘密。
-   - macOS 26 或更高：后台服务运行中从菜单「退出」App 时，系统会询问是否允许后台任务继续运行（“On Mac computers with macOS 26 or later, if background tasks are started by an app and remain active after a user quits the app, the user is prompted to allow or not allow the background tasks to remain active.”，https://support.apple.com/guide/deployment/manage-login-items-background-tasks-mac-depdca572563/web）。选「允许」服务才会继续运行。选「不允许」后服务与 `SMAppService.status` 如何变化，Apple 没有写明，由 P0 `native_bridge_ipc` 记录（`sfltool dumpbtm` 查看）；菜单「退出」目前不额外提示（`App/SafariProfileSurgeApp.swift`）。服务停止时入口规则与 SFE-ROUTE 选择保持原样，见 docs/INSTALL.md §2 第 2 步。
-4. 「停止后台服务」只注销 LaunchAgent，**不改变** Surge 中的入口规则或 SFE-ROUTE 选择；要撤销本应用的规则，先进入普通模式，再按 docs/INSTALL.md §5 切回原配置、删除工作配置与本应用文件（受管理段只在工作配置中，本应用没有移除受管理段的功能）。
+   - macOS 26 或更高：后台服务运行中从菜单「退出」App 时，系统会询问是否允许后台任务继续运行（“On Mac computers with macOS 26 or later, if background tasks are started by an app and remain active after a user quits the app, the user is prompted to allow or not allow the background tasks to remain active.”，https://support.apple.com/guide/deployment/manage-login-items-background-tasks-mac-depdca572563/web）。选「允许」服务才会继续运行。选「不允许」后服务与 `SMAppService.status` 如何变化，Apple 没有写明，由 P0 `native_bridge_ipc` 记录（`sfltool dumpbtm` 查看）；菜单「退出」目前不额外提示（`App/SafariProfileSurgeApp.swift`）。服务停止时入口规则与 SFE-ROUTE 选择保持原样；本机资源服务随之停止，Surge 保留已下载的节点，对它的更新与定时刷新报告无法连接，这期间资源端口可能被其他程序占用并收到读取令牌（服务恢复后能发现，不能阻止），见 docs/INSTALL.md §2 第 2 步。
+4. 「停止后台服务」只注销 LaunchAgent，**不改变** Surge 中的入口规则或 SFE-ROUTE 选择（本机资源服务随服务停止，Surge 沿用缓存的节点，同上）；要撤销本应用的规则，先进入普通模式，再按 docs/INSTALL.md §5 切回原配置、删除工作配置与本应用文件（受管理段只在工作配置中，本应用没有移除受管理段的功能）。
 
 ## 启用扩展并授权 www.amazon.com
 
@@ -117,7 +117,7 @@ xcodebuild -scheme SafariProfileSurge test     # 运行 XCTest
 ## 秘密的存放（不使用钥匙串）
 
 - 本项目不读写 macOS 钥匙串，App、扩展与服务都不会触发钥匙串授权提示；App 包内没有钥匙串工具，entitlements 不含 `keychain-access-groups`。
-- 代理凭据、亚马逊账号密码与 pepper 等秘密由本机服务以**明文**保存在自己的资料中（数据目录 `~/Library/Application Support/SafariProfileSurge` 下服务的 SQLite 数据库 `sfe.sqlite`），只靠文件权限保护：数据目录 0700，文件 0600，只有本机这个用户可以读取。宿主 App 每次启动都把数据目录收紧为 0700（`App/SecureFile.swift` 的 `ensurePrivateDirectory`）。能以这个用户身份读文件的程序、以及数据目录的备份（例如时间机器）都能读到这些明文。代理凭据另外按 Surge 语法明文写在节点资源文件中（含秘密的完整位置见 docs/ARCHITECTURE.md §2）。
+- 代理凭据、亚马逊账号密码与 pepper 等秘密由本机服务以**明文**保存在自己的资料中（数据目录 `~/Library/Application Support/SafariProfileSurge` 下服务的 SQLite 数据库 `sfe.sqlite`），只靠文件权限保护：数据目录 0700，文件 0600，只有本机这个用户可以读取。宿主 App 每次启动都把数据目录收紧为 0700（`App/SecureFile.swift` 的 `ensurePrivateDirectory`）。能以这个用户身份读文件的程序、以及数据目录的备份（例如时间机器）都能读到这些明文。代理凭据另外按 Surge 语法以明文交给 Surge：服务内的本机资源服务只监听 127.0.0.1，以带随机读取令牌的地址提供节点列表（令牌也写在工作配置中），Surge 下载后自己再缓存一份（位置待 P0 实测）；D10 之前的版本写在节点资源文件 `sfe-nodes.list` 中（含秘密的完整位置见 docs/ARCHITECTURE.md §2）。
 - 登录填充：何时允许填充全部由服务按 docs/ARCHITECTURE.md §6.10 判断；允许时服务从本机资料读出账号密码，直接放在 `requestLoginFill` 的应答中（`{ field, value }`，与扩展收到的 `LoginFillResponse` 同形）。原生桥原样交给扩展，不读取、不改写、不缓存、不记录；扩展只在内存中短暂持有。
 - 用旧的钥匙串版本创建的数据目录不能直接沿用（秘密值在钥匙串里，新版本不会去读）：服务启动时检测到后报告 `SECRET_STORE_FAILED` 并拒绝启动（说明只写在数据目录的 `service.log` 中；不读钥匙串，也不重新生成 pepper，数据库原样保留）。按 docs/INSTALL.md §7 的完整步骤处理，**顺序不能颠倒**：
   1. 先撤销旧版本在 Surge 中的入口：最好在升级之前用旧版本进入普通模式（已经升级时可以装回旧版本进入普通模式）；或在 Surge 中手动切回原配置，并逐条移除本应用留下的临时规则（含 Safari 进程路径、策略为 `REJECT` 或 `SFE-ROUTE`；不要用 `rule temp flush`）。在此之前，Safari 可能仍按旧版本的入口经旧的买家出口发出，或一直被拒绝。
@@ -137,6 +137,6 @@ xcodebuild -scheme SafariProfileSurge test     # 运行 XCTest
 
 1. 先在插件或网页中进入普通模式（撤销本应用的入口）。
 2. 菜单「停止后台服务」。
-3. 删除 `SafariProfileSurge.app`；按需删除 `~/Library/Application Support/SafariProfileSurge`（含数据库——其中有明文保存的代理凭据与账号密码——、备份与令牌副本）与 `~/Library/Group Containers/<Team ID>.sfe`。
+3. 删除 `SafariProfileSurge.app`；按需删除 `~/Library/Application Support/SafariProfileSurge`（含数据库——其中有明文保存的代理凭据、账号密码与本机资源服务的读取令牌——、备份与令牌副本）与 `~/Library/Group Containers/<Team ID>.sfe`。Surge 自己缓存的节点列表（明文代理凭据）不在这些目录中，按 docs/INSTALL.md §5 第 5 步处理。
 4. 本项目不使用钥匙串。只有曾经装过旧的钥匙串版本时，才需要删除它留下的项：`security delete-generic-password -s com.sfe.proxy`（`com.sfe.account`、`com.sfe.system` 同样），每次删除一项，重复运行到提示找不到为止；也可以在「钥匙串访问」中按名称搜索「SafariProfileSurge」逐条删除。详见 docs/INSTALL.md。
-5. 按 docs/INSTALL.md 移除 Surge 工作配置中的受管理段。
+5. 按 docs/INSTALL.md §5 在 Surge 中切回原配置，再删除工作配置「日常-Safari环境.conf」（其中含读取令牌）与本应用的文件（受管理段只在工作配置中，不需要逐段移除）。

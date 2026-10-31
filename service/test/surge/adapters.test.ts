@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, test, vi } from 'vitest';
-import { SfeError } from '@sfe/contract';
+import { SfeError, nodeResourceUrl } from '@sfe/contract';
 import type { SurgeAdapter } from '../../src/ports.js';
 import {
   CLI_ARGV_ALLOWLIST,
@@ -8,6 +9,7 @@ import {
   isAllowedCliArgv,
   ruleMatchArgs,
   safeArg,
+  safeCliResourceKey,
   safeConnectionId,
   safeResourceKey,
   safeRouteSelection,
@@ -19,6 +21,11 @@ import { createCompositeAdapter } from '../../src/surge/composite.js';
 import { SURGE_PRIMITIVES, type MechanismMap, type SurgePrimitive } from '../../src/surge/primitives.js';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST } from '../../src/surge/fake.js';
 import { CLI_PATH as CLI, CLI_SAMPLE_ARGS as SAMPLE_ARGS, SAMPLE_RULE } from './cli-samples.js';
+
+const sha = (s: string): string => createHash('sha256').update(s).digest('hex');
+// 合成的本机资源服务地址与令牌（D10）
+const LOOPBACK_TOKEN = '9f'.repeat(32);
+const LOOPBACK_URL = nodeResourceUrl(20001, LOOPBACK_TOKEN);
 
 const allCli: MechanismMap = Object.fromEntries(SURGE_PRIMITIVES.map((p) => [p, 'cli']));
 const allHttp: MechanismMap = Object.fromEntries(SURGE_PRIMITIVES.map((p) => [p, 'http']));
@@ -189,7 +196,7 @@ describe('CLI command table and argv allowlist', () => {
     const list = CLI_COMMANDS.listExternalResources as CliCommand<[], unknown>;
     const temps = CLI_COMMANDS.listTempRules as CliCommand<[], unknown>;
     expect(list.parse(out(JSON.stringify({ resources: [{ key: 'k1', type: 'ruleset', path: 'https://rules.example.test/a.list', lastUpdated: 1760000000 }] })), ctx, [])).toEqual([
-      { key: 'k1', type: 'ruleset', location: 'https://rules.example.test/a.list', lastUpdatedAt: new Date(1760000000 * 1000), error: null, local: null, updating: null, fromModule: null },
+      { key: 'k1', type: 'ruleset', location: 'https://rules.example.test/a.list', locationHash: sha('https://rules.example.test/a.list'), lastUpdatedAt: new Date(1760000000 * 1000), error: null, local: null, updating: null, fromModule: null },
     ]);
     expect(temps.parse(out('[]'), ctx, [])).toEqual([]);
     expect(temps.parse(out(JSON.stringify(['DOMAIN,a.example.test,REJECT'])), ctx, [])).toEqual(['DOMAIN,a.example.test,REJECT']);
@@ -419,6 +426,49 @@ describe('createCliAdapter', () => {
     await expect(cli(timeout).listTempRules()).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
   });
 
+  test('per-primitive timeouts override the default; an update timeout is an ambiguous command failure, not unreachable (D10)', async () => {
+    const key = '0123456789abcdef0123456789abcdef';
+    const killed = vi.fn<ExecFn>(async () => Promise.reject(Object.assign(new Error('killed'), { killed: true, signal: 'SIGTERM', code: null })));
+    const a = cli(killed, { timeoutsMs: { updateExternalResource: 30_000 } });
+    const err = (await a.updateExternalResource(key).catch((e: unknown) => e)) as SfeError;
+    expect(err).toBeInstanceOf(SfeError);
+    expect(err.code).toBe('SURGE_COMMAND_FAILED');
+    expect(err.details).toEqual({ primitive: 'updateExternalResource', reason: 'update_timeout' });
+    expect(killed).toHaveBeenLastCalledWith(CLI, ['external-resource', 'update', key], expect.objectContaining({ timeout: 30_000 }));
+    // 其他原语保持缺省超时与“无法连接”的分类
+    await expect(a.listExternalResources()).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
+    expect(killed).toHaveBeenLastCalledWith(CLI, ['--raw', 'external-resource', 'list'], expect.objectContaining({ timeout: 15_000 }));
+    // 没有覆盖时更新也用缺省超时，超时同样不是“无法连接”
+    await expect(cli(killed).updateExternalResource(key)).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED', details: { reason: 'update_timeout' } });
+    expect(killed).toHaveBeenLastCalledWith(CLI, ['external-resource', 'update', key], expect.objectContaining({ timeout: 15_000 }));
+    expect(killed).toHaveBeenCalledTimes(3);
+    // 输出超限结束的更新是输出超限的命令失败，不是超时
+    const overflow: ExecFn = async () => Promise.reject(Object.assign(new Error('maxBuffer'), { killed: true, signal: 'SIGTERM', code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' }));
+    await expect(cli(overflow).updateExternalResource(key)).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED', message: '执行 Surge 命令失败：输出超过上限' });
+  });
+
+  test.each([{ updateExternalResource: 0 }, { updateExternalResource: -1 }, { updateExternalResource: 1.5 }, { updateExternalResource: Number.NaN }, { reload: 1000 }])(
+    'invalid per-primitive timeouts %j are refused at construction',
+    (timeoutsMs) => {
+      expect(() => cli(okExec(''), { timeoutsMs: timeoutsMs as never })).toThrow(/原语超时设置不正确/);
+    },
+  );
+
+  test('a resource key that looks like a URL or a read token never reaches the CLI argv (D10)', async () => {
+    const exec = okExec('');
+    for (const key of [LOOPBACK_URL, LOOPBACK_TOKEN, `policy-path:${LOOPBACK_URL}`, LOOPBACK_TOKEN.toUpperCase(), 'https://rules.example.test/a.list']) {
+      const err = (await cli(exec).updateExternalResource(key).catch((e: unknown) => e)) as SfeError;
+      expect(err.code, key).toBe('VALIDATION_FAILED');
+      expect(err.message).not.toContain(LOOPBACK_TOKEN);
+      expect(() => safeCliResourceKey(key)).toThrow(/不能作为命令行参数/);
+      expect(isAllowedCliArgv(['external-resource', 'update', key])).toBe(false);
+    }
+    expect(exec).not.toHaveBeenCalled();
+    // 32 位十六进制 key 与其他不含 URL 的 key 照常放行；HTTP 的 safeResourceKey 不受影响（key 在请求体中）
+    expect(isAllowedCliArgv(['external-resource', 'update', '0123456789abcdef0123456789abcdef'])).toBe(true);
+    expect(safeResourceKey(LOOPBACK_URL)).toBe(LOOPBACK_URL);
+  });
+
   test('non-zero exit is SURGE_COMMAND_FAILED with scrubbed, truncated stderr', async () => {
     const stderr = `error: Front-A = socks5, 192.0.2.10, 1080, username=exampleU, password=exampleP0 at https://u:p@x.example.test/a?token=zz ${'x'.repeat(500)}`;
     const exec: ExecFn = async () => Promise.reject(Object.assign(new Error('Command failed'), { code: 2, stdout: '', stderr }));
@@ -636,8 +686,8 @@ describe('createHttpAdapter', () => {
       scrub: (s) => s,
     });
     expect(await a.listExternalResources()).toEqual([
-      { key: 'k-local', type: 'policy-group', location: '/Users/example/Surge/sfe-nodes.list', lastUpdatedAt: null, error: null, local: true, updating: false, fromModule: null },
-      { key: 'k-remote', type: 'ruleset', location: 'https://rules.example.test/a.list', lastUpdatedAt: new Date(1759800000 * 1000), error: null, local: false, updating: true, fromModule: 'Mod' },
+      { key: 'k-local', type: 'policy-group', location: '/Users/example/Surge/sfe-nodes.list', locationHash: sha('/Users/example/Surge/sfe-nodes.list'), lastUpdatedAt: null, error: null, local: true, updating: false, fromModule: null },
+      { key: 'k-remote', type: 'ruleset', location: 'https://rules.example.test/a.list', locationHash: sha('https://rules.example.test/a.list'), lastUpdatedAt: new Date(1759800000 * 1000), error: null, local: false, updating: true, fromModule: 'Mod' },
     ]);
     expect(await a.updateExternalResource('k-remote')).toEqual({ key: 'k-remote', refreshed: true, outcome: 'downloaded' });
     expect(JSON.parse(String(calls.at(-1)!.init.body))).toEqual({ key: 'k-remote' });
@@ -697,6 +747,41 @@ describe('createHttpAdapter', () => {
     expect(err.message).not.toContain(KEY);
     const b = createHttpAdapter({ baseUrl: 'http://127.0.0.1:6171', getKey: async () => KEY, mechanism: allHttp, fetch: fakeFetch({}, [], 401), scrub: (s) => s });
     await expect(b.listPolicies()).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED', message: '调用 Surge HTTP API 失败：认证被拒绝' });
+  });
+
+  test('per-primitive timeouts: an update timeout is an ambiguous command failure; other timeouts and refused connections stay unreachable (D10)', async () => {
+    // 一直不响应、直到被中止的请求
+    const hanging = vi.fn(
+      (_url: URL | string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+        }),
+    );
+    const a = createHttpAdapter({
+      baseUrl: 'http://127.0.0.1:6171',
+      getKey: async () => KEY,
+      mechanism: allHttp,
+      fetch: hanging as unknown as typeof fetch,
+      timeoutMs: 10,
+      timeoutsMs: { updateExternalResource: 30 },
+      scrub: (s) => s,
+    });
+    const started = Date.now();
+    const err = (await a.updateExternalResource(LOOPBACK_URL).catch((e: unknown) => e)) as SfeError;
+    expect(Date.now() - started).toBeGreaterThanOrEqual(25);
+    expect(err.code).toBe('SURGE_COMMAND_FAILED');
+    expect(err.details).toEqual({ primitive: 'updateExternalResource', reason: 'update_timeout' });
+    expect(err.message).not.toContain(LOOPBACK_TOKEN);
+    // HTTP 把 key 放在请求体中：含地址的 key 也可以经 HTTP 更新
+    expect(JSON.parse(String(hanging.mock.calls[0]![1]!.body))).toEqual({ key: LOOPBACK_URL });
+    await expect(a.listExternalResources()).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
+    // 请求没有发出（连接被拒绝）时更新也是“无法连接”：Surge 不可能收到
+    const refused = (async () => {
+      throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+    }) as unknown as typeof fetch;
+    const b = createHttpAdapter({ baseUrl: 'http://127.0.0.1:6171', getKey: async () => KEY, mechanism: allHttp, fetch: refused, timeoutsMs: { updateExternalResource: 30_000 }, scrub: (s) => s });
+    await expect(b.updateExternalResource('k')).rejects.toMatchObject({ code: 'SURGE_UNREACHABLE' });
+    expect(() => createHttpAdapter({ baseUrl: 'http://127.0.0.1:6171', getKey: async () => KEY, mechanism: allHttp, timeoutsMs: { updateExternalResource: 0 }, scrub: (s) => s })).toThrow(/原语超时设置不正确/);
   });
 
   test('primitives not mapped to http are refused without a request', async () => {

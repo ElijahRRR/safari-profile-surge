@@ -1,12 +1,12 @@
 // 离线测试用的“迷你 Surge”：用 FakeSurge 的规则求值决定策略链，再经真实的本机 SOCKS5 测试服务
-// （前置 → 出口）把请求送到回显服务，模拟 Surge 的 HTTP 代理端口与 testPolicy。只用于验证 P0 命令的编排，
-// 不代表真实 Surge 的任何行为。
+// （前置 → 出口）把请求送到回显服务，模拟 Surge 的 HTTP 代理端口与 testPolicy。节点取自配置的 [Proxy] 与 FakeSurge 已加载的
+// SFE-ROUTE 资源内容（回环测试资源时是 Surge 缓存中被接受的行，而不是磁盘上的文件）。只用于验证 P0 命令的编排，不代表真实
+// Surge 的任何行为。
 
 import { readFileSync } from 'node:fs';
 import { createServer, type IncomingMessage } from 'node:http';
 import { connect, type Socket } from 'node:net';
 import { join } from 'node:path';
-import { NODE_RESOURCE_FILE } from '@sfe/contract';
 import { FakeSurge, findSections, isCommentLine, parseProfile, parseProxyLine } from '../../src/deps.js';
 
 interface NodeDef {
@@ -17,17 +17,22 @@ interface NodeDef {
   password: string | null;
 }
 
-function loadNodes(dir: string, profileFile: string): Map<string, NodeDef> {
+function loadNodes(surge: FakeSurge): Map<string, NodeDef> {
   const out = new Map<string, NodeDef>();
   const add = (line: string): void => {
     if (isCommentLine(line)) return;
     const p = parseProxyLine(line);
-    if (!p || !p.server || !p.port) return;
+    if (!p || !p.server || !p.port || out.has(p.name)) return;
     out.set(p.name, { name: p.name, server: p.server, port: p.port, username: p.params.username ?? null, password: p.params.password ?? null });
   };
-  const parsed = parseProfile(readFileSync(join(dir, profileFile), 'utf8'));
+  const parsed = parseProfile(readFileSync(join(surge.directory, surge.profileFileName), 'utf8'));
   for (const s of findSections(parsed, 'Proxy')) for (let i = (s.header ?? s.start) + 1; i < s.end; i++) add(parsed.lines[i]!.text);
-  for (const line of readFileSync(join(dir, NODE_RESOURCE_FILE), 'utf8').split('\n')) add(line);
+  // SFE-ROUTE 的 policy-path：按 FakeSurge 已加载的内容（磁盘上的文件或回环资源的缓存）
+  for (const line of parsed.lines) {
+    const m = /^\s*SFE-ROUTE\s*=.*\bpolicy-path=(\S+)/.exec(line.text);
+    const content = m ? surge.loadedContent(surge.resourceKeyFor(m[1]!)) : null;
+    for (const l of (content ?? '').split('\n')) add(l.trim());
+  }
   return out;
 }
 
@@ -84,7 +89,7 @@ async function openChain(nodes: Map<string, NodeDef>, chain: readonly string[], 
 }
 
 export class MiniSurge extends FakeSurge {
-  readonly nodes = (): Map<string, NodeDef> => loadNodes(this.directory, this.profileFileName);
+  readonly nodes = (): Map<string, NodeDef> => loadNodes(this);
 
   /** 真正经过节点链访问给定地址（FakeSurge 本身不发网络请求）。 */
   override async testPolicy(policy: string, url: string): Promise<{ ok: boolean; latencyMs: number | null; error: string | null }> {

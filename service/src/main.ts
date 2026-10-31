@@ -27,8 +27,8 @@ import { createCliAdapter, defaultCodesignRunner, verifyCliPath } from './surge/
 import { createCompositeAdapter } from './surge/composite.js';
 import { createHttpAdapter, parseHttpApiLine } from './surge/http-adapter.js';
 import { SERVICE_CODESIGN_TIMEOUT_MS, createDefaultSurgeInstanceReader } from './surge/running-instance.js';
-import { capabilityUnverified, SURGE_PRIMITIVES, type MechanismMap } from './surge/primitives.js';
-import { DEMO_RESOURCE_RELOAD_WAIT, DEMO_RULESET_WATCH, createDemoSurge, prepareDemoState, seedDemoData } from './demo/index.js';
+import { capabilityUnverified, SURGE_PRIMITIVES, SURGE_RESOURCE_UPDATE_TIMEOUT_MS, type MechanismMap, type PrimitiveTimeouts } from './surge/primitives.js';
+import { DEMO_RESOURCE_UPDATE_WAIT, DEMO_RULESET_WATCH, createDemoSurge, prepareDemoState, seedDemoData } from './demo/index.js';
 import { systemClock } from './util/clock.js';
 import { execFixed } from './util/exec-fixed.js';
 import { createIdGenerator } from './util/ids.js';
@@ -128,10 +128,12 @@ export function macHost(platform: NodeJS.Platform): Partial<HostInfo> {
 async function buildRealSurge(config: ServiceConfig, repos: Repositories, logger: Logger, scrub: (s: string) => string): Promise<SurgeAdapter> {
   const mechanism: MechanismMap = {};
   for (const p of SURGE_PRIMITIVES) mechanism[p] = config.adapterMechanism[p] ?? 'unavailable';
+  // 更新本机节点资源可能要等 Surge 下载与重试结束（D10）：超时是结果未知，不是无法连接。
+  const timeoutsMs: PrimitiveTimeouts = { updateExternalResource: SURGE_RESOURCE_UPDATE_TIMEOUT_MS };
   let cli: SurgeAdapter | undefined;
   if (config.surgeCliPath && Object.values(mechanism).includes('cli')) {
     const v = await verifyCliPath(config.surgeCliPath, { realpath, runCodesign: defaultCodesignRunner, teamId: null, platform: config.platform });
-    if (v.ok) cli = createCliAdapter({ cliPath: config.surgeCliPath, mechanism, scrub });
+    if (v.ok) cli = createCliAdapter({ cliPath: config.surgeCliPath, mechanism, scrub, timeoutsMs });
     else logger.log('error', 'surge.cli_unverified', { reason: v.reason });
   }
   let http: SurgeAdapter | undefined;
@@ -150,6 +152,7 @@ async function buildRealSurge(config: ServiceConfig, repos: Repositories, logger
           },
           mechanism,
           scrub,
+          timeoutsMs,
         });
       } else if (api) logger.log('error', 'surge.http_not_loopback');
     } catch {
@@ -221,9 +224,9 @@ async function startServiceHeld(opts: StartOptions): Promise<RunningService> {
   let store: SecretStore;
   let surge: SurgeAdapter;
   let maintenance: MaintenanceSurge = unavailableMaintenance;
-  let demoSurge: ReturnType<typeof createDemoSurge> | null = null;
+  let demoSurge: Awaited<ReturnType<typeof createDemoSurge>> | null = null;
   if (config.demo) {
-    demoSurge = createDemoSurge(config.dataDir);
+    demoSurge = await createDemoSurge(config.dataDir, repos.meta);
     store = demoSurge.store;
     surge = demoSurge.fake;
     maintenance = demoSurge.fake;
@@ -263,8 +266,16 @@ async function startServiceHeld(opts: StartOptions): Promise<RunningService> {
       return issueLoginUrl(sessions, http);
     },
     serviceVersion: SERVICE_VERSION,
-    // 演示的等待按演示 FakeSurge 的监视延迟轮询（演示专用；真实 Surge 用缺省值，TODO(P0) 按实测设定）
-    ...(demoSurge ? { demoHooks: demoSurge.hooks, resourceReloadWait: DEMO_RESOURCE_RELOAD_WAIT, rulesetWatch: DEMO_RULESET_WATCH } : {}),
+    // 演示的等待按演示 FakeSurge 的延迟轮询（演示专用；真实 Surge 用缺省值，TODO(P0) 按实测设定）。演示的本机资源服务用
+    // 进程内的绑定方（与演示 FakeSurge 共用），不开任何套接字（正式服务缺省经 127.0.0.1 套接字）
+    ...(demoSurge
+      ? {
+          demoHooks: demoSurge.hooks,
+          rulesetWatch: DEMO_RULESET_WATCH,
+          resourceUpdateWait: DEMO_RESOURCE_UPDATE_WAIT,
+          resourceBinder: demoSurge.binder,
+        }
+      : {}),
   });
   await app.start();
   if (demoSurge && opts.seedDemo !== false) {
@@ -320,6 +331,9 @@ async function startServiceHeld(opts: StartOptions): Promise<RunningService> {
       await bridge?.close().catch(() => undefined);
       await http?.close().catch(() => undefined);
       await app.stop();
+      // 本机资源服务最后关闭（执行器停止——会等进行中的操作结束——之后、关闭数据库之前）：进行中的发布或回滚可能仍要
+      // Surge 下载本服务提供的版本，下载记录要写进数据库
+      await app.engine.resource?.close().catch(() => undefined);
       logger.log('info', 'service.stopped');
       repos.db.close();
       sink.close();

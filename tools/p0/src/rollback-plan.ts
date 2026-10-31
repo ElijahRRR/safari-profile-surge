@@ -32,6 +32,12 @@ export function buildRollbackPlan(state: RunState, currentTempRules: readonly st
   const alreadyAbsent = current === null ? [] : ours.filter((r) => !current.has(normalizeRuleText(r)));
   const original = state.sourceProfileName ?? '（盘点时记录的原配置）';
   const manual = [
+    // 回环测试资源接入过（D10）：先改回 SFE-ROUTE 的原行并手动重新加载，再停止资源服务
+    ...(state.loopback?.setupAt
+      ? [`运行 loopback --rollback 把测试配置的 SFE-ROUTE 改回本地文件引用，并在 Surge 中手动重新加载一次；之后在 resource-server 终端按 Ctrl+C，用 lsof -nP -iTCP:${state.loopback.port} -sTCP:LISTEN 确认资源端口已空闲。`]
+      : state.loopback
+        ? [`在 resource-server 终端按 Ctrl+C，用 lsof -nP -iTCP:${state.loopback.port} -sTCP:LISTEN 确认资源端口已空闲。`]
+        : []),
     `在 Surge 菜单「配置」中手动切回原配置「${original}」（工具从不切换配置）。`,
     `确认 Surge 已不在「${TEST_PROFILE_NAME}」后，再把下列测试文件移到废纸篓；不要删除其他文件。`,
     '确认增强模式、系统代理与出站模式与盘点时一致（工具从不修改它们）。',

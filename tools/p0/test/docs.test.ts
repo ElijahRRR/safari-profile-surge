@@ -94,7 +94,7 @@ describe('docs/P0-RUNBOOK.md', () => {
     expect(text).toContain('`--check/-c` 这样的写法按 `--check` 识别');
   });
 
-  it('measures the documented local-file watcher instead of a targeted update, and the 6.9+ reload escalation', () => {
+  it('measures the documented local rule-set watcher, publishes test nodes through the loopback resource (D10), and the 6.9+ reload escalation', () => {
     for (const quote of [
       'Local resources are skipped.',
       'Local files are watched and reloaded automatically when they change.',
@@ -112,6 +112,32 @@ describe('docs/P0-RUNBOOK.md', () => {
     for (const stale of ['temp-rule add', '按 key 定向刷新', '定向刷新被重新读取', 'updateExternalResource(key) 后改变匹配', '资源更新时间前进']) expect(text).not.toContain(stale);
     expect(text).toContain('不要为了测试运行 `restart-engine`');
     expect(text).toContain('### 1.6 文档没有写明、要在测试 Mac 上实测的行为（TODO(P0)）');
+  });
+
+  it('documents the loopback test resource server and the four loopback capabilities without a reload fallback (D10)', () => {
+    // 测试资源服务的命令行与场景集合
+    expect(text).toContain('`resource-server [--port N] [--scenario S] [--squat squat200|squat404]`');
+    for (const s of ['loopback --setup', 'loopback --rollback', 'loopback-auth', 'loopback-restart --phase prepare|after-surge-restart|after-mac-restart', 'loopback-crash']) {
+      expect(text).toContain(s);
+    }
+    // 每一项回环能力的失败处理：新版本保持待部署，从不自动重载兜底
+    const section = (key: string) => {
+      const start = text.indexOf(` ${key}（`);
+      return text.slice(start, text.indexOf('\n### ', start));
+    };
+    for (const key of ['loopback_resource_update', 'loopback_resource_auth', 'loopback_resource_restart', 'loopback_publish_crash']) {
+      const s = section(key);
+      const failure = s.slice(s.indexOf('**失败处理**'), s.indexOf('**证据**'));
+      expect(failure, key).toContain('新节点保持「已保存，待部署」');
+      expect(failure, key).toContain('**不自动重载兜底**');
+    }
+    // 只对单个 key 更新一次，从不 update all；本地 policy-path 的旧方案与它的等待参数不再出现
+    expect(section('loopback_resource_update')).toContain('只对测试资源执行**一次**单 key 更新（从不 update all，结果不明时从不重放）');
+    for (const stale of ['不实现回环地址', 'resourceReloadWait', '### 3.10 targeted_resource_refresh', 'policy_path_reread（']) expect(text).not.toContain(stale);
+    // 回退：撤除测试资源并确认端口空闲
+    const rollback = text.slice(text.indexOf('## 2. 通用回退'), text.indexOf('## 3. 逐项能力'));
+    expect(rollback).toContain('`loopback --rollback`');
+    expect(rollback).toContain('资源端口已空闲');
   });
 
   it('3.6 describes the DNS-free probes: process-only witness and insertion rules, documentation-IP targets and the witness form check', () => {
@@ -146,7 +172,7 @@ describe('docs/P0-RUNBOOK.md', () => {
   });
 
   it('documents the overall order and the manual profile switch', () => {
-    for (const cmd of ['inventory', 'instance', 'test-servers', 'make-test-profile', 'attribution', 'entry', 'refresh', 'continuity', 'chain', 'charset', 'preflight', 'checklist', 'propose', 'rollback']) {
+    for (const cmd of ['inventory', 'instance', 'test-servers', 'make-test-profile', 'attribution', 'entry', 'resource-server', 'loopback', 'loopback-auth', 'loopback-restart', 'loopback-crash', 'refresh', 'continuity', 'chain', 'charset', 'preflight', 'checklist', 'propose', 'rollback']) {
       expect(text).toContain(cmd);
     }
     expect(text).toContain('手动');
@@ -219,10 +245,25 @@ describe('docs/ACCEPTANCE.md', () => {
     expect(text).not.toContain('钥匙串的保护范围');
   });
 
-  it('records the 6.10 version cross-check and the measured watcher behaviour in the environment table', () => {
-    for (const row of ['| 版本交叉核对（surge-cli --raw version 一致、Controller 协议 ≥ 22） | 未验证 |', '| 本地 policy-path 是否被自动重新读取及延迟（3.11 实测） | 未验证 |', '| 新临时规则的插入位置（entry 插入探测） | 未验证 |']) {
+  it('records the 6.10 version cross-check and the loopback resource facts (D10) in the environment table', () => {
+    for (const row of [
+      '| 版本交叉核对（surge-cli --raw version 一致、Controller 协议 ≥ 22） | 未验证 |',
+      '| 本应用资源的 key 形式与 updateExternalResource 的实现（cli 只在 key 是 32 位十六进制且不含令牌时；3.10 实测） | 未验证 |',
+      '| Surge 资源缓存的位置与凭据保存方式（3.11 实测） | 未验证 |',
+      '| 新临时规则的插入位置（entry 插入探测） | 未验证 |',
+    ]) {
       expect(text).toContain(row);
     }
+    // 本地 policy-path 的测量已被 D10 取代
+    expect(text).not.toContain('本地 policy-path 是否被自动重新读取');
+    expect(text).not.toContain('不实现回环地址');
+  });
+
+  it('loopback_publish_crash lists the automated-test items, and the limitations name the loopback residual risks', () => {
+    const start = text.indexOf('loopback_publish_crash（');
+    const crash = text.slice(start, text.indexOf('\n### ', start));
+    for (const item of ['| 自动化测试：发布互斥', '| 自动化测试：启动顺序', '| 自动化测试：崩溃恢复']) expect(crash).toContain(item);
+    for (const s of ['| 回环资源的读取令牌与端口占用 |', '| Surge 一侧的凭据副本 |', '| 部分接受与重名 |', '| 不使用自定义认证请求头 |']) expect(text).toContain(s);
   });
 });
 
@@ -247,8 +288,11 @@ describe('docs/ARCHITECTURE.md §0', () => {
     expect(s0).not.toContain('**登录填充依赖已过时的钥匙串接口。**');
   });
 
-  it('numbers every user decision (D1–D9) with its date, and process decisions (W1–W3); no undefined decision number is cited', () => {
+  it('numbers every user decision (D1–D10) with its date, and process decisions (W1–W3); no undefined decision number is cited', () => {
     for (let i = 1; i <= 9; i++) expect(s0).toMatch(new RegExp(`^\\| D${i} \\| 2026-10-2\\d \\|`, 'm'));
+    // D10（2026-10-31）取代 D7：D7 保留为历史并标明已被取代
+    expect(s0).toMatch(/^\| D10 \| 2026-10-31 \| 节点发布机制（取代 D7） \|/m);
+    expect(s0.split('\n').find((l) => l.startsWith('| D7 |'))).toContain('已被 D10 取代');
     for (let i = 1; i <= 3; i++) expect(s0).toMatch(new RegExp(`^\\| W${i} \\| 2026-10-2\\d \\|`, 'm'));
     expect(s0).toContain('| D9 | 2026-10-24 | 切换进行中点击「进入普通模式」 | 保留排队');
     expect(s0).toContain('PR #7');
@@ -328,16 +372,65 @@ describe('docs/ARCHITECTURE.md §0', () => {
   });
 });
 
+describe('docs/ARCHITECTURE.md D10: loopback node resource (deviation, publish flow, listener, warning, startup order, secrets)', () => {
+  const text = read('ARCHITECTURE.md');
+  const s0 = text.slice(text.indexOf('## 0.'), text.indexOf('## 1.'));
+
+  it('§0 quotes design line 83, says how each clause is met and lists the residual risks', () => {
+    expect(s0).toContain('**节点发布机制（用户决定 D10，2026-10-31，取代 D7；');
+    expect(s0).toContain('可以另测受保护的回环资源服务，但它增加了凭据读取边界，不能随便开放一个无需认证的 localhost 订阅地址；也不能假设 Surge 支持任意自定义鉴权头。未经验证不纳入首版承诺。');
+    for (const s of ['不退化为重载', '增加的凭据读取边界', '不开放无需认证的地址', '不假设自定义鉴权头', '未经验证不纳入首版承诺：`resourceServe` 门槛', '**剩余风险**', 'lo0', 'Surge 的资源缓存', '用户决定 D8', '`rotateResourceUrl`']) {
+      expect(s0).toContain(s);
+    }
+    // 旧方案的说法不再作为现行机制出现
+    for (const stale of ['不实现回环地址', 'resourceReloadWait', '`updateExternalResource` 不在任何一项中（从不调用）']) expect(text).not.toContain(stale);
+  });
+
+  it('§6.2 publishes by serving a candidate and exactly one single-key update, with the rollback and crash rules', () => {
+    const s62 = text.slice(text.indexOf('### 6.2 发布'), text.indexOf('### 6.3'));
+    for (const s of ['恰好一次 `updateExternalResource(key)`（从不 update all；结果不明时从不重放）', '在**同一个事务**中', '`revertToCommitted`', '**不执行第二次更新**', '`recoverPublish`', '`READBACK_COVERAGE_KEYS`']) {
+      expect(s62).toContain(s);
+    }
+    expect(s62).not.toContain('原子替换资源文件');
+    expect(s62).not.toContain('resource:writeBaseline');
+  });
+
+  it('documents the resource listener, node_resource_unverified, the startup order and the token in the secrets list', () => {
+    const s74 = text.slice(text.indexOf('### 7.4 本机资源服务'), text.indexOf('## 8.'));
+    for (const s of ['`timingSafeEqual`', '同样的 404', '**启动顺序**', '在开始监听**之前**做一次下载核对', '从不提供未提交的版本']) expect(s74).toContain(s);
+    const s66 = text.slice(text.indexOf('### 6.6'), text.indexOf('### 6.7'));
+    expect(s66).toContain('**节点资源未确认（`node_resource_unverified`，D10）**');
+    expect(s66).toContain('进入普通模式与 REJECT 的保持**从不**因为它被拒绝');
+    const s2 = text.slice(text.indexOf('## 2.'), text.indexOf('## 3.'));
+    const secrets = s2.slice(s2.indexOf('- **含秘密的位置**'));
+    for (const s of ['读取令牌：', 'Surge 的资源缓存', '旧版 `sfe-nodes.list`（只有 D10 之前的安装才有']) expect(secrets).toContain(s);
+    expect(secrets).not.toContain('  - `sfe-nodes.list`（Surge 语法要求明文代理凭据）；');
+  });
+});
+
+describe('docs/P0-CHECKLIST.md (D10)', () => {
+  const text = read('P0-CHECKLIST.md');
+
+  it('U2 is answered by D10, the loopback step exists and the report covers all capability keys', () => {
+    expect(text).toContain('**已决定（2026-10-31，用户决定 D10）**');
+    expect(text).toContain('### 第 5 步：本机回环节点资源');
+    expect(text).toContain(`${CAPABILITY_KEYS.length} 项能力（\`CAPABILITY_KEYS\`）`);
+    expect(text).not.toContain('不实现回环地址');
+    expect(text).not.toContain('19 项能力');
+  });
+});
+
 describe('README.md and docs/DEVELOPMENT.md (read first per CLAUDE.md)', () => {
   const readme = readFileSync(new URL('../../../README.md', import.meta.url), 'utf8');
   const dev = read('DEVELOPMENT.md');
 
-  it('state the 6.10 minimum and node publishing by file watch, not the 6.5 target or a targeted refresh', () => {
+  it('state the 6.10 minimum and node publishing through the loopback resource (D10), not the 6.5 target or the superseded local-file wait', () => {
     expect(readme).toContain('最低支持 Surge for Mac 6.10.0（构建 ≥ 12500、Controller 协议 ≥ 22');
     expect(dev).toContain('最低支持 Surge for Mac 6.10.0（构建 ≥ 12500、Controller 协议 ≥ 22）');
     for (const t of [readme, dev]) {
       expect(t).toContain('external-resource update');
-      for (const stale of ['本次设计调研的目标版本为 Surge 6.5.0', '定向刷新并读回', '当前仅有 Surge 6.5 的只读命令', '节点资源定向刷新 |', '定向节点刷新']) expect(t).not.toContain(stale);
+      expect(t).toContain('D10');
+      for (const stale of ['本次设计调研的目标版本为 Surge 6.5.0', '定向刷新并读回', '当前仅有 Surge 6.5 的只读命令', '节点资源定向刷新 |', '定向节点刷新', '不实现回环地址', '原子写入受管理的本地节点资源']) expect(t).not.toContain(stale);
     }
   });
 });
@@ -445,7 +538,22 @@ describe('docs/INSTALL.md', () => {
     expect(text).toContain('**账号密码**：修改、清除密码或删除环境后，旧值在下一次清理时（服务启动时与之后每小时）删除。');
     expect(text).toContain('**代理用户名与密码**：旧值属于旧的代理版本，要等这个版本“退役”（retired）之后的下一次清理才删除。');
     expect(text).toContain('部署新版本的那次发布仍保留旧节点');
-    expect(text).toContain('旧值一直留在 `secret_values` 中，通常也仍在 `sfe-nodes.list` 中，没有期限');
+    expect(text).toContain('旧值一直留在 `secret_values` 中，通常也仍在本机资源服务提供的节点列表与 Surge 自己的资源缓存中（D10 之前的安装是 `sfe-nodes.list`），没有期限');
+  });
+
+  it('D10: no placeholder node file at init, resource port and token are not in install.json, the Surge resource cache is in the uninstall list, legacy sfe-nodes.list is removed by remerge', () => {
+    const install = text.slice(text.indexOf('## 2. 安装'), text.indexOf('## 3.'));
+    expect(install).toContain('本机资源服务的端口与读取令牌都不在 `install.json` 中');
+    const first = text.slice(text.indexOf('## 3.'), text.indexOf('## 4.'));
+    expect(first).toContain('不再创建 `sfe-nodes.list`');
+    expect(first).not.toContain('与占位资源文件');
+    expect(first).toContain('**D10 之前初始化的工作配置**');
+    expect(first).not.toContain('节点发布依赖 Surge 自动重新读取 `sfe-nodes.list`');
+    const s5 = text.slice(text.indexOf('## 5.'), text.indexOf('## 6.'));
+    expect(s5).toContain('**Surge 自己的资源缓存**');
+    expect(s5).toContain('TODO(P0)');
+    const s6 = text.slice(text.indexOf('## 6.'), text.indexOf('## 7.'));
+    expect(s6).toContain('**本机资源服务的读取令牌与它提供的节点列表**');
   });
 
   it('§7 stops the old service before the App is replaced and reuses old P0 runs with --raw-dir', () => {

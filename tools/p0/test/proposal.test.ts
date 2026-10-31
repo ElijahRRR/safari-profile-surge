@@ -1,4 +1,4 @@
-import { GATING_COVERAGE_ITEMS, type CapabilityContext, type CapabilityKey, type ProtocolCoverage } from '@sfe/contract';
+import { CAPABILITY_CRITERIA, GATING_COVERAGE_ITEMS, type CapabilityContext, type CapabilityKey, type ProtocolCoverage } from '@sfe/contract';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { udpQuicCoverage } from '../src/analysis/udp-coverage.js';
@@ -27,7 +27,7 @@ const CTX: CapabilityContext = {
 };
 
 function result(key: CapabilityKey, over: Partial<CapabilityResult> = {}): CapabilityResult {
-  return { key, command: 'test', at: '2026-10-21T10:00:00.000Z', verdict: 'pass', checks: [check('a', true)], summary: ['通过条件：x', '说明 203.0.113.5'], context: CTX, ...over };
+  return { key, command: 'test', at: '2026-10-21T10:00:00.000Z', verdict: 'pass', checks: [check('a', true)], summary: ['通过条件：x', '说明 203.0.113.5'], criteria: CAPABILITY_CRITERIA[key], context: CTX, ...over };
 }
 
 function input(key: CapabilityKey, over: Partial<ProposalInput> = {}): ProposalInput {
@@ -70,6 +70,29 @@ describe('buildProposal', () => {
 
   it('requires a measured result', () => {
     expect(refusal(() => buildProposal(input('independent_node_preflight', { result: null })))).toContain('没有');
+  });
+
+  it('refuses a result whose recorded criteria differ from the current contract (or were never recorded), whatever the verdict', () => {
+    const changed = result('connection_continuity', { criteria: '发布节点资源期间（写入本地 policy-path 文件），其他应用的长连接保持' });
+    for (const status of ['supported', 'unsupported'] as const) {
+      const r = { ...changed, verdict: status === 'supported' ? ('pass' as const) : ('fail' as const) };
+      expect(refusal(() => buildProposal(input('connection_continuity', { status, result: r, overrides: { workingProfileId: 'any' } })))).toContain('通过条件与当前版本不同');
+    }
+    const { criteria: _c, ...legacy } = result('independent_node_preflight');
+    expect(refusal(() => buildProposal(input('independent_node_preflight', { result: legacy as never })))).toContain('通过条件与当前版本不同');
+    // 结果记的是另一项能力
+    expect(refusal(() => buildProposal(input('independent_node_preflight', { result: result('connection_continuity') })))).toContain('不属于');
+  });
+
+  it('ignores history measured under other criteria as any-evidence (neither evidence nor conflict)', () => {
+    const key = 'auto_reload_atomic_replace';
+    const on = result(key, { declaredAutoReload: 'on', at: '2026-10-21T09:00:00.000Z' });
+    const off = result(key, { declaredAutoReload: 'off' });
+    const staleConflict = result(key, { declaredAutoReload: 'on', verdict: 'fail', criteria: 'old criteria', at: '2026-10-21T11:00:00.000Z' });
+    const staleOnly = result(key, { declaredAutoReload: 'on', criteria: 'old criteria' });
+    const ok = buildProposal(input(key, { result: off, overrides: { workingProfileId: 'any', autoReload: 'any' }, history: [on, off, staleConflict] }));
+    expect(ok.context.autoReload).toBe('any');
+    expect(refusal(() => buildProposal(input(key, { result: off, overrides: { workingProfileId: 'any', autoReload: 'any' }, history: [staleOnly, off] })))).toContain('缺少：自动重载开');
   });
 
   it('refuses supported unless the verdict is pass, and unsupported when it is', () => {
@@ -180,8 +203,8 @@ describe('buildProposal', () => {
   });
 
   it('requires explicit working-profile any for profile-dependent keys', () => {
-    expect(refusal(() => buildProposal(input('targeted_resource_refresh')))).toContain('--working-profile any');
-    const req = buildProposal(input('targeted_resource_refresh', { overrides: { workingProfileId: 'any' } }));
+    expect(refusal(() => buildProposal(input('loopback_resource_update')))).toContain('--working-profile any');
+    const req = buildProposal(input('loopback_resource_update', { overrides: { workingProfileId: 'any' } }));
     expect(req.context.workingProfileId).toBe('any');
     expect(req.summary).toContain('工作配置身份记为 any');
   });
@@ -246,17 +269,17 @@ describe('buildProposal', () => {
   });
 
   it('auto-reload any for other capabilities needs that capability measured under both settings', () => {
-    const offRun = result('targeted_resource_refresh', { declaredAutoReload: 'off' });
+    const offRun = result('loopback_resource_update', { declaredAutoReload: 'off' });
     const base = { overrides: { workingProfileId: 'any' as const, autoReload: 'any' as const }, result: offRun };
-    expect(refusal(() => buildProposal(input('targeted_resource_refresh', { ...base, history: [offRun] })))).toContain('缺少：自动重载开');
+    expect(refusal(() => buildProposal(input('loopback_resource_update', { ...base, history: [offRun] })))).toContain('缺少：自动重载开');
     // 另一项能力（auto_reload_atomic_replace）在开时通过不能替代本能力的证据。
     const otherKey = result('auto_reload_atomic_replace', { declaredAutoReload: 'on' });
-    expect(refusal(() => buildProposal(input('targeted_resource_refresh', { ...base, history: [offRun, otherKey] })))).toContain('缺少：自动重载开');
+    expect(refusal(() => buildProposal(input('loopback_resource_update', { ...base, history: [offRun, otherKey] })))).toContain('缺少：自动重载开');
     // 开时的测量来自不同的 Surge 构建：不算证据。
-    const onOld = result('targeted_resource_refresh', { declaredAutoReload: 'on', context: { ...CTX, surgeBuild: '10000' } });
-    expect(refusal(() => buildProposal(input('targeted_resource_refresh', { ...base, history: [offRun, onOld] })))).toContain('缺少：自动重载开');
-    const on = result('targeted_resource_refresh', { declaredAutoReload: 'on' });
-    expect(buildProposal(input('targeted_resource_refresh', { ...base, history: [offRun, on] })).context.autoReload).toBe('any');
+    const onOld = result('loopback_resource_update', { declaredAutoReload: 'on', context: { ...CTX, surgeBuild: '10000' } });
+    expect(refusal(() => buildProposal(input('loopback_resource_update', { ...base, history: [offRun, onOld] })))).toContain('缺少：自动重载开');
+    const on = result('loopback_resource_update', { declaredAutoReload: 'on' });
+    expect(buildProposal(input('loopback_resource_update', { ...base, history: [offRun, on] })).context.autoReload).toBe('any');
   });
 
   it('takeover any needs passing measurements under enhanced, system_proxy and both', () => {

@@ -142,6 +142,8 @@ describe('route table', () => {
       if (exp.method !== 'importTemplateCsv' && exp.method !== 'listCapabilities' && exp.method !== 'getSettings' && exp.method !== 'listFrontProxies' && exp.method !== 'surgePolicies') {
         expect(args[i]).toMatchObject({ kind: 'web' });
       }
+      // 重新合并预览的选项（rotateResourceUrl）在 actor 之后传入
+      if (name === 'remergePreview') expect(args[i + 1]).toEqual(payload);
     });
   }
 

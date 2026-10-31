@@ -23,6 +23,7 @@ import {
   type PublishPendingRequest,
   type RegisterFrontProxyRequest,
   type RemergeCommitRequest,
+  type RemergePreviewRequest,
   type ReplaceFrontCommitRequest,
   type ReplaceFrontPreviewRequest,
   type SessionInfo,
@@ -123,7 +124,7 @@ export const API_HANDLERS: Record<JsonRouteName, RouteHandler> = {
   refreshSurge: (ctx) => json(ctx.app.refreshSurge(ctx.actor)),
   initPreview: (ctx) => json(ctx.app.initPreview(as<InitPreviewRequest>(ctx.body), ctx.actor)),
   initCommit: (ctx) => accepted(ctx.app.initCommit(as<InitCommitRequest>(ctx.body), ctx.actor)),
-  remergePreview: (ctx) => json(ctx.app.remergePreview(ctx.actor)),
+  remergePreview: (ctx) => json(ctx.app.remergePreview(ctx.actor, as<RemergePreviewRequest>(ctx.body))),
   remergeCommit: (ctx) => accepted(ctx.app.remergeCommit(as<RemergeCommitRequest>(ctx.body), ctx.actor)),
 };
 

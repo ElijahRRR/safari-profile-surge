@@ -86,9 +86,21 @@ describe('startService --demo', () => {
     expect(demoFake.instanceReads).toBeGreaterThan(0);
     expect(demoFake.calls.getVersion ?? 0).toBeGreaterThan(0);
     expect(svc.app.engine.facts.controllerProtocol).toBe(demoFake.controllerProtocol);
-    // 演示发布从不调用外部资源更新：演示 FakeSurge 监视本地 policy-path 文件（演示专用的假设）
-    expect(demoFake.calls.updateExternalResource ?? 0).toBe(0);
-    expect(demoFake.watcherReloads.length).toBeGreaterThan(0);
+    // 演示发布经演示本机资源服务（进程内绑定方，不开套接字）：只对本应用的资源单 key 更新，从不更新全部或重载，也没有本地节点
+    // 文件与文件监视的重新读取
+    const ourUrl = svc.app.engine.resourceUrl()!;
+    const ourKey = demoFake.resourceKeyFor(ourUrl);
+    expect(demoFake.calls.updateExternalResource ?? 0).toBeGreaterThan(0);
+    expect(demoFake.remoteFetches.filter((f) => f.trigger === 'update' && f.key === ourKey && f.outcome === 'downloaded').length).toBeGreaterThan(0);
+    expect(demoFake.remoteFetches.every((f) => f.key === ourKey)).toBe(true);
+    expect(demoFake.updateAllAttempts).toBe(0);
+    expect(demoFake.calls.reloadProfile ?? 0).toBe(0);
+    expect(demoFake.watcherReloads.some((r) => r.key.startsWith('policy-path:'))).toBe(false);
+    expect(existsSync(join(svc.config.dataDir, 'surge', 'sfe-nodes.list'))).toBe(false);
+    expect(readFileSync(demoFake.profilePath, 'utf8')).toContain(`policy-path=${ourUrl}`);
+    expect(svc.app.engine.resource!.listening()).toBe(true);
+    expect(snap.surge.nodeResource).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false });
+    expect(JSON.stringify(snap)).not.toContain(svc.app.engine.resource!.token);
 
     // HTTP：未登录的接口请求被拒绝（服务在线）
     const res = await fetch(`${svc.url}/api/snapshot`);
@@ -119,7 +131,7 @@ describe('startService --demo', () => {
     expect(await fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe(selection);
     expect(entryMode).toBe('ACTIVE');
     svc = null;
-    // 演示经真实流程发布并激活（等待按演示 FakeSurge 的监视延迟轮询）：明确的时限，不靠 vitest 的 5 秒缺省值
+    // 演示经真实流程发布并激活（入口等待按演示 FakeSurge 的监视延迟轮询）：明确的时限，不靠 vitest 的 5 秒缺省值
   }, 20_000);
 
   test('`main.ts --demo` as its own process prints the startup line and keeps running (startup waits must not drain the event loop)', async () => {

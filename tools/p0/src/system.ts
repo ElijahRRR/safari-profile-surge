@@ -136,3 +136,14 @@ export async function codesignTeamId(exec: ExecFn, appPath: string): Promise<str
   const r = await exec('/usr/bin/codesign', ['-dv', '--verbose=2', appPath]);
   return parseTeamIdentifier(`${r.stdout}\n${r.stderr}`);
 }
+
+/** `sysctl -n kern.boottime` 的启动时间（秒）：“{ sec = 1700000000, usec = 0 } …”。读不到为 null。用于确认 Mac 已重启。 */
+export function parseBootTime(text: string): number | null {
+  const m = /\{\s*sec\s*=\s*(\d{6,12})\b/.exec(text);
+  return m ? Number(m[1]) : null;
+}
+
+export async function bootTime(exec: ExecFn): Promise<number | null> {
+  const r = await exec('/usr/sbin/sysctl', ['-n', 'kern.boottime']);
+  return r.code === 0 ? parseBootTime(r.stdout) : null;
+}

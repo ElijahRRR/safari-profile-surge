@@ -65,15 +65,24 @@ describe('external resources follow the documented 6.10 semantics', () => {
     expect(fake.reloadCount).toBe(0);
   });
 
-  test('a remote resource is downloaded by key: its update time advances', async () => {
-    createFakeSurgeEnvironment(dir, { userRules: ['RULE-SET,https://rules.example.test/user.list,DIRECT'] });
+  test('a remote resource is downloaded by key through the remote source: its update time advances', async () => {
+    const url = 'https://rules.example.test/user.list';
+    createFakeSurgeEnvironment(dir, { userRules: [`RULE-SET,${url},DIRECT`] });
     let t = Date.parse('2026-10-22T00:00:00Z');
-    const fake = new FakeSurge({ directory: dir, now: () => new Date(t) });
-    const key = 'ruleset:https://rules.example.test/user.list';
-    expect((await fake.listExternalResources()).find((r) => r.key === key)).toMatchObject({ local: false, lastUpdatedAt: null });
+    let up = false;
+    const fake = new FakeSurge({
+      directory: dir,
+      now: () => new Date(t),
+      remoteSource: (u) => (up && u === url ? { kind: 'http', status: 200, body: 'DOMAIN-SUFFIX,remote.example.test\n' } : { kind: 'refused' }),
+    });
+    const key = fake.resourceKeyFor(url, 'ruleset');
+    // 加载配置时下载失败（无人监听）：未就绪，没有更新时间
+    expect((await fake.listExternalResources()).find((r) => r.key === key)).toMatchObject({ local: false, lastUpdatedAt: null, error: 'not_ready' });
+    up = true;
     t += 5_000;
     await expect(fake.updateExternalResource(key)).resolves.toEqual({ key, refreshed: true, outcome: 'downloaded' });
-    expect((await fake.listExternalResources()).find((r) => r.key === key)!.lastUpdatedAt).toEqual(new Date(t));
+    expect((await fake.listExternalResources()).find((r) => r.key === key)).toMatchObject({ lastUpdatedAt: new Date(t), error: null });
+    expect(fake.simulateRequest({ processPath: FAKE_CHROME_PATH, host: 'www.remote.example.test', protocol: 'tcp' }).rule).toBe(`RULE-SET,${url},DIRECT`);
   });
 
   test('local policy-path files are not watched by default (undocumented); members change only on a profile reload', async () => {

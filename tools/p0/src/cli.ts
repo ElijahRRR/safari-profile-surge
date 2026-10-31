@@ -15,10 +15,15 @@ import { runContinuity } from './commands/continuity.js';
 import { runEntry } from './commands/entry.js';
 import { runInstance } from './commands/instance.js';
 import { runInventory } from './commands/inventory.js';
+import { runLoopbackAuth } from './commands/loopback-auth.js';
+import { runLoopbackCrash } from './commands/loopback-crash.js';
+import { runLoopbackRestart } from './commands/loopback-restart.js';
+import { runLoopback } from './commands/loopback.js';
 import { runMakeTestProfile } from './commands/make-test-profile.js';
 import { runPreflight } from './commands/preflight.js';
 import { runPropose } from './commands/propose.js';
 import { runRefresh } from './commands/refresh.js';
+import { runResourceServer } from './commands/resource-server.js';
 import { runRollback } from './commands/rollback.js';
 import { runTestServers } from './commands/test-servers.js';
 import { EXIT, P0Error, type ExitCode } from './errors.js';
@@ -60,6 +65,9 @@ export async function main(argv: readonly string[], deps?: Partial<Deps>): Promi
       ...(deps?.surgeOverride ? { surgeOverride: deps.surgeOverride } : {}),
       ...(deps?.surgeInstance ? { surgeInstance: deps.surgeInstance } : {}),
       ...(deps?.pathPresence ? { pathPresence: deps.pathPresence } : {}),
+      ...(deps?.resourceBinder ? { resourceBinder: deps.resourceBinder } : {}),
+      ...(deps?.resourcePeerProbe ? { resourcePeerProbe: deps.resourcePeerProbe } : {}),
+      ...(deps?.random ? { random: deps.random } : {}),
     };
     const ctx: Ctx = { args, deps: full };
     switch (args.command) {
@@ -73,6 +81,16 @@ export async function main(argv: readonly string[], deps?: Partial<Deps>): Promi
         return await runMakeTestProfile(ctx);
       case 'attribution':
         return await runAttribution(ctx);
+      case 'resource-server':
+        return await runResourceServer(ctx, untilSignal);
+      case 'loopback':
+        return await runLoopback(ctx);
+      case 'loopback-auth':
+        return await runLoopbackAuth(ctx);
+      case 'loopback-restart':
+        return await runLoopbackRestart(ctx);
+      case 'loopback-crash':
+        return await runLoopbackCrash(ctx);
       case 'charset':
         return await runCharset(ctx);
       case 'refresh':

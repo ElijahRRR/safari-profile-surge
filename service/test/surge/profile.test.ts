@@ -1,11 +1,12 @@
 import { describe, expect, test } from 'vitest';
-import { SfeError } from '@sfe/contract';
+import { SfeError, nodeResourceUrl } from '@sfe/contract';
 import {
   describeOutsideChanges,
   detectManagedConfigHeader,
   entryBlockIsFirstRule,
   findForeignSfeObjects,
   findManagedBlock,
+  foreignSfePolicyNames,
   insertInitialBlocks,
   listRelativeReferences,
   listRemoteSourceHosts,
@@ -14,8 +15,9 @@ import {
   serializeProfile,
   stripManagedConfigHeader,
   unifiedDiff,
+  type OwnedSfeObjects,
 } from '../../src/surge/profile.js';
-import { entryRuleSetBlockLines, groupBlockLines } from '../../src/surge/generate.js';
+import { entryRuleSetBlockLines, groupBlockLines, loopbackGroupBlockLines } from '../../src/surge/generate.js';
 
 const BASE = [
   '#!MANAGED-CONFIG https://user:pw@sub.example.test/path/conf?token=abc interval=86400 strict=true',
@@ -230,6 +232,17 @@ describe('references', () => {
   test('remote hosts only, no paths or queries', () => {
     expect(listRemoteSourceHosts(text)).toEqual(['inc.example.test', 'nodes.example.test', 'rules.example.test']);
   });
+
+  test('our own loopback resource URL is not a remote source; other loopback sources still are (D10)', () => {
+    const url = nodeResourceUrl(20001, 'a'.repeat(64));
+    const withOurs = [text, '[Proxy Group]', '# SFE-BEGIN group v1', ...loopbackGroupBlockLines(url), '# SFE-END group'].join('\n');
+    expect(listRemoteSourceHosts(withOurs, url)).toEqual(['inc.example.test', 'nodes.example.test', 'rules.example.test']);
+    // 调用方没有给出地址（旧调用）时照旧计入，主机名不含路径
+    expect(listRemoteSourceHosts(withOurs)).toEqual(['127.0.0.1', 'inc.example.test', 'nodes.example.test', 'rules.example.test']);
+    const converter = `${withOurs}\nConv = select, policy-path=http://127.0.0.1:25500/sub?target=surge`;
+    expect(listRemoteSourceHosts(converter, url)).toEqual(['127.0.0.1', 'inc.example.test', 'nodes.example.test', 'rules.example.test']);
+    expect(listRemoteSourceHosts(withOurs, nodeResourceUrl(20001, 'b'.repeat(64)))).toContain('127.0.0.1');
+  });
 });
 
 describe('findForeignSfeObjects', () => {
@@ -259,6 +272,83 @@ describe('findForeignSfeObjects', () => {
       'group:SFE-EXTRA@8',
       'file_reference:sfe-entry-active.list@11',
     ]);
+  });
+
+  describe('loopback resource references (D10)', () => {
+    // 合成令牌与端口
+    const TOKEN = 'a'.repeat(64);
+    const URL = nodeResourceUrl(20001, TOKEN);
+    const ownedUrl = { ...owned, resourceUrl: URL };
+    const managed = (groupLines: readonly string[], extra: readonly string[] = []): string =>
+      [
+        '[General]',
+        'loglevel = notify',
+        '[Proxy Group]',
+        'Daily = select, Front-A, DIRECT',
+        '# SFE-BEGIN group v1',
+        ...groupLines,
+        '# SFE-END group',
+        ...extra,
+        '[Rule]',
+        '# SFE-BEGIN entry v1',
+        'RULE-SET,sfe-entry-udp.list,REJECT',
+        '# SFE-END entry',
+        'FINAL,DIRECT',
+      ].join('\n');
+    const show = (text: string, o: OwnedSfeObjects = ownedUrl) => findForeignSfeObjects(text, o).map((x) => `${x.kind}:${x.name}@${x.line}`);
+
+    test('our loopback group line is ours', () => {
+      expect(show(managed(loopbackGroupBlockLines(URL)))).toEqual([]);
+    });
+
+    test('references to our port outside the group segment are foreign (names carry host and port only)', () => {
+      const text = managed(loopbackGroupBlockLines(URL), [
+        `Leech = select, policy-path=${URL}`,
+        'Other = select, policy-path=http://localhost:20001/x/sfe-nodes.list',
+        '# a comment about http://127.0.0.1:20001/ is ignored',
+        'Conv = select, policy-path=http://127.0.0.1:25500/sub',
+        'Near = select, policy-path=http://127.0.0.1:200010/x',
+      ]);
+      const found = findForeignSfeObjects(text, ownedUrl);
+      expect(found.map((x) => `${x.kind}:${x.name}@${x.line}`)).toEqual(['resource_reference:127.0.0.1:20001@8', 'resource_reference:localhost:20001@9']);
+      expect(JSON.stringify(found)).not.toContain(TOKEN);
+      const general = managed(loopbackGroupBlockLines(URL)).replace('loglevel = notify', 'http-listen = 127.0.0.1:20001');
+      expect(show(general)).toEqual(['resource_reference:127.0.0.1:20001@2']);
+      const include = `#!include ${URL}\n${managed(loopbackGroupBlockLines(URL))}`;
+      expect(show(include)).toEqual(['resource_reference:127.0.0.1:20001@1']);
+    });
+
+    test('remote policy-paths inside a managed segment that are not ours are foreign', () => {
+      expect(show(managed(['SFE-ROUTE = select, REJECT, policy-path=https://nodes.example.test/a.list']))).toEqual(['resource_reference:nodes.example.test@6']);
+      expect(show(managed(loopbackGroupBlockLines(nodeResourceUrl(20001, 'b'.repeat(64)))))).toEqual(['resource_reference:127.0.0.1:20001@6']);
+      expect(show(managed(loopbackGroupBlockLines(nodeResourceUrl(20002, TOKEN))))).toEqual(['resource_reference:127.0.0.1:20002@6']);
+      // 本应用地址出现在其他受管理段中也不属于本应用
+      const inEntry = managed(loopbackGroupBlockLines(URL)).replace('RULE-SET,sfe-entry-udp.list,REJECT', `RULE-SET,${URL},REJECT`);
+      expect(show(inEntry)).toEqual(['resource_reference:127.0.0.1:20001@10']);
+      // 调用方没有给出地址时：受管理段内的任何远端引用都不属于本应用
+      expect(show(managed(loopbackGroupBlockLines(URL)), owned)).toEqual(['resource_reference:127.0.0.1:20001@6']);
+      // 旧版本地行与旧调用照旧
+      expect(show(managed(groupBlockLines()), owned)).toEqual([]);
+      expect(show(managed(groupBlockLines()))).toEqual([]);
+    });
+
+    test('a missing or ambiguous group segment leaves no place where our URL is ours', () => {
+      const text = ['[Proxy Group]', ...loopbackGroupBlockLines(URL), '[Rule]', 'FINAL,DIRECT'].join('\n');
+      expect(show(text)).toEqual(['group:SFE-ROUTE@2', 'resource_reference:127.0.0.1:20001@2']);
+    });
+
+    test('an invalid own URL is refused', () => {
+      expect(() => findForeignSfeObjects(MANAGED, { ...owned, resourceUrl: 'http://127.0.0.1:20001/x' })).toThrow(/本机资源服务地址不正确/);
+    });
+
+    test('SFE-EMPTY is whitelisted only in the Surge policy-name check, never as a profile definition', () => {
+      expect(foreignSfePolicyNames(['SFE-ROUTE', 'SFE-EMPTY', 'SFE-N-E0001-US01-v001', 'SFE-X', 'sfe-empty', 'Daily'], new Set(['SFE-ROUTE', 'SFE-N-E0001-US01-v001']))).toEqual([
+        'SFE-X',
+        'sfe-empty',
+      ]);
+      const defined = managed(loopbackGroupBlockLines(URL)).replace('[Proxy Group]', '[Proxy]\nSFE-EMPTY = direct\n[Proxy Group]');
+      expect(show(defined)).toEqual(['proxy:SFE-EMPTY@4']);
+    });
   });
 });
 

@@ -6,11 +6,14 @@ import {
   PHASE_TEXT,
   POLICY_BUTTON,
   READINESS_BADGE,
+  ROUTE_LEFT_WARNINGS,
+  SAVED_NOTICE,
   WARNING_TEXT,
   confirmationReason,
   formatRelative,
   isExpired,
   policyConsequence,
+  retestRouteLeftText,
   rollbackText,
 } from '../src/shared/text';
 import { NOW, iso } from './fixtures';
@@ -22,6 +25,7 @@ const ALL_TEXT = [
   ...Object.values(DEPLOYMENT_TEXT),
   ...Object.values(ENTRY_MODE_TEXT),
   ...Object.values(POLICY_BUTTON),
+  SAVED_NOTICE,
   policyConsequence('activate', 'closed_confirmed'),
   policyConsequence('activate', 'keep_open_acknowledged'),
   policyConsequence('normal', 'keep_open_acknowledged'),
@@ -44,6 +48,20 @@ describe('interface text', () => {
       expect(t).not.toMatch(/[一-鿿][A-Za-z0-9]/);
       expect(t).not.toMatch(/[A-Za-z0-9][一-鿿]/);
     }
+  });
+
+  it('names node_resource_unverified among the causes when a retest ends with the route no longer verified (D10)', () => {
+    expect(ROUTE_LEFT_WARNINGS).toContain('node_resource_unverified');
+    const text = retestRouteLeftText(['node_resource_unverified', 'probe_expired']);
+    expect(text).toContain(WARNING_TEXT.node_resource_unverified);
+    expect(text).toContain('自动打开订单与填充已停止');
+    // 不是使路由离开已验证状态的警告不列为原因
+    expect(text).not.toContain(WARNING_TEXT.probe_expired);
+  });
+
+  it('never claims a save is already syncing: publishing may stay pending', () => {
+    expect(SAVED_NOTICE).not.toContain('正在同步');
+    expect(SAVED_NOTICE).toContain('Surge 同步');
   });
 
   it('describes the keep-open consequences differently for activation and normal mode', () => {

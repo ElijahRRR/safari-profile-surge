@@ -1,5 +1,5 @@
 // 配置文本与 Surge 自由文本的按行规则脱敏（服务的按值脱敏器之外的第二道防线）。
-// 遮盖：节点行凭据参数与位置式用户名/密码、http-api*、[MITM] ca-*、WireGuard 密钥、URL 用户信息与查询。
+// 遮盖：节点行凭据参数与位置式用户名/密码、http-api*、[MITM] ca-*、WireGuard 密钥、URL 用户信息与查询、回环 http(s) 地址的路径。
 
 import { parseProfile, serializeProfile } from './profile.js';
 
@@ -17,10 +17,26 @@ const INLINE_SECRET_RE =
 
 const URL_RE = /\b([a-z][a-z0-9+.-]*:\/\/)([^\s/?#@,"']+@)?([^\s/?#,"']*)([^\s?#,"']*)(\?[^\s#,"']*)?(#[^\s,"']*)?/gi;
 
-/** URL 用户信息、查询与片段替换为 ***；只保留协议、主机与路径。 */
+/** 回环主机（可带端口）：127.0.0.0/8、localhost、[::1]、[::ffff:127.x.x.x]。 */
+const LOOPBACK_AUTHORITY_RE = /^(?:127(?:\.\d{1,3}){3}|localhost|\[::1\]|\[::ffff:127(?:\.\d{1,3}){3}\])(?::\d{0,5})?$/i;
+
+/** http(s) 地址的主机（host 可带端口，去掉可能残留的用户信息）是否为回环地址。 */
+export function isLoopbackHttpAuthority(scheme: string, host: string): boolean {
+  return /^https?:\/\/$/i.test(scheme) && LOOPBACK_AUTHORITY_RE.test(host.slice(host.lastIndexOf('@') + 1));
+}
+
+/**
+ * URL 用户信息、查询与片段替换为 ***；只保留协议、主机与路径。回环 http(s) 地址（127.0.0.1、localhost、[::1]）的整段路径、
+ * 查询与片段一并替换为 `/***`：本机资源服务的读取令牌在路径中（D10，`http://127.0.0.1:<端口>/***`）。路径只有 “/” 时保留。
+ */
 export function redactUrls(text: string): string {
   return text.replace(URL_RE, (_m, scheme: string, userinfo: string | undefined, host: string, path: string, query?: string, frag?: string) => {
-    return `${scheme}${userinfo ? `${MASK}@` : ''}${host}${path}${query ? `?${MASK}` : ''}${frag ? `#${MASK}` : ''}`;
+    const head = `${scheme}${userinfo ? `${MASK}@` : ''}${host}`;
+    if (isLoopbackHttpAuthority(scheme, host)) {
+      const tail = `${path}${query ?? ''}${frag ?? ''}`;
+      return `${head}${tail === '' || tail === '/' ? tail : `/${MASK}`}`;
+    }
+    return `${head}${path}${query ? `?${MASK}` : ''}${frag ? `#${MASK}` : ''}`;
   });
 }
 

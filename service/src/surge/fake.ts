@@ -1,10 +1,21 @@
 // 假 Surge：引擎测试与演示模式使用，按 Surge Mac 6.10.0 的文档语义建模（不代表任何网络事实）。工作配置从目录读取；
 // “已加载状态”与文件分开：
 // - updateExternalResource(key) 跳过本地资源，从不重新读取本地文件（HTTP API 文档：“Local resources are skipped.”），
-//   本地资源没有更新时间（“Local resources have no `updatedAt` field.”），报告 local: true；远端资源只推进更新时间；
+//   本地资源没有更新时间（“Local resources have no `updatedAt` field.”），报告 local: true；
+// - 远端资源（policy-path 与 RULE-SET 的 http(s) 地址）经 remoteSource 下载（缺省一律“连接被拒绝”：假 Surge 不访问网络；
+//   测试夹具与演示把它接到本机资源服务的进程内绑定方，每次下载都经真实的 host.handle()）。按回环矩阵的真机证据建模
+//   （docs/verification/2026-10-25-loopback-main-witness-matrix.md、2026-10-25-resource-error-classification.md）：
+//   updateExternalResource(远端 key) 只下载这一项资源，从不重载配置（磁盘上改过、未加载的主配置不会因此被加载），不碰其他
+//   资源；下载失败时保留已缓存的节点与选择、仍然就绪、错误为证据中的文字、更新时间不变，并像真实适配器一样经
+//   parseResourceUpdateText 抛出 SURGE_COMMAND_FAILED（真机上命令退出 0）；成功时只保留能解析的行、同名取第一条（`名称 = reject`
+//   也是有效节点）、重建成员（选择不再是成员时回落到首成员）、推进更新时间、清空错误。没有真机证据、做成选项或假设的部分：
+//   只含占位行的列表被接受（TODO(P0)）、Surge 自己的定时刷新（remoteRefreshIntervalMs）、重启后是否保留缓存
+//   （remoteCacheOnRestart）、更新时间的分辨率（updatedAtResolution）、Surge 报告 updating 的时长（slowUpdate）、“适配器
+//   超时而更新仍然生效”（timeoutNextUpdate）、加载配置时对未就绪资源的一次下载、远端资源 key 的形状（缺省不透明，urlKeys）；
 // - 本地 RULE-SET 文件变化后由文件监视自动重新加载（规则集文档：“Local files are watched and reloaded automatically when
 //   they change.”），只重新加载该规则集、不重载配置，延迟可配置（localWatchLatencyMs）；
-// - 本地 policy-path 文件是否被监视没有写入文档：watchLocalPolicyPaths 是测试参数，缺省关闭（成员只在 reloadProfile 时变化）；
+// - 本地 policy-path 文件是否被监视没有写入文档（自动重载关闭时实测不被重新读取，2026-10-24-fixed-profile-live.md）：
+//   watchLocalPolicyPaths 只是旧版本地文件模型的阴性回归开关，缺省关闭（成员只在 reloadProfile 时变化），从不影响远端资源；
 // - 资源类型按文档记为 policy-group / ruleset；新临时规则排在最前（“Add a temporary rule with the highest priority”，
 //   多条之间的顺序未写入文档，tempRuleInsertion 可改）；
 // - matchRule 与 simulateRequest 用同一套求值（模块规则 → 临时规则 → 配置规则）；求值走到 IP 规则（没有 no-resolve）而目标是
@@ -22,10 +33,12 @@ import { isAbsolute, join, resolve } from 'node:path';
 import {
   ENTRY_RULESET_FILES,
   NODE_RESOURCE_FILE,
+  NODE_RESOURCE_HOST,
   SfeError,
   WORKING_PROFILE_NAME,
   type TakeoverState,
 } from '@sfe/contract';
+import type { ResourceRequest, ResourceResponse } from '../resource/host.js';
 import type {
   MaintenanceSurge,
   SurgeAdapter,
@@ -45,14 +58,21 @@ import type {
 } from '../ports.js';
 import { commandExitError, unsupportedCommandError } from './cli-adapter.js';
 import { ruleMatchArgs } from './cli-commands.js';
-import { unrecognized } from './parse-output.js';
-import { ENTRY_BITS_IN_ORDER, entryRuleSetFileContent, entryRuleSetBlockLines, groupBlockLines, resourceFile } from './generate.js';
-import { SURGE_PRIMITIVES, type MechanismMap, type SurgePrimitive } from './primitives.js';
+import { parseResourceUpdateText, sha256Hex, unrecognized } from './parse-output.js';
+import {
+  ENTRY_BITS_IN_ORDER,
+  entryRuleSetFileContent,
+  entryRuleSetBlockLines,
+  groupBlockLines,
+  loopbackGroupBlockLines,
+  resourceFile,
+} from './generate.js';
+import { SURGE_PRIMITIVES, resourceUpdateTimeoutError, type MechanismMap, type SurgePrimitive } from './primitives.js';
 import { SURGE_APP_BUNDLE, SURGE_BUNDLE_IDS, compareSurgeVersions, type RunningInstanceFailure, type RunningInstanceResult } from './running-instance.js';
 import { SURGE_BUILD_RE, SURGE_VERSION_RE } from './capability-gate.js';
 import { findSections, parseProfile } from './profile.js';
 import { parseProxyLine } from './proxy-line.js';
-import { redactProxyLine } from './redact-profile.js';
+import { redactProxyLine, redactUrls } from './redact-profile.js';
 import {
   BUILTIN_POLICIES,
   DnsLookupFailure,
@@ -96,6 +116,166 @@ function syntheticAddresses(host: string): ResolvedAddresses | null {
   return { v4: `198.51.100.${(n % 254) + 1}`, v6: `2001:db8::${((n % 0xfffe) + 1).toString(16)}` };
 }
 
+/**
+ * 一次下载尝试（Surge 发出的一个请求）的结果：http（任何状态码与内容）、连接被重置、响应被截断（Content-Length 未满足）、
+ * 服务不答复（超时）、连接被拒绝（端口上无人监听）。
+ */
+export type FakeRemoteResponse =
+  | { kind: 'http'; status: number; body: string | Buffer }
+  | { kind: 'reset' }
+  | { kind: 'truncated' }
+  | { kind: 'no_response' }
+  | { kind: 'refused' };
+
+/**
+ * 远端资源的下载来源。参数是工作配置中的原样地址（本机资源服务的地址含读取令牌：来源不得把它写入日志或错误）。同步返回：
+ * 定时刷新也会在 simulateRequest 中触发。
+ */
+export type FakeRemoteSource = (url: string) => FakeRemoteResponse;
+
+/**
+ * 真机证据中的资源错误文字（Surge Mac 6.10.0 (12500)，2026-10-25 合成回环矩阵；与 adapters.test.ts 的退出 0 失败文字表相同）。
+ * HTTP 4xx/5xx 一律为“异常状态码”文字；连接重置与响应截断都是 -1005；服务不答复是 -1001；无人监听是 -1004。
+ */
+export const FAKE_REMOTE_ERRORS = Object.freeze({
+  status: (status: number): string => `服务器返回了异常状态码：${status}。`,
+  empty: '服务器未返回任何数据。',
+  parse: 'Failed to parse remote resource data',
+  interrupted: '网络连接已中断。 (NSURLErrorDomain:-1005) [未能完成操作。（kCFErrorDomainCFNetwork错误-1005。） (kCFErrorDomainCFNetwork:-1005)]',
+  timeout: '请求超时。 (NSURLErrorDomain:-1001) [未能完成操作。（kCFErrorDomainCFNetwork错误-1001。） (kCFErrorDomainCFNetwork:-1001)]',
+  refused: '无法连接服务器。 (NSURLErrorDomain:-1004) [未能完成操作。（kCFErrorDomainCFNetwork错误-1004。） (kCFErrorDomainCFNetwork:-1004)]',
+});
+
+/**
+ * 一次下载中 Surge 最多发出的请求数（回环矩阵：一次命令触发连接重置 6 次、响应截断 2 次、服务不答复 2 次下载请求，其余 1 次）。
+ * 按最近一次尝试的结果判断是否再试：重试中得到其他结果时按那个结果的次数停止。
+ */
+export const FAKE_REMOTE_ATTEMPTS: Readonly<Record<FakeRemoteResponse['kind'], number>> = Object.freeze({
+  http: 1,
+  reset: 6,
+  truncated: 2,
+  no_response: 2,
+  refused: 1,
+});
+
+/** 一次下载（含重试）的记录：不含地址中的令牌（location 已遮盖）；Surge 的定时刷新与加载配置时的下载也在这里，不计入 calls。 */
+export interface FakeRemoteFetch {
+  key: string;
+  location: string;
+  at: Date;
+  trigger: 'update' | 'scheduled' | 'load';
+  /** Surge 发出的请求数（含重试）。 */
+  attempts: number;
+  outcome: 'downloaded' | 'failed';
+  /** 失败时的资源错误（证据文字）。 */
+  error: string | null;
+  /** 成功时接受的行数（节点或规则）。 */
+  accepted: number;
+}
+
+const REMOTE_VALUE_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+function keyPrefix(type: 'policy-group' | 'ruleset'): string {
+  return type === 'policy-group' ? 'policy-path' : 'ruleset';
+}
+
+/**
+ * 远端资源的不透明 key：sha1('<policy-path|ruleset>:<地址>') 的前 32 位十六进制（合成形状，满足 CLI 的 key 安全守卫；
+ * 真实形状 TODO(P0)：loopback_resource_update 记录）。
+ */
+export function fakeOpaqueResourceKey(type: 'policy-group' | 'ruleset', value: string): string {
+  return createHash('sha1').update(`${keyPrefix(type)}:${value}`, 'utf8').digest('hex').slice(0, 32);
+}
+
+/** Surge 接受的节点类型（假设：只为让“坏行被跳过”有确定的含义；Surge 真实的接受规则不只看类型，见 acceptNodeLine 选项）。 */
+const NODE_TYPES_WITHOUT_SERVER: ReadonlySet<string> = new Set(['direct', 'reject', 'reject-tinygif', 'reject-drop', 'reject-no-drop']);
+const NODE_TYPES_WITH_SERVER: ReadonlySet<string> = new Set([
+  'http',
+  'https',
+  'socks5',
+  'socks5-tls',
+  'ss',
+  'vmess',
+  'trojan',
+  'snell',
+  'tuic',
+  'tuic-v5',
+  'hysteria2',
+  'wireguard',
+  'ssh',
+  'anytls',
+]);
+
+/**
+ * 缺省的节点行接受规则：能解析为“名称 = 类型, …”，类型已知；需要服务器的类型带主机与 1-65535 的端口。`名称 = reject`
+ * 是有效节点（本应用的占位行 SFE-EMPTY = reject）。
+ */
+export function fakeAcceptsNodeLine(line: string): boolean {
+  const p = parseProxyLine(line);
+  if (!p || p.name === '' || /[,=]/.test(p.name)) return false;
+  if (NODE_TYPES_WITHOUT_SERVER.has(p.type)) return true;
+  return NODE_TYPES_WITH_SERVER.has(p.type) && p.server !== null && p.port !== null;
+}
+
+/** 进程内的请求函数（virtualBinder 的 request）：端口无人绑定时抛 code 为 ECONNREFUSED 的错误，处理程序不答复时抛 ECONNRESET。 */
+export type LoopbackRequest = (port: number, req: Omit<ResourceRequest, 'localPort'>) => ResourceResponse;
+
+/**
+ * Surge 对本机资源服务地址发出的下载请求：GET 原样路径，唯一的 Host 为 127.0.0.1:<端口>，两端都是回环地址，不带浏览器请求头
+ * （TODO(P0)：loopback_resource_auth 记录 Surge 实际发出的请求头名称）。不是 http://127.0.0.1:<端口>/… 时为 null（假 Surge
+ * 的网络上没有别的服务，按连接被拒绝处理）。
+ */
+export function loopbackResourceRequest(url: string): { port: number; request: Omit<ResourceRequest, 'localPort'> } | null {
+  const m = /^http:\/\/127\.0\.0\.1:([0-9]{1,5})(\/[^#]*)?(?:#.*)?$/.exec(url);
+  if (!m) return null;
+  const port = Number(m[1]);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return {
+    port,
+    request: {
+      method: 'GET',
+      rawPath: m[2] ?? '/',
+      rawHeaders: ['Host', `${NODE_RESOURCE_HOST}:${port}`, 'User-Agent', 'Surge'],
+      remoteAddress: NODE_RESOURCE_HOST,
+      localAddress: NODE_RESOURCE_HOST,
+    },
+  };
+}
+
+/**
+ * 把进程内的请求函数（通常是 virtualBinder.request）接成 remoteSource：每次下载都经占用该端口的处理程序（本机资源服务的
+ * host.handle()）；抛出的 ECONNREFUSED 记为连接被拒绝，ECONNRESET 记为连接被重置，其他错误照原样抛出（测试错误）。
+ */
+export function loopbackRemoteSource(request: LoopbackRequest): FakeRemoteSource {
+  return (url) => {
+    const target = loopbackResourceRequest(url);
+    if (target === null) return { kind: 'refused' };
+    try {
+      const r = request(target.port, target.request);
+      return { kind: 'http', status: r.status, body: r.body };
+    } catch (err) {
+      const code = typeof err === 'object' && err !== null ? (err as { code?: unknown }).code : undefined;
+      if (code === 'ECONNREFUSED') return { kind: 'refused' };
+      if (code === 'ECONNRESET') return { kind: 'reset' };
+      throw err;
+    }
+  };
+}
+
+/** 假 Surge 的网络上什么也没有：一律连接被拒绝。 */
+const refusedSource: FakeRemoteSource = () => ({ kind: 'refused' });
+
+/**
+ * 慢更新：每次远端下载（单 key 更新、定时刷新、加载配置时的下载）开始后，该资源报告 updating: true 共 durationMs 毫秒（按 now），
+ * 到时（之后的第一次原语调用或 simulateRequest）才经 remoteSource 下载并应用结果。单 key 更新不等下载就答复：reply 为
+ * downloaded（缺省，报告成功）或 timeout（适配器等待超时，结果未知）。这是假设（TODO(P0)：loopback_publish_crash 记录答复
+ * 时机与更新进行中再次更新的行为），用来检验发布从不把答复当作已下载、并等待 updating 结束再读回。
+ */
+export interface FakeSlowUpdate {
+  durationMs: number;
+  reply?: 'downloaded' | 'timeout';
+}
+
 export interface FakeSurgeOptions {
   directory: string;
   profileFileName?: string;
@@ -107,8 +287,35 @@ export interface FakeSurgeOptions {
   tempRuleInsertion?: 'head' | 'tail';
   /** 本地文件变化后到监视器重新加载之间的延迟（毫秒，按 now 计）；缺省 0：变化后的下一次调用即重新加载。 */
   localWatchLatencyMs?: number;
-  /** 本地 policy-path 文件是否像本地 RULE-SET 一样被监视（文档未说明，缺省关闭）。 */
+  /**
+   * 本地 policy-path 文件是否像本地 RULE-SET 一样被监视（文档未说明；自动重载关闭时实测不被重新读取）。缺省关闭，只作为旧版
+   * 本地文件模型的阴性回归开关，从不影响远端资源。
+   */
   watchLocalPolicyPaths?: boolean;
+  /** 远端资源的下载来源；缺省一律连接被拒绝。 */
+  remoteSource?: FakeRemoteSource;
+  /**
+   * true：远端资源的 key 为 `policy-path:<地址>` / `ruleset:<地址>`（含读取令牌，只用于 key 安全守卫的测试）；缺省为不透明的
+   * 32 位十六进制（fakeOpaqueResourceKey）。本地资源的 key 始终是 `policy-path:<值>` / `ruleset:<值>`。
+   */
+  urlKeys?: boolean;
+  /**
+   * Surge 自己的定时刷新间隔（毫秒，按 now 计，在每次原语调用与 simulateRequest 时检查）：距上次下载尝试满这么久的远端资源经同一
+   * 下载路径再下载一次，不计入 calls（记入 remoteFetches，trigger 'scheduled'）。缺省 null：不刷新（真实间隔 TODO(P0)）。
+   */
+  remoteRefreshIntervalMs?: number | null;
+  /** Surge 重启后远端资源的缓存：keep（缺省）沿用；drop 丢弃，之后像从未下载过一样再下载一次。TODO(P0)：loopback_resource_restart。 */
+  remoteCacheOnRestart?: 'keep' | 'drop';
+  /** 远端资源更新时间的分辨率：ms（缺省，严格递增）或 s（取整到秒，同一秒内的两次下载更新时间相同）。TODO(P0)：实测。 */
+  updatedAtResolution?: 'ms' | 's';
+  /** 见 FakeSurge.slowUpdate。 */
+  slowUpdate?: FakeSlowUpdate | null;
+  /** 节点行的接受规则（缺省 fakeAcceptsNodeLine）；Surge 真实的接受规则与 parseProxyLine 不同。 */
+  acceptNodeLine?: (line: string) => boolean;
+  /**
+   * 构造前已有的远端缓存（如同之前的运行中已下载过，见 seedRemoteCache）：这些资源在第一次加载时已就绪，不下载。
+   */
+  remoteCache?: ReadonlyArray<{ url: string; body: string; type?: 'policy-group' | 'ruleset'; updatedAt?: Date }>;
   /** getVersion 报告的 Controller 协议号（合成值；真实值由 P0 读取）。 */
   controllerProtocol?: number;
   /** getVersion 报告的 Core 版本（合成值）。 */
@@ -139,20 +346,52 @@ interface LoadedGroup {
   policyPaths: string[];
 }
 
+interface PendingFetch {
+  trigger: FakeRemoteFetch['trigger'];
+  /** 下载完成（真正调用 remoteSource 并应用结果）的时刻（毫秒，按 now）。 */
+  completesAt: number;
+  /** 进行中再次单 key 更新时的答复（与开始这次下载的答复相同）。 */
+  reply: 'downloaded' | 'timeout';
+}
+
+/**
+ * Surge 对一项远端资源的缓存（按 key 保存，跨配置重载保留；重启按 remoteCacheOnRestart）。content 为 null 表示从未成功下载
+ * （未就绪：列表报告 error 'not_ready'、没有更新时间、组中没有它的节点）。
+ */
+interface RemoteState {
+  /** 工作配置中的原样地址（含读取令牌）：只交给 remoteSource，从不出现在列表、记录或错误中。 */
+  readonly url: string;
+  readonly type: 'policy-group' | 'ruleset';
+  /** 已接受的行（只含能解析的行，同名只留第一条）。 */
+  content: string | null;
+  conditions: RuleCondition[];
+  updatedAt: Date | null;
+  /** 最近一次下载失败的资源错误；成功时清空。 */
+  error: string | null;
+  /** 最近一次下载尝试的时刻（毫秒），定时刷新据此计算。 */
+  lastAttemptAt: number | null;
+  pending: PendingFetch | null;
+}
+
 interface LoadedResource {
   key: string;
   /** HTTP API 文档的资源类型（policy-path 的类型是 policy-group）。 */
   type: 'policy-group' | 'ruleset';
   value: string;
+  /** 列表中的位置：本地资源为绝对路径，远端资源为 redactUrls 遮盖后的地址（与 parse-output 相同）。 */
   location: string;
+  /** 遮盖之前原样位置的 SHA-256（与 parse-output 的 locationHash 相同）。 */
+  locationHash: string;
   local: boolean;
+  /** 本地资源的已加载内容；远端资源的内容在 remote 中。 */
   content: string | null;
   conditions: RuleCondition[];
-  /** 只有远端资源有；本地资源始终为 null。 */
-  lastUpdatedAt: Date | null;
+  /** 本地资源的错误（文件不存在）；远端资源的错误在 remote 中。 */
   error: string | null;
   /** 监视器第一次看到文件与已加载内容不同的时刻（毫秒）；没有待处理的变化为 null。 */
   changeSeenAt: number | null;
+  /** 远端资源的缓存（本地资源为 null）。 */
+  remote: RemoteState | null;
 }
 
 export interface SimulatedRequest extends SurgeRequestRecord {
@@ -194,6 +433,19 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   watchLocalPolicyPaths: boolean;
   /** 文件监视器重新加载单个资源的记录（不是配置重载，不计入 reloadCount）。 */
   readonly watcherReloads: Array<{ key: string; at: Date }> = [];
+  /** 远端资源的下载来源（可随时替换）。 */
+  remoteSource: FakeRemoteSource;
+  readonly urlKeys: boolean;
+  remoteRefreshIntervalMs: number | null;
+  remoteCacheOnRestart: 'keep' | 'drop';
+  updatedAtResolution: 'ms' | 's';
+  /** 慢更新（见 FakeSlowUpdate）；null 时下载立即完成。可随时修改，只影响之后开始的下载。 */
+  slowUpdate: FakeSlowUpdate | null;
+  acceptNodeLine: (line: string) => boolean;
+  /** 每次远端下载（含 Surge 自己的定时刷新与加载配置时的下载）的记录。 */
+  readonly remoteFetches: FakeRemoteFetch[] = [];
+  /** updateExternalResource('all') 等更新全部资源的尝试次数（本应用从不这样做；假 Surge 拒绝并计数）。 */
+  updateAllAttempts = 0;
   frontResolution: 'skip' | 'direct';
   reloadClearsTempRules: boolean;
   reachable = true;
@@ -216,6 +468,10 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   private groups = new Map<string, LoadedGroup>();
   private profileRules: string[] = [];
   private resources = new Map<string, LoadedResource>();
+  /** 远端资源的缓存，按 key（不随配置重载清空）。 */
+  private remote = new Map<string, RemoteState>();
+  /** timeoutNextUpdate 排队的“适配器超时而更新仍然生效”。 */
+  private updateTimeouts: Array<{ applyAfterMs: number }> = [];
   private watched = new Map<string, string | null>();
   private selection = new Map<string, string | null>();
   private temps: string[] = [];
@@ -242,6 +498,18 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     this.tempRuleInsertion = opts.tempRuleInsertion ?? 'head';
     this.localWatchLatencyMs = opts.localWatchLatencyMs ?? 0;
     this.watchLocalPolicyPaths = opts.watchLocalPolicyPaths ?? false;
+    this.remoteSource = opts.remoteSource ?? refusedSource;
+    this.urlKeys = opts.urlKeys ?? false;
+    this.remoteRefreshIntervalMs = opts.remoteRefreshIntervalMs ?? null;
+    this.remoteCacheOnRestart = opts.remoteCacheOnRestart ?? 'keep';
+    this.updatedAtResolution = opts.updatedAtResolution ?? 'ms';
+    this.slowUpdate = opts.slowUpdate ?? null;
+    this.acceptNodeLine = opts.acceptNodeLine ?? fakeAcceptsNodeLine;
+    const interval = this.remoteRefreshIntervalMs;
+    if (interval !== null && !(Number.isFinite(interval) && interval > 0)) throw new RangeError('remoteRefreshIntervalMs must be a positive number or null');
+    if (this.slowUpdate !== null && !(Number.isFinite(this.slowUpdate.durationMs) && this.slowUpdate.durationMs >= 0)) {
+      throw new RangeError('slowUpdate.durationMs must be a finite non-negative number');
+    }
     this.frontResolution = opts.frontResolution ?? 'skip';
     this.reloadClearsTempRules = opts.reloadClearsTempRules ?? false;
     this.version = opts.version ?? '6.10.0';
@@ -252,6 +520,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     this.now = opts.now ?? (() => new Date());
     this.startedAt = this.now();
     this.currentProfile = { name: this.profileFileName.replace(/\.conf$/, ''), path: this.profilePath };
+    for (const c of opts.remoteCache ?? []) this.seedRemoteCache(c.url, c.body, { ...(c.type ? { type: c.type } : {}), ...(c.updatedAt ? { updatedAt: c.updatedAt } : {}) });
     this.loadAll();
   }
 
@@ -286,6 +555,67 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   }
 
   /**
+   * 下一次远端资源的单 key 更新：适配器等待超时（抛 SURGE_COMMAND_FAILED，details.reason update_timeout，与真实适配器相同），
+   * 而 Surge 端的更新仍然生效——applyAfterMs 为 0（缺省）时立即下载并应用，否则 updating 持续这么久之后才下载并应用。
+   * 计入 calls；与 failNext 一样只作用一次（可排多次）。
+   */
+  timeoutNextUpdate(opts: { applyAfterMs?: number } = {}): void {
+    const applyAfterMs = opts.applyAfterMs ?? 0;
+    if (!Number.isFinite(applyAfterMs) || applyAfterMs < 0) throw new RangeError('applyAfterMs must be a finite non-negative number');
+    this.updateTimeouts.push({ applyAfterMs });
+  }
+
+  /**
+   * 立即触发 Surge 自己的一次刷新（与定时刷新相同的下载路径；不计入 calls，trigger 'scheduled'）：给出 key 时只刷新该项，
+   * 否则刷新每个远端资源。进行中的下载不另起。slowUpdate 生效时只开始下载（updating 为 true）。
+   */
+  runScheduledRefresh(key?: string): void {
+    const targets = key === undefined ? [...this.resources.values()] : [this.resources.get(key)].filter((r): r is LoadedResource => r !== undefined);
+    if (key !== undefined && targets.length === 0) throw new Error('runScheduledRefresh: unknown resource key');
+    let changed = false;
+    for (const res of targets) {
+      if (!res.remote || res.remote.pending !== null) continue;
+      if (this.startFetch(res, 'scheduled').fetched) changed = true;
+    }
+    if (changed) this.rebuildExternalNodes();
+  }
+
+  /**
+   * 预置 Surge 对某个地址的缓存，如同之前的运行中已经下载过（测试用：例如 Surge 带着旧缓存重启）。不经 remoteSource、不记入
+   * remoteFetches；内容按与下载相同的规则接受，没有可接受的行时抛错（测试错误）。之后加载配置时该资源已就绪。
+   */
+  seedRemoteCache(url: string, body: string, opts: { type?: 'policy-group' | 'ruleset'; updatedAt?: Date } = {}): void {
+    const type = opts.type ?? 'policy-group';
+    if (!REMOTE_VALUE_RE.test(url)) throw new Error('seedRemoteCache: not a remote address');
+    const accepted = this.acceptRemote(type, { kind: 'http', status: 200, body });
+    if (!accepted.ok) throw new Error(`seedRemoteCache: body not accepted (${accepted.error})`);
+    const key = this.resourceKeyFor(url, type);
+    const st = this.remote.get(key) ?? this.newRemoteState(url, type);
+    st.content = accepted.content;
+    st.conditions = accepted.conditions;
+    st.error = null;
+    st.updatedAt = opts.updatedAt ? new Date(opts.updatedAt) : this.stampUpdatedAt(st.updatedAt);
+    st.lastAttemptAt = this.now().getTime();
+    this.remote.set(key, st);
+    const res = this.resources.get(key);
+    if (res) {
+      res.remote = st;
+      this.rebuildExternalNodes();
+    }
+  }
+
+  /** 假 Surge 给这个 policy-path（或 RULE-SET）值的资源 key：本地值与 urlKeys 时为 `<policy-path|ruleset>:<值>`，否则不透明。 */
+  resourceKeyFor(value: string, type: 'policy-group' | 'ruleset' = 'policy-group'): string {
+    if (!REMOTE_VALUE_RE.test(value) || this.urlKeys) return `${keyPrefix(type)}:${value}`;
+    return fakeOpaqueResourceKey(type, value);
+  }
+
+  /** 该远端资源是否有进行中的下载（listExternalResources 的 updating）。不是远端资源时为 false。 */
+  isUpdating(key: string): boolean {
+    return this.resources.get(key)?.remote?.pending != null;
+  }
+
+  /**
    * 升级或降级 Surge：改版本需要退出并重新打开 Surge，等同于 restart()（临时规则“are discarded when Surge stops”）。
    * 只改字段而不重启的测试会让旧版本仍然保留新版本添加的临时规则，与真实情形不符。
    */
@@ -301,12 +631,17 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     if (compareSurgeVersions(this.version, '6.9.0') < 0 || this.controllerProtocol < 20) throw unsupportedCommandError(primitive);
   }
 
-  /** Surge 重启：临时规则清空、整体加载、启动时间变化、活动连接清空。 */
+  /**
+   * Surge 重启：临时规则清空、整体加载、启动时间变化、活动连接清空。进行中的远端下载中断；远端缓存按 remoteCacheOnRestart
+   * 保留或丢弃（TODO(P0)：loopback_resource_restart），未就绪的资源在加载时下载一次。
+   */
   restart(): void {
     this.temps = [];
     this.active.clear();
     const t = this.now();
     this.startedAt = t.getTime() > this.startedAt.getTime() ? t : new Date(this.startedAt.getTime() + 1);
+    for (const st of this.remote.values()) st.pending = null;
+    if (this.remoteCacheOnRestart === 'drop') this.remote.clear();
     this.loadAll();
   }
 
@@ -314,12 +649,14 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     return [...this.temps];
   }
 
-  /** 已加载（而不是文件中）的资源内容。 */
+  /** 已加载（而不是文件中或资源服务正在提供）的资源内容：远端资源为 Surge 缓存中被接受的行，未就绪为 null。 */
   loadedContent(key: string): string | null {
-    return this.resources.get(key)?.content ?? null;
+    const res = this.resources.get(key);
+    return res ? this.contentOf(res) : null;
   }
 
   checkFileChanges(): boolean {
+    let reloaded = false;
     if (this.autoReload) {
       for (const [path, snapshot] of this.watched) {
         if (readOrNull(path) !== snapshot) {
@@ -327,12 +664,41 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
           this.autoReloadCount++;
           this.loadAll();
           if (this.reloadClearsTempRules) this.temps = [];
-          return true;
+          reloaded = true;
+          break;
         }
       }
     }
-    this.runWatchers();
-    return false;
+    if (!reloaded) this.runWatchers();
+    this.runRemote();
+    return reloaded;
+  }
+
+  /**
+   * 远端资源的后台进度（每次原语调用与 simulateRequest 时）：到期的进行中下载经 remoteSource 完成并应用；打开定时刷新时，距上次
+   * 下载尝试满 remoteRefreshIntervalMs 的资源再下载一次（时钟一次跳过多个间隔也只下载一次）。都不计入 calls。
+   */
+  private runRemote(): void {
+    const t = this.now().getTime();
+    let changed = false;
+    for (const res of this.resources.values()) {
+      const st = res.remote;
+      if (!st || st.pending === null || t < st.pending.completesAt) continue;
+      const trigger = st.pending.trigger;
+      st.pending = null;
+      this.fetchNow(res, trigger);
+      changed = true;
+    }
+    const interval = this.remoteRefreshIntervalMs;
+    if (interval !== null && Number.isFinite(interval) && interval > 0) {
+      for (const res of this.resources.values()) {
+        const st = res.remote;
+        if (!st || st.pending !== null) continue;
+        if (st.lastAttemptAt !== null && t - st.lastAttemptAt < interval) continue;
+        if (this.startFetch(res, 'scheduled').fetched) changed = true;
+      }
+    }
+    if (changed) this.rebuildExternalNodes();
   }
 
   /**
@@ -435,7 +801,12 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
       resolved = this.resolveHost(host);
       return resolved;
     };
-    const ctx = { ruleSet: (value: string) => this.resources.get(`ruleset:${value}`)?.conditions ?? null, lookup };
+    const ruleSet = (value: string): RuleCondition[] | null => {
+      const res = this.resources.get(this.resourceKeyFor(value, 'ruleset'));
+      if (!res) return null;
+      return res.remote ? res.remote.conditions : res.conditions;
+    };
+    const ctx = { ruleSet, lookup };
     const ordered = [...this.modules.map((m) => m.text), ...this.temps, ...this.profileRules];
     try {
       for (const text of ordered) {
@@ -462,7 +833,6 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     this.userProxies.clear();
     this.groups.clear();
     this.profileRules = [];
-    const previous = this.resources;
     this.resources = new Map();
     this.watched = new Map([[this.profilePath, raw]]);
     const linesOf = (name: string): string[] =>
@@ -485,7 +855,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
         else if (part.slice(0, eq).trim().toLowerCase() === 'policy-path') {
           const value = part.slice(eq + 1).trim();
           group.policyPaths.push(value);
-          this.registerResource('policy-group', value, previous);
+          this.registerResource('policy-group', value);
         }
       }
       this.groups.set(group.name, group);
@@ -495,44 +865,186 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
       const r = parseRule(line);
       if (!r) continue;
       this.profileRules.push(line.trim());
-      if (r.condition.type === 'RULE-SET') this.registerResource('ruleset', r.condition.value!, previous);
+      if (r.condition.type === 'RULE-SET') this.registerResource('ruleset', r.condition.value!);
     }
     for (const res of this.resources.values()) this.loadResource(res);
+    // 配置中不再引用的远端资源：进行中的下载随之放弃（缓存保留，重新引用同一地址时沿用）
+    const referenced = new Set([...this.resources.values()].map((r) => r.remote));
+    for (const st of this.remote.values()) if (!referenced.has(st)) st.pending = null;
+    // 未就绪的远端资源（从未成功下载）在加载配置时下载一次；已就绪的沿用缓存，不重新下载（假设，TODO(P0)：重启与重载时
+    // Surge 是否重新下载由 loopback_resource_restart 记录）
+    for (const res of this.resources.values()) {
+      if (res.remote && res.remote.content === null && res.remote.pending === null) this.startFetch(res, 'load');
+    }
     this.rebuildExternalNodes();
   }
 
-  /** 资源 key 是不透明的合成值（真实 Surge 的 key 由它自己生成）：policy-path:<值> 与 ruleset:<值>。 */
-  private registerResource(type: 'policy-group' | 'ruleset', value: string, previous: Map<string, LoadedResource>): void {
-    const key = `${type === 'policy-group' ? 'policy-path' : 'ruleset'}:${value}`;
+  /**
+   * 资源 key 是合成值（真实 Surge 的 key 由它自己生成）：本地资源为 policy-path:<值> 与 ruleset:<值>；远端资源缺省不透明
+   * （resourceKeyFor）。远端资源的缓存按 key 跨配置重载保留。
+   */
+  private registerResource(type: 'policy-group' | 'ruleset', value: string): void {
+    const key = this.resourceKeyFor(value, type);
     if (this.resources.has(key)) return;
-    const local = !/^[a-z][a-z0-9+.-]*:\/\//i.test(value);
-    const prev = previous.get(key);
+    if (REMOTE_VALUE_RE.test(value)) {
+      let st = this.remote.get(key);
+      if (!st) {
+        st = this.newRemoteState(value, type);
+        this.remote.set(key, st);
+      }
+      this.resources.set(key, {
+        key,
+        type,
+        value,
+        location: redactUrls(value),
+        locationHash: sha256Hex(value),
+        local: false,
+        content: null,
+        conditions: [],
+        error: null,
+        changeSeenAt: null,
+        remote: st,
+      });
+      return;
+    }
+    const location = isAbsolute(value) ? value : join(this.directory, value);
     this.resources.set(key, {
       key,
       type,
       value,
-      location: local ? (isAbsolute(value) ? value : join(this.directory, value)) : value,
-      local,
+      location,
+      locationHash: sha256Hex(location),
+      local: true,
       content: null,
       conditions: [],
-      lastUpdatedAt: local ? null : (prev?.lastUpdatedAt ?? null),
       error: null,
       changeSeenAt: null,
+      remote: null,
     });
   }
 
-  private bumpTime(prev: Date | null): Date {
-    const t = this.now();
-    return prev && t.getTime() <= prev.getTime() ? new Date(prev.getTime() + 1) : t;
+  private newRemoteState(url: string, type: 'policy-group' | 'ruleset'): RemoteState {
+    return { url, type, content: null, conditions: [], updatedAt: null, error: null, lastAttemptAt: null, pending: null };
+  }
+
+  private contentOf(res: LoadedResource): string | null {
+    return res.remote ? res.remote.content : res.content;
+  }
+
+  /** 远端资源的更新时间：ms 时严格递增（时钟没走时比上一次多 1 毫秒）；s 时取整到秒（同一秒内的下载更新时间相同）。 */
+  private stampUpdatedAt(prev: Date | null): Date {
+    const t = this.now().getTime();
+    if (this.updatedAtResolution === 's') return new Date(Math.floor(t / 1000) * 1000);
+    return prev && t <= prev.getTime() ? new Date(prev.getTime() + 1) : new Date(t);
+  }
+
+  /**
+   * 开始一次远端下载：slowUpdate 生效时只记下进行中（updating），到时由 runRemote 完成；否则立即下载。fetched 为真时已经下载
+   * （调用方负责重建节点），error 为资源错误（成功为 null）。
+   */
+  private startFetch(
+    res: LoadedResource,
+    trigger: FakeRemoteFetch['trigger'],
+  ): { fetched: true; error: string | null } | { fetched: false; reply: 'downloaded' | 'timeout' } {
+    const st = res.remote!;
+    const slow = this.slowUpdate;
+    if (slow !== null && Number.isFinite(slow.durationMs) && slow.durationMs > 0) {
+      const reply = slow.reply ?? 'downloaded';
+      st.pending = { trigger, completesAt: this.now().getTime() + slow.durationMs, reply };
+      return { fetched: false, reply };
+    }
+    return { fetched: true, error: this.fetchNow(res, trigger) };
+  }
+
+  /**
+   * 下载一次（含 Surge 的重试，见 FAKE_REMOTE_ATTEMPTS）并写入缓存：成功时内容换成被接受的行、错误清空、更新时间推进；
+   * 失败时只记错误（缓存的内容、就绪状态与更新时间不变）。返回资源错误，成功为 null。不重建节点（调用方负责）。
+   */
+  private fetchNow(res: LoadedResource, trigger: FakeRemoteFetch['trigger']): string | null {
+    const st = res.remote!;
+    const at = this.now();
+    st.lastAttemptAt = at.getTime();
+    let attempts = 0;
+    let response: FakeRemoteResponse;
+    for (;;) {
+      attempts++;
+      response = this.remoteSource(st.url);
+      const max = FAKE_REMOTE_ATTEMPTS[response?.kind];
+      if (max === undefined) throw new Error('FakeSurge: remoteSource returned an unknown response');
+      if (attempts >= max) break;
+    }
+    const outcome = this.acceptRemote(st.type, response);
+    if (outcome.ok) {
+      st.content = outcome.content;
+      st.conditions = outcome.conditions;
+      st.error = null;
+      st.updatedAt = this.stampUpdatedAt(st.updatedAt);
+    } else {
+      st.error = outcome.error;
+    }
+    this.remoteFetches.push({
+      key: res.key,
+      location: res.location,
+      at,
+      trigger,
+      attempts,
+      outcome: outcome.ok ? 'downloaded' : 'failed',
+      error: outcome.ok ? null : outcome.error,
+      accepted: outcome.ok ? outcome.accepted : 0,
+    });
+    return outcome.ok ? null : outcome.error;
+  }
+
+  /**
+   * 下载结果是否被接受（证据文字见 FAKE_REMOTE_ERRORS）：非 2xx 为异常状态码；空内容为“服务器未返回任何数据。”；没有一条
+   * 可接受的行（含只有文件头注释的内容）为 Failed to parse remote resource data。节点资源只保留 acceptNodeLine 接受的行、
+   * 同名只留第一条；规则集只保留能解析的规则。
+   */
+  private acceptRemote(
+    type: 'policy-group' | 'ruleset',
+    response: FakeRemoteResponse,
+  ): { ok: true; content: string; conditions: RuleCondition[]; accepted: number } | { ok: false; error: string } {
+    switch (response.kind) {
+      case 'refused':
+        return { ok: false, error: FAKE_REMOTE_ERRORS.refused };
+      case 'reset':
+      case 'truncated':
+        return { ok: false, error: FAKE_REMOTE_ERRORS.interrupted };
+      case 'no_response':
+        return { ok: false, error: FAKE_REMOTE_ERRORS.timeout };
+      case 'http':
+        break;
+    }
+    const status = response.status;
+    if (!Number.isInteger(status) || status < 200 || status > 299) return { ok: false, error: FAKE_REMOTE_ERRORS.status(status) };
+    const body = typeof response.body === 'string' ? response.body : Buffer.from(response.body).toString('utf8');
+    if (body.length === 0) return { ok: false, error: FAKE_REMOTE_ERRORS.empty };
+    const lines: string[] = [];
+    const conditions: RuleCondition[] = [];
+    const names = new Set<string>();
+    for (const raw of body.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (line === '' || isCommentLine(line)) continue;
+      if (type === 'ruleset') {
+        const c = parseCondition(line);
+        if (c === null) continue;
+        conditions.push(c);
+        lines.push(line);
+        continue;
+      }
+      if (!this.acceptNodeLine(line)) continue;
+      const name = parseProxyLine(line)?.name;
+      if (name === undefined || names.has(name)) continue;
+      names.add(name);
+      lines.push(line);
+    }
+    if (lines.length === 0) return { ok: false, error: FAKE_REMOTE_ERRORS.parse };
+    return { ok: true, content: lines.join('\n'), conditions, accepted: lines.length };
   }
 
   private loadResource(res: LoadedResource): void {
-    if (!res.local) {
-      // 假 Surge 不下载任何东西：远端资源没有内容。
-      res.content = '';
-      res.conditions = [];
-      return;
-    }
+    // 远端资源的内容是 Surge 的缓存（RemoteState），加载配置时不重新读取（未就绪的在 loadAll 中下载一次）
+    if (res.remote) return;
     const content = readOrNull(res.location);
     this.watched.set(res.location, content);
     res.content = content;
@@ -551,8 +1063,9 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   private rebuildExternalNodes(): void {
     this.externalNodes.clear();
     for (const res of this.resources.values()) {
-      if (res.type !== 'policy-group' || res.content === null) continue;
-      for (const line of res.content.split(/\r?\n/)) {
+      const content = this.contentOf(res);
+      if (res.type !== 'policy-group' || content === null) continue;
+      for (const line of content.split(/\r?\n/)) {
         if (isCommentLine(line)) continue;
         const p = parseProxyLine(line);
         if (!p || this.externalNodes.has(p.name) || this.userProxies.has(p.name)) continue;
@@ -565,7 +1078,8 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     for (const g of this.groups.values()) {
       const members = this.membersOf(g.name);
       const sel = this.selection.get(g.name);
-      // select 组的选择失效时回落到首成员（REJECT）。
+      // select 组的选择失效（节点被删除、坏行被跳过）时回落到首成员：本应用的 SFE-ROUTE 首成员是 REJECT（回环矩阵：删除选中
+      // 成员后落到 REJECT 只因为它排在首位）。
       if (sel === undefined || sel === null || !members.includes(sel)) this.selection.set(g.name, members[0] ?? null);
     }
   }
@@ -575,9 +1089,10 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     if (!g) return [];
     const out = [...g.explicit];
     for (const value of g.policyPaths) {
-      const res = this.resources.get(`policy-path:${value}`);
-      if (!res?.content) continue;
-      for (const line of res.content.split(/\r?\n/)) {
+      const res = this.resources.get(this.resourceKeyFor(value, 'policy-group'));
+      const content = res ? this.contentOf(res) : null;
+      if (!content) continue;
+      for (const line of content.split(/\r?\n/)) {
         if (isCommentLine(line)) continue;
         const p = parseProxyLine(line);
         if (p && this.externalNodes.has(p.name) && !out.includes(p.name)) out.push(p.name);
@@ -599,6 +1114,8 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     }
     const node = this.userProxies.get(policy) ?? this.externalNodes.get(policy);
     if (!node) return { leaf: 'REJECT', chain: ['REJECT'], rejected: true, frontMissing: false };
+    // `名称 = reject` 一类的节点（例如本应用的占位行 SFE-EMPTY）拒绝连接
+    if (REJECT_POLICIES.has(node.type.toUpperCase())) return { leaf: node.name, chain: [node.name], rejected: true, frontMissing: false };
     if (node.front === null) return { leaf: node.name, chain: [node.name], rejected: false, frontMissing: false };
     if (node.frontMissing) return { leaf: node.name, chain: [node.name, 'DIRECT'], rejected: false, frontMissing: true };
     const front = this.resolvePolicy(node.front, depth + 1);
@@ -624,6 +1141,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     return Object.fromEntries(SURGE_PRIMITIVES.map((p) => [p, 'fake' as const]));
   }
 
+  /** 整体重载配置：远端资源沿用缓存，只对未就绪的资源下载一次（见 loadAll）。 */
   reloadProfile(): Promise<void> {
     return this.invoke('reloadProfile', () => {
       this.reloadCount++;
@@ -780,30 +1298,74 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     });
   }
 
+  /**
+   * 与真实解析（parse-output parseExternalResources）相同的字段：location 经 redactUrls 遮盖，locationHash 是原样位置的
+   * SHA-256。远端资源：未就绪（从未成功下载）时 error 为 'not_ready'、没有更新时间；就绪后 error 是最近一次下载失败的文字
+   * （成功时为 null）；有进行中的下载时 updating 为 true。本地资源没有更新时间、updating 为 false。
+   */
   listExternalResources(): Promise<SurgeExternalResource[]> {
     return this.invoke('listExternalResources', () =>
-      [...this.resources.values()].map((r) => ({
-        key: r.key,
-        type: r.type,
-        location: r.location,
-        lastUpdatedAt: !r.local && r.lastUpdatedAt ? new Date(r.lastUpdatedAt) : null,
-        error: r.error,
-        local: r.local,
-        updating: false,
-        fromModule: null,
-      })),
+      [...this.resources.values()].map((r) => {
+        const st = r.remote;
+        const ready = st !== null && st.content !== null;
+        return {
+          key: r.key,
+          type: r.type,
+          location: r.location,
+          locationHash: r.locationHash,
+          lastUpdatedAt: ready && st.updatedAt ? new Date(st.updatedAt) : null,
+          error: st === null ? r.error : ready ? st.error : 'not_ready',
+          local: st === null,
+          updating: st !== null && st.pending !== null,
+          fromModule: null,
+        };
+      }),
     );
   }
 
-  /** 单个 key：本地资源被跳过（不重新读取文件，结果不算刷新）；远端资源推进更新时间；不存在的 key 失败（HTTP 400）。 */
+  /**
+   * 单个 key：本地资源被跳过（不重新读取文件，结果不算刷新）；远端资源只下载这一项（从不重载配置、不碰其他资源），结果与
+   * 真实适配器相同地经 parseResourceUpdateText（`<key>: success` 或 `<key>: <错误文字>` → SURGE_COMMAND_FAILED）；不存在的
+   * key 失败（HTTP 400）。更新全部资源（'all'、空 key）从不是本应用的调用：拒绝并计入 updateAllAttempts。打开 autoReload 时，
+   * 每次原语调用之前的文件变化检查仍会整体重载改过的配置——那是模拟的自动重载，不是这次更新。
+   * 进行中的下载（slowUpdate、timeoutNextUpdate 的延迟生效）期间再次更新同一 key：不另起下载，答复与进行中的那次相同（假设，
+   * TODO(P0)：loopback_publish_crash 记录真实行为）。
+   */
   updateExternalResource(key: string): Promise<SurgeResourceUpdateResult> {
+    if (typeof key !== 'string' || key.trim() === '' || key.trim().toLowerCase() === 'all') {
+      this.calls.updateExternalResource = (this.calls.updateExternalResource ?? 0) + 1;
+      this.updateAllAttempts++;
+      return Promise.reject(new SfeError('INTERNAL', '假 Surge 拒绝更新全部外部资源：本应用只对单个 key 执行更新'));
+    }
     return this.invoke('updateExternalResource', () => {
       const res = this.resources.get(key);
       if (!res) throw commandFailed('更新外部资源失败：资源不存在');
-      if (res.local) return { key, refreshed: false, outcome: 'skipped' as const };
-      res.lastUpdatedAt = this.bumpTime(res.lastUpdatedAt);
-      res.error = null;
-      return { key, refreshed: true, outcome: 'downloaded' as const };
+      if (res.local || !res.remote) return { key, refreshed: false, outcome: 'skipped' as const };
+      const st = res.remote;
+      if (st.pending !== null) {
+        if (st.pending.reply === 'timeout') throw resourceUpdateTimeoutError();
+        return { key, refreshed: true, outcome: 'downloaded' as const };
+      }
+      const timeout = this.updateTimeouts.shift();
+      if (timeout) {
+        // 适配器等待超时，而 Surge 端的更新照样生效（立即，或 updating 一段时间之后）
+        if (timeout.applyAfterMs > 0) {
+          st.pending = { trigger: 'update', completesAt: this.now().getTime() + timeout.applyAfterMs, reply: 'timeout' };
+        } else {
+          this.fetchNow(res, 'update');
+          this.rebuildExternalNodes();
+        }
+        throw resourceUpdateTimeoutError();
+      }
+      const started = this.startFetch(res, 'update');
+      if (!started.fetched) {
+        // 慢更新：下载尚未发生就答复
+        if (started.reply === 'timeout') throw resourceUpdateTimeoutError();
+        return { key, refreshed: true, outcome: 'downloaded' as const };
+      }
+      this.rebuildExternalNodes();
+      // 与真实适配器相同的文字结果解析：成功为 downloaded，资源错误为 SURGE_COMMAND_FAILED（真机上退出 0）
+      return parseResourceUpdateText(`${key}: ${started.error ?? 'success'}`, key, (s) => s);
     });
   }
 
@@ -839,18 +1401,40 @@ export interface FakeEnvironmentOptions {
   userRules?: string[];
   /** 用户规则之后、FINAL 之前的 IP 规则（缺省 FAKE_IP_RULE，不带 no-resolve）；null 表示不写。 */
   ipRule?: string | null;
+  /**
+   * D10：SFE-ROUTE 的 policy-path 指向本机资源服务（loopbackGroupBlockLines(url)，url 须是 nodeResourceUrl 的结果），不写
+   * sfe-nodes.list。给出 request（通常是 virtualBinder 的 request）时，返回值的 remoteSource 经它下载（loopbackRemoteSource）。
+   */
+  resource?: { url: string; request?: LoopbackRequest };
+  /**
+   * 旧版（D7）的本地文件引用（LEGACY_NODE_GROUP_LINE）与占位的 sfe-nodes.list：迁移（重新合并改用本机资源服务）与旧组行停泊的
+   * 测试。与 resource 互斥。两者都不给时同样是旧版环境：只检验入口策略或本地资源语义（skipped、文件监视）的假 Surge 测试
+   * 不涉及节点资源模型；引擎夹具（harness）与演示总是给出 resource 或明确的 legacy。
+   */
+  legacy?: boolean;
 }
 
 export interface FakeEnvironment {
   directory: string;
   profileName: string;
   profilePath: string;
-  /** 写入的本应用文件（相对配置目录）。 */
+  /** 写入的本应用文件（相对配置目录）。回环环境没有 sfe-nodes.list。 */
   files: string[];
+  /** 节点资源模型：loopback（给出 resource）或 legacy。 */
+  nodeResource: 'loopback' | 'legacy';
+  /** 给出 resource.request 时接到它的下载来源（交给 FakeSurgeOptions.remoteSource），否则为 null。 */
+  remoteSource: FakeRemoteSource | null;
 }
 
-/** 合成工作配置：用户节点（合成占位值）、FINAL 规则、SFE 受管理段与占位资源文件。 */
+/**
+ * 合成工作配置：用户节点（合成占位值）、FINAL 规则与 SFE 受管理段；节点组受管理段按 resource（本机资源服务地址，D10）或
+ * legacy（本地 sfe-nodes.list 与占位文件）写入。
+ */
 export function createFakeSurgeEnvironment(dir: string, opts: FakeEnvironmentOptions = {}): FakeEnvironment {
+  if (opts.resource !== undefined && opts.legacy === true) throw new Error('createFakeSurgeEnvironment: resource and legacy are mutually exclusive');
+  const loopback = opts.resource !== undefined;
+  // 地址不对时 loopbackGroupBlockLines 抛 VALIDATION_FAILED（不带出地址）
+  const groupLines = loopback ? loopbackGroupBlockLines(opts.resource!.url) : groupBlockLines();
   const directory = resolve(dir);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const strategy = opts.entryStrategy ?? 'ruleset_resource';
@@ -868,7 +1452,7 @@ export function createFakeSurgeEnvironment(dir: string, opts: FakeEnvironmentOpt
     '[Proxy Group]',
     'Daily = select, Front-A, Front-B, DIRECT',
     '# SFE-BEGIN group v1',
-    ...groupBlockLines(),
+    ...groupLines,
     '# SFE-END group',
     '',
     '[Rule]',
@@ -883,13 +1467,24 @@ export function createFakeSurgeEnvironment(dir: string, opts: FakeEnvironmentOpt
   const profileName = WORKING_PROFILE_NAME;
   const profilePath = join(directory, `${profileName}.conf`);
   writeFileSync(profilePath, profile, { mode: 0o600 });
-  const files = [NODE_RESOURCE_FILE];
-  writeFileSync(join(directory, NODE_RESOURCE_FILE), resourceFile(0, []), { mode: 0o600 });
+  const files: string[] = [];
+  if (!loopback) {
+    files.push(NODE_RESOURCE_FILE);
+    writeFileSync(join(directory, NODE_RESOURCE_FILE), resourceFile(0, []), { mode: 0o600 });
+  }
   if (strategy === 'ruleset_resource') {
     for (const bit of ENTRY_BITS_IN_ORDER) {
       writeFileSync(join(directory, ENTRY_RULESET_FILES[bit]), entryRuleSetFileContent(bit, false, entryOpts), { mode: 0o600 });
       files.push(ENTRY_RULESET_FILES[bit]);
     }
   }
-  return { directory, profileName, profilePath, files };
+  const request = opts.resource?.request;
+  return {
+    directory,
+    profileName,
+    profilePath,
+    files,
+    nodeResource: loopback ? 'loopback' : 'legacy',
+    remoteSource: request ? loopbackRemoteSource(request) : null,
+  };
 }

@@ -17,6 +17,8 @@ import {
   type CapabilityStatus,
   type CapabilityView,
   type EntryStrategy,
+  type NodeResourceState,
+  type NodeResourceStatusView,
   type ProtocolCoverage,
   type SurgeStatusView,
 } from '@sfe/contract';
@@ -26,6 +28,7 @@ export type GateName = keyof typeof CAPABILITY_GATES;
 
 export const GATE_LABELS: Record<GateName, string> = {
   publish: '发布节点',
+  resourceServe: '本机资源服务提供节点',
   activate: '切换环境',
   activateRulesetStrategy: '规则集入口策略',
   killSafariConnections: '结束 Safari 旧连接',
@@ -70,6 +73,32 @@ export function evaluateGate(caps: readonly CapabilityView[], gate: GateName, en
     }
   }
   return { met: missing.length === 0, missing };
+}
+
+/** 各状态下发布停泊的原因（serving 为 null：可以发布）。 */
+const NODE_RESOURCE_PUBLISH_BLOCK: Record<NodeResourceState, string | null> = {
+  serving: null,
+  not_listening: '本机资源服务不可用：没有在已设置的端口监听（端口被其他程序占用、尚未选定端口，或等 Surge 可连接后再监听）',
+  token_unavailable: '本机资源服务的读取令牌不可用，资源服务没有启动',
+  legacy_line: '工作配置的 SFE-ROUTE 仍引用旧版的本地节点文件：需要重新合并以改用本机资源服务',
+  not_installed: '工作配置中没有指向本机资源服务当前地址的节点组定义：需要重新合并',
+};
+
+/**
+ * 发布在本机资源服务（D10）上的前提，与服务端发布停泊的条件一致：固定工作配置已初始化、资源服务存在并在已设置的端口监听、
+ * 读取令牌不可疑、工作配置的节点组定义指向本服务的当前地址（仍是旧版本地节点文件引用时需要重新合并）。返回不能发布的原因
+ * （可能有多条），可以发布时为空。nodeResource 为 undefined（旧版服务不带这一项）时不额外判断；服务端仍会再次检查并停泊。
+ * 只用状态码，从不涉及地址、端口或令牌。
+ */
+export function nodeResourcePublishBlocks(nodeResource: NodeResourceStatusView | null | undefined): string[] {
+  if (nodeResource === undefined) return [];
+  if (nodeResource === null) return ['尚未初始化固定工作配置'];
+  const reasons: string[] = [];
+  const byState = NODE_RESOURCE_PUBLISH_BLOCK[nodeResource.state];
+  // 未知状态（新版服务新增）按不能发布处理
+  if (byState !== null) reasons.push(byState ?? '本机资源服务状态未知');
+  if (nodeResource.tokenSuspect) reasons.push('读取令牌可能已泄露：需要重新合并并更换本机资源地址');
+  return reasons;
 }
 
 export function capabilityCounts(caps: readonly CapabilityView[]): Record<CapabilityStatus, number> {

@@ -256,7 +256,8 @@ describe('roles and masking', () => {
     expect(snap.demoMode).toBe(false);
     expect(snap.sequence).toBe(h.app.events.currentSequence());
     expect(snap.capabilities).toHaveLength(CAPABILITY_KEYS.length);
-    expect(snap.capabilities).toHaveLength(19);
+    // D10：删除两项本地 policy-path 能力、加入四项回环资源能力
+    expect(snap.capabilities).toHaveLength(21);
     expect(snap.capabilities.map((c) => c.key)).not.toContain('bridge_keychain_access');
     expect(snap.settings.workingProfilePath).toBe(h.profilePath);
   });

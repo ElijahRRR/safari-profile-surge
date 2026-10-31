@@ -221,7 +221,10 @@ describe('normal mode is always available (§5.2)', () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
     const original = readFileSync(h.profilePath, 'utf8');
-    writeFileSync(h.profilePath, original.replace('SFE-ROUTE = select, REJECT, policy-path=sfe-nodes.list', 'SFE-ROUTE = select, REJECT, DIRECT, policy-path=sfe-nodes.list'));
+    // 改的是入口段里的一行注释（节点组段被改时另有 node_resource_unverified，只由经确认的读回清除，见 resource-reconcile.test.ts）
+    const tampered = original.replace('# SFE-BEGIN entry v1\n', '# SFE-BEGIN entry v1\n# 用户的注释\n');
+    expect(tampered).not.toBe(original);
+    writeFileSync(h.profilePath, tampered);
     await h.app.runPeriodicReconcile();
     expect(h.repos.routeState.get().warnings).toContain('managed_segments_changed');
     const opId = await enterNormal(envId);
@@ -829,6 +832,7 @@ describe('normal mode is always available (§5.2)', () => {
   test('a watcher slower than the entry wait for the whole normal mode (ruleset_resource): retries keep what was written and normal mode finishes', async () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const resourceUpdates = h.fake.calls.updateExternalResource ?? 0;
     // 假 Surge 的监视延迟（假时钟 60 秒）一直高于入口等待上限（40 毫秒）：每一步都超时；两次尝试之间监视赶上
     h.fake.localWatchLatencyMs = 60_000;
     const phases: string[] = [];
@@ -854,12 +858,14 @@ describe('normal mode is always available (§5.2)', () => {
     expect(already[0]).not.toContain('Surge 中没有本应用的入口规则');
     expectOriginalRules();
     expect(safariOutcome(h, 'www.example.test', 'udp').rule).toBe('FINAL,DIRECT');
-    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+    // 普通模式从不更新外部资源（之前的发布更新过一次）
+    expect((h.fake.calls.updateExternalResource ?? 0) - resourceUpdates).toBe(0);
   });
 
   test('…retried every 30 s while the watcher needs 60 s (ruleset_resource): no retry re-tightens a kept udp-/block-, normal mode finishes and each failure says to wait for the watcher', async () => {
     h = await createHarness();
     const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const resourceUpdates = h.fake.calls.updateExternalResource ?? 0;
     h.fake.localWatchLatencyMs = 60_000;
     const ops: string[] = [];
     for (let i = 0; i < 14; i++) {
@@ -887,7 +893,8 @@ describe('normal mode is always available (§5.2)', () => {
     for (const o of heldOff) expect(h.repos.operations.listSteps(o.id).some((st) => st.message.startsWith('已阻断 Safari 新请求'))).toBe(false);
     expectOriginalRules();
     expect(safariOutcome(h, 'www.example.test', 'udp').rule).toBe('FINAL,DIRECT');
-    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+    // 普通模式从不更新外部资源（之前的发布更新过一次）
+    expect((h.fake.calls.updateExternalResource ?? 0) - resourceUpdates).toBe(0);
   });
 
   test('…with a blocking module rule ahead of the entry: the retry whose intermediate block is already in force (udp off) reports the rule and goes on', async () => {

@@ -1,32 +1,21 @@
-// 发布批次的崩溃恢复与回滚归属（§6.2）：合并进批次的操作与导入逐行操作在崩溃后不会永远停在 running；
-// 多目标发布按操作记录；回滚写入失败或中途崩溃时，本应用自己写入的节点资源不会被误报为外部修改。
-// 从不重放写入：写入阶段的批次记为 UNKNOWN_STATE，由下一次发布按事实收敛。
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+// 发布批次的崩溃恢复与回滚（§6.2，D10）：合并进批次的操作与导入逐行操作在崩溃后不会永远停在 running；多目标发布按操作
+// 记录；回滚的单 key 更新失败或中途崩溃时需要处理或按事实收敛（系统强制刷新把 Surge 带回已提交版本），从不误报为外部修改。
+// 从不重放：提供候选之后的批次记为 UNKNOWN_STATE，待部署的修改由下一次发布收敛。
 import { afterEach, describe, expect, test } from 'vitest';
-import { NODE_RESOURCE_FILE, type ImportPreviewRequest } from '@sfe/contract';
-import type { ManagedProfileFiles } from '../../src/surge/files.js';
+import { ROUTE_GROUP_NAME, type ImportPreviewRequest } from '@sfe/contract';
 import { WEB, createEnv, createHarness, envInput, rid, type Harness } from './harness.js';
+import { hangAt, needsRefresh, pointer, served } from './publish-helpers.js';
 
 let h: Harness;
 afterEach(async () => {
   await h?.close();
 });
 
-// getGroupMembers：写入节点资源之后第一次读组成员就是等待它重新读取（写入之前另读一次组成员，作为“成员变化”的对照）；
-// 发布从不调用 updateExternalResource（Surge 6.10 的外部资源更新跳过本地资源）。
+// getGroupMembers：本机资源服务提供候选版本之后读组成员就是单 key 更新之后的读回（提供之前另读一次，作为更新之前的状态）。
 type FakeMethod = 'getGroupMembers' | 'listPolicies';
 
-/** 节点资源文件的当前内容。 */
-function nodeResource(): string {
-  return readFileSync(join(h.surgeDir, NODE_RESOURCE_FILE), 'utf8');
-}
-
-/** 节点资源文件自调用时起是否已被改写（发布已写入）。 */
-function resourceWritten(): () => boolean {
-  const before = nodeResource();
-  return () => nodeResource() !== before;
-}
+/** 本机资源服务正在提供候选版本（已暂存、尚未提交或撤回）。 */
+const candidateServed = (): boolean => served(h)?.state === 'candidate';
 
 /** 让某个 FakeSurge 原语挂起（模拟进程在调用中途崩溃）；when 为 false 的调用照常执行。 */
 function hang(name: FakeMethod, when: () => boolean = () => true): { entered: () => boolean; restore: () => void } {
@@ -65,10 +54,11 @@ async function queueTwoPortEdits(): Promise<{ x: string; y: string; ux: string; 
 }
 
 describe('publish batch crash recovery', () => {
-  test('crash while waiting for Surge to re-read the resource: the merged sibling is settled too, and the next publish converges both', async () => {
+  test('crash after the single-key update, before the readback: the merged sibling is settled too, Surge is brought back to the committed nodes, and the next publish converges both', async () => {
     h = await createHarness({ dbFile: true });
     const { x, y, ux, uy } = await queueTwoPortEdits();
-    const stuck = hang('getGroupMembers', resourceWritten());
+    const committed = await h.fake.getGroupMembers(ROUTE_GROUP_NAME);
+    const stuck = hang('getGroupMembers', candidateServed);
     h.app.executor.start();
     await until(stuck.entered);
     // X 是主操作，Y 被合并进同一批次
@@ -84,6 +74,10 @@ describe('publish batch crash recovery', () => {
     h.clock.advance(60 * 60 * 1000);
     await h.idle();
     expect(h.repos.operations.listByStatus(['queued', 'running'])).toEqual([]);
+    // 启动撤回了候选指针，系统强制刷新（没有目标环境）把 Surge 带回已提交版本
+    expect(pointer(h)?.candidate).toBeNull();
+    expect(await h.fake.getGroupMembers(ROUTE_GROUP_NAME)).toEqual(committed);
+    expect(needsRefresh(h)).toBeNull();
     // 两个待部署目标由一次发布收敛
     const pub = await h.app.publishPending({ request_id: rid() }, WEB);
     await h.idle();
@@ -91,7 +85,7 @@ describe('publish batch crash recovery', () => {
     expect(h.repos.environments.get(x)!.deployedProxyRevision).toBe(2);
     expect(h.repos.environments.get(y)!.deployedProxyRevision).toBe(2);
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
-    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+    expect(h.fake.updateAllAttempts).toBe(0);
   });
 
   test('crash before any write: the re-run batch re-collects the merged sibling instead of leaving it running', async () => {
@@ -156,11 +150,11 @@ describe('publish batch crash recovery', () => {
 describe('deployment records', () => {
   test('one publish operation with several pending targets deploys them all (one record per operation)', async () => {
     h = await createHarness();
-    h.revoke(['policy_path_reread']);
+    h.revoke(['loopback_resource_update']);
     const a = await createEnv(h, 'US-Buyer-01', '203.0.113.10');
     const b = await createEnv(h, 'US-Buyer-02', '203.0.113.11');
     expect(op(a.operation_id).phase).toBe('WAITING_DEPLOYMENT');
-    h.grant(['policy_path_reread']);
+    h.grant(['loopback_resource_update']);
     const pub = await h.app.publishPending({ request_id: rid() }, WEB);
     await h.idle();
     expect(op(pub.operation_id).phase).toBe('READY_FOR_NEXT_OPEN');
@@ -171,77 +165,69 @@ describe('deployment records', () => {
   });
 });
 
-describe('rollback ownership of the node resource', () => {
-  /** 第一次读回不一致（写入之后等待期间读到的仍是旧成员 → 回滚）；回滚写入节点资源时按 mode 失败或挂起。 */
-  function failRefreshThenRollbackWrite(mode: 'throw' | 'hang'): { rollbackWriteEntered: () => boolean; restore: () => void } {
-    const written = resourceWritten();
-    const origMembers = h.fake.getGroupMembers.bind(h.fake);
+describe('rollback of the node resource', () => {
+  /** 第一次读回（提供候选之后）读到的仍是旧成员 → 读回不一致 → 回滚（Surge 已下载候选：回滚单 key 更新一次）。 */
+  function staleMembersOnFirstReadback(): void {
+    const orig = h.fake.getGroupMembers.bind(h.fake);
     let lied = false;
     h.fake.getGroupMembers = async (group: string) => {
-      if (!lied && written()) {
+      if (!lied && candidateServed()) {
         lied = true;
         return ['REJECT', 'SFE-N-E0001-US01-v001'];
       }
-      return origMembers(group);
-    };
-    const engine = h.app.engine;
-    const origFiles = engine.profileFiles.bind(engine);
-    let resourceWrites = 0;
-    let entered = false;
-    engine.profileFiles = (): ManagedProfileFiles | null => {
-      const f = origFiles();
-      if (!f) return f;
-      return {
-        ...f,
-        writeAtomic: async (name, content, prev) => {
-          if (name === NODE_RESOURCE_FILE && ++resourceWrites === 2) {
-            entered = true;
-            if (mode === 'throw') throw new Error('disk full');
-            return new Promise<never>(() => undefined);
-          }
-          return f.writeAtomic(name, content, prev);
-        },
-      };
-    };
-    return {
-      rollbackWriteEntered: () => entered,
-      restore: () => {
-        engine.profileFiles = origFiles;
-      },
+      return orig(group);
     };
   }
 
-  test('rollback write fails → needs attention, but the next publish is not misreported as BASELINE_CHANGED', async () => {
+  test('the rollback update fails → needs attention with the node resource warning and needsRefresh kept; the next publish converges, never BASELINE_CHANGED', async () => {
     h = await createHarness();
     await createEnv(h, 'US-Buyer-A', '203.0.113.10');
-    const patch = failRefreshThenRollbackWrite('throw');
+    staleMembersOnFirstReadback();
+    const orig = h.fake.updateExternalResource.bind(h.fake);
+    let calls = 0;
+    h.fake.updateExternalResource = async (key: string) => {
+      if (++calls === 2) throw new Error('synthetic rollback update failure');
+      return orig(key);
+    };
     const b = await createEnv(h, 'US-Buyer-B', '203.0.113.11');
-    expect(patch.rollbackWriteEntered()).toBe(true);
+    h.fake.updateExternalResource = orig;
+    expect(calls).toBe(2);
     expect(op(b.operation_id).phase).toBe('BLOCKED_NEEDS_ATTENTION');
-    patch.restore();
-    // 文件仍是本应用刚写入的内容：归属记录确认它
-    const rec = h.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)!;
-    expect(rec.state).toBe('present');
-    expect(rec.contentDigest).toBe(await h.app.engine.profileFiles()!.digest(NODE_RESOURCE_FILE));
+    expect(h.repos.deployments.latest()!.state).toBe('failed');
+    expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
+    expect(pointer(h)?.candidate).toBeNull();
+    expect(served(h)).toMatchObject({ state: 'committed', generation: 1 });
+    expect(needsRefresh(h)).not.toBeNull();
+    // 下一次发布：Surge 中仍是候选（未提交）——提供并单 key 更新、读回一致，清除警告
     const pub = await h.app.publishPending({ request_id: rid() }, WEB);
     await h.idle();
     expect(op(pub.operation_id).error?.code).not.toBe('BASELINE_CHANGED');
     expect(op(pub.operation_id).phase).toBe('READY_FOR_NEXT_OPEN');
     expect(h.repos.environments.get(b.environment_id!)!.deployedProxyRevision).toBe(1);
+    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
+    expect(needsRefresh(h)).toBeNull();
   });
 
-  test('crash in ROLLING_BACK before the rollback write → recovery confirms our own content; the next publish converges', async () => {
+  test('crash in ROLLING_BACK during the rollback update → recovery fails the batch (never replays); one system refresh brings Surge back; the next publish converges', async () => {
     h = await createHarness({ dbFile: true });
     await createEnv(h, 'US-Buyer-A', '203.0.113.10');
-    const patch = failRefreshThenRollbackWrite('hang');
+    const committedMembers = await h.fake.getGroupMembers(ROUTE_GROUP_NAME);
+    staleMembersOnFirstReadback();
+    // 第一次更新是发布的，第二次是回滚的：挂在回滚的更新上（Surge 已下载候选之后才挂起的是发布那一次，这里挂在调用之前）
+    const stuck = hangAt(h, 'updateExternalResource', 2, { before: true });
     const b = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-B', '203.0.113.11') }, WEB);
-    await until(patch.rollbackWriteEntered);
+    await until(stuck.reached);
     expect(op(b.operation_id).phase).toBe('ROLLING_BACK');
-    patch.restore();
+    // 回滚事务已撤回候选指针，needsRefresh 保留
+    expect(pointer(h)?.candidate).toBeNull();
+    expect(needsRefresh(h)).not.toBeNull();
+    stuck.restore();
     await h.crash();
     await h.idle();
     expect(op(b.operation_id).error?.code).toBe('UNKNOWN_STATE');
-    expect(h.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)!.state).toBe('present');
+    expect(h.repos.deployments.list(10).find((d) => d.operationId === b.operation_id)!.state).toBe('failed');
+    expect(await h.fake.getGroupMembers(ROUTE_GROUP_NAME)).toEqual(committedMembers);
+    expect(needsRefresh(h)).toBeNull();
     const pub = await h.app.publishPending({ request_id: rid() }, WEB);
     await h.idle();
     expect(op(pub.operation_id).error?.code).not.toBe('BASELINE_CHANGED');

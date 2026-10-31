@@ -24,6 +24,7 @@ import { isIP } from 'node:net';
 import type { OperationRecord, RouteStateRecord } from '../../db/index.js';
 import { PUBLISH_KINDS, newRoutePayload, payloadOf, type EndHoldIntent, type ProbeVerdict, type RouteEnding, type RoutePayload, type SafariProbeEvidence } from '../../domain/operations.js';
 import { LOSS_OF_CONTROL_WARNINGS, REUSE_BLOCKING_WARNINGS, hasAny, safariProbeCurrent } from '../../domain/route-rules.js';
+import { NODE_RESOURCE_WARNING, nodeResourceSwitchFailure } from '../node-resource.js';
 import { labelOf } from '../../domain/naming.js';
 import { probeView } from '../../domain/views.js';
 import type { EntryController, EntryReadback, EntryTransitionOptions } from '../../ports.js';
@@ -428,6 +429,7 @@ const RETEST_LOST_TEXT: Partial<Record<RouteWarning, string>> = {
   external_profile_change: 'Surge 当前配置不是固定工作配置',
   precedence_violation: '有规则排在本应用入口之前',
   managed_segments_changed: '受管理段或本应用文件被外部修改',
+  node_resource_unverified: '节点资源未确认（Surge 中的节点无法证明来自本机资源服务的已提交版本）',
 };
 
 /**
@@ -1205,6 +1207,10 @@ async function checkSwitchPreconditions(engine: Engine, p: RoutePayload, ctrl: E
   if (!front || front.retired || !policies.proxies.includes(front.surgeName)) {
     throw new RouteFailure({ code: 'FRONT_PROXY_MISSING', message: '激活失败：前置节点不在 Surge 中，路由未改变' });
   }
+  // 节点资源（D10）：警告已设、本机资源服务不在监听、令牌可疑、审计无法解释、组成员与已提交版本不同，或目标节点在 Surge 中的
+  // 服务器、端口与前置与其版本不同（getPolicyDetail 已映射时）——不选择它，路由未改变（同时设 node_resource_unverified）
+  const resourceFailure = await nodeResourceSwitchFailure(engine, p.nodeName);
+  if (resourceFailure) throw new RouteFailure(resourceFailure);
   const members = await engine.surge.getGroupMembers(ROUTE_GROUP_NAME);
   if (!members.includes(p.nodeName)) throw new RouteFailure({ code: 'NODE_NOT_DEPLOYED', message: '激活失败：目标节点不在 SFE-ROUTE 中，路由未改变' });
 }
@@ -1696,6 +1702,10 @@ function exitIpMismatch(engine: Engine, p: RoutePayload, suffix: string): ApiErr
 function changedDuringCheck(engine: Engine, p: RoutePayload, where: string): ApiErrorBody | null {
   const replaced = replacedTarget(engine, p);
   if (replaced) return { code: 'NODE_NOT_DEPLOYED', message: `切换失败：${replaced}（核对期间保存），${where}` };
+  // 等待实测期间对账设了节点资源未确认（D10）：Surge 中的节点无法证明来自已提交版本，不写入 ACTIVE、不提交
+  if (engine.repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) {
+    return { code: 'NODE_NOT_DEPLOYED', message: `切换失败：节点资源未确认（Surge 中的节点无法证明来自本机资源服务的已提交版本），${where}`, details: { reason: NODE_RESOURCE_WARNING } };
+  }
   return exitIpMismatch(engine, p, `核对期间预期出口已修改，${where}`);
 }
 
@@ -1831,6 +1841,8 @@ function commitActive(engine: Engine, opId: string, p: RoutePayload, evidence: R
   // 普通模式未能确认 Safari 已离开买家出口的警告：只有本次激活第 7 步在已确认的阻断下结束了全部 Safari 连接（含持久标记中
   // 被换掉的进程路径上可能经买家出口的连接）时才清除；否则（升级前已在进行中的激活）之前买家出口上的连接仍可能存在
   if (route.warnings.includes('buyer_exit_connections_unconfirmed') && p.safariConnectionsEnded !== true) warnings.push('buyer_exit_connections_unconfirmed');
+  // 节点资源未确认（D10）不由激活清除：只在经确认的发布或回滚读回之后清除（提交之前的再核对已拒绝它，这里只是纵深防御）
+  if (route.warnings.includes(NODE_RESOURCE_WARNING)) warnings.push(NODE_RESOURCE_WARNING);
   const retired: OperationRecord[] = [];
   repos.tx(() => {
     // WAITING_ROUTE 只针对使用中的环境（§6.3 第 4 步）：另一个环境成为使用中的环境时，停在 WAITING_ROUTE 的其他环境的发布
@@ -1891,6 +1903,10 @@ function previousRouteOf(engine: Engine, snapshot: ActivationSnapshot | null): '
   return rev?.nodeName === snapshot.previousSelectedNode ? 'restorable' : 'held';
 }
 
+/** 回滚成功、节点资源未确认（D10）时的步骤说明：不恢复切换前的买家节点，改选 REJECT。 */
+const RESOURCE_HELD_STEP =
+  '切换失败：节点资源未确认（Surge 中的节点无法证明来自本机资源服务的已提交版本），不恢复切换前的买家节点：SFE-ROUTE 改选 REJECT（读回确认），Safari 保持阻断；路由需要处理：节点资源经确认的发布之后重新使用此环境，或进入普通模式';
+
 /** 回滚成功、切换前已改选 REJECT（previousRouteOf 为 'held'）时的步骤说明：没有恢复任何买家节点。 */
 function rejectKeptStep(previousSelection: string | null): string {
   const why = previousSelection === 'REJECT' ? '切换前 SFE-ROUTE 已失败即关闭改选 REJECT' : '切换前记录的选择不是使用中环境已验证的出口';
@@ -1943,7 +1959,11 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
       }
     }
     repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
-    const previous = previousRouteOf(engine, snapshot);
+    const previousRoute = previousRouteOf(engine, snapshot);
+    // 节点资源未确认（D10）：SFE-ROUTE 中的节点无法证明来自已提交版本，切换前的买家节点同样不能当作已验证的出口——不恢复它，
+    // 与切换前已改选 REJECT 一样改选 REJECT 并保持阻断（从不回退到其他买家出口）
+    const resourceHeld = previousRoute === 'restorable' && repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING);
+    const previous = resourceHeld ? 'held' : previousRoute;
     const hasPrevious = previous === 'restorable';
     /** 切换前 SFE-ROUTE 已失败即关闭改选 REJECT（或记录的选择不是使用中环境已验证的出口）：没有可恢复的买家节点，改回 REJECT。 */
     const rejectKept = previous === 'held';
@@ -1992,6 +2012,8 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
         .get()
         .warnings.filter((w) => w === 'managed_windows_on_original_rules' || w === 'takeover_unknown' || w === 'buyer_exit_connections_unconfirmed');
       if (segmentsChanged) keep.push('managed_segments_changed');
+      // 节点资源未确认只由经确认的读回清除，回滚保留它
+      if (resourceHeld || repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) keep.push(NODE_RESOURCE_WARNING);
       if (written && !keep.includes('managed_windows_on_original_rules')) keep.push('managed_windows_on_original_rules');
       repos.routeState.update({
         // 切换前已改选 REJECT：使用中的环境没有已验证的出口，路由仍需要处理（重新使用环境或进入普通模式），不是「已恢复、需要重新核验」
@@ -2014,9 +2036,11 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
         `${
           hasPrevious
             ? '已回滚：恢复切换前的节点，Safari 保持阻断，需要重新核验'
-            : rejectKept
-              ? rejectKeptStep(snapshot!.previousSelectedNode)
-              : '切换失败：切换前没有已验证的路由，Safari 保持阻断'
+            : resourceHeld
+              ? RESOURCE_HELD_STEP
+              : rejectKept
+                ? rejectKeptStep(snapshot!.previousSelectedNode)
+                : '切换失败：切换前没有已验证的路由，Safari 保持阻断'
         }${written ? `；${activeWrittenNote(written)}` : ''}`,
       );
       repos.outbox.cancelForOperation(opId);
@@ -2418,6 +2442,9 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
     // （acknowledgeWindows 不等待路由操作），不能按开始时读到的路由把它加回来
     const carriedWindows = repos.routeState.get().warnings.includes('managed_windows_on_original_rules');
     if (keepOpen || handedOverNote !== null || carriedWindows) warnings.unshift('managed_windows_on_original_rules');
+    // 节点资源未确认（D10）不由普通模式清除：撤销本应用入口不改变 SFE-ROUTE 中的节点从哪里来，只有经确认的发布或回滚读回才清除
+    // （与 managed_segments_changed 一样跨普通模式保留，之后的激活据此拒绝）
+    if (repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) warnings.push(NODE_RESOURCE_WARNING);
     // 之前的普通模式（含交给它的切换已写入 ACTIVE、它失败了）留下的旧窗口警告：完成说明同样写明，不声称 Safari 全部按原规则
     const notes = windowNotes.length === 0 && carriedWindows ? ['之前记下的旧环境窗口未关闭，其后续请求将按 Surge 原规则发出（可能直连）'] : windowNotes;
     repos.routeState.update({

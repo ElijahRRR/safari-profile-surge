@@ -64,6 +64,19 @@ export interface ServersInfo {
   h3Host: string;
 }
 
+/**
+ * 回环测试资源的接入状态（D10，loopback --setup / --rollback）。读取令牌只在运行目录的令牌文件中，资源 key 从不保存（每次按
+ * 地址摘要重新识别，key 可能含令牌）。
+ */
+export interface LoopbackInfo {
+  /** 写入测试配置地址的端口（resource-server 必须在这个端口上运行）。 */
+  port: number;
+  /** 接入（改写 SFE-ROUTE 行）的时间；回退之后为 null。 */
+  setupAt: string | null;
+  /** 最近一次手动重新加载之后读回确认已被 Surge 载入的配置 canary 编号；不知道为 null。 */
+  loadedCanaryIndex: number | null;
+}
+
 export interface RunState {
   version: 1;
   runId: string;
@@ -90,6 +103,8 @@ export interface RunState {
   processPaths: string[];
   /** 最近一次测量时的上下文（供提议时比较是否已变化）。 */
   lastContext: CapabilityContext | null;
+  /** 回环测试资源的接入状态；没有接入过为 null（旧运行没有该字段）。 */
+  loopback: LoopbackInfo | null;
 }
 
 export function emptyState(runId: string, now: Date): RunState {
@@ -112,6 +127,7 @@ export function emptyState(runId: string, now: Date): RunState {
     tempListConfirmed: null,
     processPaths: [],
     lastContext: null,
+    loopback: null,
   };
 }
 

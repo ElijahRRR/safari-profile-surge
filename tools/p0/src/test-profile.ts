@@ -4,11 +4,15 @@
 // 从不引用真实环境节点。测试凭据是合成的，只对本机测试服务有效。
 // 两种 canary：规则集 canary（p0-canary.list，本地规则集，由 Surge 的文件监视自动重新读取——refresh 测量它的延迟与
 // 影响）与配置 canary（测试配置 [Rule] 中的一行，只在配置重载时被读取——作为“是否发生了配置重载”的信号）。
+// 生成时 SFE-ROUTE 仍是本地文件引用（与旧版初始化相同）；loopback --setup 只把受管理段中的这一行改为回环测试资源地址
+// （replaceRouteLine，D10），loopback --rollback 改回原样。
 
 import {
   ENTRY_RULESET_FILES,
+  LEGACY_NODE_GROUP_LINE,
   NODE_RESOURCE_FILE,
   ROUTE_GROUP_NAME,
+  parseNodeResourceUrl,
   type EntryBits,
 } from '@sfe/contract';
 import {
@@ -23,6 +27,7 @@ import {
   groupBlockLines,
   insertInitialBlocks,
   isCommentLine,
+  loopbackGroupBlockLines,
   nodeLine,
   parseHttpApiLine,
   parseProfile,
@@ -147,6 +152,48 @@ export function armProfileCanary(profileText: string, n: number): string {
   if (idx.length !== 1) throw refused('布置配置 canary 失败：测试配置中没有唯一的配置 canary 规则（测试配置可能被外部修改）');
   parsed.lines[idx[0]!]!.text = rule;
   return serializeProfile(parsed.lines);
+}
+
+/** 受管理 group 段中 SFE-ROUTE 的写法：旧版本地文件引用、指向回环测试资源的地址，或其他（外部修改过）。 */
+export type RouteLineState = { kind: 'legacy' } | { kind: 'loopback'; url: string } | { kind: 'other' };
+
+const ROUTE_LINE_RE = new RegExp(`^\\s*${ROUTE_GROUP_NAME}\\s*=`);
+
+/** 受管理 group 段中唯一的 SFE-ROUTE 定义（行号与原文）；段缺失、边界不清或不是恰好一行时拒绝。 */
+function routeLineAt(profileText: string): { index: number; text: string } {
+  const parsed = parseProfile(profileText);
+  const block = findManagedBlock(parsed, 'group');
+  if (typeof block !== 'object') throw refused('读取测试配置失败：节点组受管理段缺失或边界不清（测试配置可能被外部修改）');
+  const at: number[] = [];
+  for (let i = block.start + 1; i < block.end; i++) if (ROUTE_LINE_RE.test(parsed.lines[i]!.text)) at.push(i);
+  if (at.length !== 1) throw refused('读取测试配置失败：节点组受管理段中没有唯一的 SFE-ROUTE 定义（测试配置可能被外部修改）');
+  return { index: at[0]!, text: parsed.lines[at[0]!]!.text };
+}
+
+/** 测试配置中 SFE-ROUTE 的写法（只认本应用生成的两种原文）。 */
+export function routeLineState(profileText: string): RouteLineState {
+  const line = routeLineAt(profileText).text.trim();
+  if (line === LEGACY_NODE_GROUP_LINE) return { kind: 'legacy' };
+  const m = /\bpolicy-path=(\S+)$/.exec(line);
+  const url = m?.[1] ?? null;
+  if (url !== null && parseNodeResourceUrl(url) !== null && line === loopbackGroupBlockLines(url)[0]) return { kind: 'loopback', url };
+  return { kind: 'other' };
+}
+
+/** 只把受管理段中的 SFE-ROUTE 这一行换成 line（其余内容逐字节不变）。 */
+export function replaceRouteLine(profileText: string, line: string): string {
+  const { index } = routeLineAt(profileText);
+  const parsed = parseProfile(profileText);
+  parsed.lines[index]!.text = line;
+  return serializeProfile(parsed.lines);
+}
+
+/** 当前写入测试配置的配置 canary 编号（找不到唯一一行时为 null）。 */
+export function profileCanaryIndexOf(profileText: string): number | null {
+  const hits = parseProfile(profileText).lines.map((l) => l.text.trim()).filter((t) => PROFILE_CANARY_LINE_RE.test(t));
+  if (hits.length !== 1) return null;
+  const m = /^DOMAIN,p(\d+)\./.exec(hits[0]!);
+  return m ? Number(m[1]) : null;
 }
 
 export function entryFilesForBits(bits: EntryBits, processPaths: readonly string[], verifyHost: string): Record<string, string> {

@@ -2,9 +2,9 @@
 
 Safari 用户场景驱动的 Surge 出口控制。目标是在使用一个已绑定场景时，让 Safari 使用该环境的代理链，减少手动调整 Surge 的步骤，并保持其他浏览器使用原规则。
 
-**当前状态（2026-10-24）：已有第一版实现（本机服务、网页后台、Safari 扩展、macOS 原生宿主与 P0 实测工具），离线测试通过；测试 Mac 上只做过部分 P0 实测，还没有任何一项能力门槛在网页后台确认，真实网络验收尚未进行。**所有依赖网络能力的动作都受能力门槛约束：P0 实测通过并在网页后台确认之前会被拒绝。离线测试、语法检查与旧实验结果不能替代真实网络验收。
+**当前状态（2026-10-31）：已有第一版实现（本机服务、网页后台、Safari 扩展、macOS 原生宿主与 P0 实测工具），离线测试通过；测试 Mac 上只做过部分 P0 实测，还没有任何一项能力门槛在网页后台确认，真实网络验收尚未进行。节点发布按用户决定 D10（2026-10-31）改为本机回环资源服务，回环资源四项能力还没有在测试 Mac 上用产品代码测过。**所有依赖网络能力的动作都受能力门槛约束：P0 实测通过并在网页后台确认之前会被拒绝。离线测试、语法检查与旧实验结果不能替代真实网络验收。
 
-测试 Mac 上已有的实测（[2026-10-24 记录](docs/verification/2026-10-24-mac-p0-increment.md)，macOS 27.0.1、Safari 27.0.1、Surge 6.10.0 (12500)）：Swift XCTest 132 项通过；P0 `instance` 通过；`takeover_state_readable` 的 P0 结果通过（尚未在网页确认）；`rule match` 与临时规则的添加、按完整文本撤销可用；扩展在 Safari 退出重开后仍启用、弹窗读到同一场景。**`safari_process_attribution`（Safari 精确进程归属）目前阻塞**：Safari 与独立 WKWebView 的对照还不能给出稳定的 Safari 专属进程路径，而入口规则的前提正是它。其余能力的证据状态见该记录的矩阵。
+测试 Mac 上已有的实测（[2026-10-24 记录](docs/verification/2026-10-24-mac-p0-increment.md)，macOS 27.0.1、Safari 27.0.1、Surge 6.10.0 (12500)）：Swift XCTest 132 项通过；P0 `instance` 通过；`takeover_state_readable` 的 P0 结果通过（尚未在网页确认）；`rule match` 与临时规则的添加、按完整文本撤销可用；扩展在 Safari 退出重开后仍启用、弹窗读到同一场景。**`safari_process_attribution`（Safari 精确进程归属）目前阻塞**：Safari 与独立 WKWebView 的对照还不能给出稳定的 Safari 专属进程路径，而入口规则的前提正是它。其余能力的证据状态见该记录的矩阵。[2026-10-24 固定配置实测](docs/verification/2026-10-24-fixed-profile-live.md)表明自动重载关闭时本地节点文件不被 Surge 重新读取，原来的本地文件发布路线在日常条件下不成立；[2026-10-25 回环资源补测](docs/verification/2026-10-25-loopback-main-witness-matrix.md)（原型夹具、合成节点）观察到对 127.0.0.1 资源的单 key 更新不加载磁盘上未加载的主配置，但下载失败时命令仍退出 0，坏节点会被静默丢弃——这是 D10 的依据，也是它必须严格读回的原因。
 
 GitHub 仓库标识使用 `safari-profile-surge`，项目中文名称保留为 `safari场景-surge`。
 
@@ -22,7 +22,7 @@ GitHub 仓库标识使用 `safari-profile-surge`，项目中文名称保留为 `
 - [安装与回退](docs/INSTALL.md)：构建、免费 Apple ID 签名、首次运行、卸载。
 - [P0 实测手册](docs/P0-RUNBOOK.md) 与 [验收报告模板](docs/ACCEPTANCE.md)：在测试 Mac 上逐项验证能力门槛。
 - [测试 Mac 执行清单](docs/P0-CHECKLIST.md)：当前真机状态、开始前要用户决定的事项、P0 的执行顺序与停止条件。
-- [实测记录](docs/verification/)：测试 Mac 上每轮实测的脱敏结果与证据边界（目前有 [2026-10-24](docs/verification/2026-10-24-mac-p0-increment.md)）。
+- [实测记录](docs/verification/)：测试 Mac 上每轮实测的脱敏结果与证据边界（目前有 [2026-10-24 增量](docs/verification/2026-10-24-mac-p0-increment.md)、[2026-10-24 固定配置](docs/verification/2026-10-24-fixed-profile-live.md)、[2026-10-25 资源错误分类](docs/verification/2026-10-25-resource-error-classification.md)、[2026-10-25 回环资源补测](docs/verification/2026-10-25-loopback-main-witness-matrix.md)）。
 
 ## 代码结构与本地演示
 
@@ -60,8 +60,8 @@ npm run demo     # 演示模式：模拟 Surge 与合成数据，不读写真实
 
 仓库只包含源码、文档与合成测试数据；未包含本机 Surge 配置、代理凭据、证书、买家账号、浏览器资料、原始请求日志及此前请求头标记实验的安装包。开发先用空白测试场景和合成数据；真实网络测试在用户指定的测试 Mac 本地完成。
 
-最低支持 Surge for Mac 6.10.0（构建 ≥ 12500、Controller 协议 ≥ 22，用户决定；不兼容 6.5）。design 中以 6.5.0 (10960) 为测试版本的调研只作历史记录；开发与 P0 都按 6.10 官方文档使用命令，文档没有写明的行为标为待验证（TODO(P0)）并失败即关闭。低于最低版本或读不到版本时依赖版本的动作被拒绝，进入普通模式仍可用（低于 6.9 时入口撤销无法用 `rule match` 确认，见 docs/ARCHITECTURE.md §0）。节点发布不调用 `external-resource update`（文档：本地资源被跳过），而是原子写入后等待 Surge 自动重新读取本地文件并读回；本地 policy-path 是否被监视需 P0 实测，确认前新节点保持待部署。与 design 的偏离记录在 docs/ARCHITECTURE.md §0。
+最低支持 Surge for Mac 6.10.0（构建 ≥ 12500、Controller 协议 ≥ 22，用户决定；不兼容 6.5）。design 中以 6.5.0 (10960) 为测试版本的调研只作历史记录；开发与 P0 都按 6.10 官方文档使用命令，文档没有写明的行为标为待验证（TODO(P0)）并失败即关闭。低于最低版本或读不到版本时依赖版本的动作被拒绝，进入普通模式仍可用（低于 6.9 时入口撤销无法用 `rule match` 确认，见 docs/ARCHITECTURE.md §0）。节点发布（用户决定 D10，2026-10-31）：SFE-ROUTE 的 policy-path 指向本机回环资源服务（只监听 127.0.0.1，路径带随机读取令牌）；发布时服务提供新版本，只对这一项资源执行一次 `external-resource update`（从不 update all），再严格读回并与服务记录的下载核对。回环资源四项 P0 补测（单 key 更新、认证与端口占用、重启后的缓存与恢复、并发与崩溃）在网页确认之前新节点保持“已保存，待部署”，其中前三项确认之前资源服务只提供不含买家节点的占位内容。与 design 的偏离（含固定工作配置设计第 81、83 行）记录在 docs/ARCHITECTURE.md §0。
 
 ## 开发优先级
 
-先验证 Safari 精确归属、无主配置切换的运行时控制、节点资源写入后被 Surge 自动重新读取（不调用外部资源更新）和其他应用连接连续性；通过后再完成导入、界面、场景绑定、订单和填充。能力门槛不过时先记录限制，不用扩大 MITM、全局改代理或频繁重载掩盖问题。
+先验证 Safari 精确归属、无主配置切换的运行时控制、经本机回环资源服务的节点资源单 key 更新（及其认证与端口占用、重启缓存、并发与崩溃补测）和其他应用连接连续性；通过后再完成导入、界面、场景绑定、订单和填充。能力门槛不过时先记录限制，不用扩大 MITM、全局改代理或频繁重载掩盖问题。

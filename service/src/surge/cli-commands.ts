@@ -95,6 +95,21 @@ export function safeResourceKey(key: unknown): string {
   return k;
 }
 
+/**
+ * 像是含 URL 或本机资源服务读取令牌（64 位十六进制，D10）的资源 key：不能放进 surge-cli 的 argv（CLAUDE.md：凭据不进命令行参数）。
+ * 纵深防御：发布先按 resource-key.ts resourceUpdateRoute 选择实现，这里在执行前再拒绝一次。
+ */
+const CLI_TOKEN_LIKE_KEY_RE = /:\/\/|[0-9a-f]{64}/i;
+
+/** 经 CLI 更新的资源 key：safeResourceKey 之外不能像是含 URL 或读取令牌（错误信息不回显 key）。 */
+export function safeCliResourceKey(key: unknown): string {
+  const k = safeResourceKey(key);
+  if (CLI_TOKEN_LIKE_KEY_RE.test(k)) {
+    throw new SfeError('VALIDATION_FAILED', '执行 Surge 命令失败：资源 key 可能含读取令牌，不能作为命令行参数');
+  }
+  return k;
+}
+
 /** `policy-group set` 只用于 SFE-ROUTE，且选项不能是 auto（它清除自动组覆盖，不是选择一个策略）。 */
 export function safeRouteSelection(group: unknown, policy: unknown): [string, string] {
   if (group !== ROUTE_GROUP_NAME) throw new SfeError('VALIDATION_FAILED', `执行 Surge 命令失败：只能选择 ${ROUTE_GROUP_NAME}`);
@@ -146,7 +161,7 @@ export interface CliArgvRule {
 
 const anyArg: ArgCheck = (v) => isSafeArgValue(v);
 const absolutePath: ArgCheck = (v) => isSafeArgValue(v) && v.startsWith('/');
-const singleResourceKey: ArgCheck = (v) => isSafeArgValue(v) && !ALL_RESOURCES_RE.test(v.trim());
+const singleResourceKey: ArgCheck = (v) => isSafeArgValue(v) && !ALL_RESOURCES_RE.test(v.trim()) && !CLI_TOKEN_LIKE_KEY_RE.test(v);
 const routeOption: ArgCheck = (v) => isSafeArgValue(v) && v.trim().toLowerCase() !== 'auto';
 const connectionId: ArgCheck = (v) => CONNECTION_ID_RE.test(v);
 const hostname: ArgCheck = (v) => HOSTNAME_RE.test(v);
@@ -157,7 +172,7 @@ const option =
 
 /**
  * 允许执行的全部 argv。只读命令带 --raw；写命令只有四种，且参数都被限制在单个对象上：SFE-ROUTE 的选择（不能是 auto）、
- * 单个数字连接 id、单个资源 key（不能是 all）、单条临时规则。
+ * 单个数字连接 id、单个资源 key（不能是 all，也不能像是含 URL 或读取令牌）、单条临时规则。
  */
 export const CLI_ARGV_ALLOWLIST: readonly CliArgvRule[] = [
   { prefix: ['--check'], args: [absolutePath] },
@@ -324,9 +339,10 @@ export const CLI_COMMANDS: CliCommandTable = {
     parse: (out) => parseExternalResources(jsonOrThrow(out.stdout, '外部资源')),
   },
   // 写：单个 key（从不 all）。本地资源被跳过（HTTP API 文档：“Local resources are skipped.”），结果从不算作刷新。
+  // 像是含 URL 或读取令牌的 key 不进 argv（本机节点资源的 key 先经 resource-key.ts 检查，见 safeCliResourceKey）。
   updateExternalResource: {
     evidence: 'unverified',
-    argv: (key) => ['external-resource', 'update', safeResourceKey(key)],
+    argv: (key) => ['external-resource', 'update', safeCliResourceKey(key)],
     parse: (out, ctx, [key]) => parseResourceUpdateText(out.stdout, key, ctx.scrub),
   },
   // 随包技能 §3.9：`rule temp <list|add|remove|…>` 对应控制器命令 `dump temp-rule`、`add-temp-rule`、`del-temp-rule`。

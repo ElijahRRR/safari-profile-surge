@@ -150,7 +150,7 @@ describe('capability proposals and confirmation', () => {
 
   test('a new proposal for the same capability dismisses older pending proposals that can never be confirmed; other pending proposals stay', async () => {
     h = await createHarness({ capabilities: [] });
-    const legacy = (id: string, key: 'connection_continuity' | 'policy_path_reread', surgeVersion: string | null) =>
+    const legacy = (id: string, key: 'connection_continuity' | 'loopback_resource_update', surgeVersion: string | null) =>
       h.repos.proposals.insert({
         id,
         key,
@@ -163,7 +163,7 @@ describe('capability proposals and confirmation', () => {
     // 早于版本校验提交的提议（旧解析器记录 127.0.0.1；a95e67d 的 P0 提交读不到版本的提议）
     legacy('prop_legacy_a', 'connection_continuity', '127.0.0.1');
     legacy('prop_legacy_b', 'connection_continuity', null);
-    legacy('prop_legacy_other', 'policy_path_reread', null);
+    legacy('prop_legacy_other', 'loopback_resource_update', null);
     const valid = await h.app.proposeCapability(proposal(), AGENT);
     const pending = () => h.repos.proposals.list({ pending: true }).map((p) => p.id).sort();
     expect(pending()).toEqual(['prop_legacy_other', valid.proposal_id].sort());

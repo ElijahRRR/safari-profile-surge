@@ -6,6 +6,7 @@ import type {
   CapabilityStatus,
   CapabilityView,
   EnvironmentView,
+  NodeResourceStatusView,
   OperationView,
   ProxyRevisionView,
   RouteStateView,
@@ -180,6 +181,17 @@ export function snapshot(over: Partial<Snapshot> = {}): Snapshot {
     pendingOperations: [],
     ...over,
   };
+}
+
+/** 本机资源服务（D10）的状态：默认正在提供，没有标志。只有状态码，从不带地址、端口或令牌。 */
+export function nodeResource(over: Partial<NodeResourceStatusView> = {}): NodeResourceStatusView {
+  return { state: 'serving', tokenSuspect: false, needsRefresh: false, ...over };
+}
+
+/** 带本机资源服务状态的快照（null：尚未初始化固定工作配置）。 */
+export function snapshotWithNodeResource(nr: NodeResourceStatusView | null, over: Partial<Snapshot> = {}): Snapshot {
+  const base = snapshot(over);
+  return { ...base, surge: { ...base.surge, nodeResource: nr } };
 }
 
 export function event<E extends ServiceEvent>(e: E): E {

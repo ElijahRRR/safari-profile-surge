@@ -7,7 +7,10 @@ import type { Db } from '../db/index.js';
 const PREFIX = 'engine:';
 
 export interface EngineKv {
+  /** 值无法解析为 JSON 时也返回 null（与键不存在相同）；需要区分时用 has()。 */
   get<T>(key: string): T | null;
+  /** 键是否存在（值无法解析或是 JSON null 时也算存在：读取方据此 fail closed）。 */
+  has(key: string): boolean;
   set(key: string, value: unknown): void;
   delete(key: string): void;
   /** 键以 prefix 开头的全部条目。 */
@@ -24,6 +27,9 @@ export function createEngineKv(db: Db): EngineKv {
       } catch {
         return null;
       }
+    },
+    has(key: string): boolean {
+      return db.get<{ one: number }>('SELECT 1 AS one FROM meta WHERE key = ?', [PREFIX + key]) !== undefined;
     },
     set(key: string, value: unknown): void {
       db.run('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', [PREFIX + key, toJsonColumn(value)]);

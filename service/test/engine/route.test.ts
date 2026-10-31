@@ -20,6 +20,7 @@ import {
   verify,
   type Harness,
 } from './harness.js';
+import { dropNodesOnNextUpdate } from './publish-helpers.js';
 
 let h: Harness;
 afterEach(async () => {
@@ -1671,26 +1672,18 @@ describe('rollback (§6.3 step 14)', () => {
 
   test('after a successful rollback, a publish whose own rollback cannot confirm the SFE-ROUTE selection drops rollback_needs_reverify', async () => {
     h = await createHarness();
-    const { a } = await rolledBackToA();
-    // 发布写入之后 Surge 重新读取节点资源时选择回落到 REJECT（读回不一致），回滚恢复选择的那一次写入失败
-    const orig = h.fake.getGroupMembers.bind(h.fake);
-    let first = true;
-    h.fake.getGroupMembers = async (group: string) => {
-      const r = await orig(group);
-      if (first) {
-        first = false;
-        await h.fake.selectGroupPolicy(ROUTE_GROUP_NAME, 'REJECT');
-        h.fake.failNext('selectGroupPolicy');
-      }
-      return r;
-    };
+    const { a, nodeA } = await rolledBackToA();
+    // Surge 下载候选时跳过了选中节点的行，选择回落到 REJECT（读回不一致）；回滚的单 key 更新让节点回来，改回原选择的那一次写入失败
+    dropNodesOnNextUpdate(h, [nodeA]);
+    h.fake.failNext('selectGroupPolicy');
     const c = await createEnv(h, 'US-Buyer-C', '203.0.113.12');
-    expect(first).toBe(false);
     expect(h.repos.operations.get(c.operation_id)!).toMatchObject({ phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention' });
     expect(h.repos.deployments.latest()!.state).toBe('failed');
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
     const route = h.repos.routeState.get();
     expect(route).toMatchObject({ phase: 'attention', entryMode: 'BLOCKED', activeEnvironmentId: a });
     expect(route.warnings).toContain('external_selection_change');
+    expect(route.warnings).toContain('node_resource_unverified');
     await expectNoRestoredClaim(a);
   });
 
@@ -2351,7 +2344,7 @@ describe('active environment proxy change → WAITING_ROUTE', () => {
 
   test('a revision replaced while its publish was still deploying never enters WAITING_ROUTE', async () => {
     let save: (() => Promise<void>) | null = null;
-    h = await createHarness({ surge: (fake) => beforeCall(fake, 'getGroupMembers', () => { const s = save; save = null; return s; }) });
+    h = await createHarness({ surge: (fake) => beforeCall(fake, 'listActiveRequests', () => { const s = save; save = null; return s; }) });
     const { envId } = await activeEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
     const nodeV1 = h.repos.proxyRevisions.get(envId, 1)!.nodeName;
     let env = h.repos.environments.get(envId)!;
@@ -2361,7 +2354,7 @@ describe('active environment proxy change → WAITING_ROUTE', () => {
       env = h.repos.environments.get(envId)!;
       u2 = (await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.30' } } }, WEB)).operation_id;
     };
-    // v2 的发布读取组成员时（已越过第 0 步的期望版本核对）用户保存了更正；更正的发布随后失败
+    // v2 的发布读取活动请求（生成保留集，已越过第 0 步的期望版本核对与前置检查）时用户保存了更正；更正的发布随后失败
     const u1 = await h.app.updateEnvironment(envId, { request_id: rid(), expected_revision: env.revision, changes: { proxy: { host: '203.0.113.99' } } }, WEB);
     await h.idle();
     expect(u2).not.toBe('');

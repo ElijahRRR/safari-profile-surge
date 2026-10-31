@@ -19,7 +19,7 @@ import type { PageClient, ProfileStateReport } from '../shared/messages';
 import type { RequestOf } from '../shared/native';
 import { openOrLocateOrders } from '../shared/orders';
 import { openPreparePage, type PrepareIntent } from '../shared/pages';
-import { statusIsTerminal } from '../shared/text';
+import { SAVED_NOTICE, statusIsTerminal } from '../shared/text';
 
 export const POPUP_POLL_MS = 1000;
 
@@ -244,7 +244,7 @@ export function createPopupController(deps: PopupDeps) {
       const r = await client.call({ type: 'createAndBindEnvironment', request_id: rid(), environment: input });
       if (!r.ok) return { ok: false, error: r.error };
       track(r.data.operation_id);
-      state.notice = '已保存，正在同步';
+      state.notice = SAVED_NOTICE;
       void refresh();
       return { ok: true };
     });
@@ -265,7 +265,7 @@ export function createPopupController(deps: PopupDeps) {
       });
       if (!r.ok) return { ok: false, error: r.error };
       track(r.data.operation_id);
-      state.notice = '已保存，正在同步';
+      state.notice = SAVED_NOTICE;
       void refresh();
       return { ok: true };
     });
