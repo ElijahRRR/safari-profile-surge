@@ -2777,7 +2777,7 @@ async function killForNormal(engine: Engine, opId: string, entryBlocksSafari: bo
  * 路由不是经确认的普通模式时把 SFE-ROUTE 改选首成员 REJECT 并读回（selectRejectBestEffort），之后经 SFE-ROUTE 的 Safari 新连接都被
  * 拒绝，不会经 Surge 中的任何买家节点建立。从不碰入口、从不结束连接（已建立的连接由 holdExistingConnections 记下，进入普通模式
  * 结束它们）、从不恢复买家节点。按序：
- * 1. 崩溃之前已记下改选意图（OperationPayload.endHold）而读回 REJECT：就是本操作的改选，按改选记下（先于其余判断）；
+ * 1. 崩溃之前已记下改选意图（OperationPayload.endHold）、确认当前仍是固定工作配置且读回 REJECT：按本操作的改选记下；
  * 2. 有排队的普通模式：不改选 SFE-ROUTE，结束为 SUPERSEDED（进入普通模式永远可用；它失败而入口可能仍让 Safari 经 SFE-ROUTE 时，
  *    它的失败路径按“任何买家节点都不算已验证的出口”改选 REJECT）；
  * 3. 伪造标记已清除（排入时的原因含 node_detail_mismatch 的除外：经确认的读回在它执行之前恢复了参数，之前的参数不同仍是证据，
@@ -2795,8 +2795,10 @@ export async function runForgedHold(engine: Engine, op: OperationRecord, opts: {
     if (!opts.recovering) engine.updateOp(op.id, { status: 'running', phase: 'VALIDATING' }, '开始检查是否需要把 SFE-ROUTE 改选 REJECT（Surge 中的节点可能是伪造的）');
     const intent = payloadOf(repos.operations.get(op.id) ?? op).endHold;
     let sel: string | null | undefined;
-    // 崩溃之前已记下改选意图：读回的 REJECT 就是本操作的改选（与 holdAtRouteEnd 相同，先于其余判断）
-    if (intent) {
+    // 意图属于固定工作配置：先核对配置身份，不能把其他配置同名组的 REJECT 当成本操作的改选。
+    // 身份无法确认时继续走下面的普通模式优先与不可用处理，不结算成功。
+    const recoveryFacts = intent ? await engine.readBasicFacts().catch(() => null) : null;
+    if (intent && recoveryFacts?.reachable && recoveryFacts.onWorkingProfile === true) {
       sel = await readSelectionSafe(engine);
       if (sel === 'REJECT') {
         finishForgedHold(engine, op.id, { confirmed: true, readback: 'REJECT', error: null, recovered: intent, cause: 'node_resource_forged' });
