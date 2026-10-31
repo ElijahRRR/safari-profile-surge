@@ -116,7 +116,7 @@ describe('docs/P0-RUNBOOK.md', () => {
 
   it('documents the loopback test resource server and the four loopback capabilities without a reload fallback (D10)', () => {
     // 测试资源服务的命令行与场景集合
-    expect(text).toContain('`resource-server [--port N] [--scenario S] [--squat squat200|squat404]`');
+    expect(text).toContain('`resource-server [--port N] [--scenario S] [--squat squat200|squat404|squatHang]`');
     for (const s of ['loopback --setup', 'loopback --rollback', 'loopback-auth', 'loopback-restart --phase prepare|after-surge-restart|after-mac-restart', 'loopback-crash']) {
       expect(text).toContain(s);
     }
@@ -450,6 +450,14 @@ describe('docs/INSTALL.md', () => {
     expect(text).toContain('`matchRule` 也必须映射为 `cli`');
     expect(text).toContain('`getCurrentProfile` 必须映射为 `cli`');
     expect(text).not.toContain('开发调研时为 6.5.0');
+  });
+
+  it('regression: §4 promises that deployed nodes keep working only when the resource service still serves them', () => {
+    const daily = text.slice(text.indexOf('## 4. 日常使用'), text.indexOf('## 5.'));
+    expect(daily).not.toContain('新版本显示“已保存，待部署”，已部署的节点照常使用');
+    expect(daily).toContain('资源服务照常提供时，已部署的节点照常使用');
+    expect(daily).toContain('资源服务停止提供已提交的节点（答复 503）');
+    expect(daily).toContain('loopback_resource_restart');
   });
 
   it('never instructs the tool to switch profiles or bulk-delete certificates', () => {

@@ -59,7 +59,7 @@ import { failOrphanedOperations } from './handlers/publish.js';
 import { importCommit, importPreview } from './import.js';
 import { initCommit, initPreview, remergeCommit, remergePreview } from './maintenance.js';
 import { handleNative } from './native.js';
-import { nodeResourceWatched, startResourceService } from './node-resource.js';
+import { finalResourceAudit, nodeResourceWatched, startResourceService } from './node-resource.js';
 import { controlAfterReconcile, reconcile, surgeStatus } from './reconcile.js';
 import { createViewService, type ViewService } from './view-service.js';
 import { PUBLISH_KINDS } from '../domain/operations.js';
@@ -371,6 +371,7 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
       scheduleSweep();
     },
     async stop() {
+      const first = !stopped;
       stopped = true;
       // 之后不再监听本机资源服务（关闭由 main.ts 在执行器停止之后进行）
       engine.resourceRuntime.stopped = true;
@@ -379,6 +380,9 @@ export function createAppService(deps: AppServiceDeps): EngineAppService {
       reconcileTimer = null;
       sweepTimer = null;
       await executor.stop();
+      // 关闭资源服务之前审计一次（只在第一次停止时）：本服务一直监听期间自己的失败答复只能在这时被解释
+      // （node-resource.ts finalResourceAudit）
+      if (first) await finalResourceAudit(engine).catch(() => undefined);
     },
     idle: () => executor.idle(),
     runPeriodicReconcile,

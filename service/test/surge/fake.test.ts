@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import { ENTRY_RULESET_FILES } from '@sfe/contract';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST, FakeSurge, createFakeSurgeEnvironment } from '../../src/surge/fake.js';
+import { FAKE_REMOTE_ERRORS } from '../../src/surge/fake.js';
 import { entryRuleSetFileContent, nodeLine, resourceFile } from '../../src/surge/generate.js';
 import { SURGE_PRIMITIVES } from '../../src/surge/primitives.js';
 
@@ -76,8 +77,8 @@ describe('external resources follow the documented 6.10 semantics', () => {
       remoteSource: (u) => (up && u === url ? { kind: 'http', status: 200, body: 'DOMAIN-SUFFIX,remote.example.test\n' } : { kind: 'refused' }),
     });
     const key = fake.resourceKeyFor(url, 'ruleset');
-    // 加载配置时下载失败（无人监听）：未就绪，没有更新时间
-    expect((await fake.listExternalResources()).find((r) => r.key === key)).toMatchObject({ local: false, lastUpdatedAt: null, error: 'not_ready' });
+    // 加载配置时下载失败（无人监听）：未就绪，没有更新时间，错误是那次下载的文字（与真实解析相同：错误文字优先于 not_ready）
+    expect((await fake.listExternalResources()).find((r) => r.key === key)).toMatchObject({ local: false, lastUpdatedAt: null, error: FAKE_REMOTE_ERRORS.refused });
     up = true;
     t += 5_000;
     await expect(fake.updateExternalResource(key)).resolves.toEqual({ key, refreshed: true, outcome: 'downloaded' });

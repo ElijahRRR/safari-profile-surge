@@ -83,7 +83,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: 'resource-server',
     summary: '在 127.0.0.1 启动测试资源服务（产品的处理程序；读取令牌只在运行目录中），按状态文件提供测试节点与固定的故障场景；--squat 为端口占用者',
-    usage: 'resource-server [--port N] [--scenario S] [--squat squat200|squat404]',
+    usage: 'resource-server [--port N] [--scenario S] [--squat squat200|squat404|squatHang]',
     positionals: { min: 0, max: 0 },
     flags: {
       port: PORT,

@@ -113,7 +113,10 @@
   - 不假设自定义鉴权头：只用 URL 路径中的令牌，不依赖 Surge 发送任何请求头。
   - 未经验证不纳入首版承诺：`resourceServe` 门槛（`loopback_resource_update`、`loopback_resource_auth`、`loopback_resource_restart`）满足之前，资源服务只提供第 0 代（只有占位行 `SFE-EMPTY = reject`，不含任何凭据）或 503，重新合并也不把旧版本地行改为回环地址；`publish` 门槛另加 `loopback_publish_crash`、`external_node_underlying_proxy`、`connection_continuity`，满足之前新版本保持「已保存，待部署」。
 - **剩余风险**（如实写明，不能消除）：
-  - 服务没有在监听时（停止、崩溃后 launchd 重新启动之前、登录或 Mac 重启时晚于 Surge），端口可能被其他进程（含其他系统用户）占用：Surge 的显式更新或定时刷新会把读取令牌发给它，它可以返回伪造的列表或错误。本应用只能事后由下载核对发现（`unexplained_fetch` / `unexplained_error` → `resource:tokenSuspect` 与 `node_resource_unverified`，§6.6），不能事先阻止；已被读走的凭据无法收回。
+  - 服务没有在监听时（停止、崩溃后 launchd 重新启动之前、登录或 Mac 重启时晚于 Surge），端口可能被其他进程（含其他系统用户）占用：Surge 的显式更新或定时刷新会把读取令牌发给它，它可以返回伪造的列表或错误，也可以收下令牌后不答复。本应用只能事后由下载核对发现（`unexplained_fetch` / `unexplained_error` → `resource:tokenSuspect` 与 `node_resource_unverified`，§6.6），不能事先阻止；已被读走的凭据无法收回。
+    - 本服务没有一直监听时，只有“连接被拒绝”（-1004：端口上无人监听，2026-10-25 矩阵「资源服务停止监听」）能解释新的资源错误；请求超时（-1001）说明有一方接受了连接、收到了带令牌的请求却不答复，同样按无法解释处理（已知的误报：本服务上一个实例停止前挂起超过 Surge 的超时，代价是一次轮换资源地址）。
+    - 启动时的核对读不到 Surge 时推迟监听，直到能读到外部资源并按“没有一直监听”核对之后（§7.4 第 7 步）；发布读“更新之前”的状态时同样核对一次（§6.2 第 2 步）——否则本服务之后的下载或发布的确认会把核对状态推进过占用者留下的证据。
+    - 核对只能看到 Surge **当前**的状态，不能保证发现每一次占用：载入了不是本服务提供的列表会留在更新时间上；占用者造成的资源错误（含请求超时）只在本服务恢复之前 Surge 没有再次下载时看得到——占用者离开后的下一次下载得到连接被拒绝（总能解释），可能改写之前的错误（Surge 是否只保留最近一次下载的错误，TODO(P0)：`loopback_resource_auth` 的定时刷新记录）。所以服务长时间没有在监听之后（停止、macOS 26 上选了「不允许」、登录后很久才启动），即使没有任何提示，读取令牌也应视为可能已泄露；文档（docs/INSTALL.md §2 第 2 步）请用户这时自行「更换资源地址」。
   - 令牌只能经重新合并的「更换资源地址」（`rotateResourceUrl`：新令牌与新端口，维护写入并重载同一配置，用户确认）轮换；令牌可疑时只有它能清除标记。
   - 回环接口上是明文 HTTP：能在 lo0 抓包的用户（root，或被授予 BPF 设备访问权限的用户）能直接看到令牌与列表内容。
   - Surge 一侧的副本不在本应用控制之内：工作配置中的地址（含令牌）、Surge 界面与日志中显示的资源地址、`external-resource list` 的输出（本应用读到后立即脱敏，只保留位置的 SHA-256 用来识别）、Surge 的资源缓存（位置与凭据的保存方式 TODO(P0)，由 `loopback_resource_auth` 记录）。
@@ -265,7 +268,7 @@ Surge ──GET 127.0.0.1:<资源端口>/<读取令牌>/sfe-nodes.list──▶ 
 
 **本机资源服务（用户决定 D10，§7.4）**：服务另开一个只监听 `127.0.0.1:<资源端口>` 的 HTTP 监听，只回答 Surge 对 `GET /<读取令牌>/sfe-nodes.list` 的下载，与网页（61847）和原生桥（61848）是不同的监听与端口。
 - 资源端口由服务首次启动时在 [20000, 40000) 中随机选取（避开工作配置 `[General]` 中的 http-api、http-listen、socks5-listen、external-controller-access、probe-bind 端口，并试绑定确认空闲），保存在数据库设置 `resourcePort` 中，不经设置接口修改、不在网页显示，也不在 `install.json` 中。读取令牌是 `secret_values` 中的系统秘密（32 字节随机数的十六进制，引用 `sfe.resource-token.<n>`，`meta.resource_token_ref` 指向当前一个）。
-- 与原生桥不同，读取令牌**会上线路**：Surge 不能与本服务互相认证，只能把令牌放在请求路径中明文发给占用该端口的一方。所以服务未监听时抢占端口的进程（含其他系统用户）能拿到令牌并向 Surge 返回伪造的列表；本应用只能事后由下载核对发现，不能阻止（§0「节点发布机制」的剩余风险、§6.6）。
+- 与原生桥不同，读取令牌**会上线路**：Surge 不能与本服务互相认证，只能把令牌放在请求路径中明文发给占用该端口的一方。所以服务未监听时抢占端口的进程（含其他系统用户）能拿到令牌并向 Surge 返回伪造的列表、错误，或者不答复（Surge 等到请求超时）；本应用只能事后由下载核对发现 Surge 状态中仍留着的痕迹，不能阻止，也不保证每次都能发现（§0「节点发布机制」的剩余风险、§6.6）——没有一直监听期间出现的请求超时同样按无法解释处理。
 - 资源服务对同一用户的进程不是安全边界（令牌在工作配置中，`sfe.sqlite` 本来就可读，用户决定 D8）；令牌防的是不知道它的网页与其他系统用户。
 
 **信任与最小权限**：
@@ -741,18 +744,28 @@ SFE-N-E0001-US01-v003 = socks5, 203.0.113.10, 1080, username=<u>, password=<p>, 
 
 D10（§0「节点发布机制」）：发布不写 Surge 配置目录中的任何文件，只改变本机资源服务提供的版本，并对本应用这一项资源执行一次单 key 更新。执行器是唯一写入者，同一时刻只有一个发布在 DEPLOYING/ROLLING_BACK；资源服务一次只暂存一个候选（再次暂存、或暂存期间加载已提交版本都被拒绝）。
 
-1. 前置条件（任一不满足即停在 WAITING_DEPLOYMENT，什么都不写，「已保存，待部署」）：
-   - Surge 当前配置名与路径等于记录的工作配置（否则 `EXTERNAL_PROFILE`）；
+1. 前置条件（按序检查；任一不满足都什么都不写）。以下停在 WAITING_DEPLOYMENT（「已保存，待部署」）：
+   - 已初始化固定工作配置；
    - 发布门槛（§5.2；停泊说明为「回环资源单 key 更新、服务认证与端口占用、重启缓存、并发与崩溃补测尚未通过；新版本保持待部署」）；读取自动重载设置，与 `loopback_resource_update` 记录的条件一致；
    - 读回与更新所需原语（`listExternalResources`、`updateExternalResource`、`getGroupMembers`、`getGroupSelection`）在固定实现下可用（执行器从不写入它无法读回的内容）；
-   - 本机资源服务存在（读取令牌读不到即 `SECRET_STORE_FAILED`）、在配置的端口上监听（否则 `RESOURCE_SERVER_UNAVAILABLE`）、读取令牌不可疑；
-   - 工作配置的 group 段恰好是本服务地址的回环行（旧版本地行：「需要重新合并以改用本机资源服务」）；
-   - 资源 key 的安全检查（§5.1：读取令牌不能进入 argv）。
-2. 发现与写入前快照（在下面“没有变化”的捷径之前）：本应用的资源 = `listExternalResources` 中位置的 SHA-256 等于本服务地址、类型为 policy-group、不是本地资源、`fromModule` 为空的那一项（0 个 → `RESOURCE_MISSING`，「需要重新合并」；多个 → `NAME_COLLISION`；均不写）。它报告正在更新时有界等待（`resourceUpdateWait`，缺省 30 秒、每 0.5 秒读一次），仍在更新即停泊，不暂存候选。记下写入前的错误、更新时间、成员与选择。
+   - 本机资源服务存在（读取令牌读不到即 `SECRET_STORE_FAILED`）、端口已选定并在其上监听（否则 `RESOURCE_SERVER_UNAVAILABLE`）、读取令牌不可疑；
+   - 工作配置的 group 段恰好是本服务地址的回环行（旧版本地行：「需要重新合并以改用本机资源服务」；指向别的地址或缺失：「需要重新合并」，`RESOURCE_MISSING`）；
+   - 资源 key 的安全检查（§5.1：读取令牌不能进入 argv）；第 2 步的“Surge 仍在更新”“时限内找不到本应用的资源”“核对发现无法解释的下载或资源错误”同样停泊。
+
+   以下直接结束为 FAILED（同样什么都不写）：
+   - 无法连接 Surge（`SURGE_UNREACHABLE`；第 2 步读取外部资源或 SFE-ROUTE 选择失败同此）；
+   - Surge 当前配置名与路径不等于记录的工作配置，或工作配置读不到（`EXTERNAL_PROFILE`）；
+   - group 段不是本服务当前的定义，且受管理段被修改、缺失或边界不明确（`BASELINE_CHANGED`）；
+   - 第 2 步发现多个指向本服务地址的资源，或它不是工作配置中的远端节点组资源（来自模块、本地文件或类型不符；`NAME_COLLISION`）。
+2. 发现与写入前快照（在下面“没有变化”的捷径之前）：本应用的资源 = `listExternalResources` 中位置的 SHA-256 等于本服务地址、类型为 policy-group、不是本地资源、`fromModule` 为空的那一项（多个 → `NAME_COLLISION`；均不写）。
+   - 找不到时在 `resourceUpdateWait` 的时限内等 Surge 登记它（同一配置重载之后新地址的资源不会立即出现，2026-10-25 矩阵），到时限仍找不到 → `RESOURCE_MISSING`（「需要重新合并」）。
+   - 它报告正在更新时有界等待（`resourceUpdateWait`，缺省 30 秒、每 0.5 秒读一次），仍在更新即停泊，不暂存候选。
+   - 记下写入前的错误、更新时间、成员与选择，并按对账的规则核对一次（§7.4「下载核对」，`auditForPublish`）：上次核对之后出现了本服务无法解释的下载或资源错误 → 设 `tokenSuspect`、`needsRefresh` 与 `node_resource_unverified`，停泊（「读取令牌可能已泄露」）——第 8 步的确认会把核对状态推进到这次发布的下载，之前的证据必须在这里发现。
+   - 进入普通模式永远可用：这一步的等待期间（以及第 5 步事务之前的最后一次检查）有排队的普通模式时，发布在第一次写入 Surge 之前让出——批次内的操作放回排队（步骤「让给排队的普通模式（没有写入 Surge），稍后重新发布」），合并进来的操作各自重新排入、不再记在主操作上（之后先被领取的任一发布按普通的合并收回其余操作，不会留下没有 outbox 行的排队操作），普通模式按领取顺序先执行（§6.1），之后重新发布；从不停泊或失败。已发出更新之后不再让出（Surge 可能已载入候选，必须先回滚）：写入之后的最长耗时是一次更新加等待，失败时再加回滚的一次更新加等待（TODO(P0) 实测计时）。
 3. 规划与校验：数据、前置存在于 `listPolicies` 且是固定节点、命名唯一；按保留集（§5.4）生成清单与候选列表，代数 = 配置代数 + 1，核对清单，发布前严格校验（§5.4；空清单时只有占位行）。在 `<数据目录>/tmp` 构造工作配置副本并解析全部相对引用：SFE-ROUTE 的回环地址换成相对的 `sfe-nodes.list` 并指向候选列表（`rewriteLoopbackForCheck`，§5.6），入口规则集指向候选副本，其余指向真实文件；任何引用无法解析即校验失败；每个解析结果只把路径（不含内容）记入步骤。然后 `--check`，逐节点核对预期清单，删除候选。
    - 基线检查：本操作开始时读到的工作配置在写入前未变（变了则从头重来，有限次数后 `BASELINE_CHANGED`）；受管理段内容与位置与 `managed_objects` 一致、无非本应用 `SFE-` 对象（`listPolicies` 中不在清单或进行中候选里的 `SFE-` 名称、候选新节点名已存在都算；占位 `SFE-EMPTY` 除外）；版本指针没有候选。受管理段之外的用户修改直接记为新基线。
    - 当前名称（保留集、使用中保护与移除判定共用）= 已提交版本清单中的名称 ∪（SFE-ROUTE 当前成员 − REJECT − SFE-EMPTY）；成员读不到即无法判定（保留全部、不移除），从不按空处理。保留集保留已提交版本中的全部版本（以及最近一次 verified 的版本，`retainedDeploymentKeys`），它们是回滚的目标；Surge 当前选中的节点同样保留。
-4. 没有变化的捷径：只有没有待部署的版本、没有要移除的节点、名称等于已提交版本的名称、Surge 成员等于已提交列表、本应用资源的错误为空、不是强制发布且 `needsRefresh` 为空时才不更新、直接结束。
+4. 没有变化的捷径：只有没有待部署的版本、没有要移除的节点、名称等于已提交版本的名称、Surge 成员等于已提交列表、本应用资源的错误为空、不是强制发布、`needsRefresh` 为空且路由没有 `node_resource_unverified` 时才不更新、直接结束（这一警告只由经确认的读回清除，有它时用户的发布总是单 key 更新并读回）。
 5. 事务 T1（VALIDATING → DEPLOYING）：在**同一个事务**中插入 `deployments`（state candidate）、指针 `candidate = { generation }`、`needsRefresh = { generation, reason: 'publish' }`；之后取下载记录的序号起点（`mark = auditMark()`），资源服务暂存候选（`stageCandidate`：此后令牌正确的下载得到候选）。
    - 从暂存到 T2 提交之间，任何不是成功提交的退出（含异常；T2 提交失败按读回失败处理）都进入第 9 步的回滚；资源服务只在 T2 提交之后才把候选转为已提交。
 6. 恰好一次 `updateExternalResource(key)`（从不 update all；结果不明时从不重放）：报告已下载 → 继续；报告跳过、命令失败或超时（`update_timeout`）→ 记为更新失败，但照样读取状态（Surge 可能已经下载，超时之后的更新仍可能生效）。
@@ -765,15 +778,15 @@ D10（§0「节点发布机制」）：发布不写 Surge 配置目录中的任�
    - 更新时间变了、却没有一条序号新于上次核对（`auditedSeq`）的完整 200 与它匹配（与下载核对的 `unexplained_fetch` 同一规则，§7.4）：Surge 载入了不是本服务提供的内容，读回失败（`unexplained_fetch`），同时设置 `tokenSuspect`、`needsRefresh` 与 `node_resource_unverified`（`flagUnexplainedFetch`）——否则之后经确认的回滚读回会把核对状态推进过占用者的那次下载，它就再也不会被发现。
    - 到时限 Surge 仍报告正在更新 → 按第 9 步回滚，但**不执行第二次更新**，操作结束为 `BLOCKED_NEEDS_ATTENTION`。
    - partial 部署只有在 `READBACK_COVERAGE_KEYS`（`loopback_resource_update`、`external_node_underlying_proxy`）的 P0 记录覆盖了这些未核对字段时才算“可接受的读回”：此时部署记为 verified、可以激活；否则部署停在 published（`needsRefresh` 保留），相关版本不能激活（汇总状态为 sync_failed，下一步为核验能力）。
-8. 成功 → 事务 T2（与原有的结算写入合为一个事务）：部署 verified/published，指针 committed = 候选代、candidate 置空，下载核对状态推进到匹配的那条记录（`confirmNodeResource`；`tokenSuspect` 不动），`needsRefresh` 清除并重新允许自动排入系统强制发布（只在读回为 full 或被覆盖时；不完整而未被覆盖时部署记为 published、两者都保留），各环境的版本状态与退役（`retainedDeploymentKeys` 与仍被需要的版本不退役）也在其中；T2 提交失败按读回失败回滚。提交之后资源服务才 `commitCandidate()`，然后预检、活动环境的 `WAITING_ROUTE` 与操作结算；这次确认的读回清除 `node_resource_unverified`（令牌可疑或资源服务不在监听时保留；路由仍要经原有的重测回到 active_verified）。
-9. 失败 → 回滚，走同一条已验证的路径：事务中把指针的 candidate 置空（`needsRefresh` 保留）→ 资源服务改回已提交版本（`revertToCommitted`）。
-   - Surge 可能已持有候选：更新报告已下载或结果不明（`update_timeout`）、有候选代且序号 ≥ mark 的下载记录（含没有写完的）、更新时间比写入前变了、成员与已提交列表不同，或成员读不到。此时 Surge 不在更新中 → 再执行一次 `updateExternalResource(key)` → 等待 → 按已提交代读回（同第 7 步，要求这次更新报告已下载）；Surge 到时限仍在更新 → 不更新，`BLOCKED_NEEDS_ATTENTION` 并带 `node_resource_unverified`。读取令牌可疑时同样不更新（资源服务对令牌一律 404，更新只会失败），直接 `BLOCKED_NEEDS_ATTENTION`。
-   - 否则核对 Surge 仍是更新之前的已提交版本：成员等于已提交列表、更新时间没有变化、选择等于发布前的选择、资源错误没有变化或只是无法连接/超时（资源服务改回已提交版本期间的下载失败）。
-   - 选择被改变且发布前的选择仍是成员时改选回它，从不改选另一个买家节点。
+8. 成功 → 事务 T2（与原有的结算写入合为一个事务）：部署 verified/published，指针 committed = 候选代、candidate 置空，下载核对状态推进到匹配的那条记录（`confirmNodeResource` 只写数据库；内存中的核对点、日志与事件在 T2 提交之后才生效，`applyNodeResourceConfirmation`；`tokenSuspect` 不动），`needsRefresh` 清除并重新允许自动排入系统强制发布（只在读回为 full 或被覆盖时；不完整而未被覆盖时部署记为 published、两者都保留），各环境的版本状态与退役（`retainedDeploymentKeys` 与仍被需要的版本不退役）也在其中；T2 提交失败按读回失败回滚。提交之后资源服务才 `commitCandidate()`，然后预检、活动环境的 `WAITING_ROUTE` 与操作结算；这次确认的读回清除 `node_resource_unverified`（令牌可疑或资源服务不在监听时保留；路由仍要经原有的重测回到 active_verified）。
+9. 失败 → 回滚，走同一条已验证的路径：资源服务先改回已提交版本（`revertToCommitted`，内存中、不会失败：之后撤回指针的事务即使失败也不再提供从未提交的候选）→ 事务中把指针的 candidate 置空（`needsRefresh` 保留）。
+   - Surge 可能已持有候选：更新报告已下载或结果不明（`update_timeout`）、有候选代且序号 ≥ mark 的下载记录（含没有写完的）、更新时间比写入前变了、成员与已提交列表不同，或成员读不到。此时 Surge 不在更新中 → 再执行一次 `updateExternalResource(key)` → 等待 → 按已提交代读回（同第 7 步，要求这次更新报告已下载；选择只要求两次读取一致，见下）；Surge 仍在更新 → 不更新，`BLOCKED_NEEDS_ATTENTION` 并带 `node_resource_unverified`。“仍在更新”包括第 7 步的任一次读取报告正在更新，以及回滚更新之前重新读到的状态正在更新（读不到或资源已变化同样不更新）。读取令牌可疑时同样不更新（资源服务对令牌一律 404，更新只会失败），直接 `BLOCKED_NEEDS_ATTENTION`。
+   - 否则核对 Surge 仍是更新之前的已提交版本：成员等于已提交列表、更新时间没有变化、资源错误没有变化或只是无法连接/超时（资源服务改回已提交版本期间的下载失败）。
+   - 选择：只有读回中看到“发布前选中的节点从成员中消失、选择回落到 REJECT”的证据、它现在又是成员、当前选择是 REJECT 且路由没有 `node_resource_unverified` 时才改选回它，从不改选另一个买家节点。其余的选择变化来自外部（例如用户在 Surge 中改选 REJECT 紧急停止），回滚从不改回：确认时选择与路由记录不同且路由托管中 → 与对账相同地加 `external_selection_change`、阶段改为 external_change（已是 attention 时不变）、去掉 `rollback_needs_reverify`，不设 `node_resource_unverified`。
    - 确认 → 部署 rolled_back，操作以原来的原因 FAILED；`needsRefresh`：再次更新并读回确认的按第 8 步的规则清除（读回不完整而未被覆盖时保留），Surge 从未载入候选的恢复为 T1 之前的值。无法确认 → 部署 failed，操作 `BLOCKED_NEEDS_ATTENTION`，路由 attention 并带 `node_resource_unverified`，`needsRefresh` 保留（之后由系统强制发布再次尝试回到已提交版本）。
    - 回滚无法确认时（入口不是 NORMAL）路由 attention 并带 `external_selection_change`，同时去掉之前一次成功的激活回滚留下的 `rollback_needs_reverify`（SFE-ROUTE 的选择已无法确认，「已恢复原节点」不再成立，§6.3 第 14 步）。
-10. 崩溃恢复（`recoverPublish`：启动时发现停在 DEPLOYING/ROLLING_BACK 的发布）：候选部署记为 failed，操作 `FAILED`（`UNKNOWN_STATE`），从不重放更新；启动顺序（§7.4 第 3 步）已撤回指针中的候选并保留 `needsRefresh`，由它排入一次系统强制发布（受同一门槛约束，不满足时无害地停泊）。
-   - 系统强制发布（`maybeEnqueueSystemRefresh`，发起方 service，payload `{ environmentIds: [], forceRefresh: true }`）没有目标环境：只重新提供并核对已部署的节点，从不顺带部署待部署的修改（停泊是终态，待部署的修改需要用户显式发布）。同一时刻最多一个：有进行中（排队、执行或等待）的发布，或上一次系统刷新的操作仍在（引擎键值 `resource:systemRefresh`）时不排入；停泊、失败或需要处理的系统刷新不自动重试，只有经确认的读回（第 8、9 步，`needsRefresh` 被清除时）重新允许自动排入。`needsRefresh` 已设置时用户的任何发布都按强制发布执行（网页在没有待部署版本时把按钮显示为「重新同步节点资源」）；重新合并恢复节点资源时也排入一次（§5.3）。
+10. 崩溃恢复（`recoverPublish`：启动时发现停在 DEPLOYING/ROLLING_BACK 的发布）：候选部署记为 failed，操作 `FAILED`（`UNKNOWN_STATE`），从不重放更新；启动顺序（§7.4 第 3 步）已撤回指针中的候选并保留 `needsRefresh`，由它排入一次系统强制发布（受同一门槛约束，不满足时无害地停泊）。中断的正是系统强制发布本身时，删除它的记录并重排一次（新记录标 `afterCrash`）；重排的那一次再中断时保留记录，由用户重新同步（同一崩溃链最多自动重排一次，`enqueueSystemRefreshAfterCrash`）。
+   - 系统强制发布（`maybeEnqueueSystemRefresh`，发起方 service，payload `{ environmentIds: [], forceRefresh: true }`）没有目标环境：只重新提供并核对已部署的节点，从不顺带部署待部署的修改（停泊是终态，待部署的修改需要用户显式发布）。同一时刻最多一个：有进行中（排队、执行或等待）的发布，或上一次系统刷新的操作仍在（引擎键值 `resource:systemRefresh`）时不排入；停泊、失败或需要处理的系统刷新不自动重试，只有经确认的读回（第 8、9 步，`needsRefresh` 被清除时）、上面的崩溃重排与重新合并的轮换资源地址（删除令牌可疑期间停泊的那一次的记录）重新允许自动排入。`needsRefresh` 已设置时用户的任何发布都按强制发布执行（网页在没有待部署版本时把按钮显示为「重新同步节点资源」）；重新合并恢复节点资源时也排入一次（§5.3）。
 11. 记录代数与各操作的 `deployed_proxy_revision`；非活动环境在门槛允许时独立预检，否则 inconclusive（「已部署，待激活时由 Safari 实测」）。预检不返回出口 IP（`testPolicy` 不提供），`expected_exit_ip` 只在 Safari 实测时比较。
 
 ### 6.3 激活（受控切换）
@@ -965,7 +978,7 @@ D10（§0「节点发布机制」）：发布不写 Surge 配置目录中的任�
   - 空闲且入口为 NORMAL 时（启动、刷新、动作前对账；周期对账不运行）只清除一种警告：受管理段与本应用文件检查已一致时清除撤销入口时保留的 `managed_segments_changed`（例如普通模式已改写入口文件、`maintenance.remerge` 已恢复受管理段）；托管状态下它是粘性的，由下一次激活清除。
   - 对账只发布 `route.updated`/`surge.status`，**从不写 Surge、从不抢回控制**，恢复需要用户显式激活或进入普通模式。
   - **节点资源未确认（`node_resource_unverified`，D10）**：Surge 中 SFE-ROUTE 的节点无法证明来自本机资源服务的已提交版本。工作配置引用本服务的回环地址，且下列任一成立时附加：
-    - 资源服务不存在（读取令牌不可用）或没有在配置的端口上监听（启动时推迟的监听在 Surge 仍不可达期间不算，§7.4 第 7 步）；
+    - 资源服务不存在（读取令牌不可用）或没有在配置的端口上监听（启动时推迟的监听在还读不到 Surge 的外部资源期间不算，§7.4 第 7 步）；
     - 工作配置中的回环地址不是本服务当前的地址（令牌或端口已不同，`resource_url_changed`）；
     - 读取令牌可疑（`resource:tokenSuspect`）；
     - Surge 中找不到本应用的资源、有多个，或它不是工作配置中的远端节点组资源（`resource_missing` / `resource_ambiguous` / `resource_foreign`）；
@@ -975,8 +988,9 @@ D10（§0「节点发布机制」）：发布不写 Surge 配置目录中的任�
     - 启动时撤回的候选版本已有下载记录（`candidate_served`：Surge 可能载入了从未提交的内容），发布或回滚的读回无法确认（`readback_unconfirmed`）。
     - 它在 `REUSE_BLOCKING_WARNINGS`、`ATTENTION_WARNINGS`、`IN_CONTROL_BLOCKING_WARNINGS` 中（与 `managed_segments_changed` 相同，不在 `LOSS_OF_CONTROL_WARNINGS` 中：入口规则与 SFE-ROUTE 的选择仍在控制之下）：使用中的路由改为 attention，阻止复用、填充、自动打开订单、激活与「切换到新版本」；激活前的检查（`checkSwitchPreconditions`）在选择之前做同样的逐节点核对；它存在时激活的回滚保持 REJECT，不恢复之前的买家节点。
     - 进入普通模式与 REJECT 的保持**从不**因为它被拒绝。
-    - 只有一次下载核对相符的确认读回（发布或回滚，`confirmNodeResource`）清除它，令牌可疑或资源服务不在监听时仍保留；进入普通模式、激活回滚与提交使用中路由都保留它（对账只设、从不清除）；路由仍要经原有的重测回到 active_verified。激活、「切换到新版本」与崩溃后的继续切换因它被拒绝时以 `NODE_NOT_DEPLOYED`（`details.reason = node_resource_unverified`）在任何写入之前失败，说明写明「路由未改变」。
-    - 发现漂移或 `needsRefresh` 已设置、且没有进行中的发布时，对账（启动、周期、刷新）可以排入一次系统强制发布（受发布门槛约束，不满足时无害地停泊）——对账本身仍从不写 Surge。
+    - 警告总是带着刷新要求：工作配置恰好指向本服务当前地址、资源服务存在时，设它的同时设 `needsRefresh`（已有时不改；启动时发现之前留下的警告而没有刷新要求时同样补上）——于是对账排入一次系统强制发布、用户的发布不走捷径（§6.2 第 4 步）、网页提供「重新同步节点资源」、重新合并把 `needs_refresh` 列为恢复原因；地址不是本服务当前的或令牌读不到时补救是重新合并，不设。
+    - 只有一次下载核对相符的确认读回（发布或回滚，`confirmNodeResource`）清除它（同时清除 `needsRefresh`），令牌可疑或资源服务不在监听时仍保留；进入普通模式、激活回滚与提交使用中路由都保留它（对账只设、从不清除）；路由仍要经原有的重测回到 active_verified。激活、「切换到新版本」与崩溃后的继续切换因它被拒绝时以 `NODE_NOT_DEPLOYED`（`details.reason = node_resource_unverified`）在任何写入之前失败，说明写明「路由未改变」。
+    - 发现漂移或 `needsRefresh` 已设置、且没有进行中的发布时，对账（启动、周期、刷新）可以排入一次系统强制发布（受发布门槛约束，不满足时无害地停泊）——对账本身仍从不写 Surge。使用中的节点参数漂移（同名节点的服务器、端口或前置不是已提交版本的）由这次系统强制发布单 key 更新恢复已提交的参数（同名参数变化立即生效、保留选择），确认之后清除警告；对账与回滚都不因此改选 REJECT（待用户决定：确认 Surge 载入了伪造内容时是否由执行器保持 REJECT）。
 - **动作前**：`requestLoginFill`、自动打开订单、激活复用之前，同步做一次短超时对账；失败即拒绝。弹窗与准备页的订单判定（`getCurrentState`）可复用 5 秒内完成的任何对账（§7.2），也可共用进行中的动作前对账；填充不复用，也不共用请求到达之前已开始读 Surge 的对账（它可能在出站模式、接管等改变之前就读过它们）——等它结束后再对账一次（同时到达的填充共用这一次），总时限内没有完成即拒绝；判定本身总按返回时的路由记录与实测重新计算，检查返回之后再读一次（填充同样在对账之后重新判定）。
 - **“受控”的定义**（复用、填充、自动打开订单共用一条规则）：
   - Surge 可达（§5.2 的检测读取成功）；
@@ -1043,7 +1057,7 @@ D10（§0「节点发布机制」）：发布不写 Surge 配置目录中的任�
 ### 6.11 服务停止
 
 服务停止、崩溃恢复、LaunchAgent 卸载、服务卸载**都不改变入口状态或 SFE-ROUTE 选择**。撤销本应用的规则是单独的、用户执行的、有文档的步骤（先进入普通模式，再按 docs/INSTALL.md §5 切回原配置、删除工作配置与本应用文件；受管理段只在工作配置中，本应用没有移除受管理段的功能）。
-- 本机资源服务随服务一起停止（D10，最后关闭）：Surge 保留自己缓存的节点，已选中的节点继续工作（2026-10-25 实测“资源服务停止监听”）；这期间 Surge 的显式更新或定时刷新以无法连接失败，资源错误非空、旧节点保留。端口在这期间可能被其他进程占用并收到读取令牌（§0「节点发布机制」的剩余风险）；服务重新启动后由下载核对发现（§6.6），不能事先阻止。
+- 本机资源服务随服务一起停止（D10，最后关闭）：Surge 保留自己缓存的节点，已选中的节点继续工作（2026-10-25 实测“资源服务停止监听”）；这期间 Surge 的显式更新或定时刷新以无法连接失败，资源错误非空、旧节点保留。端口在这期间可能被其他进程占用并收到读取令牌（§0「节点发布机制」的剩余风险）；服务重新启动后由下载核对发现 Surge 状态中仍留着的痕迹（§6.6），不能事先阻止，也不保证都能发现（之后的下载可能改写占用者造成的错误），所以长时间停止之后应把读取令牌视为可能已泄露。
 - 登录或 Mac 重启时服务与 Surge 谁先启动、Surge 启动时是否重新下载、缓存是否跨重启保留，没有写入文档（TODO(P0)，`loopback_resource_restart` 记录）；任何情况下资源服务都只提供已提交的版本（§7.4）。
 
 ## 7. 接口
@@ -1095,7 +1109,8 @@ D10（§0「节点发布机制」）：发布不写 Surge 配置目录中的任�
 
 - **地址**：`http://127.0.0.1:<资源端口>/<读取令牌>/sfe-nodes.list`（`nodeResourceUrl`，`parseNodeResourceUrl` 是它的严格逆）。读取令牌是 32 字节随机数的小写十六进制；资源端口与令牌的来源见 §2「本机资源服务」。
 - **监听**（`tcpBinder`）：node:http，只绑定 127.0.0.1（从不 0.0.0.0）；请求头上限 8 KiB、请求头 3 秒、整个请求 5 秒、不保持连接（`Connection: close`，每个连接只处理一个请求，流水线中之后的请求既不处理也不记录）、最多 16 个连接；带请求体的请求得到 404 并断开；关闭时断开全部连接。
-  - 端口被占用（EADDRINUSE）→ `RESOURCE_SERVER_UNAVAILABLE`（`details.reason = port_in_use`），其他失败为 `other`；从不改用另一个端口。
+  - 端口被占用（EADDRINUSE）→ `RESOURCE_SERVER_UNAVAILABLE`（`details.reason = port_in_use`），其他失败为 `other`；绑定方从不改用另一个端口（只有尚未初始化固定工作配置时，引擎按首次选定的规则改选并保存端口，见启动顺序第 7 步）。
+  - 连接层面的失败（超过连接数上限被立即关闭、无法解析或请求头/请求超时、流水线上的后续请求、处理程序没有答复、空闲超时）报告给资源服务，计入 `failureCounters()` 的 `conn_<原因>`：它们可能让 Surge 的一次下载失败（例如 -1005），本服务一直监听时的核对据此解释——否则任何本机账户占满 16 个连接就能让一次下载失败、造成假的 `tokenSuspect`。
   - Node 的 `exclusive` 选项只影响 cluster，不提供跨进程保护，不依赖它。macOS 上同一端口的 0.0.0.0、[::]、[::1] 能否被其他进程绑定、绑定后发往 127.0.0.1 的请求是否仍到达本服务，TODO(P0)（`loopback_resource_auth`）。
 - **请求校验**（`handle()`，唯一的校验与记录位置）只接受：
   - 方法 GET（其他方法 404；Surge 是否发送 HEAD，TODO(P0)）；
@@ -1107,13 +1122,14 @@ D10（§0「节点发布机制」）：发布不写 Surge 配置目录中的任�
   - 200 的响应头：`Content-Type: text/plain; charset=utf-8`、准确的 `Content-Length`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、`Cross-Origin-Resource-Policy: same-origin`、`Content-Security-Policy: default-src 'none'; sandbox`、`Referrer-Policy: no-referrer`、`Connection: close`；没有 ETag、Last-Modified 与任何 CORS 头，条件请求头与 Accept-Encoding 一律忽略。
   - 日志从不包含令牌、路径、请求头的值或响应内容；不经网页的 Bearer 认证（这条路由不在网页 HTTP 服务上）。
   - 接口：绑定方（`ResourceBinder`）的处理程序是 `(req, respond(r, onFinished?))`，绑定方在响应完整写出之后才调用 `onFinished`（`tcpBinder`：写出完成事件；`virtualBinder`：同步），中途断开、截断或没有写出时从不调用。`handle(req)` 返回 `{ response, finished }`：自己写出响应的调用方（P0 在处理程序接受请求之后包一层故障场景）只在完整写出之后调用 `finished()`，200 的记录才标为完成；非 200 时它什么也不做，重复调用无效。直接调用 `handle()` 而不调用 `finished()` 的 200 一直是未完成的记录，读回从不把它当作一次下载。
-- **提供的版本**：已提交版本（`loadCommitted`）与发布中暂存的候选（`stageCandidate` → T2 提交后 `commitCandidate`，失败时 `revertToCommitted`）；没有加载任何版本时 503（`unload`）。第 0 代只有占位行；第 0 代以外的版本只在 `resourceServe` 门槛满足后才加载，加载之前重新生成并核对发布记录的摘要。内容超过 1 MiB 拒绝加载。
+- **提供的版本**：已提交版本（`loadCommitted`）与发布中暂存的候选（`stageCandidate` → T2 提交后 `commitCandidate`，失败时 `revertToCommitted`）；没有加载任何版本时 503（`unload`）。第 0 代只有占位行；第 0 代以外的版本只在 `resourceServe` 门槛满足后才加载，加载之前重新生成并核对发布记录的摘要。内容超过 1 MiB 拒绝加载。`resourceServe` 的任一项记录被撤销（本地状态不是 supported，例如重置能力）时立即停止提供代数 > 0 的已提交版本（`unloadIfServeStatusRevoked`：确认能力时与每次对账开头，不论 Surge 是否可达、节点组定义是什么）；版本上下文造成的过期仍在 Surge 可达时判定。
 - **下载记录**（`resource:audit`）：每个令牌正确的 200 在写出响应体**之前**先同步保存一条未完成的记录，完整写出之后再标为完成；保存失败时不发出内容（503），所以从不发出没有记录的内容。只保留最近 64 条；404 只在内存中按原因计数。
 - **下载核对**（`auditResource`，纯函数，服务与 P0 共用）：每次核对先取序号起点（`mark = auditMark()`），再读 `listExternalResources` 中本应用的资源（按位置的 SHA-256 识别），之后取 `audit()` 的记录。输入另有 `serving`（本服务自上次核对以来一直在同一个配置端口上监听，同一次监听）与 `servedFailures`（这段时间本服务答复的 404 与 503 次数：`failureCounters()` 的增量，`servedFailureCount`）；核对状态（`resource:auditState`）为 `{ verifiedUpdatedAt, verifiedError, auditedSeq, windowSeq }`：
   - 第一次（没有核对状态）按读到的状态初始化，只记日志，不判为异常；这一行存在而无法读取（损坏、缺少 `windowSeq`）时不核对，按无法解释处理（`needsRefresh`，不设 `tokenSuspect`），只在经确认的读回之后重新初始化；
   - Surge 的更新时间变了：要求有一条序号大于 `auditedSeq`、已完成、时间在 [更新时间 − 容差, 更新时间 + 1 秒] 内的记录，否则 `unexplained_fetch`；`auditedSeq` 只在匹配时前移；
-  - 资源错误变成新的非空值：无法连接或超时（NSURLErrorDomain -1004/-1001、「无法连接服务器」、timed out）总能解释；其余只在 `serving` 时，由 `servedFailures > 0` 或一条序号大于 `windowSeq`、没有写完的 200 解释；没有一直在监听（启动时、监听失败过）时任何其他错误都可能来自占用端口的一方；否则 `unexplained_error`。
-  - 结论一致时 `windowSeq` 前移到 `mark − 1`：一次中断的 200 最多解释下一次核对，陈旧的记录不能解释之后的错误。异常结论不推进核对状态，并设置 `tokenSuspect` 与 `needsRefresh`（§6.6）。经确认的发布或回滚读回（`confirmNodeResource`）把状态推进到匹配的那条记录；轮换资源地址删除核对状态，由下一次核对按新地址初始化。容差缺省 5 秒；更新时间的精度、Surge 重开时不下载是否也改写更新时间，TODO(P0)。
+  - 资源错误变成新的非空值：连接被拒绝（NSURLErrorDomain -1004、「无法连接服务器」：端口上无人监听，请求没有到达任何一方）总能解释；尚未完成过下载（`not_ready` 且没有更新时间，例如 Surge 重开后缓存还没有载入或被丢弃）能解释（之后真正的下载仍要对应本服务的记录；前提是 Surge 对缓存不存在的资源显示下载失败的文字，否则占用者的 404 或不答复也只显示为 `not_ready`：TODO(P0) `loopback_resource_restart` 实测它，看到失败被藏在未就绪之后即不通过，`resourceServe` 保持关闭）；其余只在 `serving` 时，由请求超时（-1001、请求超时、timed out：只可能是本服务没有答复）、`servedFailures > 0` 或一条序号大于 `windowSeq`、没有写完的 200 解释；没有一直在监听（启动时、监听失败过）时任何其他错误——包括请求超时：有一方接受了连接、收到了带令牌的请求却不答复——都可能来自占用端口的一方；否则 `unexplained_error`。
+  - 失败次数按读取之后的计数计算，核对点记下读取之前的计数：读取期间本服务的失败答复在这一次与下一次核对中都算。
+  - 结论一致时 `windowSeq` 前移到 `mark − 1`：一次中断的 200 最多解释下一次核对，陈旧的记录不能解释之后的错误；快照没有更新时间时保留确认过的更新时间（缓存重新出现同一更新时间不算新的下载）。异常结论不推进核对状态，并设置 `tokenSuspect` 与 `needsRefresh`（§6.6）。经确认的发布或回滚读回（`confirmNodeResource`）把状态推进到匹配的那条记录；轮换资源地址删除核对状态，由下一次核对按新地址初始化。容差缺省 5 秒；更新时间的精度、Surge 重开时不下载是否也改写更新时间，TODO(P0)。
 - **启动顺序**（在 `AppService.start()` 内；main.ts 不在它之前做任何与资源服务相关的事，停止时最后关闭资源服务，§3）：
   1. 读取 keys；按需读取读取令牌。失败时资源服务为 null 并记 `resource.token_unavailable`，服务照常运行：发布以 `SECRET_STORE_FAILED` 停泊（「已保存，待部署」），初始化与重新合并以它拒绝，进入普通模式与 REJECT 的保持不受影响，工作配置引用回环地址时附加 `node_resource_unverified`。
      读取令牌之后删除轮换资源地址中断留下的旧令牌值（当前引用的前一个与之后最多 16 个，只记个数）。
@@ -1123,8 +1139,9 @@ D10（§0「节点发布机制」）：发布不写 Surge 配置目录中的任�
   5. `tokenSuspect` 已设置 → 拒绝令牌（上面的统一 404）。
   6. 在开始监听**之前**做一次下载核对（`serving = false`）；异常 → `tokenSuspect` 与警告。
   7. 在配置的端口上开始监听；失败 → 记 `resource.listen_failed`，工作配置引用回环地址时附加警告，之后每次对账时重试；原因是端口被占用且工作配置引用回环地址时同时设置 `tokenSuspect`（占用者可能已收到令牌）。
-     - 例外：工作配置指向本服务、启动时的核对读不到 Surge（例如 Mac 重启后服务先于 Surge 启动）、而已提交版本此时不能提供（第 4 步不满足，只能 503）时推迟监听（`resource.listen_deferred`），直到 Surge 可达的对账重新判定门槛之后再监听并核对——否则 Surge 启动时的下载得到本服务自己的 503，之后会被当作无法解释的错误而设置 `tokenSuspect`。推迟期间不算“没有在监听”。
-     - 服务停止（`app.stop()`）之后不再监听：对账中途完成的绑定立即关闭。
+     - 例外：工作配置指向本服务、而启动时的核对读不到 Surge 的外部资源（例如 Mac 重启后服务先于 Surge 启动）时推迟监听（`resource.listen_deferred`），直到某次对账能读到外部资源（Surge 可达、当前是工作配置）并按 `serving = false` 核对之后才监听——否则停止期间占用者留下的证据会被本服务之后的下载（或发布的确认）覆盖，本服务自己的 503 也会被当作无法解释。推迟期间 Surge 的下载得到连接被拒绝（总能解释），不算“没有在监听”；发布因资源服务没有监听而停泊。
+     - 尚未初始化固定工作配置（地址还没有写进任何配置）时，端口被其他程序占用（或还没有选定）就按第 2 步的规则改选并保存（`resource.port_reselected`），初始化的预览与提交同样先这样做；已有工作配置之后从不改选。
+     - 服务停止（`app.stop()`）之后不再监听：对账中途完成的绑定立即关闭。停止时（第一次）在执行器停止之后、关闭资源服务之前按通常的规则再核对一次（`finalResourceAudit`，读不到时跳过）：本服务一直监听期间自己的 503/404 与中途断开的 200 只能在这时被解释；崩溃没有这一步，之前自己的失败答复在重启后按无法解释处理（fail closed，轮换资源地址恢复）。
   8. 对账，然后开始执行器；`needsRefresh` 已设置（或启动时的核对与读回表明本应用资源有错误、未就绪或成员不等于已提交列表）且没有进行中的发布时，排入一次系统强制发布（受门槛约束，不满足时无害地停泊）。
 - 自动化测试覆盖（`service/test/resource`、`service/test/engine`、`service/test/e2e`）：校验规则与统一 404、下载记录与核对、发布互斥（一次只暂存一个候选、暂存期间不加载已提交版本）、启动顺序（核对在监听之前、启动时撤回候选、只提供已提交版本）、崩溃恢复（停在 DEPLOYING/ROLLING_BACK 的发布记为失败、不重放，由 `needsRefresh` 排入系统强制发布）、停止时最后关闭资源服务；这些不证明 Surge 的任何行为（§12）。
 

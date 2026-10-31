@@ -394,6 +394,8 @@ export interface RunningSquatServer {
 function squatResponse(mode: SquatMode): WireResponse {
   if (mode === 'squat404') return { status: 404, headers: { ...EMPTY_SCENARIO_HEADERS }, body: Buffer.alloc(0) };
   const body = Buffer.from(SQUAT_BODY, 'utf8');
+  // squatHang：响应头声明完整长度、不写出内容并保持连接（与 hang 场景同一写法），Surge 等到请求超时
+  if (mode === 'squatHang') return { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': String(body.length), Connection: 'keep-alive' }, body: Buffer.alloc(0) };
   return { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Content-Length': String(body.length), Connection: 'close' }, body };
 }
 
@@ -405,7 +407,9 @@ function bindRaw(host: string, port: number, onRequest: () => void, mode: SquatM
       let head = `HTTP/1.1 ${r.status} ${r.status === 200 ? 'OK' : 'Not Found'}\r\n`;
       for (const [k, v] of Object.entries(r.headers)) head += `${k}: ${v}\r\n`;
       socket.on('error', () => undefined);
-      socket.once('data', () => socket.end(Buffer.concat([Buffer.from(`${head}\r\n`, 'latin1'), r.body])));
+      const bytes = Buffer.concat([Buffer.from(`${head}\r\n`, 'latin1'), r.body]);
+      // squatHang：只写出响应头、不结束（下面的空闲时限断开）
+      socket.once('data', () => (mode === 'squatHang' ? socket.write(bytes) : socket.end(bytes)));
       socket.setTimeout(5000, () => socket.destroy());
     });
     server.once('error', (e: NodeJS.ErrnoException) => resolve({ result: e.code === 'EADDRINUSE' ? 'in_use' : e.code === 'EADDRNOTAVAIL' || e.code === 'EAFNOSUPPORT' ? 'unavailable' : 'error', server: null }));

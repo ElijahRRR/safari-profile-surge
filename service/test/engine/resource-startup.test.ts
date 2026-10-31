@@ -2,6 +2,7 @@
 // 中的端口）、指针初始化与候选版本撤回、门槛之外的代数不提供（503）、监听之前的审计、端口被占用、系统强制刷新只排入一次。
 // 只用合成数据（文档地址、example.test、合成令牌）。
 
+import { readFileSync, writeFileSync } from 'node:fs';
 import { afterEach, describe, expect, test } from 'vitest';
 import { RESOURCE_PORT_MAX, RESOURCE_PORT_MIN } from '@sfe/contract';
 import {
@@ -23,6 +24,7 @@ import {
 } from '../../src/resource/index.js';
 import { LEGACY_NODE_GROUP_LINE, nodeResourceUrl } from '@sfe/contract';
 import { loopbackGroupBlockLines, resourceBody } from '../../src/surge/generate.js';
+import { FAKE_REMOTE_ERRORS } from '../../src/surge/fake.js';
 import type { OperationRecord } from '../../src/db/index.js';
 import { reconcile } from '../../src/engine/reconcile.js';
 import { LOOPBACK_CAPS, PROFILE_A, WEB, bind, createEnv, createHarness, rid, verify, type Harness } from './harness.js';
@@ -446,6 +448,38 @@ describe('audit before listening', () => {
     expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
   });
 
+  test('regression: a never-loaded resource (empty Surge cache): a 404 answered by another process while the service was down is still found (the error text, not a bare not_ready)', async () => {
+    h = await createHarness({ nodeResource: 'loopback', surgeCache: 'empty' });
+    // 系统刷新停泊：Surge 中的资源保持从未下载成功
+    h.revoke(['loopback_publish_crash']);
+    await h.idle();
+    expect((await ourResource(h))!.lastUpdatedAt).toBeNull();
+    await downWhileSurgeFetches(h, { kind: 'squat', status: 404, body: '' });
+    const r = (await ourResource(h))!;
+    expect(r.lastUpdatedAt).toBeNull();
+    expect(r.error).toBe(FAKE_REMOTE_ERRORS.status(404));
+    await h.crash();
+    await h.idle();
+    expect(readTokenSuspect(h.app.engine.kv)).toMatchObject({ reason: 'unexplained_error' });
+  });
+
+  test('regression: our own 503 shortly before a clean stop is audited at stop, so the startup audit after the restart does not flag it', async () => {
+    h = await createHarness({ nodeResource: 'loopback' });
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    await h.idle();
+    // resourceServe 门槛失效：本服务不再提供（503），Surge 的定时刷新得到 503；之后很快正常停止（还没有对账）
+    h.app.engine.resource!.unload();
+    h.clock.advance(1_000);
+    await h.fake.updateExternalResource(h.resourceKey()!).catch(() => undefined);
+    expect((await ourResource(h))!.error).toBe(FAKE_REMOTE_ERRORS.status(503));
+    await h.app.stop();
+    await h.app.engine.resource!.close();
+    await h.crash();
+    await h.idle();
+    expect(readTokenSuspect(h.app.engine.kv)).toBeNull();
+    expect(h.logs.some((l) => l.includes('"msg":"resource.audit_unexplained"'))).toBe(false);
+  });
+
   test('connection refused while the service was down is explained: no tokenSuspect, no warning', async () => {
     h = await createHarness({ nodeResource: 'loopback' });
     await h.idle();
@@ -456,6 +490,109 @@ describe('audit before listening', () => {
     expect(readTokenSuspect(h.app.engine.kv)).toBeNull();
     expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
     expect(fetchResource(h).status).toBe(200);
+  });
+
+  test('regression: a squatter that takes the token and never answers (Surge times out) while the service was down → unexplained_error → tokenSuspect, the token is refused', async () => {
+    h = await createHarness({ nodeResource: 'loopback' });
+    await h.idle();
+    await h.app.stop();
+    await h.app.engine.resource!.close();
+    h.clock.advance(30_000);
+    // 另一个进程接受了连接、读到了带读取令牌的请求却不答复：Surge 等到超时（2026-10-25 矩阵“服务不发送响应” → -1001）
+    const orig = h.fake.remoteSource;
+    h.fake.remoteSource = () => ({ kind: 'no_response' });
+    await h.fake.updateExternalResource(h.resourceKey()!).catch(() => undefined);
+    h.fake.remoteSource = orig;
+    expect((await ourResource(h))!.error).toBe(FAKE_REMOTE_ERRORS.timeout);
+    const from = h.logs.length;
+    await h.crash();
+    await h.idle();
+    expect(readTokenSuspect(h.app.engine.kv)).toMatchObject({ reason: 'unexplained_error' });
+    expect(logIndex(h, 'resource.audit_unexplained', from)).toBeLessThan(logIndex(h, 'resource.listening', from));
+    // 之后占用者拿着令牌来取：统一的 404，从不提供凭据
+    expect(fetchResource(h).status).toBe(404);
+    expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
+  });
+
+  test('regression: Surge relaunched with its cache dropped and the first download not done yet (bare not_ready) is not a token leak', async () => {
+    h = await createHarness({ nodeResource: 'loopback', fakeRemote: { remoteCacheOnRestart: 'drop' } });
+    await h.idle();
+    await h.app.runPeriodicReconcile();
+    // 加载时的那次下载要 60 秒才完成：期间 Surge 报告 not_ready、没有更新时间
+    h.fake.slowUpdate = { durationMs: 60_000 };
+    h.fake.restart();
+    const r = (await ourResource(h))!;
+    expect(r).toMatchObject({ error: 'not_ready', lastUpdatedAt: null, updating: true });
+    const from = h.logs.length;
+    await h.app.runPeriodicReconcile();
+    expect(readTokenSuspect(h.app.engine.kv)).toBeNull();
+    expect(logIndex(h, 'resource.audit_unexplained', from)).toBe(-1);
+    // 下载完成（由本服务答复）：审计与本服务的记录对上，仍然没有令牌可疑
+    h.fake.slowUpdate = null;
+    h.clock.advance(61_000);
+    await h.app.runPeriodicReconcile();
+    expect((await ourResource(h))!.error).toBeNull();
+    expect(readTokenSuspect(h.app.engine.kv)).toBeNull();
+    expect(logIndex(h, 'resource.audit_unexplained', from)).toBe(-1);
+  });
+
+  /** 停止期间占用端口的一方答复了 Surge 的一次下载（伪造的列表），之后重启时 Surge 的外部资源读两次都失败（启动审计与启动对账）。 */
+  async function squatThenRestartUnreadable(x: Harness): Promise<void> {
+    await downWhileSurgeFetches(x, { kind: 'squat', status: 200, body: resourceBody(0, ['SFE-SQUAT = socks5, 192.0.2.66, 1080']) });
+    x.fake.failNext('listExternalResources');
+    x.fake.failNext('listExternalResources');
+    await x.crash();
+    await x.idle();
+  }
+
+  test('regression: the startup audit could not read Surge → the service does not listen until an audit succeeds; Surge\'s next fetch is refused, so the squatter\'s fetch is still found', async () => {
+    // temp_rule：读入口不读外部资源，外部资源只由启动审计与节点资源检查读取
+    h = await createHarness({ nodeResource: 'loopback', entryStrategy: 'temp_rule' });
+    await h.idle();
+    await squatThenRestartUnreadable(h);
+    const engine = h.app.engine;
+    expect(engine.resource!.listening()).toBe(false);
+    expect(h.logs.some((l) => l.includes('"msg":"resource.listen_deferred"'))).toBe(true);
+    // 推迟期间 Surge 的下载得到连接被拒绝（不会被本服务的下载覆盖证据）
+    await h.fake.updateExternalResource(h.resourceKey()!).catch(() => undefined);
+    expect((await ourResource(h))!.error).toBe(FAKE_REMOTE_ERRORS.refused);
+    // 能读到外部资源的对账：先按“没有一直监听”审计，发现停止期间的下载，之后才监听；令牌正确的请求得到 404
+    await h.app.runPeriodicReconcile();
+    expect(readTokenSuspect(engine.kv)).toMatchObject({ reason: 'unexplained_fetch' });
+    expect(engine.resource!.listening()).toBe(true);
+    expect(fetchResource(h).status).toBe(404);
+    expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
+  });
+
+  test('regression: the startup audit could not read Surge → a publish before the next audit parks (not listening) instead of overwriting the evidence', async () => {
+    h = await createHarness({ nodeResource: 'loopback', entryStrategy: 'temp_rule' });
+    await h.idle();
+    await squatThenRestartUnreadable(h);
+    const updates = h.fake.calls.updateExternalResource ?? 0;
+    const b = await createEnv(h, 'US-Buyer-B', '203.0.113.11');
+    expect(h.repos.operations.get(b.operation_id)).toMatchObject({ phase: 'WAITING_DEPLOYMENT', status: 'parked', error: { code: 'RESOURCE_SERVER_UNAVAILABLE' } });
+    expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(0);
+    await h.app.runPeriodicReconcile();
+    expect(readTokenSuspect(h.app.engine.kv)).toMatchObject({ reason: 'unexplained_fetch' });
+    // 占用者拿着之前收到的令牌来取：统一的 404，从不提供凭据
+    expect(fetchResource(h).status).toBe(404);
+  });
+
+  test('regression: a publish audits the state it reads before the update: an unexplained fetch since the last audit parks it (token suspect), the update is never sent and the evidence is not overwritten', async () => {
+    h = await createHarness({ nodeResource: 'loopback' });
+    await h.idle();
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    // 上一次审计之后 Surge 载入了本服务没有提供过的内容（没有对应的审计记录），之后还没有对账
+    h.clock.advance(5_000);
+    h.fake.seedRemoteCache(h.resourceUrl()!, resourceBody(0, ['SFE-SQUAT = socks5, 192.0.2.66, 1080']), { updatedAt: h.clock.now() });
+    const updates = h.fake.calls.updateExternalResource ?? 0;
+    const b = await createEnv(h, 'US-Buyer-B', '203.0.113.11');
+    const op = h.repos.operations.get(b.operation_id)!;
+    expect(op).toMatchObject({ phase: 'WAITING_DEPLOYMENT', status: 'parked', error: { code: 'RESOURCE_SERVER_UNAVAILABLE', details: { reason: 'token_suspect' } } });
+    expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(0);
+    expect(readTokenSuspect(h.app.engine.kv)).toMatchObject({ reason: 'unexplained_fetch' });
+    expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
+    expect(fetchResource(h).status).toBe(404);
   });
 
   test('an auditState row that exists but cannot be read → warning and needsRefresh, never tokenSuspect; re-initialised only by a confirmed readback', async () => {
@@ -485,6 +622,36 @@ describe('audit before listening', () => {
   });
 });
 
+describe('the resourceServe records revoked while a generation > 0 is served', () => {
+  test('regression: reset of loopback_resource_auth while Surge is unreachable → the committed credentials are no longer served (503) at once', async () => {
+    h = await createHarness({ nodeResource: 'loopback' });
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    await h.idle();
+    expect(fetchResource(h).status).toBe(200);
+    expect(h.app.engine.resource!.served()).toMatchObject({ generation: 1, state: 'committed' });
+    h.fake.reachable = false;
+    await h.app.confirmCapability({ request_id: rid('cap'), action: 'reset', key: 'loopback_resource_auth', note: null }, WEB);
+    expect(fetchResource(h).status).toBe(503);
+    expect(readNeedsRefresh(h.app.engine.kv)).toMatchObject({ generation: 1, reason: 'serve_gated' });
+    // Surge 仍不可达的对账不恢复提供
+    await h.app.runPeriodicReconcile();
+    expect(fetchResource(h).status).toBe(503);
+  });
+
+  test('regression: records revoked while the working profile no longer points at our address → the next reconcile stops serving generation > 0', async () => {
+    h = await createHarness({ nodeResource: 'loopback' });
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    await h.idle();
+    expect(fetchResource(h).status).toBe(200);
+    // 节点组定义被改成另一个回环地址（不再是本服务当前的）
+    const text = readFileSync(h.profilePath, 'utf8');
+    writeFileSync(h.profilePath, text.replace(h.app.engine.resource!.token, 'c'.repeat(64)));
+    h.revoke(['loopback_resource_auth']);
+    await h.app.runPeriodicReconcile();
+    expect(fetchResource(h).status).toBe(503);
+  });
+});
+
 describe('listen', () => {
   test('port in use while the profile references our URL → tokenSuspect and the warning; listening is retried on each reconcile tick', async () => {
     h = await createHarness({ nodeResource: 'loopback' });
@@ -498,7 +665,8 @@ describe('listen', () => {
     expect(h.logs.some((l) => l.includes('"msg":"resource.listen_failed"') && l.includes('"reason":"port_in_use"'))).toBe(true);
     expect(readTokenSuspect(engine.kv)).toMatchObject({ reason: 'port_in_use' });
     expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
-    expect(h.app.views.snapshot('0.0.0-test', false).surge.nodeResource).toEqual({ state: 'not_listening', tokenSuspect: true, needsRefresh: false });
+    // 警告总是带着刷新要求（网页据此提供“重新同步节点资源”）
+    expect(h.app.views.snapshot('0.0.0-test', false).surge.nodeResource).toEqual({ state: 'not_listening', tokenSuspect: true, needsRefresh: true });
     h.binderRegistry.delete(h.resourcePort);
     await h.app.runPeriodicReconcile();
     expect(engine.resource!.listening()).toBe(true);

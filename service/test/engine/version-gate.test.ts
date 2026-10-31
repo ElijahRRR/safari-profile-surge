@@ -149,8 +149,22 @@ describe('Surge below the minimum supported version (6.10.0 / 12500 / Controller
     expect(op.phase).toBe('WAITING_DEPLOYMENT');
     expect(op.error?.code).toBe('CAPABILITY_UNVERIFIED');
     expect(op.error?.message).toContain(MINIMUM_TEXT);
-    expect(op.error?.message).toContain('新版本保持待部署，已部署的节点不受影响');
+    expect(op.error?.message).toContain('新版本保持待部署');
+    // regression：resourceServe 的记录也随版本过期，本机资源服务不再提供已提交的节点——不能说“已部署的节点不受影响”
+    expect(op.error?.message).not.toContain('已部署的节点不受影响');
+    expect(op.error?.message).toContain('本机资源服务不提供已提交的节点');
+    expect(op.error?.message).toContain('loopback_resource_restart');
     expect(h.repos.deployments.list()).toEqual([]);
+    expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
+  });
+
+  test('publish parks for a missing record outside resourceServe only: the deployed nodes are unaffected', async () => {
+    h = await createHarness();
+    h.revoke(['connection_continuity']);
+    const a = await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    const op = h.repos.operations.get(a.operation_id)!;
+    expect(op.phase).toBe('WAITING_DEPLOYMENT');
+    expect(op.error?.message).toContain('新版本保持待部署，已部署的节点不受影响');
     expect(h.fake.calls.updateExternalResource ?? 0).toBe(0);
   });
 

@@ -5,7 +5,9 @@ import {
   DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS,
   assessResourceReadback,
   auditResource,
+  isConnectionRefused,
   isConnectionRefusedOrTimeout,
+  isRequestTimeout,
   resourceLocationHash,
   servedFailureCount,
   type AssessResourceReadbackInput,
@@ -69,6 +71,22 @@ describe('isConnectionRefusedOrTimeout', () => {
   ])('%s → %s', (text, expected) => {
     expect(isConnectionRefusedOrTimeout(text)).toBe(expected);
   });
+
+  test.each([
+    ['NSURLErrorDomain -1004 无法连接服务器', true, false],
+    ['Error Domain=NSURLErrorDomain Code=-1004 "Could not connect to the server."', true, false],
+    ['未能连接到服务器。无法连接服务器', true, false],
+    ['Error Domain=NSURLErrorDomain Code=-1001 "The request timed out."', false, true],
+    ['NSURLErrorDomain -1001', false, true],
+    ['请求超时。 (NSURLErrorDomain:-1001)', false, true],
+    ['The request timed out.', false, true],
+    ['NSURLErrorDomain -1005', false, false],
+    ['NSURLErrorDomain -10011', false, false],
+    ['HTTP 404', false, false],
+  ])('refused vs timeout: %s → refused %s, timeout %s', (text, refused, timeout) => {
+    expect(isConnectionRefused(text)).toBe(refused);
+    expect(isRequestTimeout(text)).toBe(timeout);
+  });
 });
 
 describe('auditResource', () => {
@@ -122,16 +140,47 @@ describe('auditResource', () => {
     expect(audit({ snapshot: snap({ updatedAt: new Date(Number.NaN) }), records: [rec(5, U1)], serving: true }).verdict).toBe('unexplained_fetch');
   });
 
-  test('updatedAt dropping to null (cache dropped) needs no fetch record', () => {
+  test('updatedAt dropping to null (cache dropped) needs no fetch record; the confirmed updatedAt is kept', () => {
     const r = audit({ snapshot: snap({ updatedAt: null, error: 'not_ready' }), serving: true, servedFailures: 1, mark: 5 });
-    expect(r).toEqual({ verdict: 'ok', matchedSeq: null, nextState: { verifiedUpdatedAt: null, verifiedError: 'not_ready', auditedSeq: 4, windowSeq: 4 } });
+    expect(r).toEqual({ verdict: 'ok', matchedSeq: null, nextState: { verifiedUpdatedAt: U0, verifiedError: 'not_ready', auditedSeq: 4, windowSeq: 4 } });
+    // 缓存重新出现同一更新时间：不是新的下载
+    expect(audit({ snapshot: snap({ updatedAt: T(U0) }), state: r.nextState, serving: false }).verdict).toBe('ok');
+    // 出现不同的更新时间：仍要对应本服务的审计记录
+    expect(audit({ snapshot: snap({ updatedAt: T(U1) }), state: r.nextState, serving: false }).verdict).toBe('unexplained_fetch');
   });
 
-  test('a new error: refused/timeout is explainable even while not serving', () => {
-    for (const error of ['NSURLErrorDomain -1004 无法连接服务器', 'Error Domain=NSURLErrorDomain Code=-1001 "The request timed out."']) {
+  test('regression: a bare not_ready without updatedAt (no completed download yet, e.g. after a Surge relaunch) is explained, serving or not', () => {
+    for (const serving of [true, false]) {
+      const s = state({ verifiedError: null });
+      const r = audit({ snapshot: snap({ updatedAt: null, error: 'not_ready' }), state: s, serving, servedFailures: 0, mark: 5 });
+      expect(r).toEqual({ verdict: 'ok', matchedSeq: null, nextState: { verifiedUpdatedAt: U0, verifiedError: 'not_ready', auditedSeq: 4, windowSeq: 4 } });
+    }
+  });
+
+  test('not_ready is explained only without updatedAt; an error text on a never-loaded resource follows the normal rules', () => {
+    // 有更新时间却报告 not_ready：不是“尚未下载”
+    expect(audit({ snapshot: snap({ updatedAt: T(U0), error: 'not_ready' }), serving: false }).verdict).toBe('unexplained_error');
+    // 从未下载成功而有错误文字（他人答复了 404）：本服务没有一直监听时无法解释
+    expect(audit({ snapshot: snap({ updatedAt: null, error: 'HTTP 404' }), serving: false }).verdict).toBe('unexplained_error');
+  });
+
+  test('a new error: connection refused (nobody listening) is explainable even while not serving', () => {
+    for (const error of ['NSURLErrorDomain -1004 无法连接服务器', 'Error Domain=NSURLErrorDomain Code=-1004 "Could not connect to the server."']) {
       const r = audit({ snapshot: snap({ error }) });
       expect(r.verdict).toBe('ok');
       expect(r.nextState.verifiedError).toBe(error);
+    }
+  });
+
+  test('regression: a request timeout is explained only while we were serving (otherwise a squatter took the token and hung)', () => {
+    const s = state();
+    for (const error of ['Error Domain=NSURLErrorDomain Code=-1001 "The request timed out."', '请求超时。 (NSURLErrorDomain:-1001) [未能完成操作。]', 'The request timed out.']) {
+      const notServing = audit({ snapshot: snap({ error }), state: s, serving: false, servedFailures: 3, records: [rec(5, U0, 1, false)] });
+      expect(notServing.verdict).toBe('unexplained_error');
+      expect(notServing.nextState).toBe(s);
+      const serving = audit({ snapshot: snap({ error }), state: s, serving: true });
+      expect(serving.verdict).toBe('ok');
+      expect(serving.nextState.verifiedError).toBe(error);
     }
   });
 

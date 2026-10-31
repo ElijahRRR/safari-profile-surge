@@ -11,7 +11,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { NODE_RESOURCE_FILE, NODE_RESOURCE_HOST, RESOURCE_TOKEN_RE, SfeError, nodeResourceUrl } from '@sfe/contract';
 import type { Clock, LogLevel, Logger } from '../ports.js';
-import type { BoundSocket, ResourceBinder, ResourceRequestHandler } from './binder.js';
+import type { BoundSocket, ResourceBinder, ResourceConnectionFailure, ResourceRequestHandler } from './binder.js';
 
 /** 资源内容上限（UTF-8 字节）：超过时拒绝加载或暂存，从不截断。 */
 export const RESOURCE_MAX_BYTES = 1024 * 1024;
@@ -119,8 +119,10 @@ export interface ResourceHost {
    */
   onServed(cb: (r: ResourceAuditRecord) => void): () => void;
   /**
-   * 按原因累计的拒绝次数（404），另有 unavailable（503）、audit_failed（写出前记录失败、改答 503）与 audit_complete_failed
-   * （完整写出之后记录完成失败；不是一次失败答复，见 audit.ts servedFailureCount）。
+   * 按原因累计的拒绝次数（404），另有 unavailable（503）、audit_failed（写出前记录失败、改答 503）、绑定方报告的连接层面失败
+   * conn_<原因>（超过连接数上限被断开、无法解析或超时、流水线上的后续请求、没有答复、空闲超时，binder.ts
+   * ResourceConnectionFailure）与 audit_complete_failed（完整写出之后记录完成失败；不是一次失败答复，见 audit.ts
+   * servedFailureCount）。
    */
   failureCounters(): Readonly<Record<string, number>>;
 }
@@ -353,6 +355,12 @@ export function createResourceHost(opts: CreateResourceHostOptions): ResourceHos
     respond(response, record === null ? undefined : finisher(record));
   };
 
+  /** 绑定方报告的连接层面失败：计数（conn_<原因>）并按原因每分钟最多记一行。 */
+  const onConnectionFailure = (reason: ResourceConnectionFailure): void => {
+    count(`conn_${reason}`);
+    rateLimitedLog(`conn:${reason}`, 'warn', 'resource.connection_failed', { reason });
+  };
+
   const host: ResourceHost = {
     token,
     url() {
@@ -389,7 +397,7 @@ export function createResourceHost(opts: CreateResourceHostOptions): ResourceHos
         }
         let socket: BoundSocket;
         try {
-          socket = await binder.bind(port, handler);
+          socket = await binder.bind(port, handler, onConnectionFailure);
         } catch (err) {
           if (err instanceof SfeError && err.code === 'RESOURCE_SERVER_UNAVAILABLE') throw err;
           throw unavailable('other', '本机资源服务不可用：无法监听本机端口');

@@ -6,6 +6,7 @@
 import {
   CAPABILITY_CONTEXT_DEPS,
   CAPABILITY_CONTEXT_FIELDS,
+  CAPABILITY_GATES,
   CAPABILITY_KEYS,
   ENTRY_STRATEGIES,
   SfeError,
@@ -41,6 +42,7 @@ import { acceptedOf, commitOperation, findDuplicateOperation, findLedger, record
 import { expireSafariProbe } from './handlers/probes.js';
 import { endWaitingRouteForNewRevision, entrySettingsChangeRefusal } from './route-control.js';
 import { markSafariMayUseRoute, safariMayUseRoute } from './safari-route-marker.js';
+import { unloadIfServeStatusRevoked } from './node-resource.js';
 
 function forbidden(message: string): SfeError {
   return new SfeError('BAD_REQUEST', message);
@@ -229,6 +231,8 @@ export async function confirmCapability(deps: AcceptDeps, req: ConfirmCapability
   } else {
     throw new SfeError('VALIDATION_FAILED', '确认能力失败：action 只能是 confirm 或 reset', { fieldErrors: [{ field: 'action', message: '只能是 confirm 或 reset' }] });
   }
+  // resourceServe 的记录被重置（或确认为不支持）：本机资源服务立即停止提供代数 > 0 的已提交版本（不等 Surge 可达的对账）
+  if ((CAPABILITY_GATES.resourceServe as readonly CapabilityKey[]).includes(key) && unloadIfServeStatusRevoked(engine)) engine.emit({ surge: true });
   engine.emit({ capabilities: true, settings: settingsChanged, environments: repos.environments.list().map((e) => e.id) });
   return engine.capabilityViews().find((v) => v.key === key)!;
 }

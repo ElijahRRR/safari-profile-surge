@@ -7,22 +7,38 @@
 //    写出；记录请求头名称与方法。发起连接的进程要在连接打开时用 lsof 读（经共用执行器异步运行；一次 200 的下载只持续几毫秒）：
 //    这一步单独再做一次更新，让产品处理程序接受请求之后暂不发送内容（hang），读完即恢复已提交版本——这是本命令中唯一经场景
 //    包装的一步，令牌与请求校验仍由产品处理程序完成；上面的“每次下载都是 200”只看未经改动的处理程序。
+//    之后用 lsof 实测资源服务进程的监听地址（只应是 127.0.0.1:<端口>；读不到时为不完整）。
 // 3. 同一用户的绑定：127.0.0.1:<端口>（必须失败）与同端口的 0.0.0.0、[::]、[::1]；绑定成功的保持监听，期间的探测与 Surge
 //    下载必须到达本服务、不到达它们。
-// 4. 另一系统用户（操作员）：运行 resource-server --squat squat404，记录 uid、绑定结果与是否收到连接。
-// 5. 服务停止时被占用（操作员停止服务并运行占用者）：显式更新与等待定时刷新，按产品的下载核对（auditResource，serving=false）
-//    伪造列表必须判为 unexplained_fetch、占用者的错误必须判为 unexplained_error；之后重新启动服务、一次更新读回回到已提交版本。
-// 6. Surge 资源缓存的位置与凭据保存方式（操作员记录）。
+// 4. 另一系统用户（操作员）：运行 resource-server --squat squat404，记录 uid、绑定结果与是否收到连接。照抄的 uid 必须与本工具的
+//    uid 不同，运行目录中也不能出现这一步期间启动的占用者记录（同一用户的占用者能写运行目录）。
+// 5. 服务停止时被占用（操作员停止服务并运行占用者）：squat200（伪造的列表）、squat404（错误）、squatHang（收下令牌后不答复，
+//    Surge 等到请求超时）。每一种先等待定时刷新（不执行更新，从占用之前的状态核对），观察到 Surge 自己的下载之后先恢复已提交
+//    版本、再次占用；然后显式更新，从更新之前的状态核对。按产品的下载核对（auditResource，serving=false）伪造列表必须判为
+//    unexplained_fetch、错误与请求超时必须判为 unexplained_error；之后重新启动服务、一次更新读回回到已提交版本。
+// 6. Surge 资源缓存的位置与凭据保存方式（操作员记录，检查项名称注明）。
 // 读取令牌只在内存中拼进探测请求，从不打印或写入记录。
 
 import { randomBytes } from 'node:crypto';
 import { connect, createServer, type Server } from 'node:net';
 import { CAPABILITY_CRITERIA } from '@sfe/contract';
-import { DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS, auditResource, type ResourceSnapshot } from '../deps.js';
+import { ACTIONS_LOG, RESOURCE_UPDATE_WAIT } from '../constants.js';
+import { DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS, auditResource, type ResourceAuditVerdict, type ResourceSnapshot } from '../deps.js';
 import { refused, type ExitCode } from '../errors.js';
-import { auditMarkOf, peersBetween, readAuditRecords, readServerStatus, requestsBetween, serverRunning, type ResourceRequestLogEntry } from '../loopback-state.js';
+import {
+  SQUAT_MODES,
+  auditMarkOf,
+  peersBetween,
+  readAuditRecords,
+  readServerStatus,
+  requestsBetween,
+  serverRunning,
+  type ResourceRequestLogEntry,
+  type SquatMode,
+} from '../loopback-state.js';
 import { redactSummary } from '../redact.js';
-import { check, writeResult } from '../results.js';
+import { check, writeResult, type ActionEntry, type CheckItem } from '../results.js';
+import type { ExecFn } from '../system.js';
 import { confirmWrites, measureContext, printResult, printSnapshot, takeSnapshot, type Ctx } from './common.js';
 import { errorClass, openLoopback, readbackText } from './loopback-ops.js';
 
@@ -117,12 +133,96 @@ function surgeRequests(entries: readonly ResourceRequestLogEntry[]): ResourceReq
   return entries.filter((e) => !e.headers.includes(PROBE_HEADER.toLowerCase()) && !e.headers.some((h) => h.startsWith('x-sfe-p0-route-')));
 }
 
+/** 每种占用按产品的下载核对（serving=false）必须得到的结论。 */
+export const SQUAT_EXPECTED_VERDICT: Readonly<Record<SquatMode, ResourceAuditVerdict>> = Object.freeze({
+  squat200: 'unexplained_fetch',
+  squat404: 'unexplained_error',
+  squatHang: 'unexplained_error',
+});
+
+/** 一次占用下载的后果与核对结论（起点是占用者开始占用之前的状态）。 */
+export interface SquatObservation {
+  members: readonly string[] | null;
+  error: string;
+  updatedAtChanged: boolean;
+  /** 这一次（定时刷新的等待或显式更新开始之后）这一种占用者收到的请求。 */
+  squatRequests: number;
+  /**
+   * 结论不单独属于这一次的请求：显式更新开始之前（起点之后）这一种占用者已收到的请求（Surge 已自己下载过），以及起点之后
+   * 其他种占用者收到的请求（例如操作员换占用者之前，上一种占用者答复了 Surge 的一次下载，Surge 的状态可能已因此改变）。
+   */
+  earlierRequests: number;
+  tokenReceived: boolean;
+  verdict: ResourceAuditVerdict;
+  expected: ResourceAuditVerdict;
+}
+
 /** 服务停止时被占用的一种情况的记录。 */
-interface SquatPhase {
-  mode: 'squat200' | 'squat404';
+export interface SquatPhase {
+  mode: SquatMode;
   ran: boolean;
-  explicit: { members: readonly string[] | null; error: string; updatedAtChanged: boolean; squatRequests: number; tokenReceived: boolean; verdict: string } | null;
-  scheduled: { observed: boolean; verdict: string | null } | null;
+  /** 定时刷新（先于显式更新，从占用之前的状态核对）：没有等待为 null；result 只在观察到 Surge 自己的下载时有。 */
+  scheduled: { minutes: number; observed: boolean; result: SquatObservation | null } | null;
+  /** 观察到定时刷新之后、再次占用之前恢复已提交版本（读回一致才测显式更新）：没有需要为 null。 */
+  between: { recovered: boolean } | null;
+  explicit: SquatObservation | null;
+}
+
+/**
+ * 一次观察是否符合：占用者没有收到请求、或显式更新之前 Surge 已自己下载过、或起点之后其他种占用者收到过请求（结论不单独属于
+ * 这一次）时不算测过（null）；否则核对结论必须是这种占用预期的结论。
+ */
+function squatObservationOk(o: SquatObservation | null): boolean | null {
+  if (o === null || o.squatRequests === 0 || o.earlierRequests > 0) return null;
+  return o.verdict === o.expected;
+}
+
+/**
+ * 占用检查的结论（纯函数）：显式更新与定时刷新分别看每一种占用的观察。任何一次观察的核对结论不是预期的结论即不通过；三种
+ * 占用都观察到（且占用者收到了请求）才通过，否则不完整。定时刷新只“观察到下载”不够：核对必须发现它。
+ */
+export function squatChecks(phases: readonly SquatPhase[]): { explicit: boolean | null; scheduled: boolean | null } {
+  const verdictOf = (pick: (p: SquatPhase) => SquatObservation | null): boolean | null => {
+    if (phases.length === 0) return null;
+    const results = SQUAT_MODES.map((mode) => {
+      const p = phases.filter((x) => x.mode === mode).at(-1);
+      return p ? squatObservationOk(pick(p)) : null;
+    });
+    return results.some((r) => r === false) ? false : results.every((r) => r === true) ? true : null;
+  };
+  return { explicit: verdictOf((p) => p.explicit), scheduled: verdictOf((p) => p.scheduled?.result ?? null) };
+}
+
+function squatObservationText(o: SquatObservation | null): string {
+  if (o === null) return '未测';
+  return `成员 ${o.members?.join('、') ?? '读不到'}，错误 ${o.error}，更新时间${o.updatedAtChanged ? '变了' : '没变'}，占用者收到 ${o.squatRequests} 个请求${o.tokenReceived ? '（带读取令牌）' : ''}${o.earlierRequests > 0 ? `（起点之后、这一次之前或其他种占用者已收到 ${o.earlierRequests} 个：不单独计入）` : ''}，核对 ${o.verdict}（预期 ${o.expected}）`;
+}
+
+/** 照抄的文字中的 uid（例如“uid 502”）；没有为 null。 */
+export function parseUid(text: string): number | null {
+  const m = /uid\D{0,3}(\d{1,10})/i.exec(text);
+  return m ? Number(m[1]) : null;
+}
+
+/** `lsof -Fn` 输出中的名称（n 开头的行）。 */
+export function parseLsofNames(text: string): string[] {
+  return text
+    .split('\n')
+    .filter((l) => l.startsWith('n'))
+    .map((l) => l.slice(1).trim())
+    .filter((n) => n !== '');
+}
+
+/**
+ * 资源服务进程在端口上的监听地址（lsof 实测，经共用执行器）：只应是 127.0.0.1:<端口>。读不到（不是 macOS、lsof 不可用或没有
+ * 输出）为 null。
+ */
+export async function listenAddresses(exec: ExecFn, pid: number, port: number): Promise<string[] | null> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  const r = await exec('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), `-iTCP:${port}`, '-sTCP:LISTEN', '-Fn'], { timeoutMs: 3000 });
+  if (r.code !== 0) return null;
+  const names = parseLsofNames(r.stdout);
+  return names.length > 0 ? names : null;
 }
 
 /** 占用前的审计起点：与产品启动时一样，从当时的快照初始化（verdict initialized，从不报警）。 */
@@ -131,7 +231,7 @@ function initAudit(snapshot: ResourceSnapshot, dirRecords: ReturnType<typeof rea
 }
 
 export async function runLoopbackAuth(ctx: Ctx): Promise<ExitCode> {
-  const { out, now, prompt, sleep, home } = ctx.deps;
+  const { out, now, prompt, sleep, home, exec } = ctx.deps;
   const { dir, session, ops, lb } = await openLoopback(ctx, { requireSetup: true });
   await lb.ensureKey();
   const snap = await takeSnapshot(ctx, session, dir, 'loopback-auth-before');
@@ -167,6 +267,11 @@ export async function runLoopbackAuth(ctx: Ctx): Promise<ExitCode> {
   const unavailable = statusOf(await rawHttp(lb.port, probes[0]!.text));
   await lb.setScenario('ok');
   const badProbes = results.filter((r) => r.status !== r.expect || (r.expect === 404 && !r.bytes.equals(reference))).map((r) => r.id);
+
+  // 1b. 监听地址：lsof 实测资源服务进程（第 3 步的同端口绑定之前）
+  const serverPid = readServerStatus(dir)?.pid ?? -1;
+  const listen = await listenAddresses(exec, serverPid, lb.port);
+  const listenOnlyLoopback = listen === null ? null : listen.every((n) => n === `127.0.0.1:${lb.port}`);
 
   // 2. Surge 的下载（产品处理程序原样答复）
   const tS = now().getTime();
@@ -220,7 +325,8 @@ export async function runLoopbackAuth(ctx: Ctx): Promise<ExitCode> {
   out.heading('另一系统用户的占用（手动）');
   out.line(`以另一个 macOS 用户登录（或在该用户的终端中），运行：npx tsx tools/p0/src/cli.ts resource-server --squat squat404 --port ${lb.port}`);
   out.line('它会打印 uid 与每个地址的绑定结果；保持它运行，回到这里继续（工具会发一次探测并执行一次单 key 更新）。');
-  let otherUser: { bindFailed: boolean | null; received: boolean | null; note: string; reachedUs: boolean } | null = null;
+  let otherUser: { bindFailed: boolean | null; received: boolean | null; note: string; reachedUs: boolean; uid: number | null; ownUid: number | null; sameUserSquatter: boolean } | null = null;
+  const tStep4 = now().getTime();
   if ((await prompt.ask('另一系统用户的占用程序已在运行吗？输入 yes 继续，直接回车跳过：')) === 'yes') {
     const tO = now().getTime();
     await rawHttp(lb.port, `GET /sfe-nodes.list HTTP/1.1\r\nHost: 127.0.0.1:${lb.port}\r\n${PROBE_HEADER}: 1\r\nConnection: close\r\n\r\n`);
@@ -230,60 +336,104 @@ export async function runLoopbackAuth(ctx: Ctx): Promise<ExitCode> {
     const note = redactSummary(((await prompt.ask('照抄占用程序打印的 uid 与各地址的绑定结果（不要输入账号或密码）：')) ?? '').slice(0, 300), { home });
     const bindFailed = yn(await prompt.ask(`占用程序绑定 127.0.0.1:${lb.port} 是否失败？（y/n）`));
     const received = yn(await prompt.ask('占用程序是否收到了任何连接？（y/n）'));
-    otherUser = { bindFailed, received, note, reachedUs };
+    // 同一用户运行的占用者能写本运行目录（另一系统用户不能）：这一步期间出现的占用者记录说明它不是另一系统用户
+    const sameUserSquatter =
+      dir.readJsonl<ActionEntry>(ACTIONS_LOG).some((a) => a?.action === 'squat_started' && Date.parse(a.at) >= tStep4) ||
+      Date.parse(readServerStatus(dir, 'squat')?.startedAt ?? '') >= tStep4;
+    otherUser = { bindFailed, received, note, reachedUs, uid: parseUid(note), ownUid: process.getuid?.() ?? null, sameUserSquatter };
   }
 
   // 5. 服务停止时被占用（操作员停止服务并运行占用者）
   const phases: SquatPhase[] = [];
   let recovered: boolean | null = null;
+  /** 占用者（这一种）正在占用 127.0.0.1:<端口>，资源服务已停止。 */
+  const squatHolding = (mode: SquatMode): boolean => {
+    const server = readServerStatus(dir);
+    const squat = readServerStatus(dir, 'squat');
+    return !serverRunning(server) && serverRunning(squat) && squat.mode === mode && squat.listening;
+  };
+  /** 一次占用下载之后等 Surge 写下结果（错误或更新时间变化，且不在更新中；squatHang 要等到 Surge 超时）。 */
+  const settle = async (before: ResourceSnapshot): Promise<ResourceSnapshot> => {
+    const changed = (x: ResourceSnapshot): boolean => x.updating !== true && (x.error !== before.error || (x.updatedAt?.getTime() ?? null) !== (before.updatedAt?.getTime() ?? null));
+    const w = await ops.poll(() => lb.snapshot(), changed, RESOURCE_UPDATE_WAIT.timeoutMs * 2, RESOURCE_UPDATE_WAIT.pollMs);
+    return w.value ?? (await lb.snapshot());
+  };
+  /** 起点：占用者开始占用之前的状态与审计序号（与产品启动时一样从快照初始化核对状态）。 */
+  type Base = { before: ResourceSnapshot; mark: number; at: number };
+  const baseNow = async (): Promise<Base> => ({ before: await lb.snapshot(), mark: auditMarkOf(dir), at: now().getTime() });
+  /** 占用者收到的请求，按占用者的种类（日志的 scenario）分开：本种与其他种（例如还没停止的上一种占用者）。 */
+  const squatRequestsOf = (mode: SquatMode, from: number, to: number) => {
+    const all = requestsBetween(dir, from, to, 'squat');
+    return { own: all.filter((e) => e.scenario === mode), other: all.filter((e) => e.scenario !== mode) };
+  };
+  /** 一次占用下载的后果，按产品的下载核对从起点判断；since：这一次（等待或更新）开始的时间。 */
+  const observe = (mode: SquatMode, base: Base, since: number, after: ResourceSnapshot): SquatObservation => {
+    const state0 = initAudit(base.before, readAuditRecords(dir), base.mark);
+    const squatted = squatRequestsOf(mode, since - 1000, now().getTime() + 1000).own;
+    // 起点之后其他种占用者收到的请求（上一种占用者答复了 Surge 的下载）：Surge 的状态可能已因它改变，这次结论不单独成立
+    const foreign = squatRequestsOf(mode, base.at, now().getTime() + 1000).other.length;
+    return {
+      members: after.members,
+      error: errorClass(after.error),
+      updatedAtChanged: (after.updatedAt?.getTime() ?? null) !== (base.before.updatedAt?.getTime() ?? null),
+      squatRequests: squatted.length,
+      earlierRequests: (since > base.at ? squatRequestsOf(mode, base.at, since - 1).own.length : 0) + foreign,
+      tokenReceived: squatted.some((e) => e.tokenOk),
+      verdict: auditResource({ snapshot: after, state: state0, records: readAuditRecords(dir), toleranceMs: DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS, serving: false, servedFailures: 0, mark: base.mark }).verdict,
+      expected: SQUAT_EXPECTED_VERDICT[mode],
+    };
+  };
   if ((await prompt.ask('现在测试“服务停止时端口被占用”吗？需要你停止 resource-server 并运行占用者。输入 yes 继续，直接回车跳过：')) === 'yes') {
-    for (const mode of ['squat200', 'squat404'] as const) {
-      const phase: SquatPhase = { mode, ran: false, explicit: null, scheduled: null };
+    for (const mode of SQUAT_MODES) {
+      const phase: SquatPhase = { mode, ran: false, scheduled: null, between: null, explicit: null };
       phases.push(phase);
+      // 起点在占用者开始之前读：占用者一开始，Surge 随时可能自己下载（每种占用单独核对，上一种留下的变化属于起点）
+      let base = await baseNow();
       await prompt.pause(`在 resource-server 终端按 Ctrl+C 停止服务（或停止上一个占用者），然后在同一终端运行 resource-server --squat ${mode}（同一运行编号）`);
-      const server = readServerStatus(dir);
-      const squat = readServerStatus(dir, 'squat');
-      if (serverRunning(server) || !serverRunning(squat) || squat.mode !== mode || !squat.listening) {
+      if (!squatHolding(mode)) {
         out.warn(`没有看到资源服务已停止、占用者（${mode}）正在占用 127.0.0.1:${lb.port}：这一情况记为未测`);
         continue;
       }
       phase.ran = true;
-      // 显式更新：从这一情况开始之前的状态核对（每种占用单独核对：上一种占用留下的变化不算这一种的证据）
-      const before = await lb.snapshot();
-      const mark = auditMarkOf(dir);
-      const state0 = initAudit(before, readAuditRecords(dir), mark);
-      const tE = now().getTime();
-      await lb.update(`squat-${mode}`);
-      const after = (await lb.waitNotUpdating()).snapshot ?? (await lb.snapshot());
-      const squatted = requestsBetween(dir, tE - 1000, now().getTime() + 1000, 'squat');
-      const verdict = auditResource({ snapshot: after, state: state0, records: readAuditRecords(dir), toleranceMs: DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS, serving: false, servedFailures: 0, mark }).verdict;
-      phase.explicit = {
-        members: after.members,
-        error: errorClass(after.error),
-        updatedAtChanged: (after.updatedAt?.getTime() ?? null) !== (before.updatedAt?.getTime() ?? null),
-        squatRequests: squatted.length,
-        tokenReceived: squatted.some((e) => e.tokenOk),
-        verdict,
-      };
-      // 定时刷新：不执行更新，等待 Surge 自己的下载（间隔没有写入文档）
+      // 定时刷新（先于显式更新）：不执行更新，等待 Surge 自己的下载（间隔没有写入文档）；从占用之前的起点核对
       const minutes = Number((await prompt.ask('等待 Surge 定时刷新的分钟数（0–30，直接回车跳过）：')) ?? '0');
       if (Number.isFinite(minutes) && minutes > 0) {
-        const stateS = initAudit(after, readAuditRecords(dir), auditMarkOf(dir));
-        const tW = now().getTime();
-        const deadline = tW + Math.min(minutes, 30) * 60_000;
+        const waitMs = Math.min(minutes, 30) * 60_000;
+        const deadline = now().getTime() + waitMs;
         let observed = false;
-        for (let i = 0; i < Math.ceil((Math.min(minutes, 30) * 60_000) / 5000) && now().getTime() <= deadline; i++) {
+        for (let i = 0; i < Math.ceil(waitMs / 5000) && now().getTime() <= deadline; i++) {
           await lb.snapshot();
-          if (requestsBetween(dir, tW, now().getTime() + 1000, 'squat').length > 0) {
+          // 只算这一种占用者收到的请求（上一种占用者在被停止之前收到的不是这一种的观察）
+          if (squatRequestsOf(mode, base.at, now().getTime() + 1000).own.length > 0) {
             observed = true;
             break;
           }
           await sleep(5000);
         }
-        const s1 = await lb.snapshot();
-        const v = observed ? auditResource({ snapshot: s1, state: stateS, records: readAuditRecords(dir), toleranceMs: DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS, serving: false, servedFailures: 0, mark: auditMarkOf(dir) }).verdict : null;
-        phase.scheduled = { observed, verdict: v };
+        phase.scheduled = { minutes: Math.min(minutes, 30), observed, result: observed ? observe(mode, base, base.at, await settle(base.before)) : null };
+        if (observed) {
+          // 显式更新要从已提交版本重新开始（定时刷新留下的变化不算显式更新的证据）：恢复，再次占用
+          await prompt.pause('停止占用者（Ctrl+C），重新启动 resource-server（同一运行编号），它启动之后按回车');
+          const server = readServerStatus(dir);
+          const back = serverRunning(server) && server.listening ? await lb.confirmCommitted(`squat-${mode}-between`) : null;
+          phase.between = { recovered: back?.assessment.ok === true };
+          if (!phase.between.recovered) {
+            out.warn(`${mode}：定时刷新之后没有恢复已提交版本（资源服务没有重新运行或读回不一致）：显式更新记为未测`);
+            continue;
+          }
+          base = await baseNow();
+          await prompt.pause(`在 resource-server 终端按 Ctrl+C 停止服务，然后再次运行 resource-server --squat ${mode}（同一运行编号）`);
+          if (!squatHolding(mode)) {
+            out.warn(`没有看到占用者（${mode}）再次占用 127.0.0.1:${lb.port}：显式更新记为未测`);
+            continue;
+          }
+        }
       }
+      // 显式更新：从占用之前的起点核对；更新之前占用者已收到请求（Surge 自己下载过）时这一次不单独计入
+      const tE = now().getTime();
+      await lb.update(`squat-${mode}`);
+      await lb.waitNotUpdating();
+      phase.explicit = observe(mode, base, tE, await settle(base.before));
     }
     await prompt.pause('停止占用者（Ctrl+C），重新启动 resource-server（同一运行编号）');
     const server = readServerStatus(dir);
@@ -308,11 +458,14 @@ export async function runLoopbackAuth(ctx: Ctx): Promise<ExitCode> {
     recovered = c.assessment.ok;
   }
 
-  const explicitPhases = phases.filter((p) => p.explicit !== null);
-  const expectVerdict = (p: SquatPhase): string => (p.mode === 'squat200' ? 'unexplained_fetch' : 'unexplained_error');
-  const squatExplicitOk = phases.length === 0 || explicitPhases.length < 2 ? null : explicitPhases.every((p) => p.explicit!.verdict === expectVerdict(p));
-  const scheduledRecorded = phases.length === 0 ? null : phases.some((p) => p.scheduled?.observed) ? true : null;
-  const checks = [
+  const squat = squatChecks(phases);
+  const otherUserOk = ((): boolean | null => {
+    if (otherUser === null) return null;
+    if (otherUser.sameUserSquatter || (otherUser.uid !== null && otherUser.uid === otherUser.ownUid)) return false;
+    if (otherUser.uid === null || otherUser.bindFailed === null || otherUser.received === null) return null;
+    return otherUser.bindFailed === true && otherUser.received === false && otherUser.reachedUs;
+  })();
+  const checks: CheckItem[] = [
     check(
       '令牌错误或缺失、带浏览器请求头或使用其他方法时一律得到同样的 404（产品处理程序）',
       uniform404 && validOk,
@@ -329,6 +482,11 @@ export async function runLoopbackAuth(ctx: Ctx): Promise<ExitCode> {
       !peerKnown ? null : peerIsSurge && peerRecovery.assessment.ok,
       `${!peerKnown ? 'lsof 读不到对端（只在 macOS 上记录）' : peers.map((p) => `${p.command}（${p.path ?? '路径读不到'}）`).join('、') || '没有找到对端进程'}；之后恢复 ${readbackText(peerRecovery.assessment)}`,
     ),
+    check(
+      '资源服务只监听 127.0.0.1（lsof 实测资源服务进程的监听地址）',
+      listenOnlyLoopback,
+      listen === null ? 'lsof 读不到资源服务进程的监听地址（只在 macOS 上记录）' : `监听 ${listen.join('、')}`,
+    ),
     check('服务运行时同一用户第二次绑定 127.0.0.1:端口失败', loopbackRebind.result === 'in_use', `127.0.0.1：${BIND_TEXT[loopbackRebind.result]}`),
     check(
       '能绑定成功的 0.0.0.0、[::]、[::1] 同端口监听不影响发往 127.0.0.1 的请求（以本服务请求记录为证）',
@@ -337,26 +495,41 @@ export async function runLoopbackAuth(ctx: Ctx): Promise<ExitCode> {
     ),
     check(
       '服务运行时另一系统用户第二次绑定 127.0.0.1:端口失败（操作员记录）',
-      otherUser === null ? null : otherUser.bindFailed === true && otherUser.received === false && otherUser.reachedUs ? true : otherUser.bindFailed === null || otherUser.received === null ? null : false,
-      otherUser === null ? '跳过（没有另一系统用户）' : `${otherUser.note || '没有照抄'}；收到连接 ${otherUser.received === null ? '未知' : otherUser.received ? '是' : '否'}；Surge 的下载${otherUser.reachedUs ? '到达本服务' : '没有到达本服务'}`,
+      otherUserOk,
+      otherUser === null
+        ? '跳过（没有另一系统用户）'
+        : [
+            `操作员照抄：${otherUser.note || '没有照抄'}`,
+            `uid ${otherUser.uid ?? '没有照抄'}${otherUser.uid !== null && otherUser.uid === otherUser.ownUid ? '（与本工具相同：不是另一系统用户）' : ''}`,
+            ...(otherUser.sameUserSquatter ? ['运行目录中出现了这一步期间启动的占用者记录（同一用户）'] : []),
+            `收到连接 ${otherUser.received === null ? '未知' : otherUser.received ? '是' : '否'}`,
+            `Surge 的下载${otherUser.reachedUs ? '到达本服务' : '没有到达本服务'}`,
+          ].join('；'),
     ),
     check(
-      '服务停止时端口被占用（显式更新）：后果已记录，产品的下载核对发现伪造列表与占用者造成的错误',
-      squatExplicitOk,
-      phases.length === 0 ? '跳过' : phases.map((p) => (p.explicit ? `${p.mode}：成员 ${p.explicit.members?.join('、') ?? '读不到'}，错误 ${p.explicit.error}，占用者收到 ${p.explicit.squatRequests} 个请求${p.explicit.tokenReceived ? '（带读取令牌）' : ''}，核对 ${p.explicit.verdict}` : `${p.mode}：未测`)).join('；'),
+      '服务停止时端口被占用（显式更新）：后果已记录，产品的下载核对发现伪造列表、占用者的错误与不答复（请求超时）',
+      squat.explicit,
+      phases.length === 0 ? '跳过' : phases.map((p) => `${p.mode}：${squatObservationText(p.explicit)}`).join('；'),
     ),
     check(
-      '服务停止时端口被占用（定时刷新）：后果已记录',
-      scheduledRecorded,
-      phases.length === 0 ? '跳过' : phases.map((p) => `${p.mode}：${p.scheduled === null ? '没有等待' : p.scheduled.observed ? `观察到 Surge 自己的下载，核对 ${p.scheduled.verdict ?? '—'}` : '等待期间没有下载'}`).join('；'),
+      '服务停止时端口被占用（定时刷新）：后果已记录，产品的下载核对发现伪造列表、占用者的错误与不答复（请求超时）',
+      squat.scheduled,
+      phases.length === 0
+        ? '跳过'
+        : phases.map((p) => `${p.mode}：${p.scheduled === null ? '没有等待' : p.scheduled.observed ? `观察到 Surge 自己的下载，${squatObservationText(p.scheduled.result)}` : `等待 ${p.scheduled.minutes} 分钟没有下载`}`).join('；'),
     ),
-    check('Surge 资源缓存的位置及其中凭据的保存方式已记录', cacheLocation !== '' && (cachePlain === 'y' || cachePlain === 'n') ? true : null, cacheLocation ? `${cacheLocation}；明文 ${cachePlain === 'y' ? '是' : cachePlain === 'n' ? '否' : '未知'}` : '没有记录'),
+    check(
+      'Surge 资源缓存的位置及其中凭据的保存方式已记录（操作员记录）',
+      cacheLocation !== '' && (cachePlain === 'y' || cachePlain === 'n') ? true : null,
+      cacheLocation ? `操作员记录：${cacheLocation}；明文 ${cachePlain === 'y' ? '是' : cachePlain === 'n' ? '否' : '未知'}` : '没有记录',
+    ),
     check('之后重新提供已提交版本，一次单 key 更新并读回一致', recovered, recovered === null ? '没有运行' : recovered ? '读回一致' : '读回不一致或服务没有重新运行'),
   ];
   dir.writeJson(`loopback-auth/${t0}.json`, {
     probes: results.map((r) => ({ id: r.id, expect: r.expect, status: r.status, length: r.bytes.length, sameAsReference: r.expect === 404 ? r.bytes.equals(reference) : null })),
     unavailable,
     surge: { downloads: fromSurge.length, methods, headerNames, peers },
+    listen,
     binds,
     altRouting,
     otherUser,
@@ -369,7 +542,11 @@ export async function runLoopbackAuth(ctx: Ctx): Promise<ExitCode> {
     command: 'loopback-auth',
     at: now().toISOString(),
     checks,
-    summary: [`通过条件：${CAPABILITY_CRITERIA.loopback_resource_auth}`, `资源服务只监听 127.0.0.1（产品的 tcpBinder）；端口 ${lb.port}`],
+    summary: [
+      `通过条件：${CAPABILITY_CRITERIA.loopback_resource_auth}`,
+      `资源服务的监听地址（lsof 实测）：${listen === null ? '读不到' : listen.join('、')}；端口 ${lb.port}`,
+      '另一系统用户的绑定结果与 Surge 资源缓存的位置由操作员照抄或记录（检查项已注明）',
+    ],
     context,
   });
   printResult(out, result);

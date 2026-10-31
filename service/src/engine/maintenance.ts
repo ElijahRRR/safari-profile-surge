@@ -76,6 +76,7 @@ import {
   classifyGroupLine,
   committedNodeNames,
   createEngineResourceHost,
+  ensureListeningBeforeInit,
   findOurResource,
   generalPorts,
   listenOnNewPort,
@@ -86,6 +87,7 @@ import {
   resourceErrorOf,
   serveCommittedGeneration,
   serveCommittedOn,
+  SYSTEM_REFRESH_KEY,
 } from './node-resource.js';
 import { registerInitialObjects, segmentDigest, SEGMENT_KIND, type SegmentName } from './ownership.js';
 import { unmeasuredFrom } from './capabilities.js';
@@ -206,6 +208,8 @@ function entryFiles(engine: Engine): Map<string, string> | null {
 
 async function buildInitPlan(engine: Engine, req: InitPreviewRequest): Promise<InitPlan> {
   const keys = await engine.keys();
+  // 尚未初始化：已选定的端口被其他程序占用时改选一个（地址还没有写进任何配置）
+  await ensureListeningBeforeInit(engine);
   const { host, url, port } = requireResourceHost(engine, '初始化');
   await engine.readBasicFacts();
   if (!engine.facts.reachable) throw new SfeError('SURGE_UNREACHABLE', '初始化失败：无法连接 Surge');
@@ -916,7 +920,8 @@ async function discardRotation(engine: Engine, r: { oldHost: ResourceHost; host:
 
 /**
  * 提交更换（工作配置已写入并已重载）：一个事务记下新令牌引用与端口、清除令牌可疑、要求刷新，并删除旧资源的审计状态（新地址在
- * Surge 中是新的资源，第一次审计按它初始化）；之后换上新的资源服务（旧的关闭，旧地址的请求再也得不到 200）、删除旧令牌的值。
+ * Surge 中是新的资源，第一次审计按它初始化），删除令牌可疑期间停泊的系统刷新的记录；之后换上新的资源服务（旧的关闭，旧地址的
+ * 请求再也得不到 200）、删除旧令牌的值。
  */
 async function commitRotation(engine: Engine, op: OperationRecord, r: PreparedRotation): Promise<void> {
   const { repos, kv } = engine;
@@ -927,6 +932,8 @@ async function commitRotation(engine: Engine, op: OperationRecord, r: PreparedRo
       writeTokenSuspect(kv, null);
       writeAuditState(kv, null);
       if (readNeedsRefresh(kv) === null) writeNeedsRefresh(kv, { generation: readServedPointer(kv)?.committed.generation ?? 0, reason: 'rotate' });
+      // 令牌可疑期间排入的系统刷新停泊在 token_suspect：删除它的记录，之后需要时可以重新自动排入（新地址由排入的强制刷新发布核对）
+      kv.delete(SYSTEM_REFRESH_KEY);
     });
   } catch (err) {
     await discardRotation(engine, r);
@@ -942,7 +949,7 @@ async function commitRotation(engine: Engine, op: OperationRecord, r: PreparedRo
     engine.log('warn', 'resource.old_token_delete_failed');
   }
   engine.log('info', 'resource.rotated');
-  engine.step(op.id, '已更换本机资源地址：新的读取令牌与端口已生效，旧地址的请求一律得到 404');
+  engine.step(op.id, '已更换本机资源地址：新的读取令牌与端口已生效；旧端口不再监听，旧读取令牌在新地址一律得到 404');
 }
 
 // ---------- 旧的本地节点文件 ----------
@@ -950,18 +957,31 @@ async function commitRotation(engine: Engine, op: OperationRecord, r: PreparedRo
 /**
  * 删除 D7 留下的本地节点文件之前的读回（只读 Surge）：回环地址上恰好一个节点组资源且就是本服务当前地址的远端资源、没有
  * 资源错误且已下载、SFE-ROUTE 成员等于已提交版本，并且 Surge 不再载入任何 sfe-nodes.list 文件。返回不满足的原因；满足为 null。
+ * 同一配置重载之后新地址的资源不会立即登记、下载也需要时间（2026-10-25 回环矩阵）：在 resourceUpdateWait 的时限内等它登记、
+ * 不在更新中且已下载，再下结论。
  */
 async function legacyCleanupReadback(engine: Engine): Promise<string | null> {
   const url = engine.resourceUrl();
   if (url === null) return '本机资源服务地址未知';
   if (!engine.facts.reachable || engine.facts.onWorkingProfile !== true) return 'Surge 不可达或当前配置不是工作配置';
+  const { timeoutMs, pollMs } = engine.resourceUpdateWait();
+  const started = engine.now().getTime();
   let list: SurgeExternalResource[];
-  try {
-    list = await engine.surge.listExternalResources();
-  } catch {
-    return '读取外部资源失败';
+  let found: ReturnType<typeof findOurResource>;
+  for (;;) {
+    try {
+      list = await engine.surge.listExternalResources();
+    } catch {
+      return '读取外部资源失败';
+    }
+    found = findOurResource(list, url);
+    const settled = found.resource !== null && found.resource.updating !== true && resourceErrorOf(found.resource) === null;
+    const elapsed = engine.now().getTime() - started;
+    if (settled || found.problem === 'resource_ambiguous' || found.problem === 'resource_foreign' || elapsed >= timeoutMs) break;
+    await new Promise<void>((done) => {
+      engine.clock.setTimeout(done, Math.max(1, Math.min(pollMs, timeoutMs - elapsed)));
+    });
   }
-  const found = findOurResource(list, url);
   // 回环地址上的节点组资源恰好一个且就是本服务的（回环地址上的规则集不能为 SFE-ROUTE 提供节点，不计）
   const loopback = list.filter((r) => r.type === 'policy-group' && loopbackPortOfLocation(r.location) !== null);
   if (found.resource === null || loopback.length !== 1) return 'Surge 中指向本机资源服务的节点组资源不是恰好一个';
@@ -1024,7 +1044,7 @@ async function cleanupLegacyResourceFile(engine: Engine, op: OperationRecord): P
     return;
   }
   scrub();
-  engine.step(op.id, '已删除旧的本地节点文件 sfe-nodes.list（其中的买家代理凭据不再留在 Surge 配置目录中）');
+  engine.step(op.id, '已删除旧的本地节点文件 sfe-nodes.list；Surge 自己缓存的节点资源中仍有已部署代理的凭据（缓存位置待 P0 loopback_resource_auth 记录）');
 }
 
 // ---------- 执行 ----------

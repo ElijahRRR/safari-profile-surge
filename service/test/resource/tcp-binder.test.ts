@@ -4,7 +4,7 @@ import { request as httpRequest } from 'node:http';
 import { connect } from 'node:net';
 import { afterEach, describe, expect, test } from 'vitest';
 import { RESOURCE_PORT_MAX, RESOURCE_PORT_MIN, SfeError } from '@sfe/contract';
-import { createResourceHost, tcpBinder, type ResourceAuditRecord, type ResourceHost } from '../../src/resource/index.js';
+import { auditResource, createResourceHost, resourceLocationHash, servedFailureCount, tcpBinder, type ResourceAuditRecord, type ResourceHost } from '../../src/resource/index.js';
 import { FakeClock } from '../../src/util/clock.js';
 import { OTHER_TOKEN, PATH, TOKEN, recordingLogger, sampleContent } from './helpers.js';
 
@@ -190,7 +190,11 @@ describe('tcpBinder on 127.0.0.1', () => {
     expect(rejectedFirst.data.match(/HTTP\/1\.1 /g)).toHaveLength(1);
     expect(rejectedFirst.data.startsWith('HTTP/1.1 404 ')).toBe(true);
     expect(host.audit()).toHaveLength(1);
-    expect(host.failureCounters()).toEqual({ path: 1 });
+    // 拒绝原因只有第一个请求的 path；后续请求只记为连接层面的失败（不答复、不产生审计记录）
+    const counters = host.failureCounters();
+    expect(Object.keys(counters).filter((k) => !k.startsWith('conn_'))).toEqual(['path']);
+    expect(counters.path).toBe(1);
+    expect(counters.conn_pipelined ?? 0).toBeGreaterThanOrEqual(1);
   });
 
   test('regression: CONNECT gets the same uniform 404 bytes as other methods (counted as method), never a silent drop', async () => {
@@ -216,6 +220,44 @@ describe('tcpBinder on 127.0.0.1', () => {
     const huge = await raw(port, `GET ${PATH} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nX-Pad: ${'p'.repeat(9000)}\r\n\r\n`);
     expect(huge.closed).toBe(true);
     expect(huge.data).toBe('');
+  });
+
+  test('regression: connections dropped over the connection limit are counted as our failures, so an audit while serving explains the resulting -1005', async () => {
+    const { host, port } = await listeningHost();
+    const before = servedFailureCount(host.failureCounters());
+    // 另一个本机账户占满连接数上限（16 条空闲连接）：之后接受的连接被立即关闭，请求从不交给处理程序
+    const idle: Array<ReturnType<typeof connect>> = [];
+    try {
+      for (let i = 0; i < 16; i++) {
+        const s = connect({ host: '127.0.0.1', port });
+        s.on('error', () => undefined);
+        await new Promise<void>((resolve) => s.once('connect', () => resolve()));
+        idle.push(s);
+      }
+      await new Promise((r) => setTimeout(r, 50));
+      const dropped = await raw(port, `GET ${PATH} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+      expect(dropped.closed).toBe(true);
+      expect(dropped.data).toBe('');
+      await eventually(() => (host.failureCounters().conn_dropped ?? 0) >= 1);
+    } finally {
+      for (const s of idle) s.destroy();
+    }
+    expect(host.audit()).toEqual([]);
+    const failures = servedFailureCount(host.failureCounters()) - before;
+    expect(failures).toBeGreaterThanOrEqual(1);
+    // 这次被断开的下载在 Surge 中是连接中断（-1005）：本服务一直监听时由这个计数解释，不设 tokenSuspect
+    const url = `http://127.0.0.1:${port}${PATH}`;
+    const snapshot = { key: 'k', locationHash: resourceLocationHash(url), updatedAt: new Date('2026-10-31T00:00:00.000Z'), error: 'NSURLErrorDomain -1005', updating: false, members: null, selection: null };
+    const state = { verifiedUpdatedAt: '2026-10-31T00:00:00.000Z', verifiedError: null, auditedSeq: 0, windowSeq: 0 };
+    expect(auditResource({ snapshot, state, records: host.audit(), toleranceMs: 5000, serving: true, servedFailures: failures, mark: host.auditMark() }).verdict).toBe('ok');
+    expect(auditResource({ snapshot, state, records: host.audit(), toleranceMs: 5000, serving: true, servedFailures: 0, mark: host.auditMark() }).verdict).toBe('unexplained_error');
+  });
+
+  test('connection-level failures are counted: unparsable requests (client_error) and pipelined requests', async () => {
+    const { host, port } = await listeningHost();
+    await raw(port, 'NOT A REQUEST\r\n\r\n');
+    await eventually(() => (host.failureCounters().conn_client_error ?? 0) === 1);
+    expect(host.audit()).toEqual([]);
   });
 
   test('does not listen on the IPv6 loopback', async () => {

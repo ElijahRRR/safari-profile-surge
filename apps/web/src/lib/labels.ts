@@ -274,9 +274,16 @@ export const NODE_RESOURCE_STATE_DETAILS: Record<NodeResourceState, string> = {
 export const NODE_RESOURCE_TOKEN_SUSPECT_TEXT =
   '读取令牌可能已泄露（出现了无法解释的下载或资源错误，或端口曾被其他程序占用）：发布暂停，只能经重新合并并勾选“更换本机资源地址”清除。';
 
-/** Surge 中的节点可能不是已提交版本时的说明（NodeResourceStatusView.needsRefresh）。 */
+/**
+ * Surge 中的节点可能不是已提交版本时的说明（NodeResourceStatusView.needsRefresh）。只在本机资源服务满足发布前提（正在提供、
+ * 令牌不可疑）时使用；否则发布停泊、服务也不会自动同步，改用 NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT。
+ */
 export const NODE_RESOURCE_NEEDS_REFRESH_TEXT =
-  'Surge 中的节点可能不是已提交的版本：下一次发布会对本应用这一项资源执行一次单 key 更新并读回。服务只自动发起一次同步，停在待部署或失败后不会自动重试。';
+  'Surge 中的节点可能不是已提交的版本：下一次发布会对本应用这一项资源执行一次单 key 更新并读回。服务自动发起一次同步（同步本身因服务中断而失败时再自动重试一次）；停在待部署或其他失败后不会自动重试，需要时请点「重新同步节点资源」。';
+
+/** 同上，但本机资源服务不满足发布前提（例如仍引用本地节点文件、未监听或令牌可疑）：在原因消除之前不会同步。 */
+export const NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT =
+  'Surge 中的节点可能不是已提交的版本：在发布暂停的原因消除之前（例如经重新合并改用本机资源服务、更换资源地址），发布与自动同步都不会进行，也不会自动重试。';
 
 export const TAKEOVER_OUTBOUND_LABELS: Record<'rule' | 'direct' | 'proxy', string> = {
   rule: '规则模式',

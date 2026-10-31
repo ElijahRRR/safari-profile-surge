@@ -77,8 +77,8 @@
 - [ ] 另开终端 `resource-server`（缺省端口 18084，被占用时用 `--port N`），全程保持运行；读取令牌只在运行目录的 0600 文件中，不要复制或贴进任何地方。
 - [ ] `loopback --setup`：工具只改写「SFE-P0-测试」中受管理的 SFE-ROUTE 一行为回环地址；按提示在 Surge 中**手动**「重新加载配置」一次，等工具确认 Surge 已登记这项资源。记录加载的时间。
 - [ ] `loopback`（3.10）：主配置见证（每次更新后的阴性检查与最后一次手动加载的阳性对照）与场景矩阵；记录资源 key 的形式判定（是否 32 位十六进制、是否含地址或令牌——不记 key 本身）与 `updateExternalResource` 实际用的实现（key 含令牌时必须是 http）。
-- [ ] `loopback-auth`（3.11）：拒绝规则、Surge 下载的请求头名称与发起进程、同一用户的绑定；按 U7 用另一个系统用户运行工具打印的 `resource-server --squat …` 命令；服务停止时的占用（`squat200`、`squat404`，显式更新与定时刷新）与下载核对；手动记录 Surge 资源缓存的位置。
-- [ ] `loopback-restart --phase prepare`，按提示退出重开 Surge（或按 U6 重启 Mac）后 `--phase after-surge-restart` / `--phase after-mac-restart`（3.12）：服务先于、晚于 Surge 启动，服务不可用，只返回 503，以及已暂存候选各一轮。
+- [ ] `loopback-auth`（3.11）：拒绝规则、Surge 下载的请求头名称与发起进程、同一用户的绑定；按 U7 用另一个系统用户运行工具打印的 `resource-server --squat …` 命令；服务停止时的占用（`squat200`、`squat404`、`squatHang`，每种先等定时刷新、再显式更新）与下载核对；手动记录 Surge 资源缓存的位置。
+- [ ] `loopback-restart --phase prepare`，按提示退出重开 Surge（或按 U6 重启 Mac）后 `--phase after-surge-restart` / `--phase after-mac-restart`（3.12）：服务先于、晚于 Surge 启动，服务不可用，只返回 503，以及已暂存候选各一轮。结果中的「重开后缓存不存在时，本服务答复失败的下载在资源错误中可见」不通过时（Surge 把下载错误藏在未就绪之后），`resourceServe` 保持关闭，记录下来交给用户决定。
 - [ ] `loopback-crash`（3.13）：提供候选后、更新进行中、响应中途中断服务，以及更新进行中再次更新；记录同一提交的 `npx vitest run service/test` 结果（发布互斥、启动顺序、崩溃恢复由自动化测试覆盖）。
 - **通过**：四项结论都是“通过”。
 - **停下**：任何一次 Surge 载入了测试服务没有提交的内容、加载了磁盘上未加载的主配置、或发生引擎重启；或某次更新的结果不明（先读状态，不重放），把原始结论交给开发者。**不要**用重载、update all 或本地文件补救。

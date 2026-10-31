@@ -1,9 +1,9 @@
 // resource-server：在 127.0.0.1 启动测试资源服务（D10），保持运行（Ctrl+C 停止）。处理程序就是产品的 createResourceHost，
 // 绑定方是产品的 tcpBinder；读取令牌由工具生成并只保存在运行目录的 0600 文件中（从不作为参数、从不打印）。提供哪一代内容与
 // 故障场景由其他命令原子写入的状态文件决定；--scenario 只设启动时的场景（封闭集合）。
-// --squat squat200|squat404：端口占用者（loopback-auth 第 4、5 步）。只在端口空闲时绑定 127.0.0.1，对任何请求答复伪造的列表
-// 或 404；127.0.0.1 被占用时另试同端口的 0.0.0.0、[::]、[::1] 并计数收到的连接。另一系统用户运行时读不到本运行目录：只打印
-// uid、绑定结果与收到的请求数。
+// --squat squat200|squat404|squatHang：端口占用者（loopback-auth 第 4、5 步）。只在端口空闲时绑定 127.0.0.1，对任何请求答复
+// 伪造的列表、404，或收下请求后只写出响应头、不发送内容（Surge 等到请求超时）；127.0.0.1 被占用时另试同端口的 0.0.0.0、[::]、
+// [::1] 并计数收到的连接。另一系统用户运行时读不到本运行目录：只打印 uid、绑定结果与收到的请求数。
 
 import { randomBytes } from 'node:crypto';
 import { DEFAULT_RESOURCE_PORT, SERVER_LOGS } from '../constants.js';
@@ -110,7 +110,7 @@ export async function runResourceServer(ctx: Ctx, waitForStop: () => Promise<voi
 
 async function runSquat(ctx: Ctx, mode: SquatMode, waitForStop: () => Promise<void>): Promise<ExitCode> {
   const { out, now } = ctx.deps;
-  if (!(SQUAT_MODES as readonly string[]).includes(mode)) throw usage('参数检查失败：--squat 只能是 squat200、squat404');
+  if (!(SQUAT_MODES as readonly string[]).includes(mode)) throw usage(`参数检查失败：--squat 只能是 ${SQUAT_MODES.join('、')}`);
   // 另一系统用户读不到本次运行目录：只在终端报告（uid、绑定结果、收到的请求数）
   let dir: RunDir | null = null;
   let loopbackPort: number | null = null;
@@ -156,7 +156,7 @@ async function runSquat(ctx: Ctx, mode: SquatMode, waitForStop: () => Promise<vo
   out.heading(`端口占用者（${mode}）· uid ${uid}`);
   out.table([['地址', '绑定结果'], ...squat.binds.map((b) => [`${b.address.includes(':') ? `[${b.address}]` : b.address}:${port}`, BIND_TEXT[b.result]])]);
   if (!squat.holdsLoopback) out.line(`127.0.0.1:${port} 已被占用（预期：资源服务在运行）；其余地址中绑定成功的保持监听，收到的连接会在这里打印。`);
-  else out.line(mode === 'squat200' ? '已占用端口：对任何请求答复伪造的节点列表（合成数据）。' : '已占用端口：对任何请求答复 404。');
+  else out.line(SQUAT_TEXT[mode]);
   if (!dir) out.line('读不到本次运行目录（另一系统用户）：结束时把 uid、绑定结果与收到的连接数照抄到 loopback-auth 的提示中。');
   out.line('按 Ctrl+C 停止占用。');
   await waitForStop();
@@ -168,6 +168,12 @@ async function runSquat(ctx: Ctx, mode: SquatMode, waitForStop: () => Promise<vo
   out.line(`占用者已停止：uid ${uid}，收到 ${squat.requests()} 个连接。`);
   return 0;
 }
+
+const SQUAT_TEXT: Record<SquatMode, string> = {
+  squat200: '已占用端口：对任何请求答复伪造的节点列表（合成数据）。',
+  squat404: '已占用端口：对任何请求答复 404。',
+  squatHang: '已占用端口：收下任何请求（含读取令牌）后只写出响应头、不发送内容，Surge 等到请求超时。',
+};
 
 const BIND_TEXT: Record<SquatBindResult['result'], string> = {
   bound: '绑定成功',

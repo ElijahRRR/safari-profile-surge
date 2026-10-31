@@ -12,11 +12,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { parseArgs } from '../src/args.js';
 import { main } from '../src/cli.js';
 import type { Ctx, Deps } from '../src/commands/common.js';
+import type { RestartObservation } from '../src/commands/loopback-restart.js';
 import { runResourceServer } from '../src/commands/resource-server.js';
 import { runTestServers } from '../src/commands/test-servers.js';
 import { EXIT } from '../src/errors.js';
 import { createMemoryOutput, createScriptedPrompter, type Prompter } from '../src/io.js';
-import { readAuditRecords, readResourceLog, readServed, readServerStatus } from '../src/loopback-state.js';
+import { readAuditRecords, readResourceLog, readServed, readServerStatus, requestsBetween } from '../src/loopback-state.js';
 import type { CapabilityResult } from '../src/results.js';
 import { RunDir } from '../src/run-dir.js';
 import { loadState, saveState } from '../src/state.js';
@@ -171,6 +172,14 @@ export async function setupLoopback(e: LoopbackEnv): Promise<void> {
   expect(await main(['loopback', '--setup', ...e.common()], d), d.out.text()).toBe(EXIT.OK);
 }
 
+/** lsof 实测监听地址的替身：资源服务（同一进程）只监听 127.0.0.1:<端口>；其他命令读不到。 */
+function lsofListen(e: LoopbackEnv, names?: string[]) {
+  return async (file: string, args: readonly string[]) =>
+    file === '/usr/sbin/lsof' && args.includes('-sTCP:LISTEN') && args.includes(String(process.pid))
+      ? { stdout: `p${process.pid}\nf12\n${(names ?? [`127.0.0.1:${e.resourcePort}`]).map((n) => `n${n}`).join('\n')}\n`, stderr: '', code: 0 }
+      : { stdout: '', stderr: '', code: -1 };
+}
+
 function result(key: CapabilityKey): CapabilityResult {
   return env!.run().readJson<CapabilityResult>(`results/${key}.json`)!;
 }
@@ -266,11 +275,32 @@ describe('loopback (loopback_resource_update)', () => {
     expect(evidence.rows.map((x) => x.id)).toContain('headerOnly');
     expect(evidence.rows.find((x) => x.id === 'validAbBadC')!.readback.failed).toContain('members');
     expect(evidence.rows.find((x) => x.id === 'paramReplaceC')!.readback.failed).toContain('detail:SFE-N-P0-C');
+    // 同名替换的服务器、端口与前置都由 getPolicyDetail 读到新值
+    expect((evidence.rows.find((x) => x.id === 'paramReplaceC') as unknown as { detailC: unknown }).detailC).toEqual({ server: '192.0.2.33', port: 9, underlyingProxy: 'P0-Front-Dead' });
     // 阳性对照与改回原编号各一次手动重新加载（加上接入时的一次）
     expect(e.surge.reloadCount).toBe(3);
     expect(await e.surge.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', TEST_NODES.a, TEST_NODES.b]);
     expect(await e.surge.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
     expect(readServed(e.run())!.scenario).toBe('ok');
+  }, 60_000);
+
+  it('regression: other resources changed by the manual reloads of the positive control are recorded, not blamed on the single-key updates', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    // 另一个外部资源（例如用户配置中的远端规则集）在每次整体重新加载时被刷新
+    const reloadsBefore = e.surge.reloadCount;
+    const list = e.surge.listExternalResources.bind(e.surge);
+    e.surge.listExternalResources = async () => {
+      const other = { key: 'ffffffffffffffffffffffffffffffff', type: 'ruleset', location: 'https://rules.example.test/x.list', locationHash: 'h', lastUpdatedAt: new Date(1_000 + (e.surge.reloadCount - reloadsBefore) * 1000), error: null, local: false, updating: false, fromModule: null };
+      return [...(await list()), other] as never;
+    };
+    const d = e.deps();
+    expect(await main(['loopback', ...e.common()], d)).toBe(EXIT.OK);
+    const r = result('loopback_resource_update');
+    expect(e.surge.reloadCount - reloadsBefore).toBe(2);
+    expect(r.checks.find((c) => c.name === '其他外部资源不变')?.ok).toBe(true);
+    expect(r.summary.join('\n')).toContain('重新加载的影响');
+    expect(r.verdict).toBe('pass');
   }, 60_000);
 
   it('fails the kept-on-failure check when Surge drops the old resource after a failed download', async () => {
@@ -378,20 +408,30 @@ describe('loopback-auth (loopback_resource_auth)', () => {
       await squat.done;
       squat = null;
     };
+    const firstSquat = new Set<string>();
     const onPause = async (m: string): Promise<void> => {
-      const mode = /--squat (squat200|squat404)/.exec(m)?.[1];
+      const mode = /--squat (squat200|squat404|squatHang)/.exec(m)?.[1];
       if (mode) {
         await stopSquat();
         await e.stopResourceServer();
         squat = await e.startResourceServer(['--squat', mode]);
+        // Surge 的定时刷新随时可能发生：每种占用者第一次启动后立即来一次（在工具开始等待之前）。工具的起点必须在占用之前读，
+        // 否则这一次下载会被当作起点的一部分而核对不出来
+        if (!firstSquat.has(mode)) {
+          firstSquat.add(mode);
+          e.surge.remoteRefreshIntervalMs = 1;
+          await new Promise((r) => setTimeout(r, 5));
+          await e.surge.listExternalResources();
+          e.surge.remoteRefreshIntervalMs = null;
+        }
       } else if (m.includes('重新启动 resource-server')) {
         await stopSquat();
         e.surge.remoteRefreshIntervalMs = null;
         await e.startResourceServer();
       }
     };
-    const answers = ['yes', 'uid 502：127.0.0.1 绑定失败', 'y', 'n', 'yes', '1', '1', '~/Library/Caches/example（0600）', 'y'];
-    const d = e.deps({ answers, onPause });
+    const answers = ['yes', 'uid 502：127.0.0.1 绑定失败', 'y', 'n', 'yes', '1', '1', '1', '~/Library/Caches/example（0600）', 'y'];
+    const d = { ...e.deps({ answers, onPause }), exec: lsofListen(e) };
     const ask = d.prompt.ask.bind(d.prompt);
     d.prompt.ask = async (q: string) => {
       // 等待定时刷新时打开 Surge 自己的刷新（下一次调用即刷新）；显式更新之前保持关闭
@@ -409,20 +449,140 @@ describe('loopback-auth (loopback_resource_auth)', () => {
     expect(failing, JSON.stringify(failing, null, 1)).toEqual([]);
     expect(r.verdict).toBe('pass');
     const ev = e.run().listFiles('loopback-auth')[0]!;
-    const evidence = e.run().readJson<{ probes: Array<{ id: string; status: number }>; phases: Array<{ mode: string; explicit: { verdict: string; tokenReceived: boolean } }> }>(ev)!;
+    type Obs = { verdict: string; tokenReceived: boolean; error: string };
+    const evidence = e.run().readJson<{ probes: Array<{ id: string; status: number }>; listen: string[]; phases: Array<{ mode: string; explicit: Obs; scheduled: { observed: boolean; result: Obs }; between: { recovered: boolean } }> }>(ev)!;
     expect(evidence.probes.filter((p) => p.id !== 'valid').every((p) => p.status === 404)).toBe(true);
+    expect(evidence.listen).toEqual([`127.0.0.1:${e.resourcePort}`]);
     expect(evidence.phases.map((p) => [p.mode, p.explicit.verdict])).toEqual([
       ['squat200', 'unexplained_fetch'],
       ['squat404', 'unexplained_error'],
+      ['squatHang', 'unexplained_error'],
     ]);
+    // 定时刷新先于显式更新、从占用之前的状态核对：每一种都必须被核对发现（只“观察到下载”不算）
+    expect(evidence.phases.map((p) => [p.mode, p.scheduled.observed, p.scheduled.result.verdict])).toEqual([
+      ['squat200', true, 'unexplained_fetch'],
+      ['squat404', true, 'unexplained_error'],
+      ['squatHang', true, 'unexplained_error'],
+    ]);
+    expect(evidence.phases.every((p) => p.between.recovered)).toBe(true);
+    // 不答复的占用者让 Surge 等到请求超时（服务没有在监听：按无法解释处理）
+    expect(evidence.phases.find((p) => p.mode === 'squatHang')!.explicit.error).toBe('超时（-1001）');
     // 占用者拿到了读取令牌（令牌不认证服务端）：这正是要记录的后果
-    expect(evidence.phases.every((p) => p.explicit.tokenReceived)).toBe(true);
+    expect(evidence.phases.every((p) => p.explicit.tokenReceived && p.scheduled.result.tokenReceived)).toBe(true);
     const token = (e.run().readText('resource-token') ?? '').trim();
     expect(d.out.text()).not.toContain(token);
     expect(filesContaining(e, token)).toEqual([]);
     expect(e.surge.updateAllAttempts).toBe(0);
     expect(readServed(e.run())!.probePeers).toBe(false);
   }, 60_000);
+
+  it('regression: a Surge download answered by the previous squatter (before the operator swaps squatters) is not counted as the next mode\'s observation', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    let squat: ResourceProc | null = null;
+    let currentMode: string | null = null;
+    const stopSquat = async (): Promise<void> => {
+      if (!squat) return;
+      squat.stop();
+      await squat.done;
+      squat = null;
+    };
+    const refreshNow = async (): Promise<void> => {
+      e.surge.remoteRefreshIntervalMs = 1;
+      await new Promise((r) => setTimeout(r, 5));
+      await e.surge.listExternalResources();
+      e.surge.remoteRefreshIntervalMs = null;
+    };
+    const started = new Set<string>();
+    const onPause = async (m: string): Promise<void> => {
+      const mode = /--squat (squat200|squat404|squatHang)/.exec(m)?.[1];
+      if (mode) {
+        currentMode = mode;
+        // 换到 squatHang 之前：Surge 的刷新落在还没停止的 squat404 占用者上
+        if (mode === 'squatHang' && squat && !started.has(mode)) await refreshNow();
+        await stopSquat();
+        await e.stopResourceServer();
+        squat = await e.startResourceServer(['--squat', mode]);
+        if (!started.has(mode)) {
+          started.add(mode);
+          if (mode !== 'squatHang') await refreshNow();
+        }
+      } else if (m.includes('重新启动 resource-server')) {
+        await stopSquat();
+        e.surge.remoteRefreshIntervalMs = null;
+        await e.startResourceServer();
+      }
+    };
+    const answers = ['yes', 'uid 502：127.0.0.1 绑定失败', 'y', 'n', 'yes', '1', '1', '1', '~/Library/Caches/example（0600）', 'y'];
+    const d = { ...e.deps({ answers, onPause }), exec: lsofListen(e) };
+    const ask = d.prompt.ask.bind(d.prompt);
+    d.prompt.ask = async (q: string) => {
+      // squatHang 的等待期间 Surge 没有再刷新：这一种占用者在显式更新之前没有收到任何请求
+      if (q.includes('定时刷新') && currentMode !== 'squatHang') e.surge.remoteRefreshIntervalMs = 1;
+      return ask(q);
+    };
+    const pause = d.prompt.pause.bind(d.prompt);
+    d.prompt.pause = async (m: string) => {
+      e.surge.remoteRefreshIntervalMs = null;
+      return pause(m);
+    };
+    expect(await main(['loopback-auth', ...e.common()], d)).toBe(EXIT.OK);
+    const squatLog = readResourceLog(e.run()).filter((x) => x.kind === 'request' && x.role === 'squat') as Array<{ scenario: string }>;
+    // 前提：squatHang 开始之前确实有一次下载落在了 squat404 占用者上
+    expect(squatLog.filter((x) => x.scenario === 'squat404').length).toBeGreaterThanOrEqual(3);
+    const r = result('loopback_resource_auth');
+    const scheduled = r.checks.find((c) => c.name.startsWith('服务停止时端口被占用（定时刷新）'))!;
+    const explicit = r.checks.find((c) => c.name.startsWith('服务停止时端口被占用（显式更新）'))!;
+    // squatHang 的定时刷新没有观察到（只算这一种占用者的请求），显式更新被上一种占用者的下载污染：都记为未测，从不判为不通过
+    expect(scheduled.ok).toBeNull();
+    expect(explicit.ok).toBeNull();
+    const ev = e.run().listFiles('loopback-auth')[0]!;
+    const evidence = e.run().readJson<{ phases: Array<{ mode: string; scheduled: { observed: boolean } | null; explicit: { earlierRequests: number } | null }> }>(ev)!;
+    const hang = evidence.phases.find((p) => p.mode === 'squatHang')!;
+    expect(hang.scheduled?.observed).toBe(false);
+    expect(hang.explicit!.earlierRequests).toBeGreaterThan(0);
+    expect(r.verdict).not.toBe('fail');
+  }, 60_000);
+
+  it('regression: an "other user" whose copied uid is ours is not a pass, and a listen address other than 127.0.0.1 fails the measured listen check', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    const own = process.getuid?.() ?? 0;
+    const d = { ...e.deps({ answers: ['yes', `uid ${own}：127.0.0.1 绑定失败`, 'y', 'n'] }), exec: lsofListen(e, [`127.0.0.1:${e.resourcePort}`, `*:${e.resourcePort}`]) };
+    expect(await main(['loopback-auth', ...e.common()], d)).toBe(EXIT.OK);
+    const r = result('loopback_resource_auth');
+    const other = r.checks.find((c) => c.name.startsWith('服务运行时另一系统用户'))!;
+    expect(other.ok).toBe(false);
+    expect(other.note).toContain('与本工具相同');
+    expect(other.note).toContain('操作员照抄');
+    const listen = r.checks.find((c) => c.name.startsWith('资源服务只监听 127.0.0.1'))!;
+    expect(listen.ok).toBe(false);
+    expect(listen.note).toContain(`*:${e.resourcePort}`);
+    expect(r.checks.find((c) => c.name.startsWith('Surge 资源缓存'))!.name).toContain('（操作员记录）');
+    expect(r.verdict).toBe('fail');
+  });
+
+  it('regression: a same-user squatter that wrote to the run directory during the other-user step is not a pass', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    let squat: ResourceProc | null = null;
+    const d = { ...e.deps({ answers: ['uid 502：127.0.0.1 绑定失败', 'y', 'n'] }), exec: lsofListen(e) };
+    const ask = d.prompt.ask.bind(d.prompt);
+    d.prompt.ask = async (q: string) => {
+      if (!q.includes('另一系统用户的占用程序已在运行吗')) return ask(q);
+      // 操作员误用同一用户运行占用者：它绑定 127.0.0.1 失败，但能写本运行目录
+      squat = await e.startResourceServer(['--squat', 'squat404']);
+      return 'yes';
+    };
+    expect(await main(['loopback-auth', ...e.common()], d)).toBe(EXIT.OK);
+    if (squat) {
+      (squat as ResourceProc).stop();
+      await (squat as ResourceProc).done;
+    }
+    const other = result('loopback_resource_auth').checks.find((c) => c.name.startsWith('服务运行时另一系统用户'))!;
+    expect(other.ok).toBe(false);
+    expect(other.note).toContain('同一用户');
+  });
 
   it('is incomplete when the operator skips the second user and the server-down squatting', async () => {
     const e = env!;
@@ -491,6 +651,126 @@ describe('loopback-restart (loopback_resource_restart)', () => {
     expect(r.checks.find((c) => c.name.startsWith('任何情况下都不会载入'))?.ok).toBe(false);
     expect(r.verdict).toBe('fail');
   });
+
+  it('regression: an observation spanning a Surge update is recorded but not counted, and older observations stop counting under the new version', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    const exec = async (file: string, args: readonly string[]) => {
+      if (file === '/bin/ps' && args[0] === '-axo') return { stdout: '  404 /Applications/Surge.app/Contents/MacOS/Surge\n', stderr: '', code: 0 };
+      if (file === '/bin/ps' && args[0] === '-o') return { stdout: `${e.surge.startedAt.toISOString()}\n`, stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: -1 };
+    };
+    const round = async (variant: string, restart: () => void): Promise<void> => {
+      const p = e.deps({ answers: [variant] });
+      expect(await main(['loopback-restart', '--phase', 'prepare', ...e.common()], { ...p, exec }), p.out.text()).toBe(EXIT.OK);
+      restart();
+      const a = e.deps({ onPause: async (m) => void (m.includes('运行 resource-server') && (await e.startResourceServer())) });
+      expect(await main(['loopback-restart', '--phase', 'after-surge-restart', ...e.common()], { ...a, exec }), a.out.text()).toBe(EXIT.OK);
+    };
+    await round('server-before', () => e.surge.restart());
+    expect(result('loopback_resource_restart').checks[0]!.ok).toBe(true);
+    // 退出重开时装上了 Surge 更新（Sparkle）：这一轮跨了两个版本，照样记录但不计入
+    await round('down', () => e.surge.changeVersion({ version: '6.10.1', build: '12600' }));
+    const r = result('loopback_resource_restart');
+    expect(r.context.surgeBuild).toBe('12600');
+    const obs = e.run().readJson<RestartObservation[]>('loopback-restart/observations.json')!;
+    expect(obs.at(-1)!.contextChanged).toEqual(['surgeVersion', 'surgeBuild']);
+    const down = r.checks.find((c) => c.name.startsWith('Surge 退出重开 · 服务不可用'))!;
+    expect(down.ok).toBeNull();
+    expect(down.note).toContain('重启前后上下文不同');
+    // 在旧版本上测得的 server-before 也不再计入（结论按现在的版本）
+    const before = r.checks.find((c) => c.name.startsWith('Surge 退出重开 · 服务先于'))!;
+    expect(before.ok).toBeNull();
+    expect(before.note).toContain('上下文与当前不同');
+    expect(r.summary.join('\n')).toContain('不计入');
+  }, 60_000);
+
+  it('regression: an operator-confirmed restart is marked as such, and a Mac "down" round with the server running is not counted', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    // 读不到任何启动时间：操作员确认
+    const prep = e.deps({ answers: ['down'] });
+    expect(await main(['loopback-restart', '--phase', 'prepare', ...e.common()], prep)).toBe(EXIT.OK);
+    await e.stopResourceServer();
+    e.surge.restart();
+    // 操作员没有照提示做：重启后先启动了 resource-server（变体要求不运行）
+    await e.startResourceServer();
+    const a = e.deps({ answers: ['yes'] });
+    expect(await main(['loopback-restart', '--phase', 'after-mac-restart', ...e.common()], a), a.out.text()).toBe(EXIT.ERROR);
+    expect(a.out.text()).toContain('变体与实际不符');
+    const obs = e.run().readJson<RestartObservation[]>('loopback-restart/observations.json')!.at(-1)!;
+    expect(obs.restartEvidence).toBe('operator');
+    expect(obs.variantCheck?.ok).toBe(false);
+    expect(obs.note).toContain('重启由操作员确认');
+    expect(e.run().readJsonl<{ action: string }>('actions.jsonl').some((x) => x.action === 'operator_confirmed_restart')).toBe(true);
+    const r = result('loopback_resource_restart');
+    const down = r.checks.find((c) => c.name.startsWith('Mac 重启 · 服务不可用'))!;
+    expect(down.ok).toBeNull();
+    expect(down.note).toContain('变体与实际不符');
+  });
+
+  it('regression: Surge hiding a failed download behind not_ready on an empty cache fails the not_ready-exemption premise (a visible error passes)', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    e.surge.remoteCacheOnRestart = 'drop';
+    const exec = async (file: string, args: readonly string[]) => {
+      if (file === '/bin/ps' && args[0] === '-axo') return { stdout: '  404 /Applications/Surge.app/Contents/MacOS/Surge\n', stderr: '', code: 0 };
+      if (file === '/bin/ps' && args[0] === '-o') return { stdout: `${e.surge.startedAt.toISOString()}\n`, stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: -1 };
+    };
+    const round = async (): Promise<RestartObservation> => {
+      const p = e.deps({ answers: ['503'] });
+      expect(await main(['loopback-restart', '--phase', 'prepare', ...e.common()], { ...p, exec }), p.out.text()).toBe(EXIT.OK);
+      // 缓存被丢弃：Surge 启动时下载，服务只返回 503
+      e.surge.restart();
+      const a = e.deps();
+      expect(await main(['loopback-restart', '--phase', 'after-surge-restart', ...e.common()], { ...a, exec }), a.out.text()).toBe(EXIT.OK);
+      return e.run().readJson<RestartObservation[]>('loopback-restart/observations.json')!.at(-1)!;
+    };
+    const premise = () => result('loopback_resource_restart').checks.find((c) => c.name.startsWith('重开后缓存不存在时'))!;
+    // 对照：失败的文字可见
+    expect((await round()).emptyCache).toBe('visible');
+    expect(premise().ok).toBe(true);
+    // Surge 把这次 503 藏在未就绪之后
+    e.surge.notReadyHidesDownloadErrors = true;
+    const hidden = await round();
+    expect(hidden.emptyCache).toBe('hidden');
+    expect(hidden.downloads.statuses).toContain(503);
+    expect(premise().ok).toBe(false);
+    expect(result('loopback_resource_restart').verdict).toBe('fail');
+  }, 60_000);
+
+  it('regression: a Mac "503" round counts only requests after the boot; 503 answers from before the reboot with no server afterwards are not a "503" round', async () => {
+    const e = env!;
+    await setupLoopback(e);
+    let boot = Math.floor(Date.now() / 1000) - 3600;
+    const exec = async (file: string, args: readonly string[]) => {
+      if (file === '/usr/sbin/sysctl') return { stdout: `{ sec = ${boot}, usec = 0 } Sat Oct 31 00:00:00 2026\n`, stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: -1 };
+    };
+    const p = e.deps({ answers: ['503'] });
+    expect(await main(['loopback-restart', '--phase', 'prepare', ...e.common()], { ...p, exec }), p.out.text()).toBe(EXIT.OK);
+    // 重启之前 Surge 自己刷新了一次：服务（restartUninitialized）答复 503
+    const tRefresh = Date.now();
+    e.surge.runScheduledRefresh();
+    for (let i = 0; i < 200 && !requestsBetween(e.run(), tRefresh, Date.now() + 1000, 'server').some((r) => r.status === 503); i++) {
+      await e.surge.listExternalResources();
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(requestsBetween(e.run(), tRefresh, Date.now() + 1000, 'server').map((r) => r.status)).toContain(503);
+    // 重启；操作员忘了运行 resource-server --scenario restartUninitialized
+    await e.stopResourceServer();
+    await new Promise((r) => setTimeout(r, 1100));
+    boot = Math.floor(Date.now() / 1000);
+    e.surge.restart();
+    const a = e.deps({ onPause: async (m) => void (m.includes('运行 resource-server') && (await e.startResourceServer())) });
+    expect(await main(['loopback-restart', '--phase', 'after-mac-restart', ...e.common()], { ...a, exec }), a.out.text()).toBe(EXIT.ERROR);
+    const obs = e.run().readJson<RestartObservation[]>('loopback-restart/observations.json')!.at(-1)!;
+    expect(obs.variantCheck?.ok).toBe(false);
+    expect(obs.downloads.statuses).toEqual([]);
+    const r = result('loopback_resource_restart');
+    expect(r.checks.find((c) => c.name.startsWith('Mac 重启 · 服务只返回 503'))!.ok).toBeNull();
+  }, 60_000);
 
   it('refuses the after phase when nothing restarted', async () => {
     const e = env!;

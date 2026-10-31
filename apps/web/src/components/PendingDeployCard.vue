@@ -13,7 +13,7 @@ import MissingCapabilities from './MissingCapabilities.vue';
 import NoticeBox from './NoticeBox.vue';
 import { useConsole } from '../store/context';
 import { evaluateGate, nodeResourcePublishBlocks } from '../lib/gates';
-import { DEPLOYMENT_FACET_LABELS, NODE_RESOURCE_NEEDS_REFRESH_TEXT } from '../lib/labels';
+import { DEPLOYMENT_FACET_LABELS, NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT, NODE_RESOURCE_NEEDS_REFRESH_TEXT } from '../lib/labels';
 import { envLabel } from '../lib/environments';
 import { formatCount, formatRevision } from '../lib/format';
 import { newRequestId } from '../lib/request-id';
@@ -130,7 +130,10 @@ async function publish() {
         </ul>
         <p class="mt-2">新版本保持“已保存，待部署”。</p>
       </NoticeBox>
-      <NoticeBox v-if="nodeResource?.needsRefresh" tone="warning" title="节点资源待重新同步" data-test="node-resource-refresh">{{ NODE_RESOURCE_NEEDS_REFRESH_TEXT }}</NoticeBox>
+      <!-- “下一次发布会单 key 更新”只在资源服务满足发布前提时成立；否则（仍引用本地节点文件、未监听、令牌可疑等）发布停泊、服务也不自动同步 -->
+      <NoticeBox v-if="nodeResource?.needsRefresh" tone="warning" title="节点资源待重新同步" data-test="node-resource-refresh">{{
+        resourceBlocks.length === 0 ? NODE_RESOURCE_NEEDS_REFRESH_TEXT : NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT
+      }}</NoticeBox>
       <NoticeBox v-if="dropped.length" tone="warning" title="所选环境已不再待部署" data-test="selection-dropped">
         <p>{{ dropped.join('、') }} 已部署完成或已在别处处理，已从选择中移除。{{ selectionLost ? '请重新选择要发布的环境，或清除选择后发布全部待部署。' : '请确认剩余的选择后再发布。' }}</p>
         <div v-if="selectionLost" class="mt-2">

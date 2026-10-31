@@ -296,15 +296,21 @@ describe('remerge (user-confirmed maintenance)', () => {
     expect(h.fake.calls.reloadProfile ?? 0).toBe(0);
   });
 
-  test('Surge holds a node list other than the committed version (e.g. an old cache after a restart): remerge re-serves the committed version, requires a refresh and one forced publish re-reads it by a single-key update; nothing is reloaded and no local file is written', async () => {
+  test('Surge holds a node list other than the committed version (e.g. a candidate this service served and then reverted): remerge re-serves the committed version, requires a refresh and one forced publish re-reads it by a single-key update; nothing is reloaded and no local file is written', async () => {
     h = await createHarness();
     const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await h.idle();
     const node = h.repos.environments.get(envId)!;
     const committedNode = h.repos.proxyRevisions.get(envId, node.deployedProxyRevision!)!.nodeName;
     expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', committedNode]);
-    // Surge 带着只有占位节点的旧缓存（不是已提交版本）
-    h.fake.seedRemoteCache(h.resourceUrl()!, resourceBody(0, []), { updatedAt: new Date(h.clock.now().getTime() - 3_600_000) });
+    // Surge 载入了本服务提供过、从未提交的一份只有占位节点的列表（不是已提交版本；本服务的审计记录能解释这次下载——Surge 载入
+    // 本服务没有提供过的内容时发布读“更新之前”的审计会把它当作令牌可能泄露，见 publish-loopback.test.ts）
+    const host = h.app.engine.resource!;
+    const generation = h.repos.meta.configurationGeneration() + 1;
+    host.stageCandidate({ generation, content: resourceBody(generation, []) });
+    h.clock.advance(2_000);
+    await h.fake.updateExternalResource(h.resourceKey()!);
+    host.revertToCommitted();
     expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', 'SFE-EMPTY']);
     const p = await h.app.remergePreview(WEB);
     expect(p.requiresReload).toBe(false);

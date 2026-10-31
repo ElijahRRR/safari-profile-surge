@@ -1,7 +1,7 @@
 // 回环发布（D10）测试用的小工具：只用合成数据。读 Surge 与本机资源服务的状态、让 FakeSurge 在一次下载中跳过某个节点行、
 // 在某次原语调用处挂起（模拟进程在这里退出）。
 
-import type { SurgeAdapter } from '../../src/ports.js';
+import type { MaintenanceSurge, SurgeAdapter } from '../../src/ports.js';
 import { readNeedsRefresh, readServedPointer, readTokenSuspect, type ResourceServedPointer } from '../../src/resource/index.js';
 import type { Harness } from './harness.js';
 
@@ -48,7 +48,7 @@ export function dropNodesOnNextUpdate(h: Harness, nodeNames: readonly string[]):
  * 原语 primitive 的第 nth 次调用（从现在起计）挂起：之前的调用照常，挂起的调用从不返回（模拟服务在这里退出；之后用 h.crash()）。
  * before 为 true 时挂在调用之前（Surge 没有执行它），否则在 Surge 执行之后、返回之前。
  */
-export function hangAt(h: Harness, primitive: keyof SurgeAdapter & string, nth = 1, opts: { before?: boolean } = {}): { reached: () => boolean; restore: () => void } {
+export function hangAt(h: Harness, primitive: (keyof SurgeAdapter | keyof MaintenanceSurge) & string, nth = 1, opts: { before?: boolean } = {}): { reached: () => boolean; restore: () => void } {
   const fake = h.fake as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>;
   const orig = fake[primitive]!.bind(h.fake);
   let count = 0;

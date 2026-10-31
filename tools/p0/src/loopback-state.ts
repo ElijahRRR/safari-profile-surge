@@ -45,7 +45,11 @@ export const RESOURCE_SCENARIOS = [
 ] as const;
 export type ResourceScenario = (typeof RESOURCE_SCENARIOS)[number];
 
-export const SQUAT_MODES = ['squat200', 'squat404'] as const;
+/**
+ * 端口占用者的答复（loopback-auth 第 4、5 步）：squat200 伪造的列表；squat404 404；squatHang 收下请求（含读取令牌）后只写出
+ * 响应头、不发送内容，Surge 等到请求超时（-1001，与 2026-10-25 矩阵「服务不发送响应」同一写法）。
+ */
+export const SQUAT_MODES = ['squat200', 'squat404', 'squatHang'] as const;
 export type SquatMode = (typeof SQUAT_MODES)[number];
 
 export function isResourceScenario(v: unknown): v is ResourceScenario {
@@ -169,7 +173,7 @@ export interface ResourceServerStatus {
   role: 'server' | 'squat';
   pid: number;
   port: number;
-  /** server：产品处理程序；squat200/squat404：端口占用者。 */
+  /** server：产品处理程序；squat200/squat404/squatHang：端口占用者。 */
   mode: 'serve' | SquatMode;
   startedAt: string;
   /** 进程正常结束的时间；仍在运行为 null。 */
@@ -319,10 +323,36 @@ export function servedFailuresBetween(dir: RunDir, from: number, to: number): nu
 
 // ---------- 内容类场景 ----------
 
+/** paramReplaceC 对 C 行的改写：服务器、端口与前置三项同时变化（其余参数不变）。解析不了的行原样返回。 */
+function paramReplacedLine(line: string): string {
+  const p = parseProxyLine(line);
+  if (!p || p.server === null || p.port === null) return line;
+  const server = p.server === PARAM_REPLACE_C.server ? PARAM_REPLACE_C.altServer : PARAM_REPLACE_C.server;
+  const port = p.port === PARAM_REPLACE_C.port ? PARAM_REPLACE_C.altPort : PARAM_REPLACE_C.port;
+  const m = /^(\s*[^=]+?\s*=\s*[^,]+,\s*)([^,]+)(,\s*)([^,]+)(.*)$/.exec(line);
+  if (!m) return line;
+  const rest = /\bunderlying-proxy=/.test(m[5]!) ? m[5]!.replace(/\bunderlying-proxy=[^,]*/, `underlying-proxy=${TEST_PROXIES.deadFront}`) : `${m[5]!}, underlying-proxy=${TEST_PROXIES.deadFront}`;
+  return `${m[1]}${server}${m[3]}${port}${rest}`;
+}
+
+/** paramReplaceC 提供的 C 的参数（读回必须逐项等于它们）；内容中没有 C 时为 null。 */
+export function paramReplacedC(content: string): { server: string | null; port: number | null; underlyingProxy: string | null } | null {
+  const line = scenarioBody('paramReplaceC', content)
+    .split(/\r?\n/)
+    .find((l) => parseProxyLine(l.trim())?.name === TEST_NODES.c);
+  const p = line ? parseProxyLine(line.trim()) : null;
+  return p ? { server: p.server, port: p.port, underlyingProxy: p.params['underlying-proxy'] ?? null } : null;
+}
+
 /** 坏行：Surge 应当跳过（缺少服务器与端口、不是节点行）。只用合成名称。 */
 const BAD_LINES = ['SFE-N-P0-BAD = socks5', 'this is not a proxy line'];
 /** dupC 中第二个 C 的用户名（只差用户名：读回无法区分）。 */
 export const DUP_C_USERNAME = 'p0-c-dup';
+/**
+ * paramReplaceC 中同名 C 的新服务器与端口（RFC 5737 文档地址与 discard 端口：只用于读回，从不经它连接）；与原值相同时取备用值，
+ * 保证服务器、端口与前置三项都变化。
+ */
+export const PARAM_REPLACE_C = { server: '192.0.2.33', altServer: '192.0.2.34', port: 9, altPort: 10 } as const;
 
 function splitBody(content: string): { header: string[]; nodes: Array<{ name: string; line: string }> } {
   const header: string[] = [];
@@ -348,7 +378,8 @@ function joinBody(header: readonly string[], lines: readonly string[]): string {
  * 内容类场景的响应体：由当前提供的那一代内容按固定规则变换（纯函数）。只认识合成测试节点名；C 不存在时 dupC 与
  * paramReplaceC 原样返回（调用方先提供含 C 的一代）。
  * - empty200：空内容；onlyBad：只有文件头与坏行；validAbBadC：有效的 A、B 加坏的 C；
- * - dupC：在 C 之后再加一条只差用户名的 C；paramReplaceC：同名 C 的前置改为 P0-Front-Dead（参数变化，读回可以发现）；
+ * - dupC：在 C 之后再加一条只差用户名的 C；paramReplaceC：同名 C 的服务器、端口与前置同时改变（服务器改为 RFC 5737 文档地址、
+ *   端口改为 discard、前置改为 P0-Front-Dead；读回必须逐项读到新值，证明三项都是新读的）；
  * - removeC：删除 C；placeholderOnly：只有文件头与占位行 SFE-EMPTY = reject。
  */
 export function scenarioBody(scenario: ResourceScenario, content: string): string {
@@ -374,8 +405,7 @@ export function scenarioBody(scenario: ResourceScenario, content: string): strin
     }
     case 'paramReplaceC': {
       if (!c) return content;
-      const replaced = /\bunderlying-proxy=/.test(c.line) ? c.line.replace(/\bunderlying-proxy=[^,]*/, `underlying-proxy=${TEST_PROXIES.deadFront}`) : `${c.line}, underlying-proxy=${TEST_PROXIES.deadFront}`;
-      return joinBody(header, nodes.map((n) => (n === c ? replaced : n.line)));
+      return joinBody(header, nodes.map((n) => (n === c ? paramReplacedLine(c.line) : n.line)));
     }
     case 'removeC':
       return joinBody(header, nodes.filter((n) => !isC(n)).map((n) => n.line));

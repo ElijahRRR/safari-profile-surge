@@ -8,7 +8,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { LEGACY_NODE_GROUP_LINE, NODE_RESOURCE_FILE, RESOURCE_PORT_MAX, RESOURCE_PORT_MIN, SfeError, WORKING_PROFILE_NAME, parseNodeResourceUrl } from '@sfe/contract';
 import type { OperationRecord } from '../../src/db/index.js';
 import { LEGACY_LINE_KEPT_TEXT } from '../../src/engine/maintenance.js';
-import { loopbackPortOfLocation, loopbackPortsIn, nodeResourceStatus } from '../../src/engine/node-resource.js';
+import { SYSTEM_REFRESH_KEY, loopbackPortOfLocation, loopbackPortsIn, nodeResourceStatus } from '../../src/engine/node-resource.js';
 import {
   RESOURCE_KV_KEYS,
   readNeedsRefresh,
@@ -20,7 +20,8 @@ import {
 } from '../../src/resource/index.js';
 import { loopbackResourceRequest } from '../../src/surge/fake.js';
 import { loopbackGroupBlockLines } from '../../src/surge/generate.js';
-import { WEB, createEnv, createHarness, rid, type Harness } from './harness.js';
+import { PROFILE_A, WEB, bind, createEnv, createHarness, rid, type Harness } from './harness.js';
+import { hangAt, until } from './publish-helpers.js';
 import { fetchResource, legacyDeployNodes, ourResource } from './resource-fixtures.js';
 
 let h: Harness;
@@ -57,6 +58,19 @@ const SOURCE = [
 const workingPath = () => join(h.surgeDir, `${WORKING_PROFILE_NAME}.conf`);
 const steps = (opId: string) => h.repos.operations.listSteps(opId).map((s) => s.message);
 const remergePublishes = (): OperationRecord[] => h.repos.operations.listRecent(100).filter((o) => o.kind === 'deploy.publish' && o.requestId.startsWith('remerge:'));
+
+/** 推进假时钟直到这些操作与重新合并排入的发布都结束（等待 Surge 登记资源、不再更新时按时限轮询）。 */
+async function driveUntilSettled(opIds: readonly string[]): Promise<void> {
+  const open = () => [...opIds, ...remergePublishes().map((o) => o.id)].some((id) => ['queued', 'running'].includes(h.repos.operations.get(id)!.status));
+  for (let i = 0; i < 2_000 && open(); i++) {
+    await new Promise((r) => setTimeout(r, 2));
+    await h.clock.advanceAsync(500);
+  }
+  await h.idle();
+}
+
+/** 重载之后 Surge 登记新地址的资源需要时间（2026-10-25 回环矩阵：重载之后新的 127.0.0.1 资源没有立即出现）。 */
+const WAIT = { timeoutMs: 10_000, pollMs: 500, settleMs: 0 };
 
 /** 本服务地址的一次下载，令牌换成 token（端口与路径的其余部分不变）。 */
 function fetchWithToken(port: number, token: string) {
@@ -125,11 +139,41 @@ describe('init writes the loopback group line', () => {
     expect(h.logs.join('\n')).not.toContain(engine.resource!.token);
   });
 
-  test('the resource server is not listening on the configured port → preview check fails, commit is refused with RESOURCE_SERVER_UNAVAILABLE; nothing written', async () => {
+  test('regression: before init the configured port is held by another program → a new in-range port is picked and persisted, and init proceeds on it', async () => {
     h = await createHarness({ sourceProfile: SOURCE, start: false });
     h.binderRegistry.set(h.resourcePort, 'other-process');
     await h.app.start();
+    const engine = h.app.engine;
+    const port = h.repos.settings.get('resourcePort')!;
+    expect(port).not.toBe(h.resourcePort);
+    expect(port).toBeGreaterThanOrEqual(RESOURCE_PORT_MIN);
+    expect(port).toBeLessThan(RESOURCE_PORT_MAX);
+    expect(engine.resource!.listening()).toBe(true);
+    expect(engine.resource!.port()).toBe(port);
+    expect(h.logs.some((l) => l.includes('"msg":"resource.port_reselected"'))).toBe(true);
+    const preview = await h.app.initPreview({}, WEB);
+    expect(preview.checks.find((c) => c.name === 'resource_server')).toMatchObject({ ok: true });
+    const acc = await h.app.initCommit({ request_id: rid(), preview_digest: preview.preview_digest }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(acc.operation_id)).toMatchObject({ phase: 'COMPLETED', status: 'succeeded' });
+    expect(parseNodeResourceUrl(engine.resourceUrl()!)).toMatchObject({ port });
+    expect(readFileSync(workingPath(), 'utf8')).toContain(loopbackGroupBlockLines(engine.resourceUrl()!)[0]);
+    // 已有工作配置之后从不改选：端口再被占用时只是不监听
+    await engine.resource!.close();
+    h.binderRegistry.set(port, 'other-process');
+    await h.crash();
+    expect(h.repos.settings.get('resourcePort')).toBe(port);
     expect(h.app.engine.resource!.listening()).toBe(false);
+  });
+
+  test('the resource server cannot listen (not a port conflict) → preview check fails, commit is refused with RESOURCE_SERVER_UNAVAILABLE; nothing written', async () => {
+    h = await createHarness({ sourceProfile: SOURCE, start: false });
+    h.binder.bind = async () => {
+      throw new SfeError('RESOURCE_SERVER_UNAVAILABLE', '本机资源服务不可用：无法监听本机端口', { details: { reason: 'other' } });
+    };
+    await h.app.start();
+    expect(h.app.engine.resource!.listening()).toBe(false);
+    expect(h.repos.settings.get('resourcePort')).toBe(h.resourcePort);
     const preview = await h.app.initPreview({}, WEB);
     expect(preview.checks.find((c) => c.name === 'resource_server')).toMatchObject({ ok: false });
     await expectError(h.app.initCommit({ request_id: rid(), preview_digest: preview.preview_digest }, WEB), 'RESOURCE_SERVER_UNAVAILABLE');
@@ -161,8 +205,8 @@ describe('init writes the loopback group line', () => {
  * D7 升级来的安装：工作配置是旧的本地节点文件定义，节点经本地文件部署（verified 发布），managed_objects 中有 resource_file 记录；
  * 升级后第一次启动按最近的 verified 发布初始化指针（已提交版本 = 该发布）。
  */
-async function legacyInstall(opts: { revoke?: boolean } = {}): Promise<{ envId: string; generation: number; node: string }> {
-  h = await createHarness({ nodeResource: 'legacy' });
+async function legacyInstall(opts: { revoke?: boolean; resourceUpdateWait?: { timeoutMs: number; pollMs: number; settleMs: number } } = {}): Promise<{ envId: string; generation: number; node: string }> {
+  h = await createHarness({ nodeResource: 'legacy', ...(opts.resourceUpdateWait ? { resourceUpdateWait: opts.resourceUpdateWait } : {}) });
   const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
   await h.idle();
   const generation = await legacyDeployNodes(h, [envId]);
@@ -238,6 +282,9 @@ describe('remerge converts the legacy local group line only behind the resourceS
     expect(existsSync(legacyPath)).toBe(false);
     expect(h.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)).toMatchObject({ state: 'removed', contentDigest: 'scrubbed' });
     expect(steps(acc.operation_id).some((s) => s.startsWith('已删除旧的本地节点文件 sfe-nodes.list'))).toBe(true);
+    // 只说删除了这个文件：Surge 自己的资源缓存中仍有已部署代理的凭据（位置待 P0 记录）
+    expect(steps(acc.operation_id).some((s) => s.includes('不再留在'))).toBe(false);
+    expect(steps(acc.operation_id).some((s) => s.includes('Surge 自己缓存的节点资源中仍有已部署代理的凭据'))).toBe(true);
     // 重载时 Surge 从本机资源服务下载了已提交版本；之后一次强制刷新发布经单 key 更新读回
     const publishes = remergePublishes();
     expect(publishes).toHaveLength(1);
@@ -247,6 +294,25 @@ describe('remerge converts the legacy local group line only behind the resourceS
     expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', node]);
     expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
     expect(nodeResourceStatus(h.app.engine)).toEqual({ state: 'serving', tokenSuspect: false, needsRefresh: false });
+    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
+  });
+
+  test('regression: Surge registers the new loopback resource only some time after the reload: the legacy file is still deleted after a bounded wait and the forced publish waits for it instead of parking on RESOURCE_MISSING', async () => {
+    const { node } = await legacyInstall({ resourceUpdateWait: WAIT });
+    const legacyPath = join(h.surgeDir, NODE_RESOURCE_FILE);
+    h.fake.registrationDelayMs = 2_000;
+    const p = await h.app.remergePreview(WEB);
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest }, WEB);
+    await driveUntilSettled([acc.operation_id]);
+    expect(h.repos.operations.get(acc.operation_id)).toMatchObject({ phase: 'COMPLETED', status: 'succeeded' });
+    expect(existsSync(legacyPath)).toBe(false);
+    expect(h.repos.managedObjects.get('resource_file', NODE_RESOURCE_FILE)).toMatchObject({ state: 'removed', contentDigest: 'scrubbed' });
+    const publishes = remergePublishes();
+    expect(publishes).toHaveLength(1);
+    expect(publishes[0]).toMatchObject({ status: 'succeeded' });
+    expect(publishes[0]!.error).toBeNull();
+    expect(await h.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', node]);
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
     expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
   });
 
@@ -403,6 +469,8 @@ describe('remerge option rotateResourceUrl', () => {
     expect(readTokenSuspect(engine.kv)).toBeNull();
     expect(fetchWithToken(port, oldToken).status).toBe(404);
     expect(() => fetchWithToken(h.resourcePort, oldToken)).toThrow();
+    // 步骤如实写明：旧端口不再监听（连接被拒绝），旧令牌在新地址得到 404
+    expect(steps(acc.operation_id)).toContain('已更换本机资源地址：新的读取令牌与端口已生效；旧端口不再监听，旧读取令牌在新地址一律得到 404');
     expect(fetchResource(h).status).toBe(200);
     // 一次强制刷新发布：对新资源单 key 更新并读回
     const publishes = remergePublishes();
@@ -421,6 +489,50 @@ describe('remerge option rotateResourceUrl', () => {
     const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
     await h.idle();
     expect(h.repos.environments.get(envId)!.deployedProxyRevision).not.toBeNull();
+  });
+
+  test('regression: rotation with a delayed registration: the forced publish waits for Surge to register the new resource and confirms it', async () => {
+    h = await createHarness({ resourceUpdateWait: WAIT });
+    await h.idle();
+    markSuspect();
+    h.fake.registrationDelayMs = 2_000;
+    const p = await h.app.remergePreview(WEB, { rotateResourceUrl: true });
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest, rotateResourceUrl: true }, WEB);
+    await driveUntilSettled([acc.operation_id]);
+    expect(h.repos.operations.get(acc.operation_id)).toMatchObject({ phase: 'COMPLETED', status: 'succeeded' });
+    expect(remergePublishes()).toHaveLength(1);
+    expect(remergePublishes()[0]).toMatchObject({ status: 'succeeded' });
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
+    expect(readTokenSuspect(h.app.engine.kv)).toBeNull();
+  });
+
+  test('regression: rotation clears the record of a system refresh parked on token_suspect, so a refresh can be enqueued again when the forced publish could not confirm', async () => {
+    h = await createHarness();
+    await h.idle();
+    markSuspect();
+    // 令牌可疑期间对账排入的系统刷新停泊（token_suspect）
+    await h.app.runPeriodicReconcile();
+    await h.idle();
+    const parked = h.repos.operations.listRecent(50).filter((o) => o.kind === 'deploy.publish' && o.initiatorKind === 'service');
+    expect(parked).toHaveLength(1);
+    expect(parked[0]).toMatchObject({ status: 'parked', error: { details: { reason: 'token_suspect' } } });
+    // 登记比发布的等待时限还慢：重新合并排入的强制刷新发布停泊在 RESOURCE_MISSING
+    h.fake.registrationDelayMs = 60_000;
+    const p = await h.app.remergePreview(WEB, { rotateResourceUrl: true });
+    const acc = await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest, rotateResourceUrl: true }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(acc.operation_id)!.phase).toBe('COMPLETED');
+    expect(remergePublishes()[0]).toMatchObject({ status: 'parked', error: { code: 'RESOURCE_MISSING' } });
+    expect(h.app.engine.kv.get(SYSTEM_REFRESH_KEY)).toBeNull();
+    // Surge 登记之后的对账重新排入一次系统刷新，它确认新地址的资源
+    h.clock.advance(61_000);
+    await h.app.runPeriodicReconcile();
+    await h.idle();
+    const refreshes = h.repos.operations.listRecent(50).filter((o) => o.kind === 'deploy.publish' && o.initiatorKind === 'service');
+    expect(refreshes).toHaveLength(2);
+    expect(refreshes.find((o) => o.id !== parked[0]!.id)).toMatchObject({ status: 'succeeded' });
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
+    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
   });
 
   test('the reload fails → the rotation is undone: profile restored, new token deleted, the old address and tokenSuspect are kept; a retry succeeds', async () => {
@@ -453,6 +565,66 @@ describe('remerge option rotateResourceUrl', () => {
     expect(h.repos.operations.get(acc2.operation_id)!.phase).toBe('COMPLETED');
     expect(h.repos.meta.resourceTokenRef()).toBe('sfe.resource-token.2');
     expect(readTokenSuspect(engine.kv)).toBeNull();
+  });
+
+  test('a crash after the rotation\'s reload and before its commit fails closed: the new token is deleted, nothing serves the new address, publishing and activation are refused, normal mode works; a plain remerge restores the old address and a confirmed publish clears the warning', async () => {
+    h = await createHarness({ dbFile: true });
+    await h.idle();
+    const envId = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await h.idle();
+    const oldUrl = h.resourceUrl()!;
+    const oldToken = h.app.engine.resource!.token;
+    // Surge 重载了写入新地址的工作配置之后、提交更换之前服务退出
+    const p = await h.app.remergePreview(WEB, { rotateResourceUrl: true });
+    const hang = hangAt(h, 'reloadProfile');
+    await h.app.remergeCommit({ request_id: rid(), preview_digest: p.preview_digest, rotateResourceUrl: true }, WEB);
+    await until(() => hang.reached());
+    const newUrl = readFileSync(h.profilePath, 'utf8').match(/policy-path=(\S+)/)![1]!;
+    expect(newUrl).not.toBe(oldUrl);
+    const newPort = parseNodeResourceUrl(newUrl)!.port;
+    hang.restore();
+    // 进程退出时它的全部监听随之关闭（夹具的 crash() 只关闭引擎当前的资源服务，这里关闭轮换中新建的那个）
+    expect(h.binderRegistry.has(newPort)).toBe(true);
+    h.binderRegistry.delete(newPort);
+    await h.crash();
+    await h.idle();
+    const engine = h.app.engine;
+    // 新令牌的值已删除，旧的引用、端口与地址不变；新端口上没有任何服务
+    expect(h.repos.meta.resourceTokenRef()).toBe('sfe.resource-token.1');
+    expect(await h.store.get('sfe.resource-token.2')).toBeNull();
+    expect(h.repos.settings.get('resourcePort')).toBe(h.resourcePort);
+    expect(h.resourceUrl()).toBe(oldUrl);
+    expect(engine.resource!.token).toBe(oldToken);
+    expect(h.binderRegistry.has(newPort)).toBe(false);
+    expect(engine.resourceRuntime.line).toBe('loopback_other');
+    expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
+    // 不是本服务当前的地址：不自动排入系统刷新；发布按受管理段被改过失败，从不更新
+    expect(h.repos.operations.listRecent(100).filter((o) => o.kind === 'deploy.publish' && o.initiatorKind === 'service')).toHaveLength(0);
+    const updates = h.fake.calls.updateExternalResource ?? 0;
+    const pub = await h.app.publishPending({ request_id: rid('pub') }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(pub.operation_id)).toMatchObject({ status: 'failed', error: { code: 'BASELINE_CHANGED' } });
+    expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(0);
+    // 激活被拒绝；进入普通模式照常
+    await bind(h, PROFILE_A, envId);
+    const act = await h.app.activate(envId, { request_id: rid('act') }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(act.operation_id)).toMatchObject({ status: 'failed', error: { code: 'NODE_NOT_DEPLOYED' } });
+    const n = await h.app.enterNormal({ request_id: rid('normal'), old_session_policy: 'closed_confirmed', confirmed_environment_id: null }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(n.operation_id)!.status).toBe('succeeded');
+    // 普通的重新合并恢复旧地址的定义、重新提供已提交版本并排入一次强制刷新发布，它的确认清除警告
+    h.clock.advance(1000);
+    const p2 = await h.app.remergePreview(WEB);
+    const acc2 = await h.app.remergeCommit({ request_id: rid(), preview_digest: p2.preview_digest }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(acc2.operation_id)).toMatchObject({ phase: 'COMPLETED', status: 'succeeded' });
+    expect(readFileSync(h.profilePath, 'utf8')).toContain(loopbackGroupBlockLines(oldUrl)[0]);
+    const publishes = remergePublishes();
+    expect(publishes).toHaveLength(1);
+    expect(publishes[0]).toMatchObject({ status: 'succeeded' });
+    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
+    expect(readNeedsRefresh(engine.kv)).toBeNull();
   });
 
   test('a token value left by an interrupted rotation is deleted at startup', async () => {

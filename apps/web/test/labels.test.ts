@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { OPERATION_KINDS, OPERATION_PHASES, type EnvironmentReadiness, type NodeResourceState, type RouteWarning } from '@sfe/contract';
 import {
   ENTRY_MODE_LABELS,
+  NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT,
   NODE_RESOURCE_NEEDS_REFRESH_TEXT,
   NODE_RESOURCE_STATE_DETAILS,
   NODE_RESOURCE_STATE_LABELS,
@@ -120,6 +121,7 @@ describe('local resource server labels (D10)', () => {
       ...Object.values(NODE_RESOURCE_STATE_DETAILS),
       NODE_RESOURCE_TOKEN_SUSPECT_TEXT,
       NODE_RESOURCE_NEEDS_REFRESH_TEXT,
+      NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT,
     ];
     for (const t of texts) {
       expect(t).toMatch(/[一-龥]/);
@@ -135,6 +137,12 @@ describe('local resource server labels (D10)', () => {
     expect(NODE_RESOURCE_STATE_DETAILS.legacy_line).toContain('需要重新合并以改用本机资源服务');
     expect(NODE_RESOURCE_STATE_DETAILS.not_installed).toContain('需要重新合并');
     expect(NODE_RESOURCE_TOKEN_SUSPECT_TEXT).toContain('更换本机资源地址');
+  });
+
+  it('regression: the needsRefresh text states the one automatic retry after a crash of the sync itself (ARCHITECTURE §6.2 step 10)', () => {
+    expect(NODE_RESOURCE_NEEDS_REFRESH_TEXT).not.toContain('服务只自动发起一次同步，停在待部署或失败后不会自动重试');
+    expect(NODE_RESOURCE_NEEDS_REFRESH_TEXT).toContain('同步本身因服务中断而失败时再自动重试一次');
+    expect(NODE_RESOURCE_NEEDS_REFRESH_TEXT).toContain('重新同步节点资源');
   });
 });
 

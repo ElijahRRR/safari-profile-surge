@@ -6,12 +6,16 @@
 //   测试夹具与演示把它接到本机资源服务的进程内绑定方，每次下载都经真实的 host.handle()）。按回环矩阵的真机证据建模
 //   （docs/verification/2026-10-25-loopback-main-witness-matrix.md、2026-10-25-resource-error-classification.md）：
 //   updateExternalResource(远端 key) 只下载这一项资源，从不重载配置（磁盘上改过、未加载的主配置不会因此被加载），不碰其他
-//   资源；下载失败时保留已缓存的节点与选择、仍然就绪、错误为证据中的文字、更新时间不变，并像真实适配器一样经
-//   parseResourceUpdateText 抛出 SURGE_COMMAND_FAILED（真机上命令退出 0）；成功时只保留能解析的行、同名取第一条（`名称 = reject`
-//   也是有效节点）、重建成员（选择不再是成员时回落到首成员）、推进更新时间、清空错误。没有真机证据、做成选项或假设的部分：
-//   只含占位行的列表被接受（TODO(P0)）、Surge 自己的定时刷新（remoteRefreshIntervalMs）、重启后是否保留缓存
-//   （remoteCacheOnRestart）、更新时间的分辨率（updatedAtResolution）、Surge 报告 updating 的时长（slowUpdate）、“适配器
-//   超时而更新仍然生效”（timeoutNextUpdate）、加载配置时对未就绪资源的一次下载、远端资源 key 的形状（缺省不透明，urlKeys）；
+//   资源；下载失败时保留已缓存的节点与选择、仍然就绪、错误为证据中的文字，并像真实适配器一样经 parseResourceUpdateText 抛出
+//   SURGE_COMMAND_FAILED（真机上命令退出 0）；成功时只保留能解析的行、同名取第一条（`名称 = reject` 也是有效节点）、重建成员
+//   （选择不再是成员时回落到首成员）、清空错误。没有真机证据、做成选项或假设的部分（TODO(P0)）：只含占位行的列表被接受；
+//   更新时间（updatedAt）的语义——下载失败时不变、每次成功下载（含内容完全相同的下载）都推进、Surge 自己的定时刷新与显式
+//   更新一样推进（证据中没有记录更新时间，由回环矩阵的 kept 行与 confirmCommitted 读回实测）；Surge 自己的定时刷新
+//   （remoteRefreshIntervalMs）、重启后是否保留缓存（remoteCacheOnRestart）、更新时间的分辨率（updatedAtResolution）、
+//   Surge 报告 updating 的时长（slowUpdate）、“适配器超时而更新仍然生效”（timeoutNextUpdate）、加载配置时对未就绪资源的
+//   一次下载、同一配置重载之后新引用的远端资源延迟登记（registrationDelayMs；真机证据：重载之后新地址的资源没有立即出现，
+//   2026-10-25 矩阵，P0 用 REGISTRATION_WAIT_MS 补偿）、从未下载成功的资源报告的错误（有过失败的下载时为那次的文字，否则
+//   not_ready，与 parse-output 的优先级相同）、远端资源 key 的形状（缺省不透明，urlKeys）；
 // - 本地 RULE-SET 文件变化后由文件监视自动重新加载（规则集文档：“Local files are watched and reloaded automatically when
 //   they change.”），只重新加载该规则集、不重载配置，延迟可配置（localWatchLatencyMs）；
 // - 本地 policy-path 文件是否被监视没有写入文档（自动重载关闭时实测不被重新读取，2026-10-24-fixed-profile-live.md）：
@@ -310,6 +314,11 @@ export interface FakeSurgeOptions {
   updatedAtResolution?: 'ms' | 's';
   /** 见 FakeSurge.slowUpdate。 */
   slowUpdate?: FakeSlowUpdate | null;
+  /**
+   * 同一配置重载（reloadProfile）之后，新引用的远端资源（重载之前没有的 key）在这么多毫秒内（按 now）不出现在外部资源列表中、
+   * 不能单 key 更新，加载时的那次下载也推迟到登记之后。缺省 0：立即登记。TODO(P0)：真实的登记延迟。
+   */
+  registrationDelayMs?: number;
   /** 节点行的接受规则（缺省 fakeAcceptsNodeLine）；Surge 真实的接受规则与 parseProxyLine 不同。 */
   acceptNodeLine?: (line: string) => boolean;
   /**
@@ -438,9 +447,17 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   readonly urlKeys: boolean;
   remoteRefreshIntervalMs: number | null;
   remoteCacheOnRestart: 'keep' | 'drop';
+  /**
+   * true：从未下载成功（未就绪）的远端资源即使有过失败的下载也只报告 'not_ready'（Surge 把下载错误藏在 ready=false 之后）。
+   * 缺省 false：失败的文字优先（产品下载核对中“未就绪”例外的前提；TODO(P0)：loopback_resource_restart 实测，见 P0 工具的
+   * classifyEmptyCache）。只用于测试 P0 工具能否发现这一行为。
+   */
+  notReadyHidesDownloadErrors = false;
   updatedAtResolution: 'ms' | 's';
   /** 慢更新（见 FakeSlowUpdate）；null 时下载立即完成。可随时修改，只影响之后开始的下载。 */
   slowUpdate: FakeSlowUpdate | null;
+  /** 见 FakeSurgeOptions.registrationDelayMs；可随时修改，只影响之后的重载。 */
+  registrationDelayMs: number;
   acceptNodeLine: (line: string) => boolean;
   /** 每次远端下载（含 Surge 自己的定时刷新与加载配置时的下载）的记录。 */
   readonly remoteFetches: FakeRemoteFetch[] = [];
@@ -472,6 +489,8 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   private remote = new Map<string, RemoteState>();
   /** timeoutNextUpdate 排队的“适配器超时而更新仍然生效”。 */
   private updateTimeouts: Array<{ applyAfterMs: number }> = [];
+  /** 重载之后尚未登记的远端资源：key → 登记时刻（毫秒，按 now）。 */
+  private registeringUntil = new Map<string, number>();
   private watched = new Map<string, string | null>();
   private selection = new Map<string, string | null>();
   private temps: string[] = [];
@@ -504,6 +523,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     this.remoteCacheOnRestart = opts.remoteCacheOnRestart ?? 'keep';
     this.updatedAtResolution = opts.updatedAtResolution ?? 'ms';
     this.slowUpdate = opts.slowUpdate ?? null;
+    this.registrationDelayMs = opts.registrationDelayMs ?? 0;
     this.acceptNodeLine = opts.acceptNodeLine ?? fakeAcceptsNodeLine;
     const interval = this.remoteRefreshIntervalMs;
     if (interval !== null && !(Number.isFinite(interval) && interval > 0)) throw new RangeError('remoteRefreshIntervalMs must be a positive number or null');
@@ -827,7 +847,18 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
 
   // ---------- 加载 ----------
 
-  private loadAll(): void {
+  /** 远端资源是否还在等待登记（重载之后的 registrationDelayMs 内）；到时的记录随之删除。 */
+  private registering(key: string): boolean {
+    const until = this.registeringUntil.get(key);
+    if (until === undefined) return false;
+    if (this.now().getTime() < until) return true;
+    this.registeringUntil.delete(key);
+    return false;
+  }
+
+  /** opts.delayNew：同一配置重载（reloadProfile）时，新引用的远端资源按 registrationDelayMs 延迟登记。 */
+  private loadAll(opts: { delayNew?: boolean } = {}): void {
+    const previousKeys = new Set(this.resources.keys());
     const raw = readOrNull(this.profilePath);
     const parsed = parseProfile(raw ?? '');
     this.userProxies.clear();
@@ -871,6 +902,17 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     // 配置中不再引用的远端资源：进行中的下载随之放弃（缓存保留，重新引用同一地址时沿用）
     const referenced = new Set([...this.resources.values()].map((r) => r.remote));
     for (const st of this.remote.values()) if (!referenced.has(st)) st.pending = null;
+    for (const key of [...this.registeringUntil.keys()]) if (!this.resources.has(key)) this.registeringUntil.delete(key);
+    // 同一配置重载之后新引用的远端资源：registrationDelayMs 内不登记（不在列表中、不能更新），加载时的下载推迟到登记之后
+    const delay = this.registrationDelayMs;
+    if (opts.delayNew === true && Number.isFinite(delay) && delay > 0) {
+      const until = this.now().getTime() + delay;
+      for (const res of this.resources.values()) {
+        if (!res.remote || previousKeys.has(res.key)) continue;
+        this.registeringUntil.set(res.key, until);
+        if (res.remote.content === null && res.remote.pending === null) res.remote.pending = { trigger: 'load', completesAt: until, reply: 'downloaded' };
+      }
+    }
     // 未就绪的远端资源（从未成功下载）在加载配置时下载一次；已就绪的沿用缓存，不重新下载（假设，TODO(P0)：重启与重载时
     // Surge 是否重新下载由 loopback_resource_restart 记录）
     for (const res of this.resources.values()) {
@@ -1145,7 +1187,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   reloadProfile(): Promise<void> {
     return this.invoke('reloadProfile', () => {
       this.reloadCount++;
-      this.loadAll();
+      this.loadAll({ delayNew: true });
       if (this.reloadClearsTempRules) this.temps = [];
     });
   }
@@ -1300,12 +1342,14 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
 
   /**
    * 与真实解析（parse-output parseExternalResources）相同的字段：location 经 redactUrls 遮盖，locationHash 是原样位置的
-   * SHA-256。远端资源：未就绪（从未成功下载）时 error 为 'not_ready'、没有更新时间；就绪后 error 是最近一次下载失败的文字
-   * （成功时为 null）；有进行中的下载时 updating 为 true。本地资源没有更新时间、updating 为 false。
+   * SHA-256。远端资源：未就绪（从未成功下载）时没有更新时间，error 与真实解析的优先级相同——有过失败的下载时为那次的文字
+   * （错误文字优先于 ready=false），否则为 'not_ready'；就绪后 error 是最近一次下载失败的文字（成功时为 null）；有进行中的
+   * 下载时 updating 为 true。本地资源没有更新时间、updating 为 false。重载之后尚未登记的远端资源不在列表中
+   * （registrationDelayMs）。
    */
   listExternalResources(): Promise<SurgeExternalResource[]> {
     return this.invoke('listExternalResources', () =>
-      [...this.resources.values()].map((r) => {
+      [...this.resources.values()].filter((r) => !this.registering(r.key)).map((r) => {
         const st = r.remote;
         const ready = st !== null && st.content !== null;
         return {
@@ -1314,7 +1358,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
           location: r.location,
           locationHash: r.locationHash,
           lastUpdatedAt: ready && st.updatedAt ? new Date(st.updatedAt) : null,
-          error: st === null ? r.error : ready ? st.error : 'not_ready',
+          error: st === null ? r.error : ready ? st.error : st.lastAttemptAt !== null && st.error !== null && !this.notReadyHidesDownloadErrors ? st.error : 'not_ready',
           local: st === null,
           updating: st !== null && st.pending !== null,
           fromModule: null,
@@ -1339,7 +1383,7 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     }
     return this.invoke('updateExternalResource', () => {
       const res = this.resources.get(key);
-      if (!res) throw commandFailed('更新外部资源失败：资源不存在');
+      if (!res || this.registering(key)) throw commandFailed('更新外部资源失败：资源不存在');
       if (res.local || !res.remote) return { key, refreshed: false, outcome: 'skipped' as const };
       const st = res.remote;
       if (st.pending !== null) {

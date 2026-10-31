@@ -203,9 +203,9 @@ describe('listing: opaque keys, redacted location, location hash, readiness', ()
     expect((await fake.listExternalResources()).map((r) => r.key)).toContain('ruleset:sfe-entry-block.list');
   });
 
-  test('a resource never downloaded is not ready: error not_ready, no update time, only REJECT; the load attempt is recorded, not counted as a call', async () => {
+  test('a resource never downloaded is not ready: no update time, only REJECT; the error is the failed load attempt\'s text (the parser prefers an error text over not_ready); the load attempt is recorded, not counted as a call', async () => {
     const { fake, ours, server } = setup();
-    expect(await ours()).toMatchObject({ error: 'not_ready', lastUpdatedAt: null, updating: false });
+    expect(await ours()).toMatchObject({ error: FAKE_REMOTE_ERRORS.refused, lastUpdatedAt: null, updating: false });
     expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT']);
     expect(await fake.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
     expect(server.count('ours')).toBe(1);
@@ -376,7 +376,8 @@ describe('single-key update: failures keep the cached nodes (matrix rows)', () =
     const { fake, key, ours, server } = setup();
     server.answer({ kind: 'http', status: 503, body: '' });
     await expect(fake.updateExternalResource(key)).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED' });
-    expect(await ours()).toMatchObject({ error: 'not_ready', lastUpdatedAt: null });
+    // 仍未就绪（没有更新时间），错误是这次失败的文字
+    expect(await ours()).toMatchObject({ error: FAKE_REMOTE_ERRORS.status(503), lastUpdatedAt: null });
     server.serve([LINE_A]);
     await fake.updateExternalResource(key);
     server.answer({ kind: 'http', status: 500, body: '' });
@@ -513,6 +514,40 @@ describe('scheduled refresh, reload and restart', () => {
     expect(fake.loadedContent(key)).toBe(LINE_A);
   });
 
+  test('not_ready only before any download attempt: a restart that drops the cache and defers the load reports bare not_ready', async () => {
+    const { fake, key, ours, server } = setup({ remoteCacheOnRestart: 'drop' });
+    server.serve([LINE_A]);
+    await fake.updateExternalResource(key);
+    fake.slowUpdate = { durationMs: 10_000 };
+    fake.restart();
+    expect(await ours()).toMatchObject({ error: 'not_ready', lastUpdatedAt: null, updating: true });
+    t += 10_000;
+    expect(await ours()).toMatchObject({ error: null, updating: false });
+  });
+
+  test('registrationDelayMs: after a same-profile reload a newly referenced remote resource is not listed nor updatable until the delay passes; its load download happens then', async () => {
+    const { fake, server } = setup();
+    server.serve([LINE_A]);
+    const newUrl = nodeResourceUrl(PORT + 7, 'c'.repeat(64));
+    server.serve([LINE_A, LINE_B], 2, newUrl);
+    fake.registrationDelayMs = 2_000;
+    writeFileSync(join(dir, fake.profileFileName), readFileSync(join(dir, fake.profileFileName), 'utf8').replace(URL, newUrl));
+    await fake.reloadProfile();
+    const newKey = fake.resourceKeyFor(newUrl);
+    expect((await fake.listExternalResources()).some((r) => r.key === newKey)).toBe(false);
+    await expect(fake.updateExternalResource(newKey)).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED' });
+    expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT']);
+    t += 2_000;
+    const listed = (await fake.listExternalResources()).find((r) => r.key === newKey)!;
+    expect(listed).toMatchObject({ error: null, updating: false });
+    expect(await fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT', A, B]);
+    expect(fake.remoteFetches.at(-1)).toMatchObject({ key: newKey, trigger: 'load', outcome: 'downloaded' });
+    // 已登记的资源在之后的重载中不再延迟
+    t += 1_000;
+    await fake.reloadProfile();
+    expect((await fake.listExternalResources()).some((r) => r.key === newKey)).toBe(true);
+  });
+
   test("restart with 'keep' keeps the cache, error and selection without downloading; 'drop' downloads once and stays empty if the server is down", async () => {
     const keep = setup();
     keep.server.serve([LINE_A, LINE_B]);
@@ -537,7 +572,7 @@ describe('scheduled refresh, reload and restart', () => {
     drop.server.answer({ kind: 'http', status: 503, body: '' });
     drop.fake.restart();
     expect(drop.fake.remoteFetches.at(-1)).toMatchObject({ trigger: 'load', outcome: 'failed', error: FAKE_REMOTE_ERRORS.status(503) });
-    expect(await drop.ours()).toMatchObject({ error: 'not_ready', lastUpdatedAt: null });
+    expect(await drop.ours()).toMatchObject({ error: FAKE_REMOTE_ERRORS.status(503), lastUpdatedAt: null });
     expect(await drop.fake.getGroupMembers('SFE-ROUTE')).toEqual(['REJECT']);
     drop.server.serve([LINE_A, LINE_B], 2);
     drop.fake.restart();
@@ -572,7 +607,8 @@ describe('slow update and ambiguous timeout', () => {
     const requests = server.count('ours');
     await expect(fake.updateExternalResource(key)).resolves.toEqual({ key, refreshed: true, outcome: 'downloaded' });
     expect(server.count('ours')).toBe(requests);
-    expect(await ours()).toMatchObject({ updating: true, error: 'not_ready' });
+    // 还没有下载成功过：错误是构造时那次（被拒绝的）加载的文字
+    expect(await ours()).toMatchObject({ updating: true, error: FAKE_REMOTE_ERRORS.refused, lastUpdatedAt: null });
     expect(fake.isUpdating(key)).toBe(true);
     // 进行中再次更新：不另起下载
     await expect(fake.updateExternalResource(key)).resolves.toMatchObject({ outcome: 'downloaded' });
@@ -636,7 +672,7 @@ describe('slow update and ambiguous timeout', () => {
     server.stop();
     fake.restart();
     t += 5_000;
-    expect(await ours()).toMatchObject({ updating: false, error: 'not_ready' });
+    expect(await ours()).toMatchObject({ updating: false, error: FAKE_REMOTE_ERRORS.refused, lastUpdatedAt: null });
     expect(fake.remoteFetches.map((f) => f.trigger)).toEqual(['load', 'load']);
   });
 });

@@ -183,6 +183,26 @@ describe('squatter (--squat)', () => {
     }
   });
 
+  it('squatHang takes the request (with the token) and writes only the headers: Surge waits until its request timeout', async () => {
+    const port = await freePort();
+    const logs: ResourceRequestLogEntry[] = [];
+    const sq = await startSquatServer({ port, mode: 'squatHang', binder: tcpBinder({ logger: testLogger() }), clock, token: 'a'.repeat(64), log: (e) => void (e.kind === 'request' && logs.push(e)) });
+    try {
+      expect(sq.holdsLoopback).toBe(true);
+      const t0 = Date.now();
+      // 读到时限为止：只有响应头（声明完整长度），没有内容，连接一直没有被占用者关闭
+      const res = await rawHttp(port, `GET /${'a'.repeat(64)}/sfe-nodes.list HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`, 400);
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(350);
+      expect(statusOf(res)).toBe(200);
+      const text = res.toString('latin1');
+      expect(text).toMatch(new RegExp(`Content-Length: ${Buffer.byteLength(SQUAT_BODY)}\\r\\n`, 'i'));
+      expect(text.slice(text.indexOf('\r\n\r\n') + 4)).toBe('');
+      expect(logs).toEqual([expect.objectContaining({ role: 'squat', handler: 'squat', tokenOk: true, scenario: 'squatHang', bytes: 0 })]);
+    } finally {
+      await sq.close();
+    }
+  });
+
   it('fails to bind 127.0.0.1 while the resource server holds the port and records the other addresses', async () => {
     const t = await start();
     const sq = await startSquatServer({ port: t.port, mode: 'squat404', binder: tcpBinder({ logger: testLogger() }), clock, token: null, log: null });

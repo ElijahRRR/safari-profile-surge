@@ -605,8 +605,33 @@ describe('local resource server status (D10)', () => {
     const notes = document.body.querySelector('[data-test="node-resource-notes"]')!;
     expect(notes.textContent).toContain('RESOURCE_SERVER_UNAVAILABLE');
     expect(notes.textContent).toContain('更换本机资源地址');
-    expect(notes.textContent).toContain('单 key 更新并读回');
+    // 未监听且令牌可疑：发布停泊，不承诺“下一次发布会单 key 更新”
+    expect(notes.textContent).toContain('发布暂停的原因消除之前');
+    expect(notes.textContent).not.toContain('下一次发布会');
     expect(notes.className).toContain('bg-red-50');
+    expectNoResourceSecrets();
+    m.unmount();
+  });
+
+  it('promises the single-key resync only while the resource service can publish', async () => {
+    const { ctx } = testContext(() => NOT_FOUND, snapshotWithNodeResource(nodeResource({ needsRefresh: true })));
+    const m = await mountWith(PublishView, ctx, {}, '/publish');
+    expect(document.body.querySelector('[data-test="node-resource-notes"]')?.textContent).toContain('下一次发布会对本应用这一项资源执行一次单 key 更新并读回');
+    expect(document.body.querySelector('[data-test="node-resource-refresh"]')?.textContent).toContain('下一次发布会对本应用这一项资源执行一次单 key 更新并读回');
+    m.unmount();
+  });
+
+  it('regression: a legacy local-file line with needsRefresh does not promise a single-key update or an automatic sync', async () => {
+    const { ctx } = testContext(() => NOT_FOUND, snapshotWithNodeResource(nodeResource({ state: 'legacy_line', needsRefresh: true })));
+    const m = await mountWith(PublishView, ctx, {}, '/publish');
+    const notes = document.body.querySelector('[data-test="node-resource-notes"]')!;
+    expect(notes.textContent).toContain('需要重新合并以改用本机资源服务');
+    expect(notes.textContent).not.toContain('下一次发布会');
+    expect(notes.textContent).not.toContain('服务自动发起一次同步');
+    expect(notes.textContent).toContain('发布暂停的原因消除之前');
+    const refresh = document.body.querySelector('[data-test="node-resource-refresh"]')!;
+    expect(refresh.textContent).not.toContain('下一次发布会');
+    expect(refresh.textContent).toContain('发布暂停的原因消除之前');
     expectNoResourceSecrets();
     m.unmount();
   });

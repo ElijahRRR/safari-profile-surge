@@ -20,9 +20,20 @@ export type ResourceRespond = (r: ResourceResponse, onFinished?: () => void) => 
 /** 绑定方对每个请求调用一次；处理程序必须同步调用 respond，否则连接被断开。 */
 export type ResourceRequestHandler = (req: ResourceRequest, respond: ResourceRespond) => void;
 
+/**
+ * 连接层面的失败（请求没有交给处理程序、或处理程序没有答复，连接被断开）：dropped（超过连接数上限，接受后立即关闭）、
+ * client_error（无法解析、请求头过大、请求头或请求超时）、pipelined（同一连接上的后续请求）、no_response（处理程序没有答复）、
+ * idle_timeout（连接空闲超时被断开）。这些都可能让 Surge 的一次下载失败（例如 -1005），由资源服务计入失败次数，审计据此解释
+ * 本服务一直监听期间的资源错误（audit.ts servedFailureCount）。
+ */
+export type ResourceConnectionFailure = 'dropped' | 'client_error' | 'pipelined' | 'no_response' | 'idle_timeout';
+
 export interface ResourceBinder {
-  /** 绑定 127.0.0.1:<port>；占用时抛 RESOURCE_SERVER_UNAVAILABLE（details.reason port_in_use），其他失败 reason other。从不改用其他端口。 */
-  bind(port: number, handler: ResourceRequestHandler): Promise<BoundSocket>;
+  /**
+   * 绑定 127.0.0.1:<port>；占用时抛 RESOURCE_SERVER_UNAVAILABLE（details.reason port_in_use），其他失败 reason other。从不改用其他端口。
+   * onConnectionFailure：连接层面的失败（见 ResourceConnectionFailure）各调用一次；进程内绑定方没有连接，从不调用。
+   */
+  bind(port: number, handler: ResourceRequestHandler, onConnectionFailure?: (reason: ResourceConnectionFailure) => void): Promise<BoundSocket>;
 }
 
 export interface VirtualResourceBinder extends ResourceBinder {
@@ -89,12 +100,19 @@ function rawResponseBytes(r: ResourceResponse): Buffer {
 export function tcpBinder(opts: { logger: Logger }): ResourceBinder {
   const { logger } = opts;
   return {
-    bind(port, handler) {
+    bind(port, handler, onConnectionFailure) {
       try {
         assertPort(port);
       } catch (err) {
         return Promise.reject(err);
       }
+      const connectionFailed = (reason: ResourceConnectionFailure): void => {
+        try {
+          onConnectionFailure?.(reason);
+        } catch {
+          // 计数回调的失败不影响连接处理
+        }
+      };
       const sockets = new Set<Socket>();
       // 每条连接只处理一个请求：流水线上的后续请求不交给处理程序（不产生审计记录，也不答复）。第一个响应带 Connection: close，
       // 写完后 Node 关闭连接，排队的请求随之丢弃
@@ -104,7 +122,10 @@ export function tcpBinder(opts: { logger: Logger }): ResourceBinder {
 
       const onRequest = (req: IncomingMessage, res: ServerResponse): void => {
         res.sendDate = false;
-        if (handled.has(req.socket)) return;
+        if (handled.has(req.socket)) {
+          connectionFailed('pipelined');
+          return;
+        }
         handled.add(req.socket);
         const withBody = hasRequestBody(req);
         let responded = false;
@@ -130,7 +151,10 @@ export function tcpBinder(opts: { logger: Logger }): ResourceBinder {
         } catch {
           // 处理程序抛错：不答复，直接断开
         }
-        if (!responded) req.socket.destroy();
+        if (!responded) {
+          connectionFailed('no_response');
+          req.socket.destroy();
+        }
       };
 
       const server = createServer(
@@ -146,6 +170,8 @@ export function tcpBinder(opts: { logger: Logger }): ResourceBinder {
         onRequest,
       );
       server.maxConnections = RESOURCE_SERVER_LIMITS.maxConnections;
+      // 超过连接数上限：Node 接受后立即关闭，请求从不交给处理程序（Surge 的下载因此失败时，审计要能把它算作本服务的失败答复）
+      server.on('drop', () => connectionFailed('dropped'));
       // 带 Expect 的请求：不让 Node 自动答复 100 Continue 或 417，同样交给 handle()（拒绝为 404）
       server.on('checkContinue', onRequest);
       server.on('checkExpectation', onRequest);
@@ -167,6 +193,7 @@ export function tcpBinder(opts: { logger: Logger }): ResourceBinder {
         }
         const response = out.response;
         if (response === null || response.status === 200) {
+          connectionFailed('no_response');
           socket.destroy();
           return;
         }
@@ -174,13 +201,17 @@ export function tcpBinder(opts: { logger: Logger }): ResourceBinder {
       });
       server.on('connection', (socket: Socket) => {
         sockets.add(socket);
-        socket.setTimeout(RESOURCE_SERVER_LIMITS.socketIdleTimeoutMs, () => socket.destroy());
+        socket.setTimeout(RESOURCE_SERVER_LIMITS.socketIdleTimeoutMs, () => {
+          connectionFailed('idle_timeout');
+          socket.destroy();
+        });
         socket.on('close', () => sockets.delete(socket));
         socket.on('error', () => undefined);
       });
       // 无法解析的请求（含请求头过大）：不答复（Node 缺省答复 400/431），直接断开；只按分钟汇总记一行，不记内容
       server.on('clientError', (_err: Error, socket: Socket) => {
         socket.destroy();
+        connectionFailed('client_error');
         clientErrors++;
         const now = Date.now();
         if (clientErrorLoggedAt === null || now - clientErrorLoggedAt >= CLIENT_ERROR_LOG_INTERVAL_MS || now < clientErrorLoggedAt) {

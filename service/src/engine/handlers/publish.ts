@@ -20,6 +20,9 @@
 //      是否单 key 更新一次并按已提交版本读回；无法确认时 BLOCKED_NEEDS_ATTENTION、路由需要处理、node_resource_unverified。
 // 读回不完整时只有 P0 记录覆盖未核对字段才算可接受（verified），否则停在 published，needsRefresh 保留到下一次发布。
 // 崩溃恢复从不重放：启动时撤回候选指针（needsRefresh 保留），recoverPublish 结束操作并按需排入一次系统强制刷新发布。
+// 进入普通模式永远可用：第一次写入 Surge（暂存候选之后的单 key 更新）之前，有排队的普通模式时发布让出（操作放回排队，普通模式
+// 先执行，之后重新发布；从不停泊或失败）。已发出更新之后不再让出：Surge 可能已载入候选，发布必须先回滚。TODO(P0)：写入之后的
+// 最长耗时是一次更新加等待，失败时再加回滚的一次更新加等待（按 resourceUpdateWait 与适配器的更新超时），由 P0 实测计时。
 // 令牌、地址与端口从不进入操作说明、错误或日志；资源 key 也不写进说明。
 
 import { readFile } from 'node:fs/promises';
@@ -45,6 +48,7 @@ import {
   clearCandidatePointer,
   commitCandidatePointer,
   isConnectionRefusedOrTimeout,
+  servedFailureCount,
   matchAuditRecord,
   readAuditState,
   readNeedsRefresh,
@@ -68,13 +72,17 @@ import { readbackCovered } from '../capabilities.js';
 import { checkCandidate } from '../candidate.js';
 import {
   NODE_RESOURCE_WARNING,
+  applyNodeResourceConfirmation,
+  auditForPublish,
   classifyGroupLine,
   committedNodeNames,
   confirmNodeResource,
+  enqueueSystemRefreshAfterCrash,
   findOurResource,
   flagUnexplainedFetch,
-  maybeEnqueueSystemRefresh,
   membersMatchCommitted,
+  raiseNodeResourceWarning,
+  type NodeResourceConfirmed,
 } from '../node-resource.js';
 import { checkSegments } from '../ownership.js';
 import { entryKey, generateResource, manifestMatches, type ResourceEntry } from '../resource.js';
@@ -118,6 +126,46 @@ function park(body: ApiErrorBody): PublishStop {
 
 function fail(err: SfeError | ApiErrorBody): PublishStop {
   return new PublishStop('fail', err instanceof SfeError ? err.toBody() : err);
+}
+
+/** 第一次写入 Surge 之前发现排队的普通模式：发布让出（操作放回排队，见 requeueForNormal）。 */
+class PublishYield extends Error {
+  constructor() {
+    super('yield to a queued normal mode');
+  }
+}
+
+/** 有排队（尚未执行）的进入普通模式请求。 */
+function normalQueued(engine: Engine): boolean {
+  return engine.repos.operations.listByStatus(['queued']).some((o) => o.kind === 'route.normal');
+}
+
+/**
+ * 让给排队的普通模式（还没有写入 Surge）：批次内的操作放回排队（SAVED），普通模式按领取顺序先执行（executor claimPreference）。
+ * 放回的批次自成一体：主操作与合并进来的操作各自重新排入（导入的逐行操作随其父操作收回），主操作上的 batchMembers 清除——之后
+ * 无论哪一个发布先被领取，都按普通的合并收回其余操作，不会留下没有 outbox 行、永远排队的操作。从不停泊或失败：停泊是终态，
+ * 系统刷新也会因此失去它的记录。
+ */
+function requeueForNormal(engine: Engine, batch: Batch): void {
+  const { repos } = engine;
+  repos.tx(() => {
+    for (const op of batch.ops) {
+      const cur = repos.operations.get(op.id);
+      if (!cur || (cur.status !== 'queued' && cur.status !== 'running')) continue;
+      const payload = payloadOf(cur);
+      const update: Parameters<typeof repos.operations.update>[1] = { phase: 'SAVED', status: 'queued', error: null };
+      if (op.id === batch.primary.id && payload.batchMembers !== undefined) {
+        const { batchMembers: _members, ...rest } = payload;
+        update.payload = rest;
+      }
+      repos.operations.update(op.id, update);
+      repos.operations.appendStep(op.id, 'SAVED', '让给排队的普通模式（没有写入 Surge），稍后重新发布');
+      if (!payload.parentOperationId) repos.outbox.enqueue(op.id, null, engine.now());
+    }
+  });
+  engine.log('info', 'publish.yielded_to_normal', { operationId: batch.primary.id });
+  emitBatch(engine, batch);
+  engine.kick();
 }
 
 // ---------- 批次 ----------
@@ -427,13 +475,14 @@ function sleep(engine: Engine, ms: number): Promise<void> {
   });
 }
 
-type UpdateWait = { state: 'idle' | 'updating' | 'unknown'; waitedMs: number; polls: number };
+type UpdateWait = { state: 'idle' | 'updating' | 'unknown' | 'yield'; waitedMs: number; polls: number };
 
 /**
  * 有限等待 Surge 不再报告本应用的资源 updating（AppServiceDeps.resourceUpdateWait 的 timeoutMs/pollMs）：idle —— 不在更新
- * （或已找不到这一项，由读回判断）；updating —— 到时限仍在更新；unknown —— 到时限最后一次仍读不到。只读，从不再次更新。
+ * （或已找不到这一项，由读回判断）；updating —— 到时限仍在更新；unknown —— 到时限最后一次仍读不到；yield —— 只在
+ * opts.yieldToNormal（暂存候选之前的等待）时：等待期间受理了普通模式，发布让出。只读，从不再次更新。
  */
-async function waitWhileUpdating(engine: Engine, url: string): Promise<UpdateWait> {
+async function waitWhileUpdating(engine: Engine, url: string, opts: { yieldToNormal?: boolean } = {}): Promise<UpdateWait> {
   const { timeoutMs, pollMs } = engine.resourceUpdateWait();
   const started = engine.now().getTime();
   let polls = 0;
@@ -448,6 +497,7 @@ async function waitWhileUpdating(engine: Engine, url: string): Promise<UpdateWai
     }
     const elapsed = engine.now().getTime() - started;
     if (state === 'idle' || elapsed >= timeoutMs) return { state, waitedMs: elapsed, polls };
+    if (opts.yieldToNormal === true && normalQueued(engine)) return { state: 'yield', waitedMs: elapsed, polls };
     await sleep(engine, Math.max(1, Math.min(pollMs, timeoutMs - elapsed)));
   }
 }
@@ -519,14 +569,29 @@ function fetchUnexplained(engine: Engine, host: ResourceHost, before: ResourceSn
   return matchAuditRecord(host.audit(), u, engine.resourceAuditToleranceMs(), state.auditedSeq + 1) === null;
 }
 
-/** SFE-ROUTE 的选择被改变（例如选中的节点一度不在成员中而回落到 REJECT）：只在原选择仍是成员时改回它，从不改选别的买家出口。 */
-async function reselect(engine: Engine, selectionBefore: string | null): Promise<void> {
-  if (selectionBefore === null) return;
+/**
+ * Surge 因选中的节点从成员中消失而回落到 REJECT 的证据（发布读回中看到）：原选择是一个节点（不是 REJECT），某次读到的成员中
+ * 没有它而选择是 REJECT。只有这时回滚才改回原选择；其余的选择变化来自外部（例如用户在 Surge 中改选了 REJECT 以紧急停止），
+ * 回滚从不覆盖它（与对账相同：外部修改只报告，从不抢回）。
+ */
+function fallbackToReject(selectionBefore: string | null, reads: ReadonlyArray<Observed | null>): boolean {
+  if (selectionBefore === null || selectionBefore.toUpperCase() === 'REJECT') return false;
+  return reads.some((o) => o !== null && o.members !== null && !o.members.includes(selectionBefore) && o.selection !== null && o.selection.toUpperCase() === 'REJECT');
+}
+
+/**
+ * 回滚之后改回原选择：只在有回落证据（fallbackToReject）、原选择仍是成员、当前选择是 REJECT、且路由没有 node_resource_unverified
+ * 时；从不改选别的买家出口。返回是否改回。
+ */
+async function reselectAfterFallback(engine: Engine, selectionBefore: string | null, evidence: boolean): Promise<boolean> {
+  if (!evidence || selectionBefore === null) return false;
+  if (engine.repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) return false;
   const sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-  if (sel === selectionBefore) return;
+  if (sel === selectionBefore || sel === null || sel.toUpperCase() !== 'REJECT') return false;
   const members = await engine.surge.getGroupMembers(ROUTE_GROUP_NAME);
-  if (!members.includes(selectionBefore)) return;
+  if (!members.includes(selectionBefore)) return false;
   await engine.surge.selectGroupPolicy(ROUTE_GROUP_NAME, selectionBefore);
+  return true;
 }
 
 // ---------- 主流程 ----------
@@ -542,6 +607,10 @@ export async function runPublish(engine: Engine, primary: OperationRecord): Prom
   try {
     await publishBatch(engine, batch);
   } catch (err) {
+    if (err instanceof PublishYield) {
+      requeueForNormal(engine, batch);
+      return;
+    }
     if (err instanceof PublishStop) {
       if (err.kind === 'park') parkAll(engine, batch, err.body);
       else failAll(engine, batch, err.body);
@@ -603,19 +672,32 @@ async function resourceHostGate(engine: Engine, files: NonNullable<ReturnType<En
   });
 }
 
-/** Surge 中本应用的资源（恰好一个），key 能经当前机制安全更新；等它不再 updating，读更新之前的状态。 */
+/**
+ * Surge 中本应用的资源（恰好一个），key 能经当前机制安全更新；等它不再 updating，读更新之前的状态并审计一次。找不到时在
+ * resourceUpdateWait 的时限内等 Surge 登记它（同一配置重载之后新地址的资源不会立即出现：2026-10-25 回环矩阵，P0 的
+ * REGISTRATION_WAIT_MS），到时限才停泊。等待期间受理了普通模式时让出（PublishYield）。
+ */
 async function discover(engine: Engine, host: ResourceHost, url: string): Promise<{ target: ResourceTarget; before: Observed }> {
-  let list: SurgeExternalResource[];
-  try {
-    list = await engine.surge.listExternalResources();
-  } catch (err) {
-    throw fail(engine.errorBody(err, '发布失败：读取外部资源失败'));
+  const { timeoutMs, pollMs } = engine.resourceUpdateWait();
+  const started = engine.now().getTime();
+  let found: ReturnType<typeof findOurResource>;
+  for (;;) {
+    let list: SurgeExternalResource[];
+    try {
+      list = await engine.surge.listExternalResources();
+    } catch (err) {
+      throw fail(engine.errorBody(err, '发布失败：读取外部资源失败'));
+    }
+    found = findOurResource(list, url);
+    const elapsed = engine.now().getTime() - started;
+    if (found.problem !== 'resource_missing' || elapsed >= timeoutMs) break;
+    if (normalQueued(engine)) throw new PublishYield();
+    await sleep(engine, Math.max(1, Math.min(pollMs, timeoutMs - elapsed)));
   }
-  const found = findOurResource(list, url);
   if (found.problem === 'resource_missing') {
     throw park({
       code: 'RESOURCE_MISSING',
-      message: '发布暂停：Surge 中找不到指向本机资源服务的节点资源（工作配置可能尚未加载），需要重新合并；新版本保持待部署',
+      message: '发布暂停：等待时限内 Surge 中找不到指向本机资源服务的节点资源（工作配置可能尚未加载），需要重新合并；新版本保持待部署',
       details: { reason: 'resource_missing' },
     });
   }
@@ -629,17 +711,32 @@ async function discover(engine: Engine, host: ResourceHost, url: string): Promis
   if (route.kind === 'park') {
     throw park({ code: 'CAPABILITY_UNVERIFIED', message: `发布暂停：${route.message}；新版本保持待部署`, details: { reason: route.reason } });
   }
-  // 之前的更新（Surge 自己的定时刷新、上一次中断的发布）仍在进行：不在它之上提供新版本
-  const wait = await waitWhileUpdating(engine, url);
+  // 之前的更新（Surge 自己的定时刷新、上一次中断的发布）仍在进行：不在它之上提供新版本；等待期间受理了普通模式时让出
+  const wait = await waitWhileUpdating(engine, url, { yieldToNormal: true });
+  if (wait.state === 'yield') throw new PublishYield();
   if (wait.state === 'updating') {
     throw park({ code: 'SURGE_COMMAND_FAILED', message: '发布暂停：Surge 仍在更新本应用的节点资源（等待超时），未提供新版本；新版本保持待部署', details: { reason: 'resource_updating' } });
   }
   if (wait.state === 'unknown') throw fail({ code: 'SURGE_UNREACHABLE', message: '发布失败：读取外部资源失败，未提供新版本' });
+  // 审计点在读取之前取：读取期间本服务的下载与失败答复都留给之后的审计
+  const mark = host.auditMark();
+  const failuresBefore = servedFailureCount(host.failureCounters());
   const before = await observe(engine, url);
   if (before.failed.includes('resources')) throw fail({ code: 'SURGE_UNREACHABLE', message: '发布失败：读取外部资源失败，未提供新版本' });
   if (before.failed.includes('selection')) throw fail({ code: 'SURGE_UNREACHABLE', message: '发布失败：读取 SFE-ROUTE 选择失败，未提供新版本' });
   if (before.resource === null || before.resource.key !== key) {
     throw fail({ code: 'BASELINE_CHANGED', message: '发布失败：Surge 中本应用的节点资源在读取期间变化，未提供新版本' });
+  }
+  // 审计“更新之前”的状态（与对账相同的规则）：发布的确认会把审计基线前移到这次发布的下载，基线之前留下的、本服务无法解释的
+  // 下载或资源错误必须在这里发现（例如本服务停止期间端口被他人占用、Surge 下载了它提供的列表），不能被确认覆盖
+  const verdict = auditForPublish(engine, host, before.resource, { mark, failuresBefore });
+  if (verdict === 'unexplained_fetch' || verdict === 'unexplained_error') {
+    raiseNodeResourceWarning(engine, [verdict]);
+    throw park({
+      code: 'RESOURCE_SERVER_UNAVAILABLE',
+      message: '发布暂停：Surge 报告了本机资源服务无法解释的下载或资源错误，读取令牌可能已泄露，需要在维护中重新合并并轮换资源地址；新版本保持待部署',
+      details: { reason: 'token_suspect' },
+    });
   }
   return { target: { host, url, key }, before };
 }
@@ -740,7 +837,9 @@ async function publishBatch(engine: Engine, batch: Batch): Promise<void> {
   // 5. 没有修改的捷径：没有待发布与待移除、清单与已提交版本相同、Surge 中正是已提交版本且没有资源错误、没有刷新要求
   const pending = batch.units.filter((u) => u.outcome === null);
   const needsRefreshBefore = readNeedsRefresh(engine.kv);
-  const forced = needsRefreshBefore !== null || batch.ops.some((o) => payloadOf(o).forceRefresh === true);
+  // 节点资源未确认的警告只由经确认的读回清除：警告在时不走捷径（门槛已保证工作配置指向本服务当前地址、令牌不可疑）
+  const forced =
+    needsRefreshBefore !== null || batch.ops.some((o) => payloadOf(o).forceRefresh === true) || repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING);
   const beforeSnap = snapshotOf(before);
   const surgeClean = resourceErrorOf(beforeSnap) === null && membersMatchCommitted(before.members ?? [], plan.committedNames);
   if (pending.length === 0 && plan.removed.length === 0 && plan.unchanged && surgeClean && !forced) {
@@ -753,6 +852,8 @@ async function publishBatch(engine: Engine, batch: Batch): Promise<void> {
   // 6. 事务 T1：候选发布记录、候选指针与 needsRefresh（之后任何中断都要求下一次发布重新更新并读回），操作进入 DEPLOYING
   const generation = plan.generation;
   const selectionBefore = before.selection;
+  // 第一次写入 Surge 之前的最后一个停止点（T1 与暂存、单 key 更新之间没有等待）：有排队的普通模式时让出
+  if (normalQueued(engine)) throw new PublishYield();
   const deployment = repos.tx(() => {
     const gen = repos.meta.bumpConfigurationGeneration();
     if (gen !== generation) throw new SfeError('INTERNAL', '发布失败：配置代数已变化');
@@ -1022,6 +1123,8 @@ interface RollbackInput {
   update: UpdateOutcome | null;
   /** 更新之后（等待与稳定延迟之后）读到的状态；没有读时为 null（回滚时再读）。 */
   after: Observed | null;
+  /** 稳定延迟之后再读的一次；没有读时为 null。 */
+  afterRepeat: Observed | null;
   /** 等待到时限 Surge 仍在更新：回滚不再更新，直接需要处理。 */
   stillUpdating: boolean;
 }
@@ -1059,7 +1162,7 @@ async function deploy(engine: Engine, ctx: DeployContext): Promise<void> {
   const { batch, plan, target } = ctx;
   const { host, url, key } = target;
   const generation = plan.generation;
-  const input: RollbackInput = { failure: { code: 'INTERNAL', message: '发布失败：内部错误' }, mark: null, update: null, after: null, stillUpdating: false };
+  const input: RollbackInput = { failure: { code: 'INTERNAL', message: '发布失败：内部错误' }, mark: null, update: null, after: null, afterRepeat: null, stillUpdating: false };
   let committed: CommitInput | null = null;
   try {
     input.mark = host.auditMark();
@@ -1085,10 +1188,13 @@ async function deploy(engine: Engine, ctx: DeployContext): Promise<void> {
     } else {
       const { settleMs } = engine.resourceUpdateWait();
       await sleep(engine, settleMs);
+      // 读回开始之前的失败答复计数：确认之后成为新审计点的基线（读回期间与之后本服务的失败答复都算进下一次审计）
+      const failuresBaseline = servedFailureCount(host.failureCounters());
       const after = await observe(engine, url);
       input.after = after;
       await sleep(engine, settleMs);
       const afterRepeat = await observe(engine, url);
+      input.afterRepeat = afterRepeat;
       const extra = await profileAndRuntime(engine, ctx);
       const details = await readDetails(engine, plan.manifest, ctx.fronts);
       const beforeSnap = snapshotOf(ctx.before);
@@ -1131,6 +1237,7 @@ async function deploy(engine: Engine, ctx: DeployContext): Promise<void> {
           acceptable,
           matchedSeq: matched.seq,
           snapshot: { updatedAt: afterSnap.updatedAt!, error: afterSnap.error },
+          failuresBaseline,
         };
         // 事务 T2：发布记录、指针、审计状态、needsRefresh 与各目标的结算（失败按读回失败回滚；各目标在内存中的结果一并复原）
         const saved = batch.units.map((u) => ({ outcome: u.outcome, error: u.error }));
@@ -1173,33 +1280,70 @@ async function deploy(engine: Engine, ctx: DeployContext): Promise<void> {
 
 // ---------- 回滚 ----------
 
+/** 过渡中的路由阶段：由负责它的路由操作处理，回滚不改它（与对账的 IN_PROGRESS 相同）。 */
+const ROUTE_IN_PROGRESS: ReadonlySet<string> = new Set(['switching', 'rolling_back']);
+
 /**
- * 回滚：一个事务撤回候选指针（needsRefresh 保留）→ 资源服务撤回候选版本（之后 Surge 的任何下载都得到已提交版本）→ 判断 Surge
- * 是否可能已载入候选：更新报告已下载或结果不明、有候选代数的审计记录（序号不小于 mark，含没有写完的）、更新时间变化、成员与
- * 已提交版本不同。可能载入且不在更新中 → 单 key 更新一次 → 有限等待 → 原选择仍是成员时改回它 → 按已提交版本严格读回；Surge 仍在
- * 更新（到时限）或令牌可疑时不更新。没有载入 → 核对成员仍是已提交版本、更新时间不变、资源错误不变或只是连接被拒绝或超时。
- * 确认 → 发布记录 rolled_back、操作按原因失败；无法确认 → 发布记录 failed、BLOCKED_NEEDS_ATTENTION、路由需要处理、
- * node_resource_unverified（从不改为 NORMAL、DIRECT 或其他出口），needsRefresh 保留。
+ * 回滚确认时读到的 SFE-ROUTE 选择与路由记录的选择不同（发布期间被外部修改，例如用户在 Surge 中改选了 REJECT）：与对账相同地
+ * 报告——托管中的路由加 external_selection_change、阶段改为 external_change（已是 attention 时不变），去掉
+ * rollback_needs_reverify（「已恢复原节点」已不成立）。从不改回选择，也不因此设 node_resource_unverified。在调用方的事务中执行，
+ * 返回是否记下。
+ */
+function noteExternalSelection(engine: Engine, selection: string | null | undefined): boolean {
+  const { repos } = engine;
+  const route = repos.routeState.get();
+  const managed = route.phase !== 'idle' || route.entryMode !== 'NORMAL';
+  if (!managed || selection === undefined || route.selectedNode === null || selection === route.selectedNode || ROUTE_IN_PROGRESS.has(route.phase)) return false;
+  const warnings = new Set(route.warnings.filter((w) => w !== 'rollback_needs_reverify'));
+  warnings.add('external_selection_change');
+  repos.routeState.update({ warnings: [...warnings], phase: route.phase === 'attention' ? 'attention' : 'external_change' });
+  return true;
+}
+
+/** 回滚的单 key 更新之前重读本应用的资源：idle 才更新；仍在更新、读不到或资源已变化（key 不同）时不再更新。 */
+async function updatingBeforeRollback(engine: Engine, url: string, key: string): Promise<'idle' | 'updating' | 'unknown'> {
+  try {
+    const found = findOurResource(await engine.surge.listExternalResources(), url);
+    if (found.resource === null || found.resource.key !== key) return 'unknown';
+    return found.resource.updating === true ? 'updating' : 'idle';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * 回滚：资源服务先撤回候选版本（内存中，不会失败：之后 Surge 的任何下载都得到已提交版本，撤回指针的事务失败时也不再提供从未
+ * 提交的候选）→ 一个事务撤回候选指针（needsRefresh 保留）→ 判断 Surge 是否可能已载入候选：更新报告已下载或结果不明、有候选
+ * 代数的审计记录（序号不小于 mark，含没有写完的）、更新时间变化、成员与已提交版本不同。可能载入时：发布读回中 Surge 已报告
+ * 在更新、或更新之前重读时仍在更新（或读不到、资源已变化）→ 不再更新；否则单 key 更新一次 → 有限等待 → 只在有“选中的节点从
+ * 成员中消失而回落到 REJECT”的证据时改回原选择 → 按已提交版本严格读回（资源部分；选择只要求两次读取一致）；令牌可疑时不更新。
+ * 没有载入 → 核对成员仍是已提交版本、更新时间不变、资源错误不变或只是连接被拒绝或超时。选择在发布期间被外部修改时从不改回：
+ * 托管中的路由记 external_selection_change（noteExternalSelection）。确认 → 发布记录 rolled_back、操作按原因失败；无法确认 →
+ * 发布记录 failed、BLOCKED_NEEDS_ATTENTION、路由需要处理、node_resource_unverified（从不改为 NORMAL、DIRECT 或其他出口），
+ * needsRefresh 保留。
  */
 async function rollbackPublish(engine: Engine, ctx: DeployContext, input: RollbackInput): Promise<void> {
   const { repos, kv } = engine;
   const { batch, target } = ctx;
   const { host, url, key } = target;
   const candidate = ctx.plan.generation;
+  host.revertToCommitted();
   repos.tx(() => {
     clearCandidatePointer(kv);
     markAll(engine, batch, 'ROLLING_BACK', 'running', `${input.failure.message}：回滚到已提交的节点资源`);
   });
   emitBatch(engine, batch);
-  host.revertToCommitted();
   let confirmed = false;
-  let confirmation: { matchedSeq: number; snapshot: { updatedAt: Date; error: string | null }; clearNeedsRefresh: boolean } | null = null;
+  let confirmation: { matchedSeq: number; snapshot: { updatedAt: Date; error: string | null }; clearNeedsRefresh: boolean; failuresBaseline: number } | null = null;
   let reason: string | null = null;
+  let reselected = false;
+  /** 确认读回中读到的 SFE-ROUTE 选择（没有确认时不用）。 */
+  let observedSelection: string | null | undefined;
   try {
     const committedGeneration = readServedPointer(kv)?.committed.generation ?? null;
     const committedNames = committedNodeNames(engine);
     if (committedGeneration === null || committedNames === null) throw new SfeError('INTERNAL', '回滚失败：已提交版本无法确定');
-    if (input.stillUpdating) {
+    if (input.stillUpdating || input.after?.resource?.updating === true || input.afterRepeat?.resource?.updating === true) {
       reason = 'Surge 仍在更新本应用的节点资源，不再更新';
     } else if (readTokenSuspect(kv) !== null) {
       reason = '读取令牌可能已泄露：资源服务不再提供内容';
@@ -1213,9 +1357,13 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
         !sameTime(afterSnap.updatedAt, ctx.before.resource?.lastUpdatedAt ?? null) ||
         !membersMatchCommitted(after.members ?? [], committedNames);
       if (held) {
-        if (after.resource?.updating === true) {
+        const fresh = await updatingBeforeRollback(engine, url, key);
+        if (fresh === 'updating') {
           reason = 'Surge 仍在更新本应用的节点资源，不再更新';
+        } else if (fresh === 'unknown') {
+          reason = '回滚之前读取本应用的节点资源失败或资源已变化，不再更新';
         } else {
+          const fallback = fallbackToReject(ctx.selectionBefore, [input.after, input.afterRepeat]);
           const mark = host.auditMark();
           const update = await updateOnce(engine, key);
           stepAll(engine, batch, update.kind === 'downloaded' ? '回滚：已对本应用的节点资源单 key 更新一次，Surge 报告已下载' : '回滚：对本应用的节点资源单 key 更新一次没有成功');
@@ -1225,19 +1373,21 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
           } else {
             const { settleMs } = engine.resourceUpdateWait();
             await sleep(engine, settleMs);
-            await reselect(engine, ctx.selectionBefore);
+            reselected = await reselectAfterFallback(engine, ctx.selectionBefore, fallback);
+            const failuresBaseline = servedFailureCount(host.failureCounters());
             const r1 = await observe(engine, url);
             await sleep(engine, settleMs);
             const r2 = await observe(engine, url);
             const committedDeployment = repos.deployments.get(committedGeneration);
             const details = await readDetails(engine, committedDeployment?.nodeManifest ?? [], ctx.fronts);
+            // 资源部分按已提交版本严格核对；选择只要求两次读取一致（外部修改由 noteExternalSelection 报告，回滚从不改回）
             const assessment = assessResourceReadback({
               url,
               before: snapshotOf(ctx.before),
               after: snapshotOf(r1),
               afterRepeat: snapshotOf(r2),
               expectedMembers: committedNames,
-              selectionBefore: ctx.selectionBefore,
+              selectionBefore: r1.selection,
               records: host.audit(),
               mark,
               expectedGeneration: committedGeneration,
@@ -1253,7 +1403,9 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
                 matchedSeq: matched.seq,
                 snapshot: { updatedAt: u, error: snapshotOf(r1).error },
                 clearNeedsRefresh: assessment.level === 'full' || readbackCovered(engine.capabilityViews(), unchecked),
+                failuresBaseline,
               };
+              observedSelection = r1.selection;
               confirmed = true;
             } else {
               reason = `读回不一致（${[...new Set([...assessment.failed, ...readFailed])].join('、')}）`;
@@ -1261,8 +1413,7 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
           }
         }
       } else {
-        // Surge 没有载入候选：核对它仍是更新之前的已提交版本
-        await reselect(engine, ctx.selectionBefore);
+        // Surge 没有载入候选：核对它仍是更新之前的已提交版本（选择的变化只可能来自外部，见 noteExternalSelection）
         const now = await observe(engine, url);
         const nowSnap = snapshotOf(now);
         const errorOk = nowSnap.error === afterSnap.error && (afterSnap.error === snapshotOf(ctx.before).error || (afterSnap.error !== null && isConnectionRefusedOrTimeout(afterSnap.error)));
@@ -1270,9 +1421,9 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
           now.failed.length === 0 &&
           membersMatchCommitted(now.members ?? [], committedNames) &&
           sameTime(nowSnap.updatedAt, ctx.before.resource?.lastUpdatedAt ?? null) &&
-          errorOk &&
-          now.selection === ctx.selectionBefore;
-        if (!confirmed) reason = 'Surge 中的节点资源与更新之前的已提交版本不一致';
+          errorOk;
+        if (confirmed) observedSelection = now.selection;
+        else reason = 'Surge 中的节点资源与更新之前的已提交版本不一致';
       }
     }
   } catch {
@@ -1280,22 +1431,30 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
     reason = reason ?? '读取或更新 Surge 失败';
   }
 
+  let selectionNoted = false;
   if (confirmed) {
+    // 确认的结果取自事务的返回值：事务（含提交）失败时没有确认，内存中的审计点、日志与事件都不发生
+    let applied = null as NodeResourceConfirmed | null;
     try {
-      repos.tx(() => {
+      applied = repos.tx(() => {
         repos.deployments.update(candidate, { state: 'rolled_back' });
         const pointer = readServedPointer(kv)!;
+        let result: NodeResourceConfirmed | null = null;
         if (confirmation !== null) {
-          confirmNodeResource(engine, { generation: pointer.committed.generation, ...confirmation });
+          result = confirmNodeResource(engine, { generation: pointer.committed.generation, ...confirmation });
         } else {
           // Surge 从未载入候选：刷新要求回到发布之前
           writeNeedsRefresh(kv, ctx.needsRefreshBefore);
         }
+        selectionNoted = noteExternalSelection(engine, observedSelection);
+        return result;
       });
     } catch {
+      selectionNoted = false;
       confirmed = false;
       reason = '回滚结果无法记录';
     }
+    if (applied !== null) applyNodeResourceConfirmation(engine, applied);
   }
   if (confirmed) {
     for (const u of batch.units) {
@@ -1303,18 +1462,27 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
       u.outcome = 'failed';
       u.error = input.failure;
     }
+    const selectionText = reselected
+      ? '，原选择已恢复（选中的节点曾从成员中消失、回落到 REJECT）'
+      : observedSelection === ctx.selectionBefore
+        ? '，原选择未变'
+        : `；SFE-ROUTE 的选择在发布期间被外部修改，回滚没有改动它${selectionNoted ? '（路由需要处理）' : ''}`;
     finishOps(engine, batch, {
       phase: 'FAILED',
       status: 'failed',
       error: input.failure,
-      step: confirmation !== null ? '已回滚：Surge 重新载入已提交的节点资源并经读回确认，原选择已恢复' : '已回滚：Surge 没有载入候选版本，仍是已提交的节点资源与原选择',
+      step: confirmation !== null ? `已回滚：Surge 重新载入已提交的节点资源并经读回确认${selectionText}` : `已回滚：Surge 没有载入候选版本，仍是已提交的节点资源${selectionText}`,
     });
+    if (selectionNoted) {
+      const route = repos.routeState.get();
+      engine.emit({ route: true, environments: route.activeEnvironmentId ? [route.activeEnvironmentId] : [] });
+    }
     return;
   }
   // 回滚无法确认：活动环境需要处理（从不改为 NORMAL、DIRECT 或其他出口）。之前一次成功回滚留下的 rollback_needs_reverify
   // （「已恢复原节点并保持阻断」）：SFE-ROUTE 的选择已无法确认，「已恢复原节点」不再成立——去掉，环境改显示路由需要处理（与对账
   // 发现选择被外部修改时相同，engine/reconcile.ts）。Surge 中的节点无法证明来自已提交版本：node_resource_unverified（只由经确认的
-  // 读回清除）。
+  // 读回清除；needsRefresh 保留，见 T1）。
   repos.deployments.update(candidate, { state: 'failed' });
   const route = repos.tx(() => {
     const r = repos.routeState.get();
@@ -1346,11 +1514,19 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
 /** D10 的四项回环资源补测（发布门槛中这四项的说明合并为一句）。 */
 const LOOPBACK_PUBLISH_KEYS: readonly CapabilityKey[] = ['loopback_resource_update', 'loopback_resource_auth', 'loopback_resource_restart', 'loopback_publish_crash'];
 
-/** 发布门槛不满足时停泊的说明。缺少回环资源补测中的任何一项时写明：这些补测通过并经确认前新版本保持待部署。 */
+/**
+ * 发布门槛不满足时停泊的说明。缺少回环资源补测中的任何一项时写明：这些补测通过并经确认前新版本保持待部署。缺少的记录含
+ * resourceServe 门槛的任何一项（例如 Surge 版本变化让它们过期）时，本机资源服务也不再提供已提交的节点（503），不能说“已部署的
+ * 节点不受影响”：Surge 已下载的节点是否保留（尤其在 Surge 重启之后）待 P0 loopback_resource_restart 实测。
+ */
 function publishGateBody(engine: Engine, views: ReturnType<Engine['capabilityViews']>, missing: CapabilityKey[]): ApiErrorBody {
   const base = capabilityError(views, missing, '发布', engine.versionGateNote(missing)).toBody();
   if (engine.versionGateNote(missing) !== null || !missing.some((k) => LOOPBACK_PUBLISH_KEYS.includes(k))) {
-    return { ...base, message: `${base.message.replace(/^发布失败：/, '发布暂停：')}；新版本保持待部署，已部署的节点不受影响` };
+    const serveGated = missing.some((k) => (CAPABILITY_GATES.resourceServe as readonly CapabilityKey[]).includes(k));
+    const tail = serveGated
+      ? '；新版本保持待部署；这次停泊没有写入 Surge；这些实测记录在当前 Surge 版本下重新有效之前，本机资源服务不提供已提交的节点（Surge 已下载的节点是否保留，尤其在 Surge 重启之后，待 P0 loopback_resource_restart 实测）'
+      : '；新版本保持待部署，已部署的节点不受影响';
+    return { ...base, message: `${base.message.replace(/^发布失败：/, '发布暂停：')}${tail}` };
   }
   const others = views.filter((v) => missing.includes(v.key) && !LOOPBACK_PUBLISH_KEYS.includes(v.key)).map((v) => v.label);
   return {
@@ -1372,6 +1548,8 @@ interface CommitInput {
   /** 与读回的更新时间匹配的、候选代数的完整 200 的审计序号。 */
   matchedSeq: number;
   snapshot: { updatedAt: Date; error: string | null };
+  /** 读回开始之前的失败答复计数（confirmNodeResource 的 failuresBaseline）。 */
+  failuresBaseline: number;
   /** 本次标为已部署的目标（entryKey；commitDeployment 填写）。 */
   deployedNow?: Set<string>;
 }
@@ -1385,7 +1563,7 @@ function commitDeployment(engine: Engine, batch: Batch, s: CommitInput): void {
   const { repos } = engine;
   const manifestKeys = new Set(s.plan.manifest.map((m) => entryKey(m.environmentId, m.proxyRevision)));
   const deployedNow = new Set<string>();
-  repos.tx(() => {
+  const confirmed = repos.tx((): NodeResourceConfirmed => {
     repos.deployments.update(s.deployment.generation, {
       state: s.acceptable ? 'verified' : 'published',
       readbackLevel: s.readback.level,
@@ -1393,7 +1571,7 @@ function commitDeployment(engine: Engine, batch: Batch, s: CommitInput): void {
     });
     const gen = commitCandidatePointer(engine.kv);
     if (gen !== s.deployment.generation) throw new SfeError('INTERNAL', '发布失败：提交的候选代数不一致');
-    confirmNodeResource(engine, { generation: gen, matchedSeq: s.matchedSeq, snapshot: s.snapshot, clearNeedsRefresh: s.acceptable });
+    const result = confirmNodeResource(engine, { generation: gen, matchedSeq: s.matchedSeq, snapshot: s.snapshot, clearNeedsRefresh: s.acceptable, failuresBaseline: s.failuresBaseline });
     for (const u of batch.units) {
       if (u.outcome !== null) continue;
       const k = entryKey(u.target.environmentId, u.target.proxyRevision);
@@ -1437,7 +1615,10 @@ function commitDeployment(engine: Engine, batch: Batch, s: CommitInput): void {
     }
     scrubRetiredDeploymentDigests(engine, retiredNow);
     retireStaleRevisions(engine, manifestKeys);
+    return result;
   });
+  // T2 已提交：审计点、日志与事件此时才生效（事务回滚时它们都不发生）
+  applyNodeResourceConfirmation(engine, confirmed);
   s.deployedNow = deployedNow;
   if (s.plan.removed.length > 0) stepAll(engine, batch, `已移除不再使用的旧节点 ${s.plan.removed.length} 个`);
 }
@@ -1606,7 +1787,8 @@ function finalPhase(engine: Engine, units: readonly Unit[]): { phase: OperationP
 /**
  * 服务重启时仍处于 DEPLOYING / RECONCILING / ROLLING_BACK 的发布：从不重放。启动时（engine/node-resource.ts，执行器之前）
  * 已撤回候选指针并保留 needsRefresh；这里把仍为 candidate 的发布记录记为 failed，批次内全部操作记为 FAILED（UNKNOWN_STATE），
- * 之后按需排入一次系统强制刷新发布（单 key 更新并读回，使 Surge 回到已提交版本；门槛不满足时停泊）。
+ * 之后按需排入一次系统强制刷新发布（单 key 更新并读回，使 Surge 回到已提交版本；门槛不满足时停泊）。中断的正是系统刷新本身时
+ * 同一崩溃链最多自动重排一次（enqueueSystemRefreshAfterCrash）；重排的那次再中断时由用户重新同步（needsRefresh 保留）。
  */
 export async function recoverPublish(engine: Engine, op: OperationRecord): Promise<void> {
   const { repos } = engine;
@@ -1621,7 +1803,8 @@ export async function recoverPublish(engine: Engine, op: OperationRecord): Promi
     if (!cur || (cur.status !== 'running' && cur.status !== 'queued')) continue;
     engine.updateOp(id, { phase: 'FAILED', status: 'failed', error: body }, body.message);
   }
-  maybeEnqueueSystemRefresh(engine);
+  // 中断的正是系统刷新（且不是崩溃之后的那次重排）时同一崩溃链再自动排入一次，其余按需排入（node-resource.ts）
+  enqueueSystemRefreshAfterCrash(engine, op.id);
 }
 
 /** 主操作发起的发布记录（代数）：发布记录的主操作，或发布包含的操作。 */

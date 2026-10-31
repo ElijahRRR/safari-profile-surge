@@ -4,7 +4,8 @@
 
 import { afterEach, describe, expect, test } from 'vitest';
 import { ROUTE_GROUP_NAME } from '@sfe/contract';
-import { confirmNodeResource } from '../../src/engine/node-resource.js';
+import { confirmNodeResource, serveCommittedGeneration } from '../../src/engine/node-resource.js';
+import { FAKE_REMOTE_ERRORS } from '../../src/surge/fake.js';
 import { matchAuditRecord, readNeedsRefresh, readTokenSuspect } from '../../src/resource/index.js';
 import { nodeLine, resourceBody } from '../../src/surge/generate.js';
 import { PROFILE_A, PROFILE_B, WEB, bind, createEnv, createHarness, rid, verify, type Harness } from './harness.js';
@@ -135,6 +136,37 @@ describe('audit while serving', () => {
     expect(fetchResource(h).status).toBe(404);
   });
 
+  test('regression: our own 503 answered while an audit reads Surge counts in the next audit (no false tokenSuspect)', async () => {
+    // temp_rule：读入口不读外部资源，对账中读外部资源的只有节点资源检查
+    h = await createHarness({ nodeResource: 'loopback', entryStrategy: 'temp_rule' });
+    h.revoke(['loopback_publish_crash']);
+    await h.idle();
+    await h.app.runPeriodicReconcile();
+    const engine = h.app.engine;
+    const host = engine.resource!;
+    // 这次对账读外部资源期间：本服务没有可提供的版本、答复了 Surge 的一次下载 503；读到的快照是下载之前的（还没有错误）
+    const orig = h.fake.listExternalResources.bind(h.fake);
+    let fired = false;
+    h.fake.listExternalResources = async () => {
+      const list = await orig();
+      if (!fired) {
+        fired = true;
+        host.unload();
+        await h.fake.updateExternalResource(h.resourceKey()!).catch(() => undefined);
+        await serveCommittedGeneration(engine);
+      }
+      return list;
+    };
+    await h.app.runPeriodicReconcile();
+    expect(fired).toBe(true);
+    h.fake.listExternalResources = orig;
+    expect((await ourResource(h))!.error).toBe(FAKE_REMOTE_ERRORS.status(503));
+    // 下一次审计看到这个错误：本服务一直在监听，读取期间的 503 算进这一次的失败次数
+    await h.app.runPeriodicReconcile();
+    expect(readTokenSuspect(engine.kv)).toBeNull();
+    expect(h.logs.some((l) => l.includes('"msg":"resource.audit_unexplained"'))).toBe(false);
+  });
+
   test('the listener lost its port to another process: retried each tick, tokenSuspect and the warning', async () => {
     h = await createHarness({ nodeResource: 'loopback' });
     await h.idle();
@@ -193,7 +225,43 @@ describe('node parameters', () => {
     expect(op.error!.message).toContain('路由未改变');
     expect(h.fake.calls.selectGroupPolicy ?? 0).toBe(selects);
     expect(h.repos.routeState.get()).toMatchObject({ phase: 'idle', entryMode: 'NORMAL', activeEnvironmentId: null });
+    expect(h.logs.some((l) => l.includes('"msg":"resource.unverified"') && l.includes('node_detail_mismatch'))).toBe(true);
+    // 警告带着刷新要求：排入的一次系统强制刷新单 key 更新、按已提交版本读回节点参数之后清除它（激活仍需用户重新发起）
+    const refresh = h.repos.operations.listRecent(50).filter((o) => o.kind === 'deploy.publish' && o.initiatorKind === 'service');
+    expect(refresh).toHaveLength(1);
+    expect(refresh[0]).toMatchObject({ phase: 'COMPLETED', status: 'succeeded' });
+    expect((await h.fake.getPolicyDetail(nodeName)).server).toBe('203.0.113.10');
+    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
+  });
+
+  test('regression: a drifted in-use node (same name, other server) on an active route converges by one system refresh; the warning clears and the route stays in attention', async () => {
+    h = await createHarness({ nodeResource: 'loopback' });
+    await h.idle();
+    const { envId, nodeName } = await activeLoopbackEnv(h, 'US-Buyer-A', '203.0.113.10', PROFILE_A);
+    const rev = h.repos.proxyRevisions.get(envId, h.repos.environments.get(envId)!.deployedProxyRevision!)!;
+    const generation = h.repos.meta.configurationGeneration() + 1;
+    await serveAndFetch(h, generation, resourceBody(generation, [nodeLine({ name: nodeName, host: '192.0.2.99', port: 1080, username: null, password: null, front: 'Front-A' })]));
+    h.app.engine.resource!.revertToCommitted();
+    expect((await h.fake.getPolicyDetail(nodeName)).server).toBe('192.0.2.99');
+    const updates = h.fake.calls.updateExternalResource ?? 0;
+    const selects = h.fake.calls.selectGroupPolicy ?? 0;
+    await h.app.runPeriodicReconcile();
     expect(h.repos.routeState.get().warnings).toContain('node_resource_unverified');
+    expect(readNeedsRefresh(h.app.engine.kv)).toMatchObject({ reason: 'node_detail_mismatch' });
+    await h.idle();
+    // 一次单 key 更新恢复已提交的参数（同名参数变化立即生效、保持选择），从不改选
+    expect((h.fake.calls.updateExternalResource ?? 0) - updates).toBe(1);
+    expect(h.fake.calls.selectGroupPolicy ?? 0).toBe(selects);
+    expect(await h.fake.getPolicyDetail(nodeName)).toMatchObject({ server: rev.host, port: rev.port });
+    expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe(nodeName);
+    const route = h.repos.routeState.get();
+    expect(route.warnings).not.toContain('node_resource_unverified');
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
+    // 路由仍需要现有的重新核验流程才能回到已验证
+    expect(route.phase).toBe('attention');
+    await h.app.runPeriodicReconcile();
+    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
   });
 });
 

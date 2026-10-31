@@ -3,6 +3,7 @@
 
 import { afterEach, describe, expect, test } from 'vitest';
 import { ROUTE_GROUP_NAME, type ActivateRequest, type RollbackResult } from '@sfe/contract';
+import { readNeedsRefresh } from '../../src/resource/index.js';
 import { PROFILE_A, PROFILE_B, WEB, activeEnv, bind, createEnv, createHarness, rid, safariOutcome, verify, type Harness } from './harness.js';
 
 let h: Harness;
@@ -136,5 +137,67 @@ describe('node_resource_unverified and activation', () => {
     expect(route.warnings).toContain('node_resource_unverified');
     expect(h.repos.environments.get(b)!.lastVerifiedProxyRevision).toBeNull();
     expect(await h.fake.getGroupSelection(ROUTE_GROUP_NAME)).toBe('REJECT');
+  });
+});
+
+describe('the warning always comes with a way to clear it (a refresh requirement)', () => {
+  const systemRefreshOps = () => h.repos.operations.listRecent(100).filter((o) => o.kind === 'deploy.publish' && o.initiatorKind === 'service' && o.payload.forceRefresh === true);
+  const updates = () => h.fake.calls.updateExternalResource ?? 0;
+
+  test('regression: one transient read without our resource → warning with needsRefresh → one system refresh → its confirmed readback clears both', async () => {
+    // temp_rule：读入口不读外部资源，对账中读外部资源的只有节点资源检查
+    h = await createHarness({ entryStrategy: 'temp_rule' });
+    const a = (await createEnv(h, 'US-Buyer-A', '203.0.113.10')).environment_id!;
+    await h.idle();
+    const before = updates();
+    // 一次对账读到的外部资源列表里没有本应用的资源（例如 Surge 正在重载）
+    h.fake.lieOnNext('listExternalResources', []);
+    await h.app.runPeriodicReconcile();
+    // 对账设下警告（系统刷新随即排入；它可能已经开始执行，所以这里看对账的记录）
+    const rec = h.repos.operations.listRecent(50).find((o) => o.kind === 'maintenance.reconcile' && (o.payload.added as string[] | undefined)?.includes('node_resource_unverified'));
+    expect(rec).toBeDefined();
+    expect(systemRefreshOps()).toHaveLength(1);
+    expect(systemRefreshOps()[0]!.payload).toMatchObject({ systemRefresh: 'needs_refresh' });
+    await h.idle();
+    expect(systemRefreshOps()).toHaveLength(1);
+    expect(systemRefreshOps()[0]).toMatchObject({ phase: 'COMPLETED', status: 'succeeded' });
+    expect(updates() - before).toBe(1);
+    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
+    // 之后激活不再因节点资源未确认被拒绝
+    await bind(h, PROFILE_A, a);
+    const act = await h.app.activate(a, { request_id: rid('act') }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(act.operation_id)!.error?.code).not.toBe('NODE_NOT_DEPLOYED');
+  });
+
+  test('regression: an explicit publish with nothing pending never takes the no-op shortcut while the warning is set', async () => {
+    h = await createHarness();
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    await h.idle();
+    // 升级之前（或令牌一度读不到时）设下、没有刷新要求的警告
+    addWarning();
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
+    const before = updates();
+    const p = await h.app.publishPending({ request_id: rid('pub') }, WEB);
+    await h.idle();
+    expect(h.repos.operations.get(p.operation_id)).toMatchObject({ phase: 'COMPLETED', status: 'succeeded' });
+    expect(updates() - before).toBe(1);
+    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
+  });
+
+  test('regression: a warning persisted across a restart without a refresh requirement gets one at startup and is cleared by the system refresh', async () => {
+    h = await createHarness({ dbFile: true });
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    await h.idle();
+    addWarning();
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
+    const before = updates();
+    await h.crash();
+    await h.idle();
+    expect(systemRefreshOps().filter((o) => o.status === 'succeeded')).toHaveLength(1);
+    expect(updates() - before).toBe(1);
+    expect(h.repos.routeState.get().warnings).not.toContain('node_resource_unverified');
+    expect(readNeedsRefresh(h.app.engine.kv)).toBeNull();
   });
 });

@@ -13,7 +13,9 @@ import FrontProxiesCard from '../components/FrontProxiesCard.vue';
 import InitWizardCard from '../components/InitWizardCard.vue';
 import RemergeCard from '../components/RemergeCard.vue';
 import { useConsole } from '../store/context';
+import { nodeResourcePublishBlocks } from '../lib/gates';
 import {
+  NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT,
   NODE_RESOURCE_NEEDS_REFRESH_TEXT,
   NODE_RESOURCE_STATE_DETAILS,
   NODE_RESOURCE_STATE_LABELS,
@@ -37,7 +39,8 @@ const nodeResourceNotes = computed(() => {
   const notes: Array<{ key: string; text: string }> = [];
   if (nr.state !== 'serving') notes.push({ key: 'state', text: NODE_RESOURCE_STATE_DETAILS[nr.state] ?? '本机资源服务状态未知。' });
   if (nr.tokenSuspect) notes.push({ key: 'tokenSuspect', text: NODE_RESOURCE_TOKEN_SUSPECT_TEXT });
-  if (nr.needsRefresh) notes.push({ key: 'needsRefresh', text: NODE_RESOURCE_NEEDS_REFRESH_TEXT });
+  // “下一次发布会单 key 更新”只在资源服务满足发布前提时成立（仍引用本地节点文件时每次发布都停泊，服务也不自动同步）
+  if (nr.needsRefresh) notes.push({ key: 'needsRefresh', text: nodeResourcePublishBlocks(nr).length === 0 ? NODE_RESOURCE_NEEDS_REFRESH_TEXT : NODE_RESOURCE_NEEDS_REFRESH_BLOCKED_TEXT });
   return notes;
 });
 const nodeResourceTone = computed<'info' | 'warning' | 'danger'>(() => {

@@ -15,7 +15,7 @@ import { compareSignals, type ReloadSignals } from '../analysis/reload.js';
 import { CALLS_LOG } from '../constants.js';
 import { loopbackGroupBlockLines, resourceFile, type ResourceSnapshot, type SurgeExternalResource } from '../deps.js';
 import { EXIT, refused, usage, type ExitCode } from '../errors.js';
-import { auditMarkOf, readAuditRecords, readResourceToken, readServerStatus, requestsBetween, scenarioBody, serverRunning, type ResourceScenario } from '../loopback-state.js';
+import { auditMarkOf, paramReplacedC, readAuditRecords, readResourceToken, readServerStatus, requestsBetween, scenarioBody, serverRunning, type ResourceScenario } from '../loopback-state.js';
 import { check, writeResult, type CheckItem } from '../results.js';
 import { loadState, saveState } from '../state.js';
 import { maskResourceKey, resourcesForPath, resourcesForUrl, type CallLogEntry } from '../surge-access.js';
@@ -240,7 +240,13 @@ function sameTime(a: Date | null, b: Date | null): boolean {
   return (a?.getTime() ?? null) === (b?.getTime() ?? null);
 }
 
-/** 一项的结论（纯函数）：失败的下载必须保留旧资源与旧节点；看似成功的变化必须由读回发现；占位列表被接受；重名由发布前校验拒绝。 */
+type NodeParams = { server: string | null; port: number | null; underlyingProxy: string | null };
+
+/**
+ * 一项的结论（纯函数）：失败的下载必须保留旧资源与旧节点；看似成功的变化必须由读回发现；占位列表被接受；重名由发布前校验拒绝。
+ * paramReplaceC 同时改变 C 的服务器、端口与前置：读回必须发现 C 的参数变化，且 getPolicyDetail 读到的三项都等于提供的新值
+ * （证明每一项都是新读的，不只是前置）。
+ */
 export function rowVerdict(input: {
   expect: RowExpect;
   before: ResourceSnapshot;
@@ -248,6 +254,9 @@ export function rowVerdict(input: {
   chainVia: string | null;
   detailMapped: boolean;
   dupRefused: boolean;
+  /** paramReplaceC：读回之后 getPolicyDetail 读到的 C（读不到为 null）与提供的新值。 */
+  detailC?: NodeParams | null;
+  servedC?: NodeParams | null;
 }): { ok: boolean | null; note: string } {
   const { before, run } = input;
   const after = run.after;
@@ -277,7 +286,14 @@ export function rowVerdict(input: {
     case 'paramC': {
       if (!input.detailMapped) return { ok: null, note: 'getPolicyDetail 不可用：读回无法核对节点参数（partial）' };
       const found = run.assessment.failed.includes(`detail:${TEST_NODES.c}`);
-      return { ok: found, note: `Surge ${after.error === null ? '报告成功' : `错误 ${errorClass(after.error)}`}，选择 ${after.selection ?? '读不到'}；读回${found ? '发现 C 的参数变化' : '没有发现 C 的参数变化'}` };
+      const d = input.detailC ?? null;
+      const served = input.servedC ?? null;
+      const fields = (['server', 'port', 'underlyingProxy'] as const).filter((f) => d !== null && served !== null && d[f] !== served[f]);
+      const fresh = d === null || served === null ? null : fields.length === 0;
+      const surge = `Surge ${after.error === null ? '报告成功' : `错误 ${errorClass(after.error)}`}，选择 ${after.selection ?? '读不到'}`;
+      const readText = `读回${found ? '发现 C 的参数变化' : '没有发现 C 的参数变化'}`;
+      const freshText = fresh === null ? '读不到 C 的服务器、端口与前置' : fresh ? '服务器、端口与前置都读到新值' : `${fields.join('、')} 没有读到新值`;
+      return { ok: !found ? false : fresh, note: `${surge}；${readText}；${freshText}` };
     }
     case 'placeholder': {
       const accepted = after.error === null && sameList(after.members, ['REJECT', EMPTY_PLACEHOLDER_NODE]);
@@ -418,8 +434,11 @@ async function runMeasure(ctx: Ctx): Promise<ExitCode> {
     }
   }
 
-  // 5. 阳性对照：手动重新加载之后新编号生效、旧编号不再生效；再把 canary 行改回原编号并加载一次
+  // 单 key 更新全部结束（含最后的恢复）：在两次手动重新加载之前读其他外部资源与重启信号——重新加载本身可能刷新或改变其他资源
+  // 的错误状态，那不是单 key 更新的影响
+  const resEnd = await tryRead(() => session.adapter.listExternalResources());
   const sig1 = await ops.signals(proxy, servers.echoPort, null);
+  // 5. 阳性对照：手动重新加载之后新编号生效、旧编号不再生效；再把 canary 行改回原编号并加载一次
   if (witness.oldIndex !== null && witness.newIndex !== null) {
     await prompt.pause('阳性对照：现在在 Surge 菜单中手动「重新加载配置」（同一配置）');
     const newVia = await probeProfileCanary(proxy, servers.echoPort, witness.newIndex);
@@ -433,9 +452,11 @@ async function runMeasure(ctx: Ctx): Promise<ExitCode> {
     ops.state = loadState(dir, now());
   }
 
-  const resEnd = await tryRead(() => session.adapter.listExternalResources());
   const key = await lb.ensureKey();
   const others = resStart && resEnd ? changedResources(resStart, resEnd, [key]) : null;
+  // 两次手动重新加载之后其他资源的变化只作记录（重新加载的影响），不计入检查
+  const resAfterReloads = positive === null ? null : await tryRead(() => session.adapter.listExternalResources());
+  const reloadEffects = resEnd && resAfterReloads ? changedResources(resEnd, resAfterReloads, [key]) : null;
   const cmp = compareSignals({ ...sig0, profileCanaryLoaded: null }, { ...sig1, profileCanaryLoaded: null } as ReloadSignals);
   const calls = dir.readJsonl<CallLogEntry>(CALLS_LOG).filter((c) => c.primitive === 'updateExternalResource' && Date.parse(c.at) >= t0);
   const masked = maskResourceKey(key, session.guard.secrets);
@@ -459,7 +480,7 @@ async function runMeasure(ctx: Ctx): Promise<ExitCode> {
     check('只差凭据的重名由发布前严格校验拒绝（dupC）', allOk(byExpect('dupC')), byExpect('dupC')[0]?.note ?? '未测'),
     check('有效的新版本经一次更新与读回确认（ok 场景与每次恢复）', restores.length === 0 ? null : restores.every(Boolean) && allOk(byExpect('ok')) === true, `恢复 ${restores.filter(Boolean).length}/${restores.length} 次读回一致`),
   ];
-  dir.writeJson(`loopback/update-${t0}.json`, { at: new Date(t0).toISOString(), keyForm, autoReload, witness, positive, rows, restores, placeholderPublish, notes, timings });
+  dir.writeJson(`loopback/update-${t0}.json`, { at: new Date(t0).toISOString(), keyForm, autoReload, witness, positive, rows, restores, placeholderPublish, notes, timings, otherResourcesChanged: others?.length ?? null, reloadEffects: reloadEffects?.length ?? null });
   const context = await measureContext(ctx, session, ops.state);
   const result = writeResult(dir, {
     key: 'loopback_resource_update',
@@ -471,6 +492,7 @@ async function runMeasure(ctx: Ctx): Promise<ExitCode> {
       `测量于测试配置（自动重载 ${autoReload === null ? '读不到' : autoReload ? '开' : '关'}）`,
       `资源 key 的形式：${keyFormText(keyForm)}`,
       ...(resolution ? [`更新时间精度：${resolution}`] : []),
+      ...(reloadEffects && reloadEffects.length > 0 ? [`阳性对照的两次手动重新加载之后另有 ${reloadEffects.length} 个外部资源的更新时间或错误状态变化（重新加载的影响，只作记录，不计入“其他外部资源不变”）`] : []),
       ...rows.map((r) => `${r.id}：${r.ok === true ? '符合' : r.ok === false ? '不符合' : '未完成'}（${r.note}；Surge 请求 ${r.requests.total} 次）`),
       ...notes,
     ],
@@ -515,7 +537,9 @@ async function runRow(opened: OpenedLoopback, row: { id: RowId; expect: RowExpec
   // 下载失败的场景：旧节点 C 仍经前置到达出口
   const chainVia = row.expect === 'kept' ? (await requestViaRoute(proxy, servers.echoPort, `loopback-${row.id}`)).via : null;
   const dupRefused = row.expect === 'dupC' ? validateGenerationLines(namesAndLines(scenarioBody('dupC', committed.content))).length > 0 : false;
-  const v = rowVerdict({ expect: row.expect, before, run, chainVia, detailMapped, dupRefused });
+  const detailC = d ? { server: d.server, port: d.port, underlyingProxy: d.underlyingProxy } : null;
+  const servedC = row.expect === 'paramC' ? paramReplacedC(committed.content) : null;
+  const v = rowVerdict({ expect: row.expect, before, run, chainVia, detailMapped, dupRefused, detailC, servedC });
   const after = run.after;
   return {
     id: row.id,
@@ -531,7 +555,7 @@ async function runRow(opened: OpenedLoopback, row: { id: RowId; expect: RowExpec
     readback: { ok: run.assessment.ok, level: run.assessment.level, failed: [...run.assessment.failed] },
     requests: { total: reqs.length, statuses: reqs.map((r) => r.status) },
     chainVia,
-    detailC: d ? { server: d.server, port: d.port, underlyingProxy: d.underlyingProxy } : null,
+    detailC,
     restored: null,
   };
 }

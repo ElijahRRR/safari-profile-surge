@@ -126,6 +126,20 @@ export async function surgeStartFingerprint(exec: ExecFn): Promise<string | null
   return parts.join('|');
 }
 
+/**
+ * Surge 主程序（/Surge.app/Contents/MacOS/）最早的启动时间（毫秒；ps -o lstart= 只到秒，按本地时间解析）。读不到为 null。
+ * 用于核对 Mac 重启后测试资源服务先于还是晚于 Surge 启动（loopback-restart）。
+ */
+export async function surgeStartedAtMs(exec: ExecFn): Promise<number | null> {
+  const main = surgeProcesses(await listProcesses(exec)).filter((p) => /\/Surge\.app\/Contents\/MacOS\//.test(p.path));
+  let earliest: number | null = null;
+  for (const p of main) {
+    const t = Date.parse((await processStartTime(exec, p.pid)) ?? '');
+    if (Number.isFinite(t) && (earliest === null || t < earliest)) earliest = t;
+  }
+  return earliest;
+}
+
 /** codesign -dv 输出中的 TeamIdentifier。 */
 export function parseTeamIdentifier(text: string): string | null {
   const m = /^TeamIdentifier=([A-Z0-9]{10})\s*$/m.exec(text);

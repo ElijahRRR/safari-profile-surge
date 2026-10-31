@@ -1,7 +1,10 @@
 // 本机资源的审计与发布读回（纯函数，与 P0 共用）。Surge 不能与本服务互相认证：本服务停止期间占用端口的一方会拿到读取令牌、
 // 并能让 Surge 载入它提供的列表。这里只做事后核对——Surge 报告的更新时间（updatedAt）必须对应本服务记下的一次完整的 200
-// 响应，资源错误必须能由本服务在审计窗口内实际产生的失败答复或“连接被拒绝或超时”解释；否则按无法解释的下载或错误处理（引擎
-// 据此设 tokenSuspect 与路由警告）。占用端口的一方让 Surge 等到超时同样无法被发现：只能事后发现，不能事先阻止。
+// 响应，资源错误必须能由本服务在审计窗口内实际产生的失败答复、“连接被拒绝”或（只在本服务一直监听时）“请求超时”解释；否则按
+// 无法解释的下载或错误处理（引擎据此设 tokenSuspect 与路由警告）。回环端口上无人监听时 Surge 立即得到连接被拒绝（-1004，
+// 2026-10-25 回环矩阵“资源服务停止监听”）；请求超时（-1001）说明有一方接受了连接、收到了带读取令牌的请求却不答复——本服务
+// 没有一直监听时那只可能是占用端口的一方，按无法解释处理（fail closed；已知的误报是本服务上一个实例停止前挂起超过 Surge 的
+// 超时，代价是一次轮换资源地址）。占用端口只能事后发现，不能事先阻止。
 // 退出码 0、success 与 ready=true 都不当作发布成功：读回逐项核对资源标识、地址摘要、错误、更新状态、组成员与选择。
 
 import { createHash } from 'node:crypto';
@@ -46,13 +49,33 @@ export function resourceLocationHash(url: string): string {
 }
 
 /**
- * 资源错误是否表示连接被拒绝或超时（服务未运行或没有答复时的预期结果）：NSURLErrorDomain -1004/-1001，以及系统的本地化
- * 文本（无法连接服务器、请求超时、could not connect to the server、timed out）。
+ * 资源错误是否表示连接被拒绝（端口上无人监听：服务未运行时的预期结果，请求没有到达任何一方）：NSURLErrorDomain -1004，以及
+ * 系统的本地化文本（无法连接服务器、could not connect to the server）。
+ */
+export function isConnectionRefused(error: string): boolean {
+  if (/NSURLErrorDomain/i.test(error) && /(^|[^0-9])-1004([^0-9]|$)/.test(error)) return true;
+  return /无法连接(到)?服务器|could not connect to the server/i.test(error);
+}
+
+/**
+ * 资源错误是否表示请求超时（有一方接受了连接、收到了请求却没有答复）：NSURLErrorDomain -1001，以及系统的本地化文本（请求超时、
+ * timed out）。只在本服务一直监听时能由本服务解释（见 errorExplained）。
+ */
+export function isRequestTimeout(error: string): boolean {
+  if (/NSURLErrorDomain/i.test(error) && /(^|[^0-9])-1001([^0-9]|$)/.test(error)) return true;
+  return /请求超时|timed out/i.test(error);
+}
+
+/**
+ * 连接被拒绝或请求超时（isConnectionRefused 或 isRequestTimeout）。只用于本服务一直在监听期间的判断（发布回滚：Surge 没有载入
+ * 候选时的资源错误）；审计按是否一直监听分别判断（errorExplained）。
  */
 export function isConnectionRefusedOrTimeout(error: string): boolean {
-  if (/NSURLErrorDomain/i.test(error) && /(^|[^0-9])-100[14]([^0-9]|$)/.test(error)) return true;
-  return /无法连接(到)?服务器|请求超时|could not connect to the server|timed out/i.test(error);
+  return isConnectionRefused(error) || isRequestTimeout(error);
 }
+
+/** Surge 报告资源尚未就绪（parse-output：ready 不为 true 且没有错误文字）。 */
+export const RESOURCE_NOT_READY = 'not_ready';
 
 function tolerance(ms: number): number {
   return Number.isFinite(ms) && ms >= 0 ? ms : DEFAULT_RESOURCE_AUDIT_TOLERANCE_MS;
@@ -102,8 +125,8 @@ export interface AuditResourceInput {
   toleranceMs: number;
   /**
    * 本服务自上次审计以来一直在已配置端口监听：期间 Surge 的每次下载只可能由本服务答复，资源错误只能来自本服务的失败答复
-   * （servedFailures，或窗口内没有写完的 200）。启动时（监听之前）或监听失败过时为 false：端口可能被他人占用，这时只有
-   * “连接被拒绝或超时”能解释，没有写完的 200 与失败计数一律不算。
+   * （servedFailures，或窗口内没有写完的 200）或本服务的超时。启动时（监听之前）或监听失败过时为 false：端口可能被他人占用，
+   * 这时只有“连接被拒绝”（无人监听）能解释——请求超时、没有写完的 200 与失败计数一律不算。
    */
   serving: boolean;
   /**
@@ -139,13 +162,21 @@ export interface AuditResourceResult {
 }
 
 /**
- * 新的资源错误能否由本服务解释：连接被拒绝或超时总能解释；其余只在本服务一直监听（serving）时，由窗口内本服务实际答复过的
- * 404/503 或没有写完的 200（序号大于 windowSeq）解释。本服务没有一直监听时，任何其他错误（HTTP 状态、空内容、无法解析、
- * 连接中断）都可能来自占用端口的一方。
+ * 新的资源错误能否由本服务解释：
+ * - 连接被拒绝（无人监听，请求没有到达任何一方）总能解释；
+ * - 尚未完成过下载（not_ready 且没有更新时间，例如 Surge 重开后缓存还没有载入或被丢弃）能解释：之后真正的下载仍要对应本服务的
+ *   审计记录。前提是 Surge 对缓存不存在的资源显示下载失败的文字（否则占用者的 404 或不答复也只显示为 not_ready）：
+ *   loopback_resource_restart（resourceServe 的一项）实测它，看到失败被藏在未就绪之后即不通过（P0 工具 classifyEmptyCache；
+ *   TODO(P0)）；
+ * - 其余只在本服务一直监听（serving）时，由请求超时（只可能是本服务没有答复）、窗口内本服务实际答复过的 404/503 或没有写完的
+ *   200（序号大于 windowSeq）解释。本服务没有一直监听时，任何其他错误（请求超时、HTTP 状态、空内容、无法解析、连接中断）都
+ *   可能来自占用端口的一方：请求超时说明有一方接受了连接、收到了带读取令牌的请求。
  */
 function errorExplained(input: AuditResourceInput, error: string, state: ResourceAuditState): boolean {
-  if (isConnectionRefusedOrTimeout(error)) return true;
+  if (isConnectionRefused(error)) return true;
+  if (error === RESOURCE_NOT_READY && input.snapshot.updatedAt === null) return true;
   if (input.serving !== true) return false;
+  if (isRequestTimeout(error)) return true;
   const failures = input.servedFailures;
   if (Number.isSafeInteger(failures) && failures > 0) return true;
   return input.records.some((r) => !r.complete && r.seq > state.windowSeq);
@@ -155,9 +186,10 @@ function errorExplained(input: AuditResourceInput, error: string, state: Resourc
  * 审计一次资源状态：
  * - 没有审计状态：按快照初始化，结论 initialized（只记日志，从不报警）；
  * - updatedAt 与确认过的不同（且不为 null）：必须有序号大于 auditedSeq、写出时间在窗口内的完整 200，否则 unexplained_fetch；
- * - 资源错误变成新的非空值：除非是连接被拒绝或超时，或本服务一直在监听且窗口内答复过 404/503 或有没有写完的 200（中途
- *   断开），否则 unexplained_error。
- * 结论为 ok 时窗口起点前移（见 ResourceAuditState.windowSeq）；无法解释时状态不变。
+ * - 资源错误变成新的非空值：除非是连接被拒绝、尚未完成过下载（not_ready 且没有更新时间），或本服务一直在监听且是请求超时、
+ *   窗口内答复过 404/503 或有没有写完的 200（中途断开），否则 unexplained_error。
+ * 结论为 ok 时窗口起点前移（见 ResourceAuditState.windowSeq）；快照没有更新时间（缓存被丢弃或尚未载入）时保留确认过的更新时间
+ * （之后缓存重新出现同一更新时间不算新的下载，出现不同的更新时间仍要对应审计记录）；无法解释时状态不变。
  */
 export function auditResource(input: AuditResourceInput): AuditResourceResult {
   const { snapshot, state, records } = input;
@@ -184,7 +216,7 @@ export function auditResource(input: AuditResourceInput): AuditResourceResult {
     verdict: 'ok',
     matchedSeq: matched?.seq ?? null,
     nextState: {
-      verifiedUpdatedAt: uIso,
+      verifiedUpdatedAt: u === null ? state.verifiedUpdatedAt : uIso,
       verifiedError: snapshot.error,
       auditedSeq: Math.max(state.auditedSeq, matched?.seq ?? 0),
       windowSeq: Math.max(state.windowSeq, windowEnd),

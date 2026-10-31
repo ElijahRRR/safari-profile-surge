@@ -9,7 +9,9 @@ import { afterEach, describe, expect, test } from 'vitest';
 import { EMPTY_PLACEHOLDER_LINE, NODE_RESOURCE_FILE, ROUTE_GROUP_NAME } from '@sfe/contract';
 import type { NodeManifestEntry } from '../../src/db/index.js';
 import { validateResourceBody } from '../../src/engine/handlers/publish.js';
-import { readAuditState, writeTokenSuspect } from '../../src/resource/index.js';
+import { readAuditState, resourceLocationHash, writeNeedsRefresh, writeTokenSuspect } from '../../src/resource/index.js';
+import { findOurResource } from '../../src/engine/node-resource.js';
+import { CHAIN_EVIDENCE_PREFLIGHT } from '../../src/engine/handlers/probes.js';
 import { FAKE_REMOTE_ERRORS } from '../../src/surge/fake.js';
 import { resourceBody } from '../../src/surge/generate.js';
 import { RESOURCE_KEY_NEEDS_HTTP_MESSAGE } from '../../src/surge/resource-key.js';
@@ -400,5 +402,150 @@ describe('parks: nothing served, nothing updated', () => {
     h = await createHarness({ withholdLoopbackCapabilities: true });
     const message = await expectParked(h, 'CAPABILITY_UNVERIFIED');
     expect(message).toBe('发布暂停：回环资源单 key 更新、服务认证与端口占用、重启缓存、并发与崩溃补测尚未通过；新版本保持待部署');
+  });
+});
+
+describe('discovery of our resource (findOurResource)', () => {
+  const URL_A = `http://127.0.0.1:23456/${'a'.repeat(64)}/sfe-nodes.list`;
+  const base = { key: '0123456789abcdef0123456789abcdef', type: 'policy-group', location: 'http://127.0.0.1:23456/***', locationHash: resourceLocationHash(URL_A), lastUpdatedAt: null, error: null, local: false, updating: false, fromModule: null };
+
+  test('exactly one policy-group, remote, not from a module → ours; none → missing; two → ambiguous; module, local or ruleset → foreign', () => {
+    expect(findOurResource([base], URL_A)).toEqual({ resource: base, problem: null });
+    expect(findOurResource([{ ...base, locationHash: resourceLocationHash(`${URL_A}x`) }], URL_A)).toEqual({ resource: null, problem: 'resource_missing' });
+    expect(findOurResource([], URL_A).problem).toBe('resource_missing');
+    expect(findOurResource([base, { ...base, key: 'ffffffffffffffffffffffffffffffff' }], URL_A)).toEqual({ resource: null, problem: 'resource_ambiguous' });
+    for (const foreign of [{ ...base, fromModule: 'M' }, { ...base, local: true }, { ...base, type: 'ruleset' }, { ...base, local: null }]) {
+      expect(findOurResource([foreign], URL_A)).toEqual({ resource: null, problem: 'resource_foreign' });
+    }
+  });
+
+  test('two resources pointing at our address → NAME_COLLISION, nothing served or updated, no deployment', async () => {
+    h = await createHarness();
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    const r = (await ourResource(h))!;
+    const servedBefore = served(h);
+    const deployments = h.repos.deployments.list().length;
+    const before = updates(h);
+    // 发布的第一次外部资源读取是 discover 的
+    h.fake.lieOnNext('listExternalResources', [r, { ...r, key: 'ffffffffffffffffffffffffffffffff' }]);
+    const b = await createEnv(h, 'US-Buyer-B', '203.0.113.11');
+    expect(op(b.operation_id)).toMatchObject({ status: 'failed', error: { code: 'NAME_COLLISION' } });
+    expect(updates(h)).toBe(before);
+    expect(served(h)).toEqual(servedBefore);
+    expect(pointer(h)).toEqual({ committed: { generation: 1 }, candidate: null });
+    expect(h.repos.deployments.list().length).toBe(deployments);
+  });
+
+  test('our address referenced by a module → NAME_COLLISION, nothing served or updated', async () => {
+    h = await createHarness();
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    const r = (await ourResource(h))!;
+    const before = updates(h);
+    h.fake.lieOnNext('listExternalResources', [{ ...r, fromModule: 'SomeModule' }]);
+    const b = await createEnv(h, 'US-Buyer-B', '203.0.113.11');
+    expect(op(b.operation_id)).toMatchObject({ status: 'failed', error: { code: 'NAME_COLLISION' } });
+    expect(updates(h)).toBe(before);
+    expect(served(h)).toMatchObject({ generation: 1, state: 'committed' });
+  });
+});
+
+describe('the audit record is what proves a download', () => {
+  test('the update reports downloaded but Surge never fetched (members unchanged by a forced refresh) → READBACK_MISMATCH with fetch; rolled back', async () => {
+    h = await createHarness();
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    writeNeedsRefresh(h.app.engine.kv, { generation: 1, reason: 'test' });
+    const before = updates(h);
+    h.fake.lieOnNext('updateExternalResource', { key: h.resourceKey(), refreshed: true, outcome: 'downloaded' });
+    const p = await h.app.publishPending({ request_id: rid('pub') }, WEB);
+    await h.idle();
+    const o = op(p.operation_id);
+    expect(o).toMatchObject({ phase: 'FAILED', status: 'failed', error: { code: 'READBACK_MISMATCH' } });
+    expect((o.error!.details as { checks: string[] }).checks).toContain('fetch');
+    expect(h.repos.deployments.latest()!.state).toBe('rolled_back');
+    expect(pointer(h)).toEqual({ committed: { generation: 1 }, candidate: null });
+    expect(updates(h) - before).toBe(2);
+    // 回滚自己的读回确认了已提交版本（不是因为这次没有下载的“成功”）
+    expect(needsRefresh(h)).toBeNull();
+  });
+});
+
+describe('bounded wait while Surge is updating: the success paths', () => {
+  const WAIT = { timeoutMs: 10_000, pollMs: 500, settleMs: 0 };
+  async function drive(id: string): Promise<void> {
+    for (let i = 0; i < 2_000 && ['queued', 'running'].includes(op(id).status); i++) {
+      await new Promise((r) => setTimeout(r, 2));
+      await h.clock.advanceAsync(500);
+    }
+    await h.idle();
+  }
+
+  test('already updating before the publish, idle within the bound → the publish waits, then deploys with one update', async () => {
+    h = await createHarness({ resourceUpdateWait: WAIT });
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    h.fake.slowUpdate = { durationMs: 8_000 };
+    h.fake.runScheduledRefresh(h.resourceKey()!);
+    h.fake.slowUpdate = null;
+    const before = updates(h);
+    // 发布的更新是否发在 Surge 自己的刷新结束之后（证明确实等待过，而不是在进行中的下载之上更新）
+    const orig = h.fake.updateExternalResource.bind(h.fake);
+    const updatingAtCall: boolean[] = [];
+    h.fake.updateExternalResource = async (key: string) => {
+      updatingAtCall.push(h.fake.isUpdating(key));
+      return orig(key);
+    };
+    const b = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-B', '203.0.113.11') }, WEB);
+    await drive(b.operation_id);
+    h.fake.updateExternalResource = orig;
+    expect(op(b.operation_id)).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded' });
+    expect(updatingAtCall).toEqual([false]);
+    expect(updates(h) - before).toBe(1);
+    expect(h.repos.deployments.latest()).toMatchObject({ generation: 2, state: 'verified' });
+    expect(pointer(h)).toEqual({ committed: { generation: 2 }, candidate: null });
+  });
+
+  test('the update answers before the download, idle within the bound → readback after the wait, one update, committed', async () => {
+    h = await createHarness({ resourceUpdateWait: WAIT });
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    const before = updates(h);
+    h.fake.slowUpdate = { durationMs: 2_000 };
+    const b = await h.app.createEnvironment({ request_id: rid(), environment: envInput('US-Buyer-B', '203.0.113.11') }, WEB);
+    await drive(b.operation_id);
+    h.fake.slowUpdate = null;
+    expect(op(b.operation_id)).toMatchObject({ phase: 'READY_FOR_NEXT_OPEN', status: 'succeeded' });
+    expect(updates(h) - before).toBe(1);
+    expect(h.repos.deployments.latest()).toMatchObject({ generation: 2, state: 'verified' });
+    expect(pointer(h)).toEqual({ committed: { generation: 2 }, candidate: null });
+  });
+});
+
+describe('truthful texts kept from the D7 publish', () => {
+  test('a normal publish notes that no engine restart was observed; the preflight records the untested-chain evidence text', async () => {
+    h = await createHarness();
+    const a = await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    expect(h.repos.operations.listSteps(a.operation_id).map((s) => s.message)).toContain('读回：未观察到 Surge 引擎重启');
+    const probe = h.repos.probes.latest(a.environment_id!, 'preflight')!;
+    expect(probe.chainEvidence).toBe(CHAIN_EVIDENCE_PREFLIGHT);
+    expect(probe.chainEvidence).toContain('未经实测');
+    expect(probe.chainEvidence).toContain('external_node_underlying_proxy');
+  });
+
+  test('an engine restart during the publish is reported in the steps', async () => {
+    h = await createHarness();
+    await createEnv(h, 'US-Buyer-A', '203.0.113.10');
+    const orig = h.fake.updateExternalResource.bind(h.fake);
+    let restarted = false;
+    h.fake.updateExternalResource = async (key: string) => {
+      const r = await orig(key);
+      if (!restarted) {
+        restarted = true;
+        h.clock.advance(5_000);
+        h.fake.restart();
+      }
+      return r;
+    };
+    const b = await createEnv(h, 'US-Buyer-B', '203.0.113.11');
+    h.fake.updateExternalResource = orig;
+    expect(restarted).toBe(true);
+    expect(h.repos.operations.listSteps(b.operation_id).some((s) => s.message.includes('Surge 引擎在发布期间重启'))).toBe(true);
   });
 });

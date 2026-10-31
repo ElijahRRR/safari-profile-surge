@@ -4,9 +4,11 @@
 //   仍在的候选版本；加载已提交版本（代数 0 为占位内容，> 0 只在 resourceServe 门槛满足且重建内容与发布记录一致时提供，否则 503）；
 //   令牌可疑时拒绝令牌；监听之前审计 Surge 报告的资源（本服务停止期间端口可能被他人占用）；最后监听。
 // - 对账（每次）：重试监听、审计、组成员与已提交版本比较、使用中节点的参数核对。只设 node_resource_unverified，从不清除它；
-//   只在经确认的发布或回滚读回之后由 confirmNodeResource 清除。
+//   只在经确认的发布或回滚读回之后由 confirmNodeResource 清除。警告总是带着刷新要求（needsRefresh，工作配置指向本服务当前地址、
+//   资源服务存在时）：系统强制刷新或用户的重新同步经确认的读回同时清除两者，警告从不因为没有可做的发布而停留。
 // - 系统强制刷新：工作配置的节点组定义恰好是本服务当前地址、需要刷新、没有进行中的发布、也没有尚未确认的系统刷新时排入一次
-//   （门槛不满足时停泊，无害）；之后只有经确认的读回才重新允许自动排入，从不自动反复更新。
+//   （门槛不满足时停泊，无害）；之后只有经确认的读回才重新允许自动排入，从不自动反复更新（系统刷新本身因崩溃中断时，同一
+//   崩溃链最多自动重排一次）。
 // 从不写 Surge：唯一的写入是排入的发布操作（由执行器按发布门槛执行）。令牌、地址与端口从不进入日志、错误、操作说明或视图。
 
 import { randomInt } from 'node:crypto';
@@ -372,6 +374,17 @@ function requireRefresh(engine: Engine, generation: number, reason: string): voi
   if (readNeedsRefresh(engine.kv) === null) writeNeedsRefresh(engine.kv, { generation, reason });
 }
 
+/**
+ * node_resource_unverified 总是带着刷新要求：工作配置的节点组定义恰好指向本服务当前地址、资源服务存在时，设 needsRefresh（已有
+ * 记录时不改）。这样 refreshReason 排入一次系统强制刷新、用户的发布不走“没有修改”的捷径、网页提供“重新同步节点资源”、重新合并
+ * 把 needs_refresh 列为恢复原因——经确认的读回（confirmNodeResource）同时清除两者。令牌读不到或地址不是本服务当前的（补救是
+ * 重新合并或轮换资源地址）时不设。
+ */
+function requireRefreshForWarning(engine: Engine, reasons: readonly string[]): void {
+  if (engine.resource === null || engine.resourceRuntime.line !== 'ours') return;
+  requireRefresh(engine, readServedPointer(engine.kv)?.committed.generation ?? 0, reasons[0] ?? 'unverified');
+}
+
 /** 令牌可能已泄露：持久记录（已有时不改）、资源服务对令牌正确的请求也答 404。只能由重新合并的“轮换资源地址”清除。 */
 function markTokenSuspect(engine: Engine, reason: string): void {
   if (readTokenSuspect(engine.kv) === null) {
@@ -454,6 +467,26 @@ async function serveCommitted(engine: Engine, host: ResourceHost, generation: nu
 }
 
 /**
+ * resourceServe 门槛的实测记录被撤销（本地记录的状态不是 supported，例如用户重置了 loopback_resource_auth）：不论 Surge 是否
+ * 可达、工作配置的节点组定义是什么，立即停止提供代数 > 0 的已提交版本（令牌正确的请求得到 503）并要求刷新——凭据只在这个
+ * 门槛满足时提供。只看本地记录的状态，与版本上下文无关；版本上下文造成的过期仍由 maintainServed 在 Surge 可达时判定（避免
+ * Surge 不可达时反复停止与恢复）。发布暂存的候选版本不在这里处理（发布门槛包含 resourceServe 的各项）。返回是否停止了提供。
+ */
+export function unloadIfServeStatusRevoked(engine: Engine): boolean {
+  const host = engine.resource;
+  const served = host?.served() ?? null;
+  if (host === null || served === null || served.state !== 'committed' || served.generation === 0) return false;
+  const revoked = CAPABILITY_GATES.resourceServe.filter((k) => engine.repos.capabilities.get(k)?.status !== 'supported');
+  if (revoked.length === 0) return false;
+  const runtime = engine.resourceRuntime;
+  host.unload();
+  if (runtime.serveIssue !== `${served.generation}:serve_gated`) engine.log('warn', 'resource.serve_gated', { generation: served.generation, missing: revoked });
+  runtime.serveIssue = `${served.generation}:serve_gated`;
+  requireRefresh(engine, served.generation, 'serve_gated');
+  return true;
+}
+
+/**
  * 对账时维护提供的内容：没有候选版本时，已提交版本没有在提供而门槛已满足（例如启动时 Surge 版本还读不到）则重新加载；提供着
  * 代数 > 0 而 resourceServe 门槛已不满足（记录过期、被撤销）则停止提供。读事实之后调用。
  */
@@ -523,6 +556,34 @@ export async function listenResourceHost(engine: Engine): Promise<boolean> {
   return true;
 }
 
+/**
+ * 尚未初始化固定工作配置（地址还没有写进任何配置）时让资源服务监听：已选定的端口被其他程序占用（或还没有选定）时按首次选定的
+ * 规则（范围内随机、避开旧端口、最多 10 次，经监听本身试绑）改选一个并保存。已有工作配置时从不改选——地址已写进工作配置，更换
+ * 端口只能经重新合并的“更换本机资源地址”。初始化的预览与提交、启动时调用；端口在预览与提交之间改变时提交得到 PREVIEW_STALE
+ * （候选中的地址不同）。返回是否在监听。
+ */
+export async function ensureListeningBeforeInit(engine: Engine): Promise<boolean> {
+  const host = engine.resource;
+  if (host === null) return false;
+  if (engine.workingProfile() || engine.resourceRuntime.stopped) return host.listening();
+  const old = engine.repos.settings.get('resourcePort');
+  if (old !== null && (host.listening() || (await listenResourceHost(engine)))) return true;
+  if (old !== null && engine.resourceRuntime.listenError !== 'port_in_use') return false;
+  const port = await listenOnNewPort(engine, host, new Set(old !== null ? [old] : []));
+  if (port === null) {
+    host.configure(old);
+    engine.log('warn', 'resource.port_unavailable', { tries: RESOURCE_PORT_PICK_TRIES });
+    return false;
+  }
+  engine.repos.settings.setResourcePort(port);
+  const runtime = engine.resourceRuntime;
+  runtime.listenEpoch++;
+  runtime.listenError = null;
+  runtime.lastAudit = null;
+  engine.log('info', 'resource.port_reselected');
+  return true;
+}
+
 // ---------- 启动 ----------
 
 /**
@@ -573,13 +634,18 @@ export async function startResourceService(engine: Engine): Promise<void> {
   });
   // 5. 令牌可疑：令牌正确的请求也答 404
   if (readTokenSuspect(engine.kv) !== null) host.setRefuseToken(true);
+  // 重启之前设下、还没有经确认的读回清除的警告（例如令牌一度读不到、现在已恢复）：补上刷新要求，让它有清除的途径
+  if (engine.repos.routeState.get().warnings.includes(NODE_RESOURCE_WARNING)) requireRefreshForWarning(engine, ['unverified_at_startup']);
   // 6. 监听之前审计：本服务停止期间占用端口的一方可能已让 Surge 下载了它提供的列表，或留下了本服务无法解释的资源错误
   let audited = false;
   if (line === 'ours') audited = await startupAudit(engine, host);
-  // 7. 监听。启动审计没能进行（Surge 不可达）而已提交版本不能提供时推迟到 Surge 可达的对账（见 ResourceRuntime.listenDeferred）
-  runtime.listenDeferred = line === 'ours' && !audited && host.served() === null;
+  // 7. 监听。启动审计没能进行（Surge 不可达或读不到外部资源）时推迟到能读到外部资源并审计的对账（见 ResourceRuntime.listenDeferred）：
+  // 先监听再审计，停止期间留下的证据会被本服务之后的下载或发布的确认覆盖
+  runtime.listenDeferred = line === 'ours' && !audited;
   if (runtime.listenDeferred) engine.log('info', 'resource.listen_deferred');
-  const listening = runtime.listenDeferred ? false : await listenResourceHost(engine);
+  let listening = runtime.listenDeferred ? false : await listenResourceHost(engine);
+  // 尚未初始化：端口被占用（或没有选定）时改选，初始化才能进行
+  if (!listening && !runtime.listenDeferred && line === null) listening = await ensureListeningBeforeInit(engine);
   // 启动审计与监听之间没有其他 Surge 读写，间隙极短：监听成功时从这里起按“一直在监听”计（之后的审计据此解释本服务的失败答复）
   if (audited && listening) runtime.lastAudit = { epoch: runtime.listenEpoch, port: host.port(), listening: true, failures: servedFailureCount(host.failureCounters()) };
 }
@@ -589,6 +655,7 @@ async function startupAudit(engine: Engine, host: ResourceHost): Promise<boolean
   const url = engine.resourceUrl();
   if (url === null) return false;
   const mark = host.auditMark();
+  const failuresBefore = servedFailureCount(host.failureCounters());
   let list: SurgeExternalResource[];
   try {
     list = await engine.surge.listExternalResources();
@@ -598,9 +665,60 @@ async function startupAudit(engine: Engine, host: ResourceHost): Promise<boolean
   }
   const found = findOurResource(list, url);
   // Surge 没有报告本服务的资源（尚未载入工作配置等）：没有可审计的下载，记下审计点
-  if (found.resource === null) markAuditPoint(engine, host);
-  else runAudit(engine, host, found.resource, { mark, serving: false, servedFailures: 0 });
+  if (found.resource === null) markAuditPoint(engine, host, failuresBefore);
+  else runAudit(engine, host, found.resource, { mark, serving: false, servedFailures: 0, failuresBaseline: failuresBefore });
   return true;
+}
+
+/**
+ * 停止之前的最后一次审计（app.stop，main.ts 关闭资源服务之前）：本服务一直监听期间自己答复的 503/404 与中途断开的 200 只能在
+ * 停止之前被解释——重启之后的启动审计按“没有一直监听”判定（端口可能被他人占用），内存中的失败计数也已不在，那时同样的错误只能
+ * 按无法解释处理。工作配置指向本服务当前地址、Surge 可达且是工作配置（按最后一次读到的事实）时读一次外部资源并按通常的规则
+ * 审计；条件不满足或读不到时不做（尽力而为）。崩溃没有这一步：之前本服务自己的失败答复在重启后被当作无法解释（fail closed，
+ * 由轮换资源地址恢复）。
+ */
+export async function finalResourceAudit(engine: Engine): Promise<void> {
+  const host = engine.resource;
+  const url = engine.resourceUrl();
+  const runtime = engine.resourceRuntime;
+  if (host === null || url === null || runtime.line !== 'ours' || runtime.listenDeferred) return;
+  if (!engine.facts.reachable || engine.facts.onWorkingProfile !== true) return;
+  const failuresBefore = servedFailureCount(host.failureCounters());
+  const mark = host.auditMark();
+  let list: SurgeExternalResource[];
+  try {
+    list = await engine.surge.listExternalResources();
+  } catch {
+    return;
+  }
+  const found = findOurResource(list, url);
+  if (found.resource === null) return;
+  const serving = servingSinceLastAudit(engine, host);
+  const last = runtime.lastAudit;
+  const servedFailures = serving && last !== null ? servedFailureCount(host.failureCounters()) - last.failures : 0;
+  runAudit(engine, host, found.resource, { mark, serving, servedFailures, failuresBaseline: failuresBefore });
+}
+
+/**
+ * 发布读“更新之前”的状态时同样审计一次（handlers/publish.ts discover）：发布的确认会把审计基线前移到这次发布的下载，基线之前
+ * 留下的无法解释的下载或错误必须在这里发现，不能被确认覆盖。mark 与 failuresBefore 是读取外部资源之前取的。返回 runAudit 的
+ * 结论（无法解释时 runAudit 已设 tokenSuspect 与 needsRefresh）。
+ */
+export function auditForPublish(
+  engine: Engine,
+  host: ResourceHost,
+  resource: SurgeExternalResource,
+  read: { mark: number; failuresBefore: number },
+): NodeResourceReason | null {
+  const serving = servingSinceLastAudit(engine, host);
+  const last = engine.resourceRuntime.lastAudit;
+  const servedFailures = serving && last !== null ? servedFailureCount(host.failureCounters()) - last.failures : 0;
+  return runAudit(engine, host, resource, { mark: read.mark, serving, servedFailures, failuresBaseline: read.failuresBefore });
+}
+
+/** 读取审计计数的辅助（发布在读取 Surge 之前取）。 */
+export function servedFailuresNow(host: ResourceHost): number {
+  return servedFailureCount(host.failureCounters());
 }
 
 // ---------- 审计与检查 ----------
@@ -631,10 +749,20 @@ function snapshotOf(r: SurgeExternalResource, members: readonly string[] | null,
   return { key: r.key, locationHash: r.locationHash, updatedAt: r.lastUpdatedAt, error: r.error, updating: r.updating, members, selection };
 }
 
-/** 记下审计点：此刻的监听状态与 404/503 计数（下一次审计据此判断期间是否一直在监听、本服务答复过多少失败）。 */
-function markAuditPoint(engine: Engine, host: ResourceHost): void {
+/**
+ * 记下审计点：此刻的监听状态与失败答复计数（下一次审计据此判断期间是否一直在监听、本服务答复过多少失败）。failures 是这次读取
+ * Surge 之前取的计数（缺省为此刻的计数）：读取期间本服务答复的失败在这一次与下一次审计中都算，不会两次都不算。
+ */
+function markAuditPoint(engine: Engine, host: ResourceHost, failures: number = servedFailureCount(host.failureCounters())): void {
   const runtime = engine.resourceRuntime;
-  runtime.lastAudit = { epoch: runtime.listenEpoch, port: host.port(), listening: host.listening(), failures: servedFailureCount(host.failureCounters()) };
+  runtime.lastAudit = { epoch: runtime.listenEpoch, port: host.port(), listening: host.listening(), failures };
+}
+
+/** 自上次审计点以来本服务是否一直在已设置的端口监听（同一次监听、同一端口）。 */
+function servingSinceLastAudit(engine: Engine, host: ResourceHost): boolean {
+  const runtime = engine.resourceRuntime;
+  const last = runtime.lastAudit;
+  return last !== null && last.listening && host.listening() && last.epoch === runtime.listenEpoch && last.port === host.port();
 }
 
 /**
@@ -646,11 +774,11 @@ function runAudit(
   engine: Engine,
   host: ResourceHost,
   resource: SurgeExternalResource,
-  input: { mark: number; serving: boolean; servedFailures: number },
+  input: { mark: number; serving: boolean; servedFailures: number; failuresBaseline?: number },
 ): NodeResourceReason | null {
   const { kv } = engine;
   const runtime = engine.resourceRuntime;
-  const recordAuditPoint = (): void => markAuditPoint(engine, host);
+  const recordAuditPoint = (): void => markAuditPoint(engine, host, input.failuresBaseline);
   const noteIssue = (issue: string, log: () => void): void => {
     if (runtime.auditIssue !== issue) log();
     runtime.auditIssue = issue;
@@ -737,6 +865,8 @@ export interface NodeResourceCheckOptions {
  */
 export async function checkNodeResource(engine: Engine, opts: NodeResourceCheckOptions): Promise<NodeResourceCheck> {
   const out: NodeResourceCheck = { line: null, reasons: [], resourceError: undefined, membersMatch: null };
+  // 门槛记录被撤销：不论节点组定义与 Surge 是否可达，先停止提供凭据
+  unloadIfServeStatusRevoked(engine);
   const line = await readGroupLine(engine);
   out.line = line;
   if (!referencesLoopback(line)) return out;
@@ -749,39 +879,63 @@ export async function checkNodeResource(engine: Engine, opts: NodeResourceCheckO
     out.reasons.push('resource_url_changed');
     return out;
   }
+  await checkOurResource(engine, host, opts, out);
+  // 发现问题：警告总是带着刷新要求（见 requireRefreshForWarning），经确认的读回同时清除两者
+  if (out.reasons.length > 0) requireRefreshForWarning(engine, out.reasons);
+  return out;
+}
+
+/** checkNodeResource 中工作配置恰好指向本服务当前地址时的检查（结果写进 out）。 */
+async function checkOurResource(engine: Engine, host: ResourceHost, opts: NodeResourceCheckOptions, out: NodeResourceCheck): Promise<void> {
   const runtime = engine.resourceRuntime;
   // 门槛按刚读到的 Surge 版本判定：Surge 不可达（版本未知）时保持当前提供的内容，不据此停止或恢复提供
   if (opts.reachable) await maintainServed(engine, host).catch(() => undefined);
-  // 启动时推迟的监听：Surge 可达时（门槛已按读到的版本重新判定）监听，随即在下面审计；Surge 仍不可达时继续推迟（不算未监听）
-  const deferred = runtime.listenDeferred && !opts.reachable;
-  if (!host.listening() && !deferred) await listenResourceHost(engine);
-  if (host.listening()) runtime.listenDeferred = false;
-  else if (!deferred) out.reasons.push('not_listening');
+  const url = engine.resourceUrl();
+  const canRead = opts.reachable && opts.onWorkingProfile === true && url !== null;
+  if (runtime.listenDeferred) {
+    // 启动时推迟的监听：先读到 Surge 的外部资源并按“没有一直监听”审计（停止期间的证据不会被之后的下载覆盖），之后才监听；读不到
+    // 时继续推迟（不算未监听：Surge 的下载得到连接被拒绝，总能解释）
+    if (!canRead || !(await startupAudit(engine, host))) {
+      if (readTokenSuspect(engine.kv) !== null) {
+        host.setRefuseToken(true);
+        out.reasons.push('token_suspect');
+      }
+      return;
+    }
+    runtime.listenDeferred = false;
+    if (await listenResourceHost(engine)) {
+      // 审计与监听之间没有其他 Surge 读写：从这里起按“一直在监听”计
+      runtime.lastAudit = { epoch: runtime.listenEpoch, port: host.port(), listening: true, failures: servedFailureCount(host.failureCounters()) };
+    }
+  }
+  if (!host.listening()) await listenResourceHost(engine);
+  if (!host.listening()) out.reasons.push('not_listening');
   if (readTokenSuspect(engine.kv) !== null) {
     host.setRefuseToken(true);
     out.reasons.push('token_suspect');
   }
-  const url = engine.resourceUrl();
-  if (!opts.reachable || opts.onWorkingProfile !== true || url === null) return out;
-  // 审计：读快照之前取 mark；本服务自上次审计以来一直在已设置的端口监听时，期间的失败答复只可能来自本服务
-  const last = runtime.lastAudit;
-  const serving = last !== null && last.listening && host.listening() && last.epoch === runtime.listenEpoch && last.port === host.port();
-  const failuresNow = servedFailureCount(host.failureCounters());
+  if (!canRead) return;
+  // 审计：读快照之前取 mark 与失败计数；本服务自上次审计以来一直在已设置的端口监听时，期间的失败答复只可能来自本服务。是否一直
+  // 监听与失败次数在读取之后判定（读取期间的失败答复算进这一次，也算进下一次：审计点记读取之前的计数）
+  const failuresBefore = servedFailureCount(host.failureCounters());
   const mark = host.auditMark();
   let list: SurgeExternalResource[];
   try {
     list = await engine.surge.listExternalResources();
   } catch {
     // 读不到外部资源：无法核对，这次不下结论（下一次对账再读）
-    return out;
+    return;
   }
-  const found = findOurResource(list, url);
+  const found = findOurResource(list, url!);
   if (found.resource === null) {
     out.reasons.push(found.problem!);
-    markAuditPoint(engine, host);
+    markAuditPoint(engine, host, failuresBefore);
   } else {
     out.resourceError = resourceErrorOf(found.resource);
-    const verdict = runAudit(engine, host, found.resource, { mark, serving, servedFailures: serving ? failuresNow - last!.failures : 0 });
+    const serving = servingSinceLastAudit(engine, host);
+    const last = runtime.lastAudit;
+    const servedFailures = serving && last !== null ? servedFailureCount(host.failureCounters()) - last.failures : 0;
+    const verdict = runAudit(engine, host, found.resource, { mark, serving, servedFailures, failuresBaseline: failuresBefore });
     if (verdict !== null) out.reasons.push(verdict);
   }
   if (!publishWriting(engine)) {
@@ -797,7 +951,6 @@ export async function checkNodeResource(engine: Engine, opts: NodeResourceCheckO
   if (typeof node === 'string' && node.toUpperCase() !== 'REJECT' && node !== EMPTY_PLACEHOLDER_NODE && (await nodeDetailMismatch(engine, node))) {
     out.reasons.push('node_detail_mismatch');
   }
-  return out;
 }
 
 /**
@@ -828,6 +981,8 @@ async function nodeDetailMismatch(engine: Engine, nodeName: string): Promise<boo
 export function raiseNodeResourceWarning(engine: Engine, reasons: readonly NodeResourceReason[]): boolean {
   const { repos } = engine;
   const route = repos.tx(() => {
+    // 警告总是带着刷新要求（见 requireRefreshForWarning）
+    requireRefreshForWarning(engine, reasons);
     const r = repos.routeState.get();
     if (r.warnings.includes(NODE_RESOURCE_WARNING)) return null;
     const toAttention = r.phase === 'active_verified' || r.phase === 'external_change';
@@ -863,9 +1018,10 @@ export async function nodeResourceSwitchFailure(engine: Engine, nodeName: string
 /** 需要排入系统强制刷新的原因；不需要时为 null。只在工作配置恰好指向本服务当前地址、资源服务存在时。 */
 function refreshReason(engine: Engine, check: Pick<NodeResourceCheck, 'resourceError' | 'membersMatch'> | null): string | null {
   if (engine.resource === null || engine.resourceRuntime.line !== 'ours') return null;
-  if (readNeedsRefresh(engine.kv) !== null) return 'needs_refresh';
+  // 这次检查发现的具体原因优先（只用作说明；检查发现问题时 needsRefresh 也已设下）
   if (check !== null && check.resourceError !== undefined && check.resourceError !== null) return 'resource_error';
   if (check !== null && check.membersMatch === false) return 'members_mismatch';
+  if (readNeedsRefresh(engine.kv) !== null) return 'needs_refresh';
   return null;
 }
 
@@ -874,7 +1030,11 @@ function refreshReason(engine: Engine, check: Pick<NodeResourceCheck, 'resourceE
  * 待部署的修改）：没有进行中（排队、执行或等待）的发布、也没有尚未经确认读回
  * 清除的系统刷新（SYSTEM_REFRESH_KEY 指向的操作仍在）时。返回排入的操作；不需要或已有时为 null。发布门槛不满足时它停泊。
  */
-export function maybeEnqueueSystemRefresh(engine: Engine, check: Pick<NodeResourceCheck, 'resourceError' | 'membersMatch'> | null = null): OperationRecord | null {
+export function maybeEnqueueSystemRefresh(
+  engine: Engine,
+  check: Pick<NodeResourceCheck, 'resourceError' | 'membersMatch'> | null = null,
+  opts: { afterCrash?: boolean } = {},
+): OperationRecord | null {
   const reason = refreshReason(engine, check);
   if (reason === null) return null;
   const { repos } = engine;
@@ -899,7 +1059,7 @@ export function maybeEnqueueSystemRefresh(engine: Engine, check: Pick<NodeResour
       '本机资源服务：Surge 中的节点资源需要与已提交版本重新核对，排入一次节点资源发布（只对本应用的资源单 key 更新并读回；发布门槛不满足时保持待部署）',
     );
     repos.outbox.enqueue(inserted.id, null, engine.now());
-    engine.kv.set(SYSTEM_REFRESH_KEY, { operationId: inserted.id, reason, at: engine.nowIso() });
+    engine.kv.set(SYSTEM_REFRESH_KEY, { operationId: inserted.id, reason, at: engine.nowIso(), ...(opts.afterCrash === true ? { afterCrash: true } : {}) });
     return inserted;
   });
   if (op === null) return null;
@@ -907,6 +1067,21 @@ export function maybeEnqueueSystemRefresh(engine: Engine, check: Pick<NodeResour
   engine.emit({ operations: [op.id] });
   engine.kick();
   return op;
+}
+
+/**
+ * 崩溃恢复结束一个发布操作之后（handlers/publish.ts recoverPublish）：被结束的正是 SYSTEM_REFRESH_KEY 记下的系统刷新、且它不是
+ * 崩溃之后的那次重排时，删除记录并按需重排一次（新记录标 afterCrash）——同一崩溃链最多自动重排一次，重排的那次再中断时保留记录，
+ * 由用户重新同步（needsRefresh 保留，网页提供“重新同步节点资源”）。其他操作只按需排入（规则同 maybeEnqueueSystemRefresh）。
+ */
+export function enqueueSystemRefreshAfterCrash(engine: Engine, recoveredOperationId: string): OperationRecord | null {
+  const rec = engine.kv.get<{ operationId?: unknown; afterCrash?: unknown }>(SYSTEM_REFRESH_KEY);
+  const own = rec !== null && rec.operationId === recoveredOperationId;
+  if (own && rec.afterCrash !== true) {
+    engine.kv.delete(SYSTEM_REFRESH_KEY);
+    return maybeEnqueueSystemRefresh(engine, null, { afterCrash: true });
+  }
+  return maybeEnqueueSystemRefresh(engine);
 }
 
 // ---------- 确认（发布与回滚的读回之后） ----------
@@ -920,15 +1095,29 @@ export interface NodeResourceConfirmation {
   snapshot: Pick<ResourceSnapshot, 'updatedAt' | 'error'>;
   /** 读回完整（或被覆盖声明覆盖）时清除 needsRefresh 并重新允许系统刷新；读回不完整而未覆盖时两者都保留。 */
   clearNeedsRefresh: boolean;
+  /**
+   * 读回开始（第一次读取 Surge）之前取的失败答复计数（servedFailuresNow）：成为新审计点的基线，读回期间与之后本服务的失败答复
+   * 都算进下一次审计。缺省为确认时的计数。
+   */
+  failuresBaseline?: number;
+}
+
+/** confirmNodeResource 在事务中做完的结果：提交之后交给 applyNodeResourceConfirmation。 */
+export interface NodeResourceConfirmed {
+  generation: number;
+  warningCleared: boolean;
+  activeEnvironmentId: string | null;
+  failuresBaseline: number | null;
 }
 
 /**
  * 经确认的读回之后（发布 T2、回滚确认，handlers/publish.ts）：在一个事务中前移审计状态（损坏的状态在这里重新初始化）、按需
  * 清除 needsRefresh 与系统刷新记录（重新允许自动排入），并清除 node_resource_unverified——令牌可疑或资源服务不在监听时保留（对账会
- * 重新设它）。可以在调用方的事务中调用（嵌套为 SAVEPOINT）。tokenSuspect 不变（只能由轮换资源地址清除）。路由仍需要现有的
- * 重新核验或检测流程才能回到已验证。返回警告是否被清除。
+ * 重新设它）。可以在调用方的事务中调用（嵌套为 SAVEPOINT）。只写数据库：内存中的审计点、日志与事件由调用方在外层事务提交之后
+ * 经 applyNodeResourceConfirmation 完成（外层事务回滚时它们都不发生）。tokenSuspect 不变（只能由轮换资源地址清除）。路由仍需要
+ * 现有的重新核验或检测流程才能回到已验证。
  */
-export function confirmNodeResource(engine: Engine, c: NodeResourceConfirmation): { warningCleared: boolean } {
+export function confirmNodeResource(engine: Engine, c: NodeResourceConfirmation): NodeResourceConfirmed {
   const { repos, kv } = engine;
   if (!Number.isSafeInteger(c.matchedSeq) || c.matchedSeq < 1) throw new SfeError('INTERNAL', '服务内部错误：节点资源读回的审计记录不正确');
   const updatedAt = c.snapshot.updatedAt;
@@ -955,10 +1144,20 @@ export function confirmNodeResource(engine: Engine, c: NodeResourceConfirmation)
     repos.routeState.update({ warnings: route.warnings.filter((w) => w !== NODE_RESOURCE_WARNING) });
     return { warningCleared: true, route };
   });
-  if (host !== null) markAuditPoint(engine, host);
-  engine.log('info', 'resource.confirmed', { generation: c.generation, warningCleared: result.warningCleared });
-  engine.emit({ route: result.warningCleared, surge: true, environments: result.warningCleared && result.route.activeEnvironmentId ? [result.route.activeEnvironmentId] : [] });
-  return { warningCleared: result.warningCleared };
+  return {
+    generation: c.generation,
+    warningCleared: result.warningCleared,
+    activeEnvironmentId: result.route.activeEnvironmentId,
+    failuresBaseline: c.failuresBaseline !== undefined && Number.isSafeInteger(c.failuresBaseline) && c.failuresBaseline >= 0 ? c.failuresBaseline : null,
+  };
+}
+
+/** confirmNodeResource 所在的事务提交之后：记下审计点（基线为读回之前的失败计数）、记日志并发出事件。 */
+export function applyNodeResourceConfirmation(engine: Engine, r: NodeResourceConfirmed): void {
+  const host = engine.resource;
+  if (host !== null) markAuditPoint(engine, host, r.failuresBaseline ?? undefined);
+  engine.log('info', 'resource.confirmed', { generation: r.generation, warningCleared: r.warningCleared });
+  engine.emit({ route: r.warningCleared, surge: true, environments: r.warningCleared && r.activeEnvironmentId ? [r.activeEnvironmentId] : [] });
 }
 
 // ---------- 视图 ----------
