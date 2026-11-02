@@ -190,6 +190,8 @@ const GENERIC_WEBKIT_PREFIXES = [
   '/System/Library/Frameworks/WebKit.framework/',
   '/System/Library/PrivateFrameworks/WebKit',
   '/System/Volumes/Preboot/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/',
+  // Surge request attribution can expose the staged OS cryptex path as well.
+  '/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/Frameworks/WebKit.framework/',
   '/System/Cryptexes/OS/System/Library/Frameworks/WebKit.framework/',
 ];
 
