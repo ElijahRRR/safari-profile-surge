@@ -16,3 +16,17 @@ evidence/raw/
 node_modules/
 .build/
 DerivedData/
+dist/
+coverage/
+*.tsbuildinfo
+apps/macos/*.xcodeproj/
+apps/macos/Local.xcconfig
+# Surge 配置与本应用生成的含凭据文件、备份、P0 输出：绝不提交
+*.conf
+sfe-*.list
+backups/
+candidates/
+tools/p0/out/
+*.webloc
+!**/test/fixtures/**/*.conf
+!**/test/fixtures/**/sfe-*.list

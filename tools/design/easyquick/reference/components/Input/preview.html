@@ -1,0 +1,58 @@
+<!-- @dsCard group="基础控件" height=232 width=1040 subtitle="input · input-label · input-hint · input-error · Select 触发器" -->
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Input</title></head>
+<body class="p-6">
+<div class="grid grid-cols-4 gap-x-5 gap-y-6">
+  <div>
+    <label class="input-label">店铺名称 <span class="text-red-500">*</span></label>
+    <input class="input" value="Tongxin Home Store">
+    <p class="input-hint mt-1.5">显示在 Walmart 前台</p>
+  </div>
+  <div>
+    <label class="input-label">商品标题（聚焦）</label>
+    <input class="input border-primary-500 ring-2 ring-primary-500/30" value="不锈钢保温杯 500ml">
+    <p class="input-hint mt-1.5">聚焦：primary-500 边框 + 30% 光环</p>
+  </div>
+  <div>
+    <label class="input-label">售价（USD）</label>
+    <input class="input input-error ring-2 ring-red-500/20" value="-12.00">
+    <p class="input-error-text mt-1.5">售价必须大于 0</p>
+  </div>
+  <div>
+    <label class="input-label">SKU</label>
+    <input class="input cursor-not-allowed bg-gray-100 opacity-60 dark:bg-dark-900" value="TX-HOME-0042" disabled>
+    <p class="input-hint mt-1.5">创建后不可修改</p>
+  </div>
+  <div>
+    <label class="input-label">搜索</label>
+    <div class="relative w-full">
+      <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3"><svg class="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"/></svg></div>
+      <input type="text" class="input pl-10" placeholder="搜索 SKU、订单号…">
+    </div>
+  </div>
+  <div>
+    <label class="input-label">API 密钥</label>
+    <div class="relative">
+      <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3.5 text-gray-400 dark:text-dark-400"><svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 5.25a3 3 0 013 3m3 0a6 6 0 01-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1121.75 8.25z"/></svg></div>
+      <input type="password" class="input w-full pl-11 pr-11" value="sk-live-7da09cab">
+      <div class="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-400 dark:text-dark-400"><svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178zM15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg></div>
+    </div>
+  </div>
+  <div>
+    <label class="input-label">发货仓库</label>
+    <button type="button" class="select-trigger">
+      <span class="select-value">美西 · 洛杉矶仓</span>
+      <span class="select-icon"><svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5"/></svg></span>
+    </button>
+  </div>
+  <div>
+    <label class="input-label">物流渠道（展开）</label>
+    <button type="button" class="select-trigger select-trigger-open">
+      <span class="select-value">WFS 平台配送</span>
+      <span class="select-icon"><svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M5 15l7-7 7 7"/></svg></span>
+    </button>
+  </div>
+</div>
+</body>
+</html>

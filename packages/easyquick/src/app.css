@@ -1,0 +1,2 @@
+/* 本项目补充的工具类：只由 Tailwind 生成 utilities 层，颜色等全部读取 tokens.css 变量。 */
+@tailwind utilities;

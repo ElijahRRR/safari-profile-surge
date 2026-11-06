@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 宿主 App 不沙盒：需要写入 ~/Library/Application Support/SafariProfileSurge 并连接 maintenance.sock。 -->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<!-- 与扩展共享 bridge.json 与 bridge.token。 -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>$(TeamIdentifierPrefix)sfe</string>
+	</array>
+</dict>
+</plist>

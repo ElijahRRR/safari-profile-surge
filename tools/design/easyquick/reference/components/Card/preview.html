@@ -1,0 +1,32 @@
+<!-- @dsCard group="数据展示" height=300 width=1040 subtitle="card · card-header / body / footer · card-hover · glass-card" -->
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Card</title></head>
+<body class="relative p-6">
+<div class="pointer-events-none absolute inset-0 bg-mesh-gradient"></div>
+<div class="relative grid grid-cols-3 gap-6">
+  <div class="card">
+    <div class="card-header"><h3 class="text-base font-semibold text-gray-900 dark:text-white">店铺概况</h3></div>
+    <div class="card-body space-y-2 text-sm text-gray-600 dark:text-gray-300">
+      <p>在售商品 <span class="font-medium text-gray-900 dark:text-white">342</span></p>
+      <p>本月销售额 <span class="font-medium text-gray-900 dark:text-white">$48,210</span></p>
+    </div>
+    <div class="card-footer flex justify-end"><button type="button" class="btn btn-secondary btn-sm">查看详情</button></div>
+  </div>
+  <div class="card card-hover -translate-y-0.5 shadow-card-hover border-gray-200 dark:border-dark-600">
+    <div class="card-body">
+      <p class="text-xs font-medium uppercase tracking-wider text-gray-500 dark:text-dark-400">可点击卡片 · 悬停态</p>
+      <p class="mt-2 text-lg font-semibold text-gray-900 dark:text-white">Walmart 美国站</p>
+      <p class="mt-1 text-sm text-gray-500 dark:text-dark-400">上移 2px，投影加深为 shadow-card-hover</p>
+    </div>
+  </div>
+  <div class="glass-card">
+    <div class="card-body">
+      <p class="text-xs font-medium uppercase tracking-wider text-gray-500 dark:text-dark-400">毛玻璃卡片</p>
+      <p class="mt-2 text-lg font-semibold text-gray-900 dark:text-white">叠在 mesh 渐变上</p>
+      <p class="mt-1 text-sm text-gray-500 dark:text-dark-400">70% 表面色 + backdrop-blur-xl + shadow-glass</p>
+    </div>
+  </div>
+</div>
+</body>
+</html>

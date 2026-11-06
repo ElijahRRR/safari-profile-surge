@@ -1,0 +1,38 @@
+<!-- @dsCard group="反馈" height=340 width=560 subtitle="Toast.vue · success / error / warning / info" -->
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>Toast</title></head>
+<body class="p-6">
+<div class="space-y-3" aria-live="polite">
+  <div class="min-w-[320px] max-w-md overflow-hidden rounded-lg shadow-lg bg-white dark:bg-dark-800 border-l-4 border-green-500">
+    <div class="p-4"><div class="flex items-start gap-3">
+      <div class="mt-0.5 flex-shrink-0"><svg class="h-5 w-5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></div>
+      <div class="min-w-0 flex-1"><p class="text-sm font-semibold text-gray-900 dark:text-white">保存成功</p><p class="text-sm leading-relaxed mt-1 text-gray-600 dark:text-gray-300">商品信息已更新，约 15 分钟后同步到 Walmart。</p></div>
+      <button type="button" class="-m-1 flex-shrink-0 rounded p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:text-gray-500 dark:hover:bg-dark-700 dark:hover:text-gray-300" aria-label="关闭"><svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg></button>
+    </div></div>
+    <div class="h-1 bg-gray-100 dark:bg-dark-700"><div class="h-full bg-green-500" style="width:64%"></div></div>
+  </div>
+  <div class="min-w-[320px] max-w-md overflow-hidden rounded-lg shadow-lg bg-white dark:bg-dark-800 border-l-4 border-red-500">
+    <div class="p-4"><div class="flex items-start gap-3">
+      <div class="mt-0.5 flex-shrink-0"><svg class="h-5 w-5 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg></div>
+      <div class="min-w-0 flex-1"><p class="text-sm leading-relaxed text-gray-900 dark:text-white">同步失败：Walmart 接口返回 429，请稍后重试。</p></div>
+      <button type="button" class="-m-1 flex-shrink-0 rounded p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:text-gray-500 dark:hover:bg-dark-700 dark:hover:text-gray-300" aria-label="关闭"><svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg></button>
+    </div></div>
+  </div>
+  <div class="min-w-[320px] max-w-md overflow-hidden rounded-lg shadow-lg bg-white dark:bg-dark-800 border-l-4 border-yellow-500">
+    <div class="p-4"><div class="flex items-start gap-3">
+      <div class="mt-0.5 flex-shrink-0"><svg class="h-5 w-5 text-yellow-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg></div>
+      <div class="min-w-0 flex-1"><p class="text-sm leading-relaxed text-gray-900 dark:text-white">有 23 个 SKU 库存低于 20。</p></div>
+      <button type="button" class="-m-1 flex-shrink-0 rounded p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:text-gray-500 dark:hover:bg-dark-700 dark:hover:text-gray-300" aria-label="关闭"><svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg></button>
+    </div></div>
+  </div>
+  <div class="min-w-[320px] max-w-md overflow-hidden rounded-lg shadow-lg bg-white dark:bg-dark-800 border-l-4 border-blue-500">
+    <div class="p-4"><div class="flex items-start gap-3">
+      <div class="mt-0.5 flex-shrink-0"><svg class="h-5 w-5 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z"/></svg></div>
+      <div class="min-w-0 flex-1"><p class="text-sm leading-relaxed text-gray-900 dark:text-white">新版本 v2.4 已可用。</p></div>
+      <button type="button" class="-m-1 flex-shrink-0 rounded p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 dark:text-gray-500 dark:hover:bg-dark-700 dark:hover:text-gray-300" aria-label="关闭"><svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg></button>
+    </div></div>
+  </div>
+</div>
+</body>
+</html>
