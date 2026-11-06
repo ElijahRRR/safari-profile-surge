@@ -81,7 +81,7 @@ const probeStopped = computed(() => {
 });
 // 失败后的说明只写读回确认过的：「不会改用直连或其他环境的出口」只在回滚读回确认 Safari 保持阻断时成立
 const failedNote = computed(() => {
-  if (held.value !== undefined && s.outcome !== 'rolled_back' && s.outcome !== 'superseded') return rejectHeldText(held.value, s.operation?.result?.rejectCause);
+  if (held.value !== undefined && s.outcome !== 'rolled_back' && s.outcome !== 'superseded') return rejectHeldText(held.value, s.operation?.result?.rejectCause, s.operation?.result?.rejectGuard);
   // 切换在第一次写入之前因节点可能被伪造而停止（error.details.forged 与 beforeWrite，用户决定 D11）：没有选择任何买家节点。
   // 核对时才发现的（已选择目标节点并开放检测之后，按快照回滚）不是这种：按回滚的说明，不否认已选择过节点
   const details = s.operation?.error?.details;

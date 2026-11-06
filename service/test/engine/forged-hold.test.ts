@@ -787,7 +787,7 @@ describe('crash safety, dedup, failures and the claim order', () => {
     expect(await selection()).toBe(nodeA);
     expect(h.app.engine.kv.get(HOLD_KEY)).toMatchObject({ unreachable: true });
     // 没有确认改选时环境的下一步不声称已改选
-    expect(h.app.views.environmentView(a)!.nextActions[0]!.message).toContain('SFE-ROUTE 尚未确认改选 REJECT');
+    expect(h.app.views.environmentView(a)!.nextActions[0]!.message).toContain('SFE-ROUTE 尚未在固定工作配置上确认改选 REJECT');
     await h.app.runPeriodicReconcile();
     await h.idle();
     expect(holds()).toHaveLength(2);

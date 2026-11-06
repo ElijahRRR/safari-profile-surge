@@ -7,6 +7,7 @@ import type {
   NeedsConfirmationDetails,
   OldSessionPolicy,
   OperationPhase,
+  OperationView,
   OperationStatus,
   RollbackResult,
   RouteSummaryView,
@@ -20,7 +21,7 @@ export const WARNING_TEXT: Record<RouteWarning, string> = {
   launch_unverified: '本次打开时场景中已有 Amazon 页面，未经启动验证',
   launch_order_unverified: '首请求与旧连接处理尚未通过实测，启动顺序未经验证',
   external_selection_change: 'SFE-ROUTE 的选择在 Surge 中被外部修改，当前未验证',
-  external_profile_change: 'Surge 当前配置不是固定工作配置，当前未验证',
+  external_profile_change: 'Surge 曾切到（或仍在）固定工作配置以外的配置，当前未验证：仍在该配置且它也含本应用入口时，Safari 请求可能经它的同名 SFE-ROUTE 发出；可在当前配置上进入普通模式（不必先切回固定工作配置）',
   surge_unreachable: '无法连接 Surge，出口状态未知',
   surge_restarted: 'Surge 已重启，入口规则需要重新确认',
   takeover_lost: 'Surge 接管已关闭，Safari 请求可能不经过 Surge',
@@ -191,12 +192,50 @@ export function rollbackText(rollback: RollbackResult): string {
   return text;
 }
 
+/** OperationView.result.rejectGuard：改选 REJECT 之前或之后不能确认 Surge 加载的是固定工作配置时的原因与阶段。 */
+export type RejectGuard = NonNullable<NonNullable<OperationView['result']>['rejectGuard']>;
+
+const REJECT_GUARD_REASON: Record<RejectGuard['reason'], string> = {
+  surge_unreachable: '无法连接 Surge',
+  external_profile: 'Surge 当前配置不是固定工作配置',
+  profile_unknown: '无法确认 Surge 当前配置是否是固定工作配置',
+  selection_unreadable: '读取 SFE-ROUTE 失败',
+};
+
+/** 之后由谁核对：读取 SFE-ROUTE 失败时 Surge 仍是确认的固定工作配置，不说「回到固定工作配置之后」。 */
+const REJECT_GUARD_FOLLOWUP: Record<RejectGuard['reason'], string> = {
+  surge_unreachable: 'Surge 可以连接、确认是固定工作配置之后服务会核对',
+  external_profile: '回到固定工作配置之后服务会核对',
+  profile_unknown: '确认是固定工作配置之后服务会核对',
+  selection_unreadable: '之后读到 SFE-ROUTE 的对账会核对',
+};
+
+/** 没有在固定工作配置上确认改选的说明（无法连接 Surge 而没有改选时为 null，沿用未能改选的说法）。 */
+function rejectGuardText(guard: RejectGuard): string | null {
+  const reason = REJECT_GUARD_REASON[guard.reason];
+  const remedy = '请立即进入普通模式（不必先切回固定工作配置）';
+  const followup = REJECT_GUARD_FOLLOWUP[guard.reason];
+  switch (guard.stage) {
+    case 'not_attempted':
+      return guard.reason === 'surge_unreachable'
+        ? null
+        : `${reason}，服务没有改选 SFE-ROUTE（不改动其他配置中的同名组）：Safari 请求可能仍经买家出口发出，${remedy}。回到固定工作配置之后，服务会在需要时再改选。`;
+    case 'profile_changed':
+      // 改选可能是 REJECT，也可能是回滚恢复的节点：不说「不记为 REJECT」
+      return `改选 SFE-ROUTE 期间${reason}：不能确认这次改选（REJECT 或恢复的节点）落在固定工作配置上，不记为路由的选择；Safari 请求可能仍经买家出口发出，${remedy}。${followup}。`;
+    default:
+      return `无法确认服务中断之前是否已在固定工作配置上改选 REJECT（${reason}）：按未改选处理，Safari 请求可能仍经买家出口发出，${remedy}。${followup}。`;
+  }
+}
+
 /**
  * 路由操作结束时服务改选了 SFE-ROUTE（OperationView.result.rejectSelected；§6.3 第 14 步的结束点）：路由已改变、需要处理。
- * confirmed 为 false 时改选或读回失败。cause 为 node_resource_forged（result.rejectCause）时按节点可能被伪造写明（服务排入的
- * REJECT 保持读回确认时结束为成功，不按状态判断）。
+ * confirmed 为 false 时改选或读回失败，或（guard，result.rejectGuard）没有在固定工作配置上确认改选。cause 为 node_resource_forged
+ * （result.rejectCause）时按节点可能被伪造写明（服务排入的 REJECT 保持读回确认时结束为成功，不按状态判断）。
  */
-export function rejectHeldText(confirmed: boolean, cause?: 'node_resource_forged'): string {
+export function rejectHeldText(confirmed: boolean, cause?: 'node_resource_forged', guard?: RejectGuard): string {
+  const guarded = !confirmed && guard ? rejectGuardText(guard) : null;
+  if (guarded !== null) return cause === 'node_resource_forged' ? `Surge 中的节点可能是伪造的；${guarded}` : guarded;
   if (cause === 'node_resource_forged') {
     return confirmed
       ? 'Surge 中的节点可能是伪造的，服务已把 SFE-ROUTE 改选 REJECT：Safari 经本应用出口的新连接被拒绝，已建立的连接不受影响（进入普通模式会结束它们），自动打开订单与填充已停止。REJECT 不会自动恢复：在网页后台处理节点资源之后，重新使用此环境。'

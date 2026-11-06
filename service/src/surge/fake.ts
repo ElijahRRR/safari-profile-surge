@@ -426,6 +426,11 @@ function commandFailed(message: string): SfeError {
   return new SfeError('SURGE_COMMAND_FAILED', message);
 }
 
+/** 假 Surge 中配置的键：有路径时按路径，否则按名称。 */
+function profileKey(p: SurgeProfileInfo): string {
+  return p.path ?? `name:${p.name}`;
+}
+
 export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   readonly directory: string;
   readonly profileFileName: string;
@@ -492,7 +497,15 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
   /** 重载之后尚未登记的远端资源：key → 登记时刻（毫秒，按 now）。 */
   private registeringUntil = new Map<string, number>();
   private watched = new Map<string, string | null>();
-  private selection = new Map<string, string | null>();
+  /**
+   * 选择组的选择按配置分开保存（Surge 中每个配置有自己的同名组与选择）：键为 profileKey(配置)。第一次切到某个配置时复制固定工作
+   * 配置（构造时的配置）此刻的选择——模拟复制出的配置；之后各自独立。restart 保留（Surge 持久保存选择）。
+   */
+  private readonly selections = new Map<string, Map<string, string | null>>();
+  /** 构造时的配置（固定工作配置）的键。 */
+  private readonly homeKey: string;
+  /** 每次 selectGroupPolicy 生效时的记录：调用时 Surge 加载的配置（profileKey）与是否是构造时的配置。 */
+  readonly selectionWrites: Array<{ profile: string; home: boolean; group: string; policy: string }> = [];
   private temps: string[] = [];
   private modules: Array<{ text: string; moduleName: string }> = [];
   private recent: SimulatedRequest[] = [];
@@ -540,12 +553,43 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     this.now = opts.now ?? (() => new Date());
     this.startedAt = this.now();
     this.currentProfile = { name: this.profileFileName.replace(/\.conf$/, ''), path: this.profilePath };
+    this.homeKey = profileKey(this.currentProfile);
+    this.selections.set(this.homeKey, new Map());
     for (const c of opts.remoteCache ?? []) this.seedRemoteCache(c.url, c.body, { ...(c.type ? { type: c.type } : {}), ...(c.updatedAt ? { updatedAt: c.updatedAt } : {}) });
     this.loadAll();
   }
 
   get profilePath(): string {
     return join(this.directory, this.profileFileName);
+  }
+
+  /** 当前加载的配置的选择（getGroupSelection、selectGroupPolicy 与流量求值都按它）。 */
+  private get selection(): Map<string, string | null> {
+    return this.selectionsOf(profileKey(this.currentProfile));
+  }
+
+  private selectionsOf(key: string): Map<string, string | null> {
+    let m = this.selections.get(key);
+    if (!m) {
+      m = new Map(this.selections.get(this.homeKey)!);
+      this.selections.set(key, m);
+    }
+    return m;
+  }
+
+  /** 测试用：读某个配置（'home' 为构造时的固定工作配置）中组的选择，不切换配置、不计入 calls。 */
+  selectionFor(profile: SurgeProfileInfo | 'home', group: string): string | null {
+    return this.selectionsOf(profile === 'home' ? this.homeKey : profileKey(profile)).get(group) ?? null;
+  }
+
+  /** 测试用：直接设某个配置中组的选择（模拟用户在 Surge 中改选），不经 selectGroupPolicy、不记入 selectionWrites。 */
+  setSelectionFor(profile: SurgeProfileInfo | 'home', group: string, policy: string | null): void {
+    this.selectionsOf(profile === 'home' ? this.homeKey : profileKey(profile)).set(group, policy);
+  }
+
+  /** 测试用：配置的键（与 selectionWrites 中的 profile 相同）。 */
+  profileKeyOf(profile: SurgeProfileInfo | 'home'): string {
+    return profile === 'home' ? this.homeKey : profileKey(profile);
   }
 
   // ---------- 模拟控制 ----------
@@ -1119,10 +1163,12 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     }
     for (const g of this.groups.values()) {
       const members = this.membersOf(g.name);
-      const sel = this.selection.get(g.name);
       // select 组的选择失效（节点被删除、坏行被跳过）时回落到首成员：本应用的 SFE-ROUTE 首成员是 REJECT（回环矩阵：删除选中
-      // 成员后落到 REJECT 只因为它排在首位）。
-      if (sel === undefined || sel === null || !members.includes(sel)) this.selection.set(g.name, members[0] ?? null);
+      // 成员后落到 REJECT 只因为它排在首位）。每个配置的选择都按同一成员回落（成员来自同一资源）
+      for (const map of this.selections.values()) {
+        const sel = map.get(g.name);
+        if (sel === undefined || sel === null || !members.includes(sel)) map.set(g.name, members[0] ?? null);
+      }
     }
   }
 
@@ -1283,6 +1329,8 @@ export class FakeSurge implements SurgeAdapter, MaintenanceSurge {
     return this.invoke('selectGroupPolicy', () => {
       if (!this.groups.has(group)) throw commandFailed('选择策略失败：组不存在');
       if (!this.membersOf(group).includes(policy)) throw commandFailed('选择策略失败：不是组成员');
+      const key = profileKey(this.currentProfile);
+      this.selectionWrites.push({ profile: key, home: key === this.homeKey, group, policy });
       this.selection.set(group, policy);
     });
   }

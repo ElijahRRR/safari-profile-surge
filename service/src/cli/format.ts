@@ -138,7 +138,8 @@ export const KIND_TEXT: Record<OperationKind, string> = {
   'front.verify': '核验前置',
   'route.activate': '切换环境',
   'route.normal': '进入普通模式',
-  'route.hold': '改选 REJECT（节点资源可能被伪造）',
+  // route.hold 包括节点可能被伪造时的保持（D11）与服务排入的推迟改选（之前的路由操作没有在固定工作配置上确认改选）：不写原因
+  'route.hold': '改选 REJECT（失败即关闭）',
   'probe.preflight': '代理预检',
   'probe.safari': 'Safari 重测',
   'maintenance.init': '初始化工作配置',

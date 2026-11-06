@@ -433,7 +433,8 @@ export function buildEnvironmentView(d: EnvironmentViewData, ctx: EnvironmentVie
       message:
         ctx.route.selectedNode === 'REJECT'
           ? 'Surge 中的节点可能是伪造的，SFE-ROUTE 当前是 REJECT：节点资源经确认的同步之后才能重新使用此环境（读取令牌可能已泄露时先进入普通模式，再在维护中更换本机资源地址）；也可以进入普通模式'
-          : 'Surge 中的节点可能是伪造的，SFE-ROUTE 尚未确认改选 REJECT（改选失败或尚未执行）：请立即进入普通模式；节点资源经确认的同步之后再重新使用此环境',
+          : // 记录不是 REJECT 不说明改选失败或没有执行：中断之前或改选期间配置变了的改选可能已生效，只是没有在固定工作配置上确认
+            'Surge 中的节点可能是伪造的，SFE-ROUTE 尚未在固定工作配置上确认改选 REJECT（改选失败、尚未执行，或无法确认中断之前或改选期间的改选）：请立即进入普通模式；节点资源经确认的同步之后再重新使用此环境',
     };
     nextActions = [primary, ...nextActions.filter((a) => a.kind !== 'probe_safari' && a.kind !== 'open_orders' && a.kind !== 'activate')];
   }

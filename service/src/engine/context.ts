@@ -260,7 +260,15 @@ export interface AppServiceDeps {
    * rule match 不可用的退路按时限等满（见 ruleset-strategy.ts 的 UnwitnessedUndo）。
    */
   rulesetWatch?: { timeoutMs: number; pollMs: number };
+  /**
+   * 改选或认定 SFE-ROUTE 选择之前（engine/route-guard.ts）读取当前配置失败时的重试间隔（毫秒，缺省
+   * DEFAULT_PROFILE_READ_RETRY_MS；测试为 0）：可达而 getCurrentProfile 抛出时最多再读两次。
+   */
+  profileReadRetryMs?: number;
 }
+
+/** 配置身份读取失败时的缺省重试间隔（毫秒，按引擎时钟）。 */
+export const DEFAULT_PROFILE_READ_RETRY_MS = 200;
 
 /**
  * 单 key 更新本应用节点资源之后的缺省等待（毫秒）：Surge 报告 updating 时最多等 30 秒（与 updateExternalResource 的适配器
@@ -625,6 +633,22 @@ export class Engine {
     if (facts.message === null && directoryUnknown) facts.message = '无法确认固定工作配置所在目录的真实位置：可能位于同步或受保护位置，请检查目录权限与链接';
     this.facts = facts;
     return facts;
+  }
+
+  /**
+   * 只做一次检测读取（与 readBasicFacts 相同的原语与结论，结论变化时同样记日志），不读其他事实、不改 this.facts：返回是否可达。
+   * 供改选或认定 SFE-ROUTE 选择之前的窄配置身份核对使用（engine/route-guard.ts routeGuard），不覆盖对账用作重启比较基线的
+   * 运行时长等事实。
+   */
+  async probeLiveness(): Promise<boolean> {
+    const liveness = await this.checkLiveness();
+    this.noteLiveness(liveness);
+    return liveness === null;
+  }
+
+  /** 配置身份读取失败时的重试间隔（毫秒，AppServiceDeps.profileReadRetryMs，缺省 200）。 */
+  profileReadRetryMs(): number {
+    return this.deps.profileReadRetryMs ?? DEFAULT_PROFILE_READ_RETRY_MS;
   }
 
   /** 一次检测读取：null 表示可达。 */

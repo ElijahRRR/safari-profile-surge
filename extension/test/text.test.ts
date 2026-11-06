@@ -73,10 +73,38 @@ describe('interface text', () => {
     expect(fail).toContain('未能把 SFE-ROUTE 改选 REJECT');
     expect(fail).toContain('请立即进入普通模式');
     expect(rejectHeldText(true)).toContain('使用中环境已验证的出口');
+    // 没有在固定工作配置上确认改选（result.rejectGuard）：按原因与阶段写明，不说「未能改选」以外的事实，补救是立即进入普通模式
+    const skipped = rejectHeldText(false, undefined, { reason: 'external_profile', stage: 'not_attempted' });
+    expect(skipped).toContain('Surge 当前配置不是固定工作配置，服务没有改选 SFE-ROUTE（不改动其他配置中的同名组）');
+    expect(skipped).toContain('请立即进入普通模式（不必先切回固定工作配置）');
+    expect(rejectHeldText(false, undefined, { reason: 'profile_unknown', stage: 'interrupted' })).toContain('无法确认服务中断之前是否已在固定工作配置上改选 REJECT');
+    expect(rejectHeldText(false, 'node_resource_forged', { reason: 'external_profile', stage: 'profile_changed' })).toContain('Surge 中的节点可能是伪造的；改选 SFE-ROUTE 期间');
+    // 无法连接 Surge 而没有改选：沿用未能改选的说法
+    expect(rejectHeldText(false, undefined, { reason: 'surge_unreachable', stage: 'not_attempted' })).toBe(rejectHeldText(false));
     for (const t of [ok, fail, WARNING_TEXT.node_resource_forged]) {
       expect(t).not.toContain('用户决定');
       expect(t).not.toMatch(/[!！]/);
     }
+  });
+
+  it('PG-T9: rejectGuard texts do not assume a REJECT write or another profile: a profile_changed restore is not called 「不记为 REJECT」, selection_unreadable is not 「回到固定工作配置之后」', () => {
+    const changed = rejectHeldText(false, undefined, { reason: 'external_profile', stage: 'profile_changed' });
+    expect(changed).toContain('不能确认这次改选（REJECT 或恢复的节点）落在固定工作配置上，不记为路由的选择');
+    expect(changed).not.toContain('不记为 REJECT');
+    const unreadable = rejectHeldText(false, undefined, { reason: 'selection_unreadable', stage: 'interrupted' });
+    expect(unreadable).toContain('之后读到 SFE-ROUTE 的对账会核对');
+    expect(unreadable).not.toContain('回到固定工作配置之后');
+    expect(rejectHeldText(false, undefined, { reason: 'external_profile', stage: 'interrupted' })).toContain('回到固定工作配置之后服务会核对');
+  });
+
+  it('T12 / PG-T12: external_profile_change states the shared-entry exposure as history plus a condition and offers normal mode on the loaded profile', () => {
+    const t = WARNING_TEXT.external_profile_change;
+    expect(t).toContain('可在当前配置上进入普通模式');
+    expect(t).toContain('Safari 请求可能经它的同名 SFE-ROUTE 发出');
+    expect(t).toContain('也含本应用入口');
+    // 粘性警告：回到固定工作配置之后仍显示，不能用现在时声称当前配置不是固定工作配置
+    expect(t).toContain('曾切到（或仍在）');
+    expect(t).not.toContain('Surge 当前配置不是固定工作配置');
   });
 
   it('never claims a save is already syncing: publishing may stay pending', () => {

@@ -134,6 +134,44 @@ describe('groups and selection', () => {
     await expect(fake.selectGroupPolicy('SFE-ROUTE', 'Front-A')).rejects.toMatchObject({ code: 'SURGE_COMMAND_FAILED' });
   });
 
+  test('selections are kept per profile: another profile first copies the working profile, then writes stay separate and the log carries the profile', async () => {
+    createFakeSurgeEnvironment(dir);
+    const fake = new FakeSurge({ directory: dir, watchLocalPolicyPaths: true });
+    writeNodes([node(1), node(2)]);
+    await fake.selectGroupPolicy('SFE-ROUTE', 'SFE-N-E0001-US01-v001');
+    const working = { ...fake.currentProfile };
+    const other = { name: 'Other', path: join(dir, 'Other.conf') };
+    fake.currentProfile = other;
+    // 第一次访问：复制固定工作配置此刻的选择（模拟复制出的配置）
+    expect(await fake.getGroupSelection('SFE-ROUTE')).toBe('SFE-N-E0001-US01-v001');
+    await fake.selectGroupPolicy('SFE-ROUTE', 'REJECT');
+    expect(await fake.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
+    expect(fake.selectionFor('home', 'SFE-ROUTE')).toBe('SFE-N-E0001-US01-v001');
+    fake.currentProfile = working;
+    expect(await fake.getGroupSelection('SFE-ROUTE')).toBe('SFE-N-E0001-US01-v001');
+    expect(fake.selectionWrites.map((w) => [w.home, w.policy])).toEqual([
+      [true, 'SFE-N-E0001-US01-v001'],
+      [false, 'REJECT'],
+    ]);
+    expect(fake.selectionWrites[1]!.profile).toBe(fake.profileKeyOf(other));
+    // 测试设值不记入日志
+    fake.setSelectionFor(other, 'SFE-ROUTE', 'SFE-N-E0001-US01-v002');
+    expect(fake.selectionFor(other, 'SFE-ROUTE')).toBe('SFE-N-E0001-US01-v002');
+    expect(fake.selectionWrites).toHaveLength(2);
+  });
+
+  test('the first-member fallback applies to every profile\'s selection', async () => {
+    createFakeSurgeEnvironment(dir);
+    const fake = new FakeSurge({ directory: dir, watchLocalPolicyPaths: true });
+    writeNodes([node(1), node(2)]);
+    const other = { name: 'Other', path: join(dir, 'Other.conf') };
+    fake.setSelectionFor(other, 'SFE-ROUTE', 'SFE-N-E0001-US01-v002');
+    await fake.selectGroupPolicy('SFE-ROUTE', 'SFE-N-E0001-US01-v002');
+    writeNodes([node(1)], 2);
+    expect(await fake.getGroupSelection('SFE-ROUTE')).toBe('REJECT');
+    expect(fake.selectionFor(other, 'SFE-ROUTE')).toBe('REJECT');
+  });
+
   test('policy detail redacts credentials and reports the front', async () => {
     createFakeSurgeEnvironment(dir);
     const fake = new FakeSurge({ directory: dir, watchLocalPolicyPaths: true });

@@ -986,6 +986,10 @@ describe('concurrency matrix', () => {
       const route = h.repos.routeState.get();
       expect(route).toMatchObject({ phase: 'attention', entryMode: 'ACTIVE', activeEnvironmentId: a, selectedNode: nodeB });
       expect(route.warnings).toEqual(expect.arrayContaining(['entry_unverified', 'buyer_exit_connections_unconfirmed', 'managed_windows_on_original_rules']));
+      // SFE-ROUTE 仍选着 B 的节点、入口不是普通模式：B 不能删除或解除绑定（environmentRouteBusy 的 selectedNode 一支）
+      const envB = h.repos.environments.get(b)!;
+      await expectError(h.app.deleteEnvironment(b, { request_id: rid(), expected_revision: envB.revision }, WEB), 'ENVIRONMENT_ACTIVE');
+      await expectError(h.app.unbind(b, { request_id: rid(), expected_revision: envB.revision }, WEB), 'ENVIRONMENT_ACTIVE');
       h.fake.reachable = true;
       await h.app.runPeriodicReconcile();
       await h.idle();
@@ -995,10 +999,11 @@ describe('concurrency matrix', () => {
       expect(d.routeSummary).toMatchObject({ phase: 'attention', entryUnconfirmed: true });
       expect(d.environment.nextActions[0]!.message).toContain('路由状态需要处理');
       expect(d.ordersAllowed).toBe(false);
-      // SFE-ROUTE 仍选着 B 的节点、入口不是普通模式：B 不能删除或解除绑定
-      const envB = h.repos.environments.get(b)!;
-      await expectError(h.app.deleteEnvironment(b, { request_id: rid(), expected_revision: envB.revision }, WEB), 'ENVIRONMENT_ACTIVE');
-      await expectError(h.app.unbind(b, { request_id: rid(), expected_revision: envB.revision }, WEB), 'ENVIRONMENT_ACTIVE');
+      // 普通模式失败时无法连接 Surge、没有改选（route:pendingHold）：Surge 可以连接且确认是固定工作配置之后的对账排入一次改选，
+      // 由执行器在固定工作配置上把仍选着 B 节点的 SFE-ROUTE 改选 REJECT（推迟的改选，ARCH §6.6）
+      expect(h.repos.operations.listRecent(50).some((o) => o.kind === 'route.hold' && o.status === 'succeeded')).toBe(true);
+      expect(h.repos.routeState.get().selectedNode).toBe('REJECT');
+      expect(h.fake.selectionFor('home', 'SFE-ROUTE')).toBe('REJECT');
       // 再次进入普通模式：完成，B 的窗口警告保留并写明
       const n2 = await h.app.enterNormal({ request_id: rid(), old_session_policy: 'closed_confirmed', confirmed_environment_id: a }, WEB);
       await h.idle();
@@ -1006,7 +1011,7 @@ describe('concurrency matrix', () => {
       expect(h.repos.operations.listSteps(n2.operation_id).at(-1)!.message).toContain('旧环境窗口未关闭');
       expect(h.repos.routeState.get()).toMatchObject({ entryMode: 'NORMAL', phase: 'idle' });
       expect(h.repos.routeState.get().warnings).toContain('managed_windows_on_original_rules');
-      // 普通模式之后可以删除（删除先把仍选着 B 节点的 SFE-ROUTE 改选 REJECT）
+      // 普通模式之后可以删除（SFE-ROUTE 已由推迟的改选改选 REJECT，删除不再需要改选）
       const del = await h.app.deleteEnvironment(b, { request_id: rid(), expected_revision: h.repos.environments.get(b)!.revision }, WEB);
       await h.idle();
       expect(h.repos.operations.get(del.operation_id)!.phase).toBe('COMPLETED');
@@ -2625,15 +2630,20 @@ describe('delete / unbind (§6.7)', () => {
     expect(h.repos.operations.get(a.operation_id)!.status).toBe('parked');
   });
 
-  test('existing route group query errors are not treated as an absent group', async () => {
+  test('existing route group before initialization: the draft is deleted without reading or selecting that group (no fixed working profile to confirm)', async () => {
     h = await createHarness({ sourceProfile: uninitializedProfile + '[Proxy Group]\nSFE-ROUTE = select, REJECT\n', capabilities: [] });
     const a = await createEnv(h, 'Draft', '203.0.113.10');
     h.fake.failNext('getGroupSelection');
+    const reads = h.fake.calls.getGroupSelection ?? 0;
     const env = h.repos.environments.get(a.environment_id!)!;
     const d = await h.app.deleteEnvironment(env.id, { request_id: rid(), expected_revision: env.revision }, ADMIN);
     await h.idle();
-    expect(h.repos.operations.get(d.operation_id)!.status).toBe('failed');
-    expect(h.repos.environments.get(env.id)!.deletedAt).toBeNull();
+    // 没有固定工作配置可核对（engine/route-guard.ts）：不读、不改选其他配置中的同名组；从未部署的草稿的节点不在 SFE-ROUTE 中
+    expect(h.repos.operations.get(d.operation_id)!.status).toBe('succeeded');
+    expect(h.fake.calls.getGroupSelection ?? 0).toBe(reads);
+    expect(h.fake.selectionWrites).toEqual([]);
+    expect(h.repos.operations.listSteps(d.operation_id).map((s) => s.message).join('\n')).toContain('该环境从未部署，节点不在 SFE-ROUTE 中，跳过选择核对');
+    expect(h.repos.environments.get(env.id)!.deletedAt).not.toBeNull();
   });
 
   test('active environment: ENVIRONMENT_ACTIVE, no request-level confirmation', async () => {

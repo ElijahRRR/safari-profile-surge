@@ -5,7 +5,10 @@
 // 切换前节点，SFE-ROUTE 改选 REJECT，见 holdUnconfirmedRollback）。路由操作结束时 Surge 仍可能加载着检测或使用中入口、
 // 而 SFE-ROUTE 的选择不是使用中环境已验证的出口（回滚、普通模式失败或撤销未经运行时确认、处理器意外异常，以及其余每条结束
 // 路径——例如对账已把路由改为 attention 之后在写入之前失败的激活，见 holdAtRouteEnd）：一律尽力改选 REJECT 并读回，如实写明
-// 是否确认（selectRejectBestEffort）。
+// 是否确认（selectRejectGuarded）。
+// SFE-ROUTE 的选择属于固定工作配置（engine/route-guard.ts）：每次改选与要记为路由状态的读取都只在确认 Surge 可连接且是固定工作
+// 配置时进行（写入之前核对，读回之后再核对配置未变）；不能确认时不改动其他配置中的同名组，如实写明没有改选（或不能确认），路由按
+// 未确认的保持记下并记 route:pendingHold（engine/pending-hold.ts），之后在固定工作配置上的对账核对或排入一次改选。
 // 节点资源可能被伪造（用户决定 D11）：执行器领取服务排入的 REJECT 保持（route.hold，runForgedHold）改选 REJECT 并读回；标记在时
 // 任何买家节点都不算已验证的出口（verifiedExitNode），各结束点、普通模式失败与执行器兜底因此一律失败即关闭；回滚不恢复切换前的
 // 买家节点。
@@ -47,6 +50,37 @@ import { hasBlockingIssue } from '../../surge/precedence.js';
 import { killSafariConnections } from '../../surge/safari-connections.js';
 import type { EmitSpec, Engine } from '../context.js';
 import { managedSegmentsChanged, reconcile } from '../reconcile.js';
+import {
+  HOLD_BLOCK_TEXT,
+  PENDING_HOLD_KEY,
+  appendSourceStep,
+  entryMayUseRoute,
+  pendingHoldStale,
+  readPendingHold,
+  recordPendingHold,
+  readUnconfirmedWrite,
+  recordUnconfirmedWrite,
+  staleText,
+  verifiedExitNode,
+  verifiedExitNodeIgnoringForged,
+  type HoldBlock,
+} from '../pending-hold.js';
+import {
+  ROUTE_GUARD_NORMAL_REMEDY,
+  ROUTE_GUARD_REMEDY,
+  ROUTE_GUARD_TEXT,
+  guardCodeOf,
+  profileStillWorking,
+  readRouteSelection,
+  readSelectionUncredited,
+  routeGuard,
+  routeGuardExposure,
+  writeRouteSelection,
+  type RouteGuard,
+  type RouteGuardAllowed,
+  type RouteGuardBlock,
+  type RouteGuardCode,
+} from '../route-guard.js';
 import { confirmationNeeded, entrySettingsKey, needsConfirmationError, routeOps, supersedeWaiting, waitingEnvironments } from '../route-control.js';
 import { clearSafariMayUseRoute, markSafariMayUseRoute, retiredSafariPaths, safariMayUseRoute } from '../safari-route-marker.js';
 import { currentPreflight, recordPreflight } from './probes.js';
@@ -154,6 +188,14 @@ interface RejectHold {
   cause?: 'node_resource_forged';
   /** 改选或读回失败时 Surge 调用的错误代码（例如 SURGE_UNREACHABLE）；确认时没有。 */
   errorCode?: string;
+  /**
+   * 没有在固定工作配置上确认改选（engine/route-guard.ts）：not_attempted 守卫拒绝、没有改选（不改动其他配置中的同名组）；
+   * profile_changed 改选期间配置变了，不能确认改选落在固定工作配置上；interrupted 崩溃恢复中无法确认中断之前是否已在固定工作配置上
+   * 改选。结果带 rejectGuard，路由按未确认的保持记下，并记 route:pendingHold（engine/pending-hold.ts），之后在固定工作配置上的对账核对。
+   */
+  guard?: { block: HoldBlock; stage: 'not_attempted' | 'profile_changed' | 'interrupted' };
+  /** 改选意图已记下而没有在固定工作配置上确认（interrupted，或记下意图之后 profile_changed）：之后读回 REJECT 时按本应用的改选记下。 */
+  unresolvedIntent?: EndHoldIntent;
 }
 
 /**
@@ -161,38 +203,60 @@ interface RejectHold {
  * 改选后不论 Surge 加载的是哪一版本应用入口，经 SFE-ROUTE 的 Safari 新连接都被拒绝，从不回退到 DIRECT、NORMAL 或其他买家出口。
  * 选择组只在建立连接时生效：已建立的连接（keep-alive、H2、WebSocket）不受改选影响，仍在原来的出口上——调用方记下
  * buyer_exit_connections_unconfirmed（holdExistingConnections），由普通模式结束它们。
+ * 只在固定工作配置上改选（engine/route-guard.ts writeRouteSelection：前置核对 Surge 可连接且是固定工作配置，读回一致之后再核对
+ * 配置未变；opts.guard 为同一步刚得到的允许结果时不重读）：守卫拒绝时不改选（不改动其他配置中的同名组），返回 guard 写明原因。
  * 从不抛出：改选或读回失败只如实返回，由调用方写明（不记为 REJECT）。
  */
-async function selectRejectBestEffort(engine: Engine): Promise<RejectHold> {
-  try {
-    await engine.surge.selectGroupPolicy(ROUTE_GROUP_NAME, 'REJECT');
-  } catch (err) {
-    return { confirmed: false, readback: null, error: holdErrorText(engine, err, '改选失败'), ...errorCodeOf(err) };
-  }
-  try {
-    const sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-    return sel === 'REJECT' ? { confirmed: true, readback: sel, error: null } : { confirmed: false, readback: sel, error: '改选后读回不一致' };
-  } catch (err) {
-    return { confirmed: false, readback: null, error: holdErrorText(engine, err, '改选后读回失败'), ...errorCodeOf(err) };
-  }
+async function selectRejectGuarded(engine: Engine, opts: { guard?: RouteGuardAllowed } = {}): Promise<RejectHold> {
+  const w = await writeRouteSelection(engine, 'REJECT', opts);
+  if (w.ok) return { confirmed: true, readback: w.readback, error: null };
+  if (w.kind === 'guard') return { confirmed: false, readback: null, error: ROUTE_GUARD_TEXT[w.block], errorCode: w.code, guard: { block: w.block, stage: w.stage } };
+  if (w.failed === 'mismatch') return { confirmed: false, readback: w.readback, error: '改选后读回不一致' };
+  return { confirmed: false, readback: null, error: holdErrorText(engine, w.error, w.failed === 'select' ? '改选失败' : '改选后读回失败'), ...errorCodeOf(w.error) };
+}
+
+/** 守卫拒绝、没有改选时的保持（不改动其他配置中的同名组）。 */
+function skippedHold(g: { block: RouteGuardBlock; code: string }, cause?: 'node_resource_forged'): RejectHold {
+  return { confirmed: false, readback: null, error: ROUTE_GUARD_TEXT[g.block], errorCode: g.code, guard: { block: g.block, stage: 'not_attempted' }, ...(cause ? { cause } : {}) };
+}
+
+/** 崩溃恢复中无法确认中断之前是否已在固定工作配置上改选（本次没有改选）。 */
+function interruptedHold(block: HoldBlock, intent: EndHoldIntent): RejectHold {
+  return {
+    confirmed: false,
+    readback: null,
+    error: HOLD_BLOCK_TEXT[block],
+    ...(block === 'selection_unreadable' ? {} : { errorCode: guardCodeOf(block) }),
+    guard: { block, stage: 'interrupted' },
+    unresolvedIntent: intent,
+    ...(intent.cause ? { cause: intent.cause } : {}),
+  };
+}
+
+/**
+ * 回滚、普通模式与执行器兜底的改选没有先记下意图：改选期间配置变了（profile_changed）时按同一意图记下（之后在固定工作配置上读回
+ * REJECT 时按本应用的改选记下）。
+ */
+function withChangedIntent(engine: Engine, hold: RejectHold): RejectHold {
+  if (hold.guard?.stage !== 'profile_changed' || hold.unresolvedIntent) return hold;
+  return { ...hold, unresolvedIntent: { externalSelectionBefore: engine.repos.routeState.get().warnings.includes('external_selection_change') } };
 }
 
 function errorCodeOf(err: unknown): { errorCode?: string } {
   return err instanceof SfeError ? { errorCode: err.code } : {};
 }
 
-/** SFE-ROUTE 的选择（读不到为 undefined）。从不抛出。 */
-async function readSelectionSafe(engine: Engine): Promise<string | null | undefined> {
-  try {
-    return await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-  } catch {
-    return undefined;
-  }
-}
-
-/** 结果中记下的改选（rejectSelected，及伪造原因 rejectCause）。 */
-function holdResult(hold: RejectHold): { rejectSelected: boolean; rejectCause?: 'node_resource_forged' } {
-  return { rejectSelected: hold.confirmed, ...(hold.cause ? { rejectCause: hold.cause } : {}) };
+/** 结果中记下的改选（rejectSelected，伪造原因 rejectCause，以及没有在固定工作配置上确认的原因与阶段 rejectGuard）。 */
+function holdResult(hold: RejectHold): {
+  rejectSelected: boolean;
+  rejectCause?: 'node_resource_forged';
+  rejectGuard?: { reason: HoldBlock; stage: 'not_attempted' | 'profile_changed' | 'interrupted' };
+} {
+  return {
+    rejectSelected: hold.confirmed,
+    ...(hold.cause ? { rejectCause: hold.cause } : {}),
+    ...(hold.guard ? { rejectGuard: { reason: hold.guard.block, stage: hold.guard.stage } } : {}),
+  };
 }
 
 function holdErrorText(engine: Engine, err: unknown, fallback: string): string {
@@ -203,11 +267,36 @@ function holdErrorText(engine: Engine, err: unknown, fallback: string): string {
   }
 }
 
-/** 改选 REJECT 的说明（如实写明是否读回确认；改选只影响新连接）。 */
-function rejectHoldText(hold: RejectHold): string {
-  return hold.confirmed
-    ? 'SFE-ROUTE 已改选 REJECT（读回确认）：Surge 即使仍加载着检测或使用中入口，经 SFE-ROUTE 的 Safari 新连接也都被拒绝，不会经任何买家出口建立'
-    : `SFE-ROUTE 未能改选 REJECT（${hold.error ?? '原因未知'}）：Surge 若仍加载着检测或使用中入口，Safari 请求（至少检测主机）可能仍经 SFE-ROUTE 当前选择的买家出口发出，请立即进入普通模式`;
+/** 守卫保持之后的对账（engine/pending-hold.ts）。 */
+const PENDING_FOLLOWUP_TEXT = '之后在固定工作配置上的对账发现仍需要时会排入改选';
+
+/**
+ * 没有在固定工作配置上确认改选（hold.guard）的说明；无法连接 Surge 而没有改选时为 null（沿用未能改选的说法）。remedy：之后要做什么
+ * （普通模式中为 ROUTE_GUARD_NORMAL_REMEDY）。
+ */
+function guardHoldText(hold: RejectHold, remedy: string): string | null {
+  const g = hold.guard;
+  if (!g || (g.stage === 'not_attempted' && g.block === 'surge_unreachable')) return null;
+  const text = HOLD_BLOCK_TEXT[g.block];
+  const exposure = g.block === 'selection_unreadable' ? '' : routeGuardExposure(g.block);
+  switch (g.stage) {
+    case 'not_attempted':
+      return `SFE-ROUTE 没有改选 REJECT（${text}：只在固定工作配置上改选，不改动其他配置中的同名组）：Surge 加载固定工作配置时若仍加载着检测或使用中入口，Safari 请求（至少检测主机）可能经 SFE-ROUTE 当前选择的买家出口发出${exposure}，请${remedy}；${PENDING_FOLLOWUP_TEXT}`;
+    case 'profile_changed':
+      return `改选 SFE-ROUTE 期间${text}：不能确认改选落在固定工作配置上（可能改到了其他配置中的同名组），不记为 REJECT；Safari 请求（至少检测主机）可能经固定工作配置中 SFE-ROUTE 当前选择的买家出口发出${exposure}，请${remedy}；之后在固定工作配置上的对账读回 SFE-ROUTE，是 REJECT 时记为本应用的改选，否则排入改选`;
+    case 'interrupted':
+      return `无法确认中断之前是否已在固定工作配置上改选 REJECT（${text}；本次没有改选${g.block === 'selection_unreadable' ? '' : '，不改动其他配置中的同名组'}）：确认之前按未改选处理，Safari 请求（至少检测主机）可能经 SFE-ROUTE 当前选择的买家出口发出${exposure}，请${remedy}；之后在固定工作配置上的对账读回 SFE-ROUTE，是 REJECT 时记为本应用中断之前的改选，否则排入改选`;
+  }
+}
+
+/** 改选 REJECT 的说明（如实写明是否读回确认、是否在固定工作配置上改选；改选只影响新连接）。 */
+function rejectHoldText(hold: RejectHold, remedy: string = ROUTE_GUARD_REMEDY): string {
+  if (hold.confirmed) {
+    return 'SFE-ROUTE 已改选 REJECT（读回确认）：Surge 即使仍加载着检测或使用中入口，经 SFE-ROUTE 的 Safari 新连接也都被拒绝，不会经任何买家出口建立';
+  }
+  const guarded = guardHoldText(hold, remedy);
+  if (guarded !== null) return guarded;
+  return `SFE-ROUTE 未能改选 REJECT（${hold.error ?? '原因未知'}）：Surge 若仍加载着检测或使用中入口，Safari 请求（至少检测主机）可能仍经 SFE-ROUTE 当前选择的买家出口发出，请立即进入普通模式${hold.guard ? `；${PENDING_FOLLOWUP_TEXT}` : ''}`;
 }
 
 /** 改选 REJECT 不影响已建立的连接：与 holdExistingConnections 记下的警告一起写明。 */
@@ -249,6 +338,15 @@ function activeWrittenNote(t: { label: string }): string {
  * 已按列表与有效规则顺序读回，只是 Surge 实际如何匹配 Safari 请求没有经 rule match 确认。
  */
 function normalHoldText(hold: RejectHold, strategy: EntryController['strategy'] | undefined): string {
+  // 没有在固定工作配置上改选（Surge 当前不是或无法确认是固定工作配置、改选期间配置变了）：普通模式照常完成，只跳过 SFE-ROUTE 的改选
+  const guarded = hold.confirmed ? null : guardHoldText(hold, ROUTE_GUARD_NORMAL_REMEDY);
+  if (guarded !== null) {
+    const cond =
+      strategy === 'temp_rule'
+        ? '临时规则已按 Surge 的临时规则列表与有效规则顺序读回，但 Surge 实际如何匹配 Safari 请求未经 rule match 求值确认'
+        : 'Surge 加载撤销之前可能仍加载着检测或使用中入口';
+    return `${cond}；${guarded}`;
+  }
   if (strategy === 'temp_rule') {
     const cond = '临时规则已按 Surge 的临时规则列表与有效规则顺序读回，但 Surge 实际如何匹配 Safari 请求未经 rule match 求值确认';
     return hold.confirmed
@@ -264,46 +362,21 @@ function normalHoldText(hold: RejectHold, strategy: EntryController['strategy'] 
  * SFE-ROUTE 当前的选择是否就是使用中环境已验证的出口：没有进行中或中断的切换（激活快照仍在时选择可能是半途切换写入的未验证
  * 节点，见 routeSnapshot），有使用中的环境，路由记录的选择等于其活动版本的节点且没有 external_selection_change，并且实际读回
  * 也等于它——选择可能在记录之外被改过（用户在 Surge 中改选别的买家节点、发布回滚无法确认选择），对账只加警告、不改记录，
- * 只看记录会把别的买家出口当作已验证的路由留给 Safari。读不到按不是。从不抛出。
+ * 只看记录会把别的买家出口当作已验证的路由留给 Safari。读不到按不是。读取之后核对配置已变（不是或无法确认是固定工作配置）时
+ * 返回拒绝的原因：调用方沿用的守卫已不成立，不改选（不改动其他配置中的同名组），按没有改选的保持记下（skippedHold，与
+ * holdAtRouteEnd 决定是否改选的读取相同）。从不抛出。
  */
-async function selectionIsVerifiedExit(engine: Engine, route: RouteStateRecord): Promise<boolean> {
+async function verifiedExitReadback(
+  engine: Engine,
+  route: RouteStateRecord,
+  guard: RouteGuardAllowed,
+): Promise<boolean | { block: RouteGuardBlock; code: RouteGuardCode }> {
   const node = verifiedExitNode(engine, route);
   if (node === null) return false;
-  try {
-    return (await engine.surge.getGroupSelection(ROUTE_GROUP_NAME)) === node;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * 按路由记录，使用中环境已验证的出口节点（selectionIsVerifiedExit 的记录部分）；记录不能证明时为 null。节点资源可能被伪造时
- * （resource:forgedNodes，用户决定 D11）任何买家节点都不算已验证的出口：为 null（结束点、普通模式失败与执行器兜底因此改选 REJECT）。
- */
-function verifiedExitNode(engine: Engine, route: RouteStateRecord): string | null {
-  if (readForgedNodes(engine.kv) !== null) return null;
-  return verifiedExitNodeIgnoringForged(engine, route);
-}
-
-/** verifiedExitNode 不看伪造标记的部分：只用于写明结束点的改选是否只因伪造标记（holdAtRouteEnd）。 */
-function verifiedExitNodeIgnoringForged(engine: Engine, route: RouteStateRecord): string | null {
-  if (route.activationSnapshot !== null || route.activeEnvironmentId === null || route.activeProxyRevision === null) return null;
-  if (route.warnings.includes('external_selection_change')) return null;
-  const rev = engine.repos.proxyRevisions.get(route.activeEnvironmentId, route.activeProxyRevision);
-  return rev && route.selectedNode === rev.nodeName ? rev.nodeName : null;
-}
-
-/**
- * 按路由记录，Surge 加载的本应用入口是否可能仍让 Safari 经 SFE-ROUTE：入口不是经运行时求值确认的阻断或普通模式（VERIFY_ONLY、
- * ACTIVE、UNKNOWN），或带 entry_unverified（读回未经运行时求值确认、退路写入、对账发现与记录不一致或能力过期），或阻断带
- * precedence_violation（排在入口之前的规则可能把 Safari 请求交给 SFE-ROUTE）。普通模式只看 entry_unverified：本应用入口已撤下时，
- * 排在它之前的规则与本应用入口无关。
- */
-function entryMayUseRoute(route: RouteStateRecord): boolean {
-  if (route.warnings.includes('entry_unverified')) return true;
-  if (route.entryMode === 'NORMAL') return false;
-  if (route.entryMode === 'BLOCKED') return route.warnings.includes('precedence_violation');
-  return true;
+  // 读取同样只在固定工作配置上认定（读取之后再核对配置未变）：其他配置的同名组选着同一节点不能证明固定工作配置上的路由
+  const r = await readRouteSelection(engine, { guard });
+  if (!r.ok) return r.kind === 'guard' ? { block: r.block, code: r.code } : false;
+  return r.selection === node;
 }
 
 /** holdAtRouteEnd 的输入：结束的操作自己在本次结束之前读到的情况。 */
@@ -324,7 +397,7 @@ interface EndHoldOptions {
  * 路由操作的结束点（失败即关闭，所有结束路径共用；在把操作记为结束之前调用）。路由操作结束之后不再有操作负责撤下当前入口，
  * 对账只读、从不写 Surge（§6.6）：结束时 Surge 加载的入口可能仍让 Safari 经 SFE-ROUTE（entryMayUseRoute），而 SFE-ROUTE 的选择
  * 不是使用中环境已验证的出口（例如半途切换写入的未验证节点、之前一次改选 REJECT 失败、选择在记录之外被改过）时，Safari（至少
- * 检测主机）会在没有任何实测进行中的情况下经它发出。与回滚无法确认同一规则：尽力改选 REJECT 并读回（selectRejectBestEffort），
+ * 检测主机）会在没有任何实测进行中的情况下经它发出。与回滚无法确认同一规则：尽力改选 REJECT 并读回（selectRejectGuarded），
  * 调用方用 recordEndHold 记下、用 endHoldNote/withEndHold 如实写明。
  * 典型来源是不由结束的操作写入、而由对账发现的状态：启动对账或周期对账把等待实测的路由改为 attention（例如有规则排在入口之前，
  * 入口改记为 UNKNOWN）之后，接手它的激活在第一次写入之前失败——它不负责非过渡中的路由（ownsTransition），不回滚。
@@ -342,41 +415,86 @@ interface EndHoldOptions {
  * 就是本操作改选的，按改选（读回确认，RejectHold.recovered）记下并结束为需要处理，不按「之前已是 REJECT、路由未改变」结束。这一
  * 判断排在排队普通模式与另一负责者两项之前：本操作改选期间受理的普通模式（受理从不拒绝，排在本操作之后）在崩溃之后仍排着，
  * 否则恢复的结束会把本操作自己的改选当作「路由未改变」。
+ * 配置身份（engine/route-guard.ts）：意图的读回只在确认是固定工作配置时认定（不能确认 → 无法确认中断之前是否已改选，interrupted，
+ * 不让给排队普通模式或另一负责者；读不到选择而有它们 → 同样 interrupted，没有它们 → 照样改选，读回确认按本操作的改选记下）。没有
+ * 意图时守卫拒绝则不记下意图、不改选，按记录判断（记录表明选着已验证的出口、结束的操作也没有读到不一致的选择时不改选；无法确认
+ * 当前配置而可连接时多读一次选择只用于更保守的判断），否则返回没有改选的保持（not_attempted）；守卫允许时决定是否改选的读取同样在
+ * 读回之后核对配置未变。调用方按 recordEndHold 记下（未确认时记 route:pendingHold）。
  */
 async function holdAtRouteEnd(engine: Engine, opId: string, opts: EndHoldOptions = {}): Promise<RejectHold | null> {
   const { repos } = engine;
   let externalSelectionBefore = false;
   /** 只因节点资源可能被伪造而改选（选择就是使用中环境已验证的出口，或读不到而记录表明是它；用户决定 D11）。 */
   let forgedOnly = false;
-  const readSelection = (): Promise<string | null | undefined> => readSelectionSafe(engine);
+  /** 配置身份核对（只核对一次，同一步之后的读取与改选沿用）。 */
+  let guard: RouteGuard | null = null;
+  /** 崩溃之前已记下的改选意图：读取失败而照样改选时，读回确认按本操作中断之前的改选记下。 */
+  let intent: EndHoldIntent | undefined;
   try {
     const route = repos.routeState.get();
     if (!entryMayUseRoute(route)) return null;
-    // 本操作在服务崩溃之前已记下改选的意图：先读回——读回的 REJECT 就是它的改选（崩溃发生在改选之后、记下之前），按改选记下，
-    // 不论之后是否有排队的普通模式或另一个负责者（它们在本操作改选期间受理，交给它们就会把本操作的结束记为「路由未改变」）
     const self = repos.operations.get(opId);
-    const intent = self ? payloadOf(self).endHold : undefined;
-    let sel: string | null | undefined;
-    let selRead = false;
-    if (intent) {
-      sel = await readSelection();
-      selRead = true;
-      if (sel === 'REJECT') return { confirmed: true, readback: 'REJECT', error: null, recovered: intent, ...(intent.cause ? { cause: intent.cause } : {}) };
-    }
+    intent = self ? payloadOf(self).endHold : undefined;
     const others = repos.operations.listByStatus(['queued', 'running', 'waiting']).filter((o) => o.id !== opId);
-    if (others.some((o) => o.kind === 'route.normal' && (o.status === 'queued' || o.status === 'running'))) return null;
+    const normalOpen = others.some((o) => o.kind === 'route.normal' && (o.status === 'queued' || o.status === 'running'));
     // 路由记在另一个未结束的操作名下（不论阶段）：它会自己结算路由——等待中的激活经它的计时器、取消或核对（对账把等待实测的
     // 路由改为 attention 之后它照样负责，例如 Surge 短暂不可达之后它仍可能核对通过），排队或执行中的接手者经 failBeforeSwitch
     // 或切换。在这里改选会让一个无关操作的结束抢走仍在进行中的激活的路由（两个负责者），之后它的核对因选择已不是目标节点失败
-    if (route.operationId !== null && others.some((o) => o.id === route.operationId)) return null;
-    if (!selRead) sel = await readSelection();
-    if (sel === 'REJECT') return null;
+    const ownerOpen = route.operationId !== null && others.some((o) => o.id === route.operationId);
+    let sel: string | null | undefined;
+    let selRead = false;
+    if (intent) {
+      // 本操作在服务崩溃之前已记下改选的意图：只有在确认是固定工作配置时读回（读回之后再核对配置未变）——读回的 REJECT 就是它的
+      // 改选（崩溃发生在改选之后、记下之前），按改选记下，不论之后是否有排队的普通模式或另一个负责者（它们在本操作改选期间受理，
+      // 交给它们就会把本操作的结束记为「路由未改变」）。不能确认是固定工作配置时不读、不认定，也不让给它们：按无法确认中断之前
+      // 是否已改选结束（route:pendingHold，之后在固定工作配置上的对账核对）
+      guard = await routeGuard(engine);
+      if (!guard.allowed) return interruptedHold(guard.block, intent);
+      const r = await readRouteSelection(engine, { guard });
+      if (r.ok) {
+        if (r.selection === 'REJECT') return { confirmed: true, readback: 'REJECT', error: null, recovered: intent, ...(intent.cause ? { cause: intent.cause } : {}) };
+        sel = r.selection;
+        selRead = true;
+      } else if (r.kind === 'guard') {
+        return interruptedHold(r.block, intent);
+      } else if (normalOpen || ownerOpen) {
+        // 读不到选择：不能说明中断之前的改选没有生效，不按「路由未改变」让给排队的普通模式或另一个负责者
+        return interruptedHold('selection_unreadable', intent);
+      } else {
+        // 读不到选择、没有其他负责者：照样改选（失败即关闭），读回确认按本操作中断之前的改选记下
+        sel = undefined;
+        selRead = true;
+      }
+    }
+    if (normalOpen) return null;
+    if (ownerOpen) return null;
+    if (guard === null) guard = await routeGuard(engine);
     const verified = verifiedExitNode(engine, route);
+    if (!guard.allowed) {
+      // 不在固定工作配置上（或无法确认）：不记下意图、不改选（不改动其他配置中的同名组），按记录判断。记录表明选着使用中环境已
+      // 验证的出口、结束的操作自己也没有读到不一致的选择时不改选（与读不到选择相同）。无法确认当前配置（可连接）时多读一次选择，
+      // 只用于让判断更保守（从不据此放过或记下）
+      const raw = guard.block === 'profile_unknown' ? await readSelectionUncredited(engine) : undefined;
+      const agrees = (v: string | null | undefined, node: string): boolean => v === undefined || v === node;
+      if (verified !== null && agrees(raw, verified) && agrees(opts.observedSelection, verified)) return null;
+      const rawForged = verified === null && readForgedNodes(engine.kv) !== null ? verifiedExitNodeIgnoringForged(engine, route) : null;
+      const onlyForged = rawForged !== null && agrees(raw, rawForged) && agrees(opts.observedSelection, rawForged);
+      return skippedHold(guard, onlyForged ? 'node_resource_forged' : undefined);
+    }
+    if (!selRead) {
+      // 决定是否改选的读取同样要在读取之后核对配置未变：其他配置的 REJECT 或已验证节点不能让本操作按「路由未改变」结束
+      const r = await readRouteSelection(engine, { guard });
+      if (r.ok) sel = r.selection;
+      else if (r.kind === 'guard') return skippedHold(r, undefined);
+      else sel = undefined;
+    }
+    if (sel === 'REJECT') return null;
     if (verified !== null && sel === verified) return null;
     // 读不到选择、而记录表明选着使用中环境已验证的出口：结束的操作没有改选过 SFE-ROUTE，读取失败不能说明选择变了——不改选
     // （否则一次短暂的读取失败就会让已验证的路由降为需要处理）；Surge 不可达由对账记下。结束的操作自己刚读到选择已不是这个
-    // 出口时除外（observedSelection）：那是选择已变的正面证据，一次读取失败不能把它变成「路由未改变」，照样改选
-    if (verified !== null && sel === undefined && (opts.observedSelection === undefined || opts.observedSelection === verified)) return null;
+    // 出口时除外（observedSelection）：那是选择已变的正面证据，一次读取失败不能把它变成「路由未改变」，照样改选。崩溃之前已记下
+    // 改选意图时同样不放过（中断之前的改选可能已生效，读不到不说明路由未改变）
+    if (!intent && verified !== null && sel === undefined && (opts.observedSelection === undefined || opts.observedSelection === verified)) return null;
     externalSelectionBefore = route.warnings.includes('external_selection_change');
     // 节点资源可能被伪造（用户决定 D11）：选择本来就是（或按同一规则视为）使用中环境已验证的出口，只因伪造标记而改选
     const raw = verified === null && readForgedNodes(engine.kv) !== null ? verifiedExitNodeIgnoringForged(engine, route) : null;
@@ -384,9 +502,19 @@ async function holdAtRouteEnd(engine: Engine, opId: string, opts: EndHoldOptions
   } catch (err) {
     engine.log('warn', 'route.end_hold_check_failed', { operationId: opId, error: err instanceof Error ? err.name : 'unknown' });
   }
+  // 读路由或操作出错时照样改选（失败即关闭），但同样只在固定工作配置上
+  if (guard === null) guard = await routeGuard(engine);
+  if (!guard.allowed) return skippedHold(guard, forgedOnly ? 'node_resource_forged' : undefined);
   markEndHoldIntent(engine, opId, { externalSelectionBefore, ...(opts.ending ? { ending: opts.ending } : {}), ...(forgedOnly ? { cause: 'node_resource_forged' as const } : {}) });
-  const hold = await selectRejectBestEffort(engine);
-  return forgedOnly ? { ...hold, cause: 'node_resource_forged' } : hold;
+  const marked = payloadOf(repos.operations.get(opId) ?? { payload: {} }).endHold;
+  const hold = await selectRejectGuarded(engine, { guard });
+  const out: RejectHold = {
+    ...hold,
+    ...(intent && hold.confirmed ? { recovered: intent } : {}),
+    // 改选期间配置变了：意图已记下，之后在固定工作配置上读回 REJECT 时按本操作的改选记下
+    ...(hold.guard?.stage === 'profile_changed' && marked ? { unresolvedIntent: marked } : {}),
+  };
+  return forgedOnly ? { ...out, cause: 'node_resource_forged' } : out;
 }
 
 /** holdAtRouteEnd 改选 REJECT 之前在操作中记下意图（OperationPayload.endHold）。写入失败只记日志：照样改选（失败即关闭）。 */
@@ -415,6 +543,8 @@ function markEndHoldIntent(engine: Engine, opId: string, intent: EndHoldIntent):
  * external_selection_change——改选之前路由没有这一警告时去掉它（改选是本应用做的，路由仍因改选需要处理）。
  * 只因节点资源可能被伪造而改选（hold.cause，用户决定 D11）：入口状态没有变化，不带 entry_unverified，改带 node_resource_unverified 与
  * node_resource_forged。
+ * 没有在固定工作配置上确认改选（hold.guard）：与改选失败一样按未确认记下（不改 selectedNode），并记 route:pendingHold
+ * （engine/pending-hold.ts recordPendingHold：之后在固定工作配置上的对账读回核对，必要时排入改选）。
  */
 function recordEndHold(engine: Engine, opId: string, hold: RejectHold | null): void {
   if (!hold) return;
@@ -436,6 +566,7 @@ function recordEndHold(engine: Engine, opId: string, hold: RejectHold | null): v
     ...(hold.confirmed ? { selectedNode: 'REJECT' } : {}),
     warnings: [...warnings],
   });
+  recordPendingHold(engine, opId, hold);
 }
 
 /**
@@ -769,7 +900,11 @@ export async function settleAbandonedTransition(engine: Engine, opId: string, er
       await settleAbandonedRouteOp(engine, opId, err);
       return;
     }
-    const hold = (await selectionIsVerifiedExit(engine, route)) ? null : await selectRejectBestEffort(engine);
+    // 只在固定工作配置上读回认定或改选（不改动其他配置中的同名组）；守卫拒绝、或读回之后核对配置已变时按未改选记下（route:pendingHold）
+    const g = await routeGuard(engine);
+    const v = g.allowed ? await verifiedExitReadback(engine, route, g) : false;
+    const hold =
+      v === true ? null : !g.allowed ? skippedHold(g) : v !== false ? skippedHold(v) : withChangedIntent(engine, await selectRejectGuarded(engine, { guard: g }));
     const cause = holdErrorText(engine, err, '内部错误');
     const written = activeWrittenUncovered(engine, opId, repos.routeState.get().activeEnvironmentId);
     // 普通模式接手了已写入 ACTIVE、未提交的切换（normal.handedOverActiveTarget）而受理时的确认没有覆盖它的窗口：这一事实只记在
@@ -779,7 +914,7 @@ export async function settleAbandonedTransition(engine: Engine, opId: string, er
     const body: ApiErrorBody = {
       code: 'UNKNOWN_STATE',
       message: `切换中断：处理中出现意外错误（${cause}），入口状态未知，需要处理${hold ? `；${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}` : ''}${written ? `；${activeWrittenNote(written)}` : ''}${handedOver ? handedOverFailNote(handedOver) : ''}`,
-      details: hold ? { rejectSelected: hold.confirmed } : {},
+      details: hold ? holdResult(hold) : {},
     };
     // 视图随之改变的环境：本操作的目标（切换中、检测中 → 未使用）、路由记录的使用中环境（→ 路由状态需要处理），以及普通模式
     // 接手的、已写入 ACTIVE 而未提交的切换目标。与其他结束路由操作的路径一样一起发布（网页后台只在 environment.updated 中更新
@@ -808,9 +943,10 @@ export async function settleAbandonedTransition(engine: Engine, opId: string, er
         ...(hold?.confirmed ? { selectedNode: 'REJECT' } : {}),
         warnings: [...warnings],
       });
+      if (hold) recordPendingHold(engine, opId, hold);
       const cur = repos.operations.get(opId);
       if (cur && (cur.status === 'running' || cur.status === 'queued' || cur.status === 'waiting')) {
-        repos.operations.update(opId, { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', error: body });
+        repos.operations.update(opId, { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', error: body, ...(hold ? { result: { ...(cur.result ?? {}), ...holdResult(hold) } } : {}) });
         repos.operations.appendStep(opId, 'BLOCKED_NEEDS_ATTENTION', body.message);
         repos.outbox.cancelForOperation(opId);
       }
@@ -1186,12 +1322,18 @@ async function tryReuse(engine: Engine, opId: string, p: RoutePayload, ctrl: Ent
   if (f.takeover.outboundMode !== null && f.takeover.outboundMode !== 'rule') return false;
   let mode: EntryMode = 'UNKNOWN';
   let selection: string | null = null;
+  let readOk = true;
   try {
     mode = (await ctrl.read()).mode;
-    selection = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
+    selection = await currentSelection(engine);
   } catch {
-    return false;
+    readOk = false;
   }
+  // 读取之后再核对当前配置仍是固定工作配置：对账之后配置变了时不复用，也不进入完整切换（第 2 步按对账时的事实会放行，第 6、7 步
+  // 会在其他配置上阻断并结束全部 Safari 连接）——在第一次写入之前拒绝，路由未改变
+  const post = await profileStillWorking(engine);
+  if (post !== null) throw new RouteFailure({ code: guardCodeOf(post), message: `激活失败：${ROUTE_GUARD_TEXT[post]}，路由未改变` });
+  if (!readOk) return false;
   if (mode !== 'ACTIVE' || selection !== p.nodeName) return false;
   const probe = repos.probes.latest(p.targetEnvironmentId, 'safari');
   const probeOk =
@@ -1336,11 +1478,26 @@ async function executeSwitch(engine: Engine, opId: string, ctrl: EntryController
     const killed = repos.operations.get(opId)!;
     repos.operations.update(opId, { payload: { ...payloadOf(killed), route: { ...routePayload(killed), safariConnectionsEnded: true } } });
     engine.step(opId, `已结束 Safari 连接 ${killResults.filter((k) => k.ok).length} 条`);
-    // 8. 选择目标节点并读回
+    // 8. 选择目标节点并读回：第 2 步的核对之后（阻断、结束连接与文件监视等待可能已过数秒）重新核对 Surge 可连接且是固定工作配置，
+    // 读回一致之后再核对配置未变（engine/route-guard.ts）；不能确认时不选择（或不记下这次选择），按第 14 步回滚（守卫同样拒绝时
+    // 回滚不恢复、不改选，见 holdGuardedRollback）
     const p = routePayload(repos.operations.get(opId)!);
-    await engine.surge.selectGroupPolicy(ROUTE_GROUP_NAME, p.nodeName);
-    const sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-    if (sel !== p.nodeName) throw new SfeError('READBACK_MISMATCH', '切换失败：SFE-ROUTE 选择读回与目标不一致');
+    const w = await writeRouteSelection(engine, p.nodeName);
+    if (!w.ok) {
+      if (w.kind === 'surge') {
+        if (w.failed === 'mismatch') throw new SfeError('READBACK_MISMATCH', '切换失败：SFE-ROUTE 选择读回与目标不一致');
+        throw w.error;
+      }
+      // 选择已发出、但不能确认落在固定工作配置上：记下这次未确认的写入（之后对账发现一致时写明不是外部修改）
+      if (w.stage === 'profile_changed') recordUnconfirmedWrite(engine, p.nodeName, opId);
+      const text = ROUTE_GUARD_TEXT[w.block];
+      throw new SfeError(
+        w.code,
+        w.stage === 'not_attempted' ? `切换失败：${text}，没有选择目标节点` : `切换失败：选择目标节点期间${text}，不能确认选择落在固定工作配置上`,
+        { details: { routeGuard: w.block } },
+      );
+    }
+    const sel = w.readback;
     repos.routeState.update({ selectedNode: sel });
     engine.step(opId, '已选择目标节点（读回确认）');
     if (p.preflightDeferred) {
@@ -1411,7 +1568,10 @@ async function startProbeWaiting(engine: Engine, opId: string, ctrl: EntryContro
   if (lost.length > 0) throw new RouteFailure({ code: 'UNKNOWN_STATE', message: '重新检测失败：路由已失去控制，请重新使用此环境或进入普通模式', details: { warnings: lost } });
   const readback = await ctrl.read();
   if (readback.mode !== 'ACTIVE') throw new RouteFailure({ code: 'UNKNOWN_STATE', message: '重新检测失败：Safari 入口读回不是使用中模式' });
-  const sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
+  // 选择属于固定工作配置：不能确认当前是固定工作配置时不开始（其他配置的同名组选着同一节点不能证明这次检测经过固定工作配置）
+  const g = await confirmWorkingProfile(engine);
+  if (!g.allowed) throw new RouteFailure({ code: g.code, message: `重新检测失败：${ROUTE_GUARD_TEXT[g.block]}` });
+  const sel = await currentSelection(engine);
   if (sel !== route.selectedNode || sel === null) throw new RouteFailure({ code: 'READBACK_MISMATCH', message: '重新检测失败：SFE-ROUTE 选择与记录不一致' }, sel);
   const deadline = addSeconds(engine, repos.settings.get('profileArrivalTimeoutSec'));
   repos.tx(() => {
@@ -1578,9 +1738,21 @@ async function rollbackFromWaiting(engine: Engine, opId: string, failure: ApiErr
 
 // ---------- 实测 ----------
 
-/** 签发检测编号前与提交后都要重读 SFE-ROUTE 选择。 */
+/** 签发检测编号前与提交后都要重读 SFE-ROUTE 选择（核对门槛：只能拒绝，不据此记下选择）。 */
 export async function currentSelection(engine: Engine): Promise<string | null> {
   return engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
+}
+
+/**
+ * 按刚读过的事实（engine.facts）确认当前是固定工作配置：可连接且确认是时允许；不可连接或读到另一个配置时拒绝；无法确认（读取
+ * 当前配置失败）时按 routeGuard 有限重试再判断——一次短暂的读取失败不让重测、提交或回滚降级。
+ */
+async function confirmWorkingProfile(engine: Engine): Promise<RouteGuard> {
+  const f = engine.facts;
+  if (!f.reachable) return { allowed: false, block: 'surge_unreachable', code: guardCodeOf('surge_unreachable') };
+  if (f.onWorkingProfile === true) return { allowed: true };
+  if (f.onWorkingProfile === false) return { allowed: false, block: 'external_profile', code: guardCodeOf('external_profile') };
+  return routeGuard(engine);
 }
 
 function browserFailure(p: RoutePayload): string | null {
@@ -1635,6 +1807,11 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
       evidence = found.match;
       if (!found.match) failure = { code: 'SAFARI_VERIFY_FAILED', message: `Safari 实测失败：${found.reason}` };
     }
+    // 重测通过之前核对当前配置仍是固定工作配置：其他配置的同名组选着同一节点、请求记录也经它时不能证明实测经过固定工作配置
+    if (!failure && p.flow === 'probe') {
+      const post = await profileStillWorking(engine);
+      if (post !== null) failure = { code: guardCodeOf(post), message: `Safari 重测失败：${ROUTE_GUARD_TEXT[post]}，不能确认实测经过固定工作配置` };
+    }
     // 预期出口按核对读完 Surge 之后重读的环境比较（exitIpMismatch）：核对的 Surge 调用期间用户可能已修改预期出口（保存不经
     // 执行器）。重测通过时从这里到记下通过（finishProbe）没有 await
     if (!failure) failure = exitIpMismatch(engine, p, '');
@@ -1674,7 +1851,12 @@ async function completeVerification(engine: Engine, op: OperationRecord): Promis
     } else {
       await engine.readBasicFacts();
       const missing = engine.activationMissing();
-      if (missing.length > 0) {
+      // 实测与入口都属于固定工作配置：等待期间 Surge 换了配置（或无法确认）时不写入 ACTIVE、不提交，按第 14 步回滚（守卫拒绝时回滚
+      // 不恢复、不改选）
+      const g = await confirmWorkingProfile(engine);
+      if (!g.allowed) {
+        precheckFailure = { code: g.code, message: `切换失败：${ROUTE_GUARD_TEXT[g.block]}，未进入使用中模式` };
+      } else if (missing.length > 0) {
         precheckFailure = capabilityFailure(engine, missing, '切换失败：', '在等待期间已不再满足激活条件');
       } else {
         ctrl = engine.entryController(() => op.id);
@@ -2039,6 +2221,14 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
       }
     }
     repos.routeState.update({ entryMode: 'BLOCKED', entryModeVerifiedAt: engine.nowIso() });
+    // SFE-ROUTE 的选择属于固定工作配置：恢复切换前的节点、改回 REJECT 或读取选择之前核对 Surge 可连接且是固定工作配置。不能确认
+    // 时不恢复、不改选、不读（不改动其他配置中的同名组），按 holdGuardedRollback 记为需要处理（入口记为 UNKNOWN：阻断是在
+    // Surge 当前加载的配置中读回的）
+    const g = await routeGuard(engine);
+    if (!g.allowed) {
+      await holdGuardedRollback(engine, opId, failure, g.block, 'not_attempted', segmentsChanged);
+      return;
+    }
     const previousRoute = previousRouteOf(engine, snapshot);
     // 节点资源未确认（D10）或可能被伪造（D11，标记在）：SFE-ROUTE 中的节点无法证明来自已提交版本，切换前的买家节点同样不能当作
     // 已验证的出口——不恢复它，与切换前已改选 REJECT 一样改选 REJECT 并保持阻断（从不回退到其他买家出口）。这次切换（或沿用快照的
@@ -2056,19 +2246,41 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
     if (hasPrevious) {
       const members = await engine.surge.getGroupMembers(ROUTE_GROUP_NAME);
       if (!members.includes(snapshot!.previousSelectedNode!)) throw new SfeError('READBACK_MISMATCH', '回滚失败：切换前的节点已不在 SFE-ROUTE 中');
-      await engine.surge.selectGroupPolicy(ROUTE_GROUP_NAME, snapshot!.previousSelectedNode!);
-      selectionAfter = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-      if (selectionAfter !== snapshot!.previousSelectedNode) throw new SfeError('READBACK_MISMATCH', '回滚失败：恢复后的选择读回不一致');
+      const w = await writeRouteSelection(engine, snapshot!.previousSelectedNode!, { guard: g });
+      if (!w.ok) {
+        if (w.kind === 'guard') {
+          await holdGuardedRollback(engine, opId, failure, w.block, w.stage, segmentsChanged, { unconfirmedPolicy: w.stage === 'profile_changed' ? snapshot!.previousSelectedNode! : undefined });
+          return;
+        }
+        if (w.failed === 'mismatch') throw new SfeError('READBACK_MISMATCH', '回滚失败：恢复后的选择读回不一致');
+        throw w.error;
+      }
+      selectionAfter = w.readback;
     } else if (rejectKept) {
       // 切换前的选择就是失败即关闭的 REJECT（之前一次路由操作的共同结束点或没有激活快照时普通模式失败改选的；回滚无法确认与
       // 执行器兜底对过渡中路由的改选保留快照，不走到这里）：没有已验证的出口可恢复，不把它当作「原节点」恢复。改回 REJECT 并读回（恢复切换前的阻断选择，不恢复任何买家节点）；读回不一致时
       // 与恢复失败相同，按回滚无法确认处理（入口仍是已确认的阻断）
-      await engine.surge.selectGroupPolicy(ROUTE_GROUP_NAME, 'REJECT');
-      selectionAfter = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-      if (selectionAfter !== 'REJECT') throw new SfeError('READBACK_MISMATCH', '回滚失败：SFE-ROUTE 改回 REJECT 后读回不一致');
+      const w = await writeRouteSelection(engine, 'REJECT', { guard: g });
+      if (!w.ok) {
+        if (w.kind === 'guard') {
+          await holdGuardedRollback(engine, opId, failure, w.block, w.stage, segmentsChanged, { rejectWrite: w.stage === 'profile_changed' });
+          return;
+        }
+        if (w.failed === 'mismatch') throw new SfeError('READBACK_MISMATCH', '回滚失败：SFE-ROUTE 改回 REJECT 后读回不一致');
+        throw w.error;
+      }
+      selectionAfter = w.readback;
     } else {
       // 切换前没有已验证的路由：没有可恢复的节点，SFE-ROUTE 仍选着本次切换写入的未验证节点（入口已确认阻断，Safari 不经它）
-      selectionAfter = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
+      const r = await readRouteSelection(engine, { guard: g });
+      if (!r.ok) {
+        if (r.kind === 'guard') {
+          await holdGuardedRollback(engine, opId, failure, r.block, 'not_attempted', segmentsChanged);
+          return;
+        }
+        throw r.error;
+      }
+      selectionAfter = r.selection;
     }
     // 「上次结果」只属于恢复的切换前路由：切换前已改选 REJECT 时不显示原环境的旧出口（那会暗示它的买家出口已恢复）
     const prevProbe = hasPrevious && snapshot?.previousSafariProbeId ? repos.probes.get(snapshot.previousSafariProbeId) : null;
@@ -2156,12 +2368,13 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
     // 已建立的连接不受改选影响，带 buyer_exit_connections_unconfirmed（holdExistingConnections）。
     // 不恢复切换前的节点，激活快照保留（之后的激活与回滚仍从最初的切换前状态出发）。有规则排在入口之前时同样改选：入口位即使
     // 已是阻断，排在它之前的规则也可能把 Safari 请求交给 SFE-ROUTE，而它选着本次切换写入的未验证节点。
-    const hold = (mode === 'BLOCKED' || mode === 'NORMAL') && !precedence ? null : await selectRejectBestEffort(engine);
+    // 改选同样只在固定工作配置上（selectRejectGuarded）：守卫拒绝时不改选，如实写明并记 route:pendingHold
+    const hold = (mode === 'BLOCKED' || mode === 'NORMAL') && !precedence ? null : withChangedIntent(engine, await selectRejectGuarded(engine));
     const written = activeWrittenUncovered(engine, opId, repos.routeState.get().activeEnvironmentId);
     const body: ApiErrorBody = {
       code: 'UNKNOWN_STATE',
       message: `回滚无法确认：${where}，需要处理${hold ? `；${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}` : ''}${written ? `；${activeWrittenNote(written)}` : ''}`,
-      details: { cause: failure.code, ...(hold ? { rejectSelected: hold.confirmed } : {}) },
+      details: { cause: failure.code, ...(hold ? holdResult(hold) : {}) },
     };
     repos.tx(() => {
       // 在事务中重读路由：改选 REJECT 的 Surge 调用期间，受理处理器可能已改过警告（确认旧窗口已关闭、预期出口重新比较）
@@ -2181,12 +2394,13 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
         ...(hold?.confirmed ? { selectedNode: 'REJECT' } : {}),
         warnings: [...warnings],
       });
+      if (hold) recordPendingHold(engine, opId, hold);
       const cur = repos.operations.get(opId)!;
       repos.operations.update(opId, {
         phase: 'BLOCKED_NEEDS_ATTENTION',
         status: 'needs_attention',
         error: body,
-        result: { ...(cur.result ?? {}), failure, ...(precedence ? { precedenceIssues: engine.scrubber.scrubDeep(precedence) } : {}) },
+        result: { ...(cur.result ?? {}), failure, ...(precedence ? { precedenceIssues: engine.scrubber.scrubDeep(precedence) } : {}), ...(hold?.guard ? holdResult(hold) : {}) },
       });
       repos.operations.appendStep(opId, 'BLOCKED_NEEDS_ATTENTION', body.message);
       repos.outbox.cancelForOperation(opId);
@@ -2205,7 +2419,7 @@ export async function rollbackActivation(engine: Engine, opId: string, failure: 
  * 切换前状态出发），路由 attention、入口记为 UNKNOWN（文件已写入阻断，Surge 加载的是哪一版未知；不记为 BLOCKED——之后的激活在
  * 写入失败时会把记录的 BLOCKED 当作已确认，跳过回到阻断就恢复切换前的节点）并带 entry_unverified，操作 BLOCKED_NEEDS_ATTENTION，
  * 说明如实写明（按入口策略，unconfirmedLoadText）。之前一次成功回滚留下的 rollback_needs_reverify 不再成立，去掉。
- * 改选或读回失败不抛出（selectRejectBestEffort）：不记为 REJECT，说明写明 Safari 请求可能仍经 SFE-ROUTE 当前选择的买家出口发出。
+ * 改选或读回失败不抛出（selectRejectGuarded）：不记为 REJECT，说明写明 Safari 请求可能仍经 SFE-ROUTE 当前选择的买家出口发出。
  */
 async function holdUnconfirmedRollback(
   engine: Engine,
@@ -2217,18 +2431,28 @@ async function holdUnconfirmedRollback(
   const { repos } = engine;
   const load = unconfirmedLoadText(strategy, '之前是普通模式时 Safari 仍按原规则发出');
   engine.step(opId, `回到阻断：入口已按计划写入阻断，但${UNCONFIRMED_ENTRY_TEXT}，${load}`);
-  const hold = await selectRejectBestEffort(engine);
+  // 改选只在固定工作配置上（selectRejectGuarded）：守卫拒绝时不改选（不改动其他配置中的同名组），如实写明并记 route:pendingHold
+  const hold = withChangedIntent(engine, await selectRejectGuarded(engine));
   const p = routePayload(repos.operations.get(opId)!);
   const written = activeWrittenUncovered(engine, opId, repos.routeState.get().activeEnvironmentId);
+  const guardBlock = hold.guard && !(hold.guard.stage === 'not_attempted' && hold.guard.block === 'surge_unreachable') ? hold.guard : null;
+  const guardText = guardBlock ? HOLD_BLOCK_TEXT[guardBlock.block] : '';
+  const exposure = guardBlock && guardBlock.block !== 'selection_unreadable' ? routeGuardExposure(guardBlock.block) : '';
   const body: ApiErrorBody = {
     code: 'UNKNOWN_STATE',
     message:
       `回滚未能确认：入口已按计划写入阻断，但未经运行时求值确认，${load}；` +
       (hold.confirmed
         ? '未恢复切换前的节点，SFE-ROUTE 已改选 REJECT（读回确认），经 SFE-ROUTE 的 Safari 新连接都被拒绝、不会经任何买家出口建立'
-        : `未恢复切换前的节点，但 SFE-ROUTE 未能改选 REJECT（${hold.error ?? '原因未知'}），Safari 请求（至少检测主机）可能仍经 SFE-ROUTE 当前选择的买家出口发出`) +
-      `；${EXISTING_CONNECTIONS_TEXT}${written ? `；${activeWrittenNote(written)}` : ''}。需要处理：进入普通模式，或等 rule match 可用后重新使用环境`,
-    details: { cause: failure.code, rejectSelected: hold.confirmed },
+        : guardBlock?.stage === 'profile_changed'
+          ? `未恢复切换前的节点；改选 SFE-ROUTE 期间${guardText}，不能确认改选 REJECT 落在固定工作配置上（可能改到了其他配置中的同名组），不记为 REJECT，Safari 请求（至少检测主机）可能经固定工作配置中 SFE-ROUTE 当前选择的买家出口发出${exposure}`
+          : guardBlock
+            ? `未恢复切换前的节点，也没有改选 SFE-ROUTE（${guardText}，不改动其他配置中的同名组），Safari 请求（至少检测主机）可能经 SFE-ROUTE 当前选择的买家出口发出${exposure}`
+            : `未恢复切换前的节点，但 SFE-ROUTE 未能改选 REJECT（${hold.error ?? '原因未知'}），Safari 请求（至少检测主机）可能仍经 SFE-ROUTE 当前选择的买家出口发出`) +
+      `；${EXISTING_CONNECTIONS_TEXT}${written ? `；${activeWrittenNote(written)}` : ''}。需要处理：${
+        guardBlock ? `${ROUTE_GUARD_REMEDY}；${PENDING_FOLLOWUP_TEXT}` : '进入普通模式，或等 rule match 可用后重新使用环境'
+      }`,
+    details: { cause: failure.code, ...holdResult(hold) },
   };
   repos.tx(() => {
     const current = repos.routeState.get();
@@ -2245,8 +2469,83 @@ async function holdUnconfirmedRollback(
       operationId: opId,
       warnings: [...warnings],
     });
+    recordPendingHold(engine, opId, hold);
     const cur = repos.operations.get(opId)!;
-    repos.operations.update(opId, { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', error: body, result: { ...(cur.result ?? {}), failure } });
+    repos.operations.update(opId, { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', error: body, result: { ...(cur.result ?? {}), failure, ...(hold.guard ? holdResult(hold) : {}) } });
+    repos.operations.appendStep(opId, 'BLOCKED_NEEDS_ATTENTION', body.message);
+    repos.outbox.cancelForOperation(opId);
+  });
+  const envs = [p.targetEnvironmentId];
+  const prev = repos.routeState.get().activationSnapshot?.previousEnvironmentId;
+  if (prev && prev !== p.targetEnvironmentId) envs.push(prev);
+  engine.emit({ operations: [opId], environments: envs, route: true });
+}
+
+/**
+ * 回滚不能确认 Surge 加载的是固定工作配置（engine/route-guard.ts：回到阻断之后、恢复切换前的节点、改回 REJECT 或读取选择之前守卫
+ * 拒绝——not_attempted；或改选期间配置变了——profile_changed）：与 holdUnconfirmedRollback 相同的需要处理，但不改选 REJECT（不改动
+ * 其他配置中的同名组）。路由 attention、入口记为 UNKNOWN（阻断是在 Surge 当前加载的配置中读回的；记为 BLOCKED 会让之后的回滚跳过
+ * 回到阻断就恢复买家节点）、带 entry_unverified 与 buyer_exit_connections_unconfirmed，其余警告（含 external_profile_change）保留；
+ * 激活快照保留（之后的激活与回滚仍从最初的切换前状态出发），selectedNode 不变（最后一次在固定工作配置上确认的选择）。操作
+ * BLOCKED_NEEDS_ATTENTION，结果没有 rollback（什么也没有恢复），带 rejectSelected: false 与 rejectGuard；记 route:pendingHold（之后在
+ * 固定工作配置上的对账必要时排入改选）。opts.unconfirmedPolicy：改选期间配置变了的恢复节点（route:unconfirmedWrite）；
+ * opts.rejectWrite：改选期间配置变了的是改回 REJECT（之后读回 REJECT 时按本应用的改选记下）。
+ */
+async function holdGuardedRollback(
+  engine: Engine,
+  opId: string,
+  failure: ApiErrorBody,
+  block: RouteGuardBlock,
+  stage: 'not_attempted' | 'profile_changed',
+  segmentsChanged: boolean,
+  opts: { unconfirmedPolicy?: string | undefined; rejectWrite?: boolean } = {},
+): Promise<void> {
+  const { repos } = engine;
+  const text = ROUTE_GUARD_TEXT[block];
+  const p = routePayload(repos.operations.get(opId)!);
+  const routeNow = repos.routeState.get();
+  const written = activeWrittenUncovered(engine, opId, routeNow.activeEnvironmentId);
+  const rejectGuard = { reason: block, stage } as const;
+  // 本次切换是否写过目标节点（第 8 步读回确认时路由记下了它，或改选期间配置变了而记下了未确认的写入）：没有写过时不说 SFE-ROUTE
+  // 可能仍选着本次切换写入的节点
+  const snap = routeNow.activationSnapshot;
+  const uw = readUnconfirmedWrite(engine);
+  const targetWritten =
+    (snap !== null && routeNow.selectedNode !== snap.previousSelectedNode) || (uw !== null && uw.operationId === opId && uw.policy !== snap?.previousSelectedNode);
+  const unreachable = block === 'surge_unreachable';
+  const lead =
+    stage === 'not_attempted'
+      ? `回滚未完成：${text}，没有恢复切换前的节点，也没有改选 SFE-ROUTE${unreachable ? '' : '（不改动其他配置中的同名组）'}`
+      : unreachable
+        ? `回滚期间${text}：不能确认已恢复切换前的节点（或改回 REJECT）已生效，不记为已恢复`
+        : `回滚期间${text}：不能确认已恢复切换前的节点（或改回 REJECT）落在固定工作配置上（可能改到了其他配置中的同名组），不记为已恢复`;
+  // 无法连接 Surge：没有迹象表明加载的是另一个配置——只说连接中断之前读回的阻断，之后的入口与选择未经确认
+  const state = unreachable
+    ? `入口在连接中断之前读回为阻断，之后的入口与 SFE-ROUTE 的选择未经确认（${targetWritten ? 'SFE-ROUTE 可能仍选着本次切换写入的未验证节点' : '本次切换没有选择目标节点'}）`
+    : targetWritten
+      ? '入口已在 Surge 当前加载的配置中读回为阻断，固定工作配置重新加载之后的入口与 SFE-ROUTE 的选择未经确认（SFE-ROUTE 可能仍选着本次切换写入的未验证节点）'
+      : '入口已在 Surge 当前加载的配置中读回为阻断；本次切换没有选择目标节点；固定工作配置重新加载之后的入口未经确认';
+  const remedy = unreachable ? 'Surge 可以连接之后进入普通模式' : ROUTE_GUARD_REMEDY;
+  const message =
+    `${lead}；${state}${routeGuardExposure(block)}` +
+    `；${EXISTING_CONNECTIONS_TEXT}${written ? `；${activeWrittenNote(written)}` : ''}。需要处理：${remedy}；${PENDING_FOLLOWUP_TEXT}`;
+  const body: ApiErrorBody = { code: 'UNKNOWN_STATE', message, details: { cause: failure.code, rejectSelected: false, rejectGuard } };
+  repos.tx(() => {
+    const current = repos.routeState.get();
+    const warnings = new Set<RouteWarning>(current.warnings.filter((w) => w !== 'rollback_needs_reverify'));
+    if (segmentsChanged) warnings.add('managed_segments_changed');
+    warnings.add('entry_unverified');
+    holdExistingConnections(engine, opId, warnings);
+    if (written) warnings.add('managed_windows_on_original_rules');
+    repos.routeState.update({ phase: 'attention', entryMode: 'UNKNOWN', awaitingDeadline: null, operationId: opId, warnings: [...warnings] });
+    if (opts.unconfirmedPolicy !== undefined) recordUnconfirmedWrite(engine, opts.unconfirmedPolicy, opId);
+    recordPendingHold(engine, opId, {
+      confirmed: false,
+      guard: { block, stage },
+      ...(opts.rejectWrite ? { unresolvedIntent: { externalSelectionBefore: current.warnings.includes('external_selection_change') } } : {}),
+    });
+    const cur = repos.operations.get(opId)!;
+    repos.operations.update(opId, { phase: 'BLOCKED_NEEDS_ATTENTION', status: 'needs_attention', error: body, result: { ...(cur.result ?? {}), failure, rejectSelected: false, rejectGuard } });
     repos.operations.appendStep(opId, 'BLOCKED_NEEDS_ATTENTION', body.message);
     repos.outbox.cancelForOperation(opId);
   });
@@ -2407,13 +2706,24 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
     const connectionsUnconfirmed = mayUseRoute && !(killAttempted && killsEnded && entryConfirmedAtKill);
     // 失败即关闭（与回滚无法确认同一规则，§6.3 第 14 步）：最后经运行时求值确认的不是阻断或普通模式，Surge 可能仍加载着检测或
     // 使用中入口，而 SFE-ROUTE 的选择不是使用中环境已验证的出口（受理时或执行前取代、接手的切换写入的未验证节点，或没有使用中
-    // 的环境；或选择在记录之外被改过，见 selectionIsVerifiedExit）——Safari 会在普通模式失败之后经它发出。尽力改选 REJECT 并读回
+    // 的环境；或选择在记录之外被改过，见 verifiedExitReadback）——Safari 会在普通模式失败之后经它发出。尽力改选 REJECT 并读回
     // （从不抛出），只有读回确认才记为 REJECT。选择读回就是使用中环境已验证的出口时不改（普通模式失败，Safari 停在原来已验证的
     // 路由上）。
     // 有规则排在入口之前时（中间阻断读回不能确认完全阻断）记下的阻断只是入口位：排在它之前的规则可能把 Safari 请求交给 SFE-ROUTE
     const loosened = (mode !== 'BLOCKED' && mode !== 'NORMAL') || (precedenceSeen && mode !== 'NORMAL');
-    const verifiedExitKept = loosened && (await selectionIsVerifiedExit(engine, repos.routeState.get()));
-    const hold = loosened && !verifiedExitKept ? await selectRejectBestEffort(engine) : null;
+    // 读回认定与改选只在固定工作配置上（engine/route-guard.ts）：守卫拒绝时不读、不改选（不改动其他配置中的同名组），读回之后
+    // 核对配置已变时同样不改选，都按未改选记下（普通模式本身从不因此拒绝：撤销入口与结束连接照常进行，只跳过 SFE-ROUTE 的改选）
+    const g = loosened ? await routeGuard(engine) : null;
+    const v = g !== null && g.allowed ? await verifiedExitReadback(engine, repos.routeState.get(), g) : false;
+    const verifiedExitKept = v === true;
+    const hold =
+      g === null || verifiedExitKept
+        ? null
+        : !g.allowed
+          ? skippedHold(g)
+          : v !== false
+            ? skippedHold(v)
+            : withChangedIntent(engine, await selectRejectGuarded(engine, { guard: g }));
     // 只写读回确认过的：「未回退到其他出口」只在入口确认阻断或已是普通模式、或选择读回就是使用中环境已验证的出口时成立
     const stateNote =
       mode === 'UNKNOWN'
@@ -2422,7 +2732,7 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
           ? '入口位停在读回确认的阻断，但有规则排在本应用入口之前（见操作结果），不能确认 Safari 完全阻断'
           : `入口停在最后经运行时求值确认的状态（${mode}）`;
     const routeNote = hold
-      ? `${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}`
+      ? `${rejectHoldText(hold, ROUTE_GUARD_NORMAL_REMEDY)}；${EXISTING_CONNECTIONS_TEXT}`
       : verifiedExitKept
         ? 'SFE-ROUTE 的选择读回就是使用中环境已验证的出口：Safari 停在原来已验证的路由上，未回退到其他出口'
         : '未回退到其他出口';
@@ -2467,12 +2777,13 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
         warnings: [...warnings],
         ...(hold?.confirmed ? { selectedNode: 'REJECT' } : {}),
       });
+      if (hold) recordPendingHold(engine, op.id, hold);
       const cur = repos.operations.get(op.id)!;
       repos.operations.update(op.id, {
         phase: 'FAILED',
         status: 'failed',
         error: body,
-        ...(hold ? { result: { ...(cur.result ?? {}), rejectSelected: hold.confirmed } } : {}),
+        ...(hold ? { result: { ...(cur.result ?? {}), ...holdResult(hold) } } : {}),
       });
       repos.operations.appendStep(
         op.id,
@@ -2522,7 +2833,8 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
   // 失败即关闭（与回滚、普通模式失败同一规则）：收紧没有经运行时求值确认时，Surge 加载撤销之前仍可能加载着检测或使用中入口，
   // 而普通模式完成之后没有使用中的环境——SFE-ROUTE 选着的任何买家出口都不是已验证的路由。尽力改选 REJECT 并读回（从不抛出），
   // 只有读回确认才记为 REJECT；入口确认之后 SFE-ROUTE 不再被 Safari 使用，选择不变（§6.5）。
-  const hold = tighteningUnconfirmed ? await selectRejectBestEffort(engine) : null;
+  // 只在固定工作配置上改选（selectRejectGuarded）：守卫拒绝时普通模式照常完成，只跳过改选，说明如实写明（normalHoldText）
+  const hold = tighteningUnconfirmed ? withChangedIntent(engine, await selectRejectGuarded(engine)) : null;
   repos.tx(() => {
     if (clearMarker) clearSafariMayUseRoute(engine);
     else if (unconfirmedReason) markSafariMayUseRoute(engine, op.id, engine.entryConfig().processPaths);
@@ -2549,8 +2861,9 @@ export async function runNormal(engine: Engine, op: OperationRecord): Promise<vo
       warnings,
       ...(hold?.confirmed ? { selectedNode: 'REJECT' } : {}),
     });
+    if (hold) recordPendingHold(engine, op.id, hold);
     const cur = repos.operations.get(op.id)!;
-    repos.operations.update(op.id, { phase: 'NORMAL_RESTORED', status: 'succeeded', ...(hold ? { result: { ...(cur.result ?? {}), rejectSelected: hold.confirmed } } : {}) });
+    repos.operations.update(op.id, { phase: 'NORMAL_RESTORED', status: 'succeeded', ...(hold ? { result: { ...(cur.result ?? {}), ...holdResult(hold) } } : {}) });
     repos.operations.appendStep(
       op.id,
       'NORMAL_RESTORED',
@@ -2774,45 +3087,76 @@ async function killForNormal(engine: Engine, opId: string, entryBlocksSafari: bo
 
 /**
  * 服务排入的 REJECT 保持（route.hold，node-resource.ts maybeEnqueueForgedHold）：Surge 中的节点可能是伪造的（resource:forgedNodes），
- * 路由不是经确认的普通模式时把 SFE-ROUTE 改选首成员 REJECT 并读回（selectRejectBestEffort），之后经 SFE-ROUTE 的 Safari 新连接都被
+ * 路由不是经确认的普通模式时把 SFE-ROUTE 改选首成员 REJECT 并读回（selectRejectGuarded），之后经 SFE-ROUTE 的 Safari 新连接都被
  * 拒绝，不会经 Surge 中的任何买家节点建立。从不碰入口、从不结束连接（已建立的连接由 holdExistingConnections 记下，进入普通模式
  * 结束它们）、从不恢复买家节点。按序：
- * 1. 崩溃之前已记下改选意图（OperationPayload.endHold）而读回 REJECT：就是本操作的改选，按改选记下（先于其余判断）；
+ * 1. 崩溃之前已记下改选意图（OperationPayload.endHold）、确认当前仍是固定工作配置且读回 REJECT（读回之后再核对配置未变）：按
+ *    本操作的改选记下；不能确认时不读、不认定（意图未解决），继续下面的判断，不以「没有改选」结束；
  * 2. 有排队的普通模式：不改选 SFE-ROUTE，结束为 SUPERSEDED（进入普通模式永远可用；它失败而入口可能仍让 Safari 经 SFE-ROUTE 时，
  *    它的失败路径按“任何买家节点都不算已验证的出口”改选 REJECT）；
  * 3. 伪造标记已清除（排入时的原因含 node_detail_mismatch 的除外：经确认的读回在它执行之前恢复了参数，之前的参数不同仍是证据，
  *    照样改选，只是不再加两项节点资源警告）、入口是经确认的普通模式：不需要改选；
- * 4. 重读 Surge 事实：不可连接或当前配置不是固定工作配置时不改选（不改动其他配置中的同名组），结束为失败，之后的对账再排入；
+ * 4. 核对配置身份（沿用第 1 步允许的核对，否则 routeGuard，读取当前配置失败时有限重试）：不可连接、不是或无法确认是固定工作配置时
+ *    不改选（不改动其他配置中的同名组）——意图未解决时按无法确认中断之前是否已改选结束（finishForgedHold，路由按未确认的保持记下、
+ *    route:pendingHold），否则结束为失败、说明按原因写明，之后的对账再排入；
  * 5. 选择已是 REJECT：崩溃之前已记下改选意图时按本操作的改选记下（同第 1 步，第一次读取失败时由这里重读），否则不需要改选
  *    （不当作本操作的改选；与记录不一致由对账按外部修改报告）；读不到选择时照样改选（失败即关闭）；
  * 6. 读取 Surge 事实与选择期间受理的排队普通模式：同第 2 步让给它（SUPERSEDED）；
- * 7. 记下意图 → 改选并读回 → 一个事务中记下（recordForgedHold）与结束（读回确认为 COMPLETED，否则 FAILED，说明如实写明）。
+ * 7. 记下意图 → 改选并读回（读回之后再核对配置未变）→ 一个事务中记下（recordForgedHold）与结束（读回确认为 COMPLETED，否则
+ *    FAILED，说明如实写明；改选期间配置变了时不记为 REJECT，记 route:pendingHold）。
+ * 伪造标记已清除（第 3 步）而崩溃之前的意图未解决时同样按无法确认结束，不按「不需要」结束。
  * 意外错误（数据库等）如实结束为 FAILED（不声称改选），标记仍在，之后的对账再排入。从不抛出。
  */
 export async function runForgedHold(engine: Engine, op: OperationRecord, opts: { recovering?: boolean } = {}): Promise<void> {
   const { repos, kv } = engine;
+  // 服务排入的推迟改选（engine/pending-hold.ts）：来源操作的结束点没有在固定工作配置上确认改选
+  if (payloadOf(repos.operations.get(op.id) ?? op).endHoldDeferred) {
+    await runDeferredHold(engine, op, opts);
+    return;
+  }
   try {
     if (!opts.recovering) engine.updateOp(op.id, { status: 'running', phase: 'VALIDATING' }, '开始检查是否需要把 SFE-ROUTE 改选 REJECT（Surge 中的节点可能是伪造的）');
     const intent = payloadOf(repos.operations.get(op.id) ?? op).endHold;
     let sel: string | null | undefined;
-    // 崩溃之前已记下改选意图：读回的 REJECT 就是本操作的改选（与 holdAtRouteEnd 相同，先于其余判断）
+    /** 崩溃之前记下的意图没有解决（不能确认是固定工作配置、读回失败或读回之后配置变了）时的原因；没有意图或已解决时为 null。 */
+    let unresolved: HoldBlock | null = null;
+    let guard: RouteGuard | null = null;
+    // 意图属于固定工作配置：先核对配置身份（routeGuard，读回之后再核对配置未变），不能把其他配置同名组的 REJECT 当成本操作的改选
     if (intent) {
-      sel = await readSelectionSafe(engine);
-      if (sel === 'REJECT') {
-        finishForgedHold(engine, op.id, { confirmed: true, readback: 'REJECT', error: null, recovered: intent, cause: 'node_resource_forged' });
-        return;
+      guard = await routeGuard(engine);
+      if (!guard.allowed) {
+        unresolved = guard.block;
+      } else {
+        const r = await readRouteSelection(engine, { guard });
+        if (r.ok) {
+          if (r.selection === 'REJECT') {
+            finishForgedHold(engine, op.id, { confirmed: true, readback: 'REJECT', error: null, recovered: intent, cause: 'node_resource_forged' });
+            return;
+          }
+          sel = r.selection;
+        } else if (r.kind === 'guard') {
+          unresolved = r.block;
+          guard = null;
+        } else {
+          unresolved = 'selection_unreadable';
+        }
       }
     }
     const queuedNormal = (): OperationRecord | undefined => repos.operations.listByStatus(['queued']).find((o) => o.kind === 'route.normal');
     const normal = queuedNormal();
     if (normal) {
-      endForgedHold(engine, op.id, { kind: 'superseded', normalId: normal.id });
+      endForgedHold(engine, op.id, { kind: 'superseded', normalId: normal.id, ...(unresolved !== null ? { unresolved } : {}) });
       return;
     }
     // 伪造标记已清除：排入时的证据含 SFE-ROUTE 选中节点的参数与其版本不同（D11 (b)）时仍改选——排入它的发布的回滚、或启动时
     // 先于它恢复的发布可能已经以经确认的读回清除了标记（参数已恢复，但之前 Safari 可能已经经不同的参数连接）；其余原因已清除时
-    // 不需要改选
+    // 不需要改选。崩溃之前的意图没有解决时不按「不需要」结束：按无法确认中断之前是否已改选记下（路由按未确认的保持，
+    // route:pendingHold，之后在固定工作配置上的对账核对）
     if (readForgedNodes(kv) === null && !detailEvidenceCleared(engine, op.id)) {
+      if (intent && unresolved !== null) {
+        finishForgedHold(engine, op.id, interruptedHold(unresolved, intent));
+        return;
+      }
       endForgedHold(engine, op.id, { kind: 'not_needed', step: '节点资源已经确认（可能被伪造的状态已清除），不需要改选' });
       return;
     }
@@ -2820,29 +3164,27 @@ export async function runForgedHold(engine: Engine, op: OperationRecord, opts: {
       endForgedHold(engine, op.id, { kind: 'not_needed', step: '入口是经确认的普通模式：Safari 不经 SFE-ROUTE，不需要改选（节点资源经确认之前激活会被拒绝）' });
       return;
     }
-    // 只在固定工作配置上改选（否则会改到其他配置中的同名组）
-    const facts = await engine.readBasicFacts().catch(() => null);
-    if (facts === null || !facts.reachable || facts.onWorkingProfile !== true) {
-      const unreachable = facts === null || !facts.reachable;
-      // 标记已清除（D11 (b) 的证据）：之后的对账不会再排入（maybeEnqueueForgedHold 要求标记在），说明不承诺
-      const cleared = readForgedNodes(kv) === null;
-      endForgedHold(engine, op.id, {
-        kind: 'unavailable',
-        code: unreachable ? 'SURGE_UNREACHABLE' : 'EXTERNAL_PROFILE',
-        cleared,
-        message: cleared
-          ? unreachable
-            ? '无法连接 Surge：没有改选 SFE-ROUTE，Safari 请求可能仍经 SFE-ROUTE 当前选中的节点发出（它的参数之前与其版本不同，之后经确认的读回已恢复并清除了可能被伪造的状态），之前建立的连接可能用了不同的参数，请进入普通模式结束它们；伪造状态已清除，之后的对账不会再排入改选'
-            : 'Surge 当前配置不是固定工作配置：没有改选（不改动其他配置中的同名组）；伪造状态已由经确认的读回清除，之后的对账不会再排入改选'
-          : unreachable
-            ? '无法连接 Surge：没有改选 SFE-ROUTE，Safari 请求可能仍经 SFE-ROUTE 当前选中的节点（可能是伪造的）发出，请立即进入普通模式；之后能连接 Surge 的对账会再排入改选'
-            : 'Surge 当前配置不是固定工作配置：没有改选（不改动其他配置中的同名组）；Surge 回到固定工作配置之后的对账会再排入改选',
-      });
+    // 只在固定工作配置上改选（否则会改到其他配置中的同名组）：沿用第 1 步允许的核对，否则重新核对（读取当前配置失败时有限重试）
+    const g = guard !== null && guard.allowed ? guard : await routeGuard(engine);
+    if (!g.allowed) {
+      if (intent && unresolved !== null) {
+        finishForgedHold(engine, op.id, interruptedHold(g.block, intent));
+        return;
+      }
+      endForgedHold(engine, op.id, forgedUnavailable(g.block, readForgedNodes(kv) === null));
       return;
     }
-    if (sel === undefined) sel = await readSelectionSafe(engine);
+    if (sel === undefined) {
+      const r = await readRouteSelection(engine, { guard: g });
+      if (r.ok) sel = r.selection;
+      else if (r.kind === 'guard') {
+        if (intent) finishForgedHold(engine, op.id, interruptedHold(r.block, intent));
+        else endForgedHold(engine, op.id, forgedUnavailable(r.block, readForgedNodes(kv) === null));
+        return;
+      }
+    }
     if (sel === 'REJECT') {
-      // 崩溃之前已记下改选意图（第一次读取失败而在这里重读到）：就是本操作的改选，按改选记下（同上）
+      // 崩溃之前已记下改选意图（第一次没有读到而在这里读到）：就是本操作的改选，按改选记下（同上）
       if (intent) {
         finishForgedHold(engine, op.id, { confirmed: true, readback: 'REJECT', error: null, recovered: intent, cause: 'node_resource_forged' });
         return;
@@ -2859,12 +3201,265 @@ export async function runForgedHold(engine: Engine, op: OperationRecord, opts: {
     }
     // 读不到选择时照样改选（失败即关闭）。改选之前记下意图：改选之后、记下之前崩溃时崩溃恢复按本操作的改选记下
     markEndHoldIntent(engine, op.id, { externalSelectionBefore: repos.routeState.get().warnings.includes('external_selection_change'), cause: 'node_resource_forged' });
-    const hold = await selectRejectBestEffort(engine);
+    const marked = payloadOf(repos.operations.get(op.id) ?? op).endHold;
+    const hold = await selectRejectGuarded(engine, { guard: g });
     // 崩溃之前已记下意图（两次读取都失败而重新改选）：读回确认时同样按崩溃恢复记下——启动对账读到本操作之前的 REJECT 而加上的
-    // 外部修改警告不是外部修改（markEndHoldIntent 保留最早的意图）
-    finishForgedHold(engine, op.id, { ...hold, ...(intent && hold.confirmed ? { recovered: intent } : {}), cause: 'node_resource_forged' });
+    // 外部修改警告不是外部修改（markEndHoldIntent 保留最早的意图）。改选期间配置变了：按未解决的意图记下（route:pendingHold）
+    finishForgedHold(engine, op.id, {
+      ...hold,
+      ...(intent && hold.confirmed ? { recovered: intent } : {}),
+      ...(hold.guard?.stage === 'profile_changed' && marked ? { unresolvedIntent: marked } : {}),
+      cause: 'node_resource_forged',
+    });
   } catch (err) {
     endForgedHold(engine, op.id, { kind: 'error', cause: holdErrorText(engine, err, '内部错误') });
+  }
+}
+
+/** 守卫拒绝（没有意图）时 REJECT 保持的 'unavailable' 结束：说明按原因写明；cleared 为伪造标记已由经确认的读回清除。 */
+function forgedUnavailable(block: RouteGuardBlock, cleared: boolean): ForgedHoldEnd {
+  const text = ROUTE_GUARD_TEXT[block];
+  const code = guardCodeOf(block);
+  if (block === 'surge_unreachable') {
+    return {
+      kind: 'unavailable',
+      code,
+      cleared,
+      message: cleared
+        ? '无法连接 Surge：没有改选 SFE-ROUTE，Safari 请求可能仍经 SFE-ROUTE 当前选中的节点发出（它的参数之前与其版本不同，之后经确认的读回已恢复并清除了可能被伪造的状态），之前建立的连接可能用了不同的参数，请进入普通模式结束它们；伪造状态已清除，之后的对账不会再排入改选'
+        : '无法连接 Surge：没有改选 SFE-ROUTE，Safari 请求可能仍经 SFE-ROUTE 当前选中的节点（可能是伪造的）发出，请立即进入普通模式；之后能连接 Surge 的对账会再排入改选',
+    };
+  }
+  return {
+    kind: 'unavailable',
+    code,
+    cleared,
+    message: cleared
+      ? `${text}：没有改选（不改动其他配置中的同名组）；伪造状态已由经确认的读回清除，之后的对账不会再排入改选`
+      : `${text}：没有改选（不改动其他配置中的同名组）${routeGuardExposure(block)}；Surge 加载固定工作配置时 Safari 请求可能仍经 SFE-ROUTE 当前选中的节点（可能是伪造的）发出，请${ROUTE_GUARD_REMEDY}；${
+          block === 'external_profile' ? 'Surge 回到固定工作配置之后' : '之后能确认是固定工作配置'
+        }的对账会再排入改选`,
+  };
+}
+
+/**
+ * 服务排入的推迟改选（route.hold，payload.endHoldDeferred；engine/pending-hold.ts）：来源操作的结束点没有在固定工作配置上确认改选
+ * REJECT，Surge 回到固定工作配置之后的对账排入。按序：崩溃恢复中已记下意图而在固定工作配置上读回 REJECT → 按改选记下；
+ * route:pendingHold 已不在或已作废（之后的路由操作改写了路由）→ 不需要；守卫拒绝 → 不改选、FAILED（记录保留，之后确认是固定
+ * 工作配置的对账再排入，不受重试间隔限制）；读回已是 REJECT 或使用中环境已验证的出口 → 不需要；有排队的普通模式 → SUPERSEDED
+ * （没有改选）；否则记下意图 → 改选并读回 → 与结束点相同地记下（recordEndHold：attention、持久标记与
+ * buyer_exit_connections_unconfirmed，读回确认才记为 REJECT）。在来源操作中追加一步写明结果。从不抛出。
+ */
+async function runDeferredHold(engine: Engine, op: OperationRecord, opts: { recovering?: boolean }): Promise<void> {
+  const { repos, kv } = engine;
+  try {
+    if (!opts.recovering) engine.updateOp(op.id, { status: 'running', phase: 'VALIDATING' }, '开始检查是否仍需要把 SFE-ROUTE 改选 REJECT（之前的路由操作没有在固定工作配置上确认改选）');
+    const self = repos.operations.get(op.id) ?? op;
+    const deferred = payloadOf(self).endHoldDeferred!;
+    const source = deferred.sourceOperationId;
+    const intent = payloadOf(self).endHold;
+    const rec = readPendingHold(engine);
+    const route = repos.routeState.get();
+    const recValid = rec !== null && rec.operationId === source && !pendingHoldStale(rec, route);
+    const g = await routeGuard(engine);
+    /** 崩溃之前记下的意图没有解决（第一次读取 SFE-ROUTE 失败）时的原因；没有意图或已解决时为 null。 */
+    let unresolved: HoldBlock | null = null;
+    let sel: string | null | undefined;
+    let selRead = false;
+    // 崩溃恢复：本操作已记下改选意图，在固定工作配置上读回 REJECT 就是它的改选；不能确认是固定工作配置时按无法确认中断之前是否
+    // 已改选记下（不认定、不改选）；读不到选择时记下没有解决，之后的判断不把它说成「没有改选」（与 runForgedHold 相同）
+    if (intent) {
+      if (!g.allowed) {
+        finishDeferredHold(engine, op.id, source, interruptedHold(g.block, intent));
+        return;
+      }
+      const r = await readRouteSelection(engine, { guard: g });
+      if (r.ok) {
+        if (r.selection === 'REJECT') {
+          finishDeferredHold(engine, op.id, source, recoveredDeferredHold(engine, intent, deferred.cause));
+          return;
+        }
+        sel = r.selection;
+        selRead = true;
+      } else if (r.kind === 'guard') {
+        finishDeferredHold(engine, op.id, source, interruptedHold(r.block, intent));
+        return;
+      } else {
+        unresolved = 'selection_unreadable';
+      }
+    }
+    if (!recValid && !intent) {
+      let step = '之后的路由操作已改写路由（或已处理），不需要改选';
+      if (rec !== null && rec.operationId === source) {
+        kv.delete(PENDING_HOLD_KEY);
+        step = `${staleText(rec)}，不需要改选`;
+      }
+      endDeferredHold(engine, op.id, source, { kind: 'not_needed', step });
+      return;
+    }
+    if (!g.allowed) {
+      // 记录保留：之后确认是固定工作配置的对账再排入（不受重试间隔限制）
+      endDeferredHold(engine, op.id, source, {
+        kind: 'unavailable',
+        code: g.code,
+        message: `${ROUTE_GUARD_TEXT[g.block]}：没有改选（不改动其他配置中的同名组）${routeGuardExposure(g.block)}；Safari 请求可能仍经 SFE-ROUTE 当前选择的出口发出，请${ROUTE_GUARD_REMEDY}；之后在固定工作配置上的对账会再排入改选`,
+      });
+      return;
+    }
+    if (!selRead) {
+      const r = await readRouteSelection(engine, { guard: g });
+      if (!r.ok && r.kind === 'guard') {
+        // 崩溃之前已记下意图：读取之后配置变了，不说「没有改选」，按无法确认中断之前是否已改选记下
+        if (intent) {
+          finishDeferredHold(engine, op.id, source, interruptedHold(r.block, intent));
+          return;
+        }
+        endDeferredHold(engine, op.id, source, {
+          kind: 'unavailable',
+          code: r.code,
+          message: `读取 SFE-ROUTE 期间${ROUTE_GUARD_TEXT[r.block]}：没有改选（不改动其他配置中的同名组）；请${ROUTE_GUARD_REMEDY}；之后在固定工作配置上的对账会再排入改选`,
+        });
+        return;
+      }
+      if (r.ok) {
+        sel = r.selection;
+        unresolved = null;
+      }
+    }
+    // 崩溃之前已记下意图（第一次没有读到而在这里读到）：读回的 REJECT 就是本操作的改选，按改选记下
+    if (sel === 'REJECT' && intent) {
+      finishDeferredHold(engine, op.id, source, recoveredDeferredHold(engine, intent, deferred.cause));
+      return;
+    }
+    // 伪造原因只在标记仍在时成立：排入之后经确认的读回清除了伪造状态时不再按伪造记下（不加两项节点资源警告、不写 rejectCause），
+    // 按入口未确认（entry_unverified）记下
+    const forgedNow = deferred.cause !== undefined && readForgedNodes(kv) !== null;
+    const cause = forgedNow ? deferred.cause : undefined;
+    const fresh = repos.routeState.get();
+    if (sel === 'REJECT' || (sel !== undefined && sel === verifiedExitNode(engine, fresh)) || (!entryMayUseRoute(fresh) && !(forgedNow && routeNotConfirmedNormal(fresh)))) {
+      repos.tx(() => {
+        if (readPendingHold(engine)?.operationId === source) kv.delete(PENDING_HOLD_KEY);
+      });
+      const why =
+        sel === 'REJECT' ? 'SFE-ROUTE 已是 REJECT，不需要改选' : '入口已不让 Safari 经 SFE-ROUTE，或 SFE-ROUTE 选着使用中环境已验证的出口：不需要改选';
+      endDeferredHold(engine, op.id, source, {
+        kind: 'not_needed',
+        step: unresolved !== null ? `${why}（服务中断之前可能已改选 REJECT：${HOLD_BLOCK_TEXT[unresolved]}，无法核对；本次未再改选）` : why,
+      });
+      return;
+    }
+    const normal = repos.operations.listByStatus(['queued']).find((o) => o.kind === 'route.normal');
+    if (normal) {
+      endDeferredHold(engine, op.id, source, { kind: 'superseded', normalId: normal.id, ...(unresolved !== null ? { unresolved } : {}) });
+      return;
+    }
+    markEndHoldIntent(engine, op.id, { externalSelectionBefore: fresh.warnings.includes('external_selection_change'), ...(cause ? { cause } : {}) });
+    const marked = payloadOf(repos.operations.get(op.id) ?? op).endHold;
+    const hold = await selectRejectGuarded(engine, { guard: g });
+    finishDeferredHold(engine, op.id, source, {
+      ...hold,
+      ...(intent && hold.confirmed ? { recovered: intent } : {}),
+      ...(hold.guard?.stage === 'profile_changed' && marked ? { unresolvedIntent: marked } : {}),
+      ...(cause ? { cause } : {}),
+    });
+  } catch (err) {
+    endDeferredHold(engine, op.id, null, { kind: 'error', cause: holdErrorText(engine, err, '内部错误') });
+  }
+}
+
+/** 推迟改选在崩溃恢复中读回 REJECT（本操作的改选）：伪造原因只在标记仍在时记下。 */
+function recoveredDeferredHold(engine: Engine, intent: EndHoldIntent, cause: 'node_resource_forged' | undefined): RejectHold {
+  const forgedNow = cause !== undefined && readForgedNodes(engine.kv) !== null;
+  return { confirmed: true, readback: 'REJECT', error: null, recovered: intent, ...(forgedNow ? { cause } : {}) };
+}
+
+/** 推迟改选之后在一个事务中记下路由（recordEndHold；先删除来源的 route:pendingHold，没有确认时 recordEndHold 重新记下）并结束操作。 */
+function finishDeferredHold(engine: Engine, opId: string, source: string, hold: RejectHold): void {
+  const { repos, kv } = engine;
+  let activeEnv: string | null = null;
+  const done = repos.tx(() => {
+    const cur = repos.operations.get(opId);
+    if (!cur || (cur.status !== 'queued' && cur.status !== 'running' && cur.status !== 'waiting')) return false;
+    activeEnv = repos.routeState.get().activeEnvironmentId;
+    if (readPendingHold(engine)?.operationId === source) kv.delete(PENDING_HOLD_KEY);
+    recordEndHold(engine, opId, hold);
+    if (hold.confirmed && readForgedNodes(kv) !== null) kv.delete(FORGED_HOLD_KEY);
+    const text = hold.confirmed
+      ? `SFE-ROUTE 已在固定工作配置上改选 REJECT（读回确认）：经 SFE-ROUTE 的 Safari 新连接都被拒绝，不会经任何买家出口建立；${EXISTING_CONNECTIONS_TEXT}；路由需要处理（自动打开订单与填充已停止）：进入普通模式，或重新使用环境`
+      : `${rejectHoldText(hold)}；${EXISTING_CONNECTIONS_TEXT}`;
+    const result = { ...(cur.result ?? {}), ...holdResult(hold) };
+    if (hold.confirmed) {
+      repos.operations.update(opId, { phase: 'COMPLETED', status: 'succeeded', result });
+      repos.operations.appendStep(opId, 'COMPLETED', text);
+    } else {
+      const code = hold.guard ? (hold.errorCode ?? 'UNKNOWN_STATE') : hold.errorCode === 'SURGE_UNREACHABLE' ? 'SURGE_UNREACHABLE' : 'READBACK_MISMATCH';
+      repos.operations.update(opId, { phase: 'FAILED', status: 'failed', error: { code: code as ApiErrorBody['code'], message: text, details: holdResult(hold) }, result });
+      repos.operations.appendStep(opId, 'FAILED', text);
+    }
+    appendSourceStep(
+      engine,
+      source,
+      hold.confirmed ? '服务排入的改选已在固定工作配置上把 SFE-ROUTE 改选 REJECT（读回确认）' : `服务排入的改选没有在固定工作配置上确认（${hold.error ?? '原因未知'}）`,
+    );
+    repos.outbox.cancelForOperation(opId);
+    return true;
+  });
+  if (!done) return;
+  engine.emit({ operations: [opId, source], route: true, environments: activeEnv ? [activeEnv] : [] });
+}
+
+/** 不改选地结束推迟改选（让给普通模式、不需要、守卫拒绝、意外错误）：不改路由；source 不为 null 时在来源操作中追加一步。从不抛出。 */
+function endDeferredHold(engine: Engine, opId: string, source: string | null, end: ForgedHoldEnd): void {
+  const { repos } = engine;
+  try {
+    const done = repos.tx(() => {
+      const cur = repos.operations.get(opId);
+      if (!cur || (cur.status !== 'queued' && cur.status !== 'running' && cur.status !== 'waiting')) return false;
+      switch (end.kind) {
+        case 'superseded':
+          repos.operations.update(opId, { phase: 'SUPERSEDED', status: 'superseded', supersededBy: end.normalId, error: { code: 'SUPERSEDED', message: '已有进入普通模式的请求，由它先执行' } });
+          repos.operations.appendStep(
+            opId,
+            'SUPERSEDED',
+            end.unresolved
+              ? `已有进入普通模式的请求：服务中断之前可能已在固定工作配置上改选 REJECT（${HOLD_BLOCK_TEXT[end.unresolved]}，无法核对），本次未再改选 SFE-ROUTE；由普通模式先撤销本应用入口（之后 Safari 不经 SFE-ROUTE）`
+              : '已有进入普通模式的请求：没有改选 SFE-ROUTE，由普通模式先撤销本应用入口（之后 Safari 不经 SFE-ROUTE）',
+          );
+          break;
+        case 'not_needed':
+          repos.operations.update(opId, { phase: 'COMPLETED', status: 'succeeded' });
+          repos.operations.appendStep(opId, 'COMPLETED', end.step);
+          break;
+        case 'unavailable':
+          repos.operations.update(opId, { phase: 'FAILED', status: 'failed', error: { code: end.code, message: end.message, details: { rejectSelected: false } } });
+          repos.operations.appendStep(opId, 'FAILED', end.message);
+          break;
+        case 'error': {
+          const message = `出现意外错误（${end.cause}），不能确认 SFE-ROUTE 是否已改选 REJECT：Safari 请求可能仍经 SFE-ROUTE 当前选择的出口发出，请立即进入普通模式`;
+          repos.operations.update(opId, { phase: 'FAILED', status: 'failed', error: { code: 'INTERNAL', message } });
+          repos.operations.appendStep(opId, 'FAILED', message);
+          break;
+        }
+      }
+      if (source !== null) {
+        appendSourceStep(
+          engine,
+          source,
+          end.kind === 'superseded'
+            ? end.unresolved
+              ? `服务排入的改选让给了之后进入普通模式的请求（服务中断之前可能已改选 REJECT：${HOLD_BLOCK_TEXT[end.unresolved]}，无法核对；本次未再改选）`
+              : '服务排入的改选让给了之后进入普通模式的请求（没有改选）'
+            : end.kind === 'not_needed'
+              ? `服务排入的改选结束：${end.step}`
+              : '服务排入的改选没有改选 SFE-ROUTE（见该操作）',
+        );
+      }
+      repos.outbox.cancelForOperation(opId);
+      return true;
+    });
+    if (done) engine.emit({ operations: [opId, ...(source ? [source] : [])] });
+  } catch (err) {
+    engine.log('error', 'route.deferred_hold_end_failed', { operationId: opId, error: err instanceof Error ? err.name : 'unknown' });
   }
 }
 
@@ -2936,6 +3531,17 @@ function forgedHoldConfirmedText(lead: string, remedy: string, ownerOpen: boolea
 
 /** REJECT 保持未能确认时的说明。 */
 function forgedHoldFailedText(lead: string, hold: RejectHold, cleared: boolean): string {
+  // 没有在固定工作配置上确认（崩溃恢复中无法核对中断之前的改选、改选期间配置变了）：不说「没有改选」，写明之后的核对
+  const g = hold.guard;
+  if (g && g.stage !== 'not_attempted') {
+    const text = HOLD_BLOCK_TEXT[g.block];
+    const exposure = g.block === 'selection_unreadable' ? '' : routeGuardExposure(g.block);
+    const head =
+      g.stage === 'interrupted'
+        ? `无法确认中断之前是否已在固定工作配置上改选 REJECT（${text}；本次没有改选${g.block === 'selection_unreadable' ? '' : '，不改动其他配置中的同名组'}）`
+        : `改选 SFE-ROUTE 期间${text}：不能确认改选落在固定工作配置上（可能改到了其他配置中的同名组），不记为 REJECT`;
+    return `${lead}：${head}：Safari 请求可能仍经 SFE-ROUTE 当前选中的节点（可能是伪造的）发出${exposure}，请${ROUTE_GUARD_REMEDY}；之后在固定工作配置上的对账读回 SFE-ROUTE：是 REJECT 时记为本操作${g.stage === 'interrupted' ? '中断之前' : ''}的改选，否则再排入改选`;
+  }
   return cleared
     ? `${lead}：SFE-ROUTE 未能改选 REJECT（${hold.error ?? '原因未知'}）：Safari 请求仍可能经 SFE-ROUTE 当前选中的节点发出，之前建立的连接可能用了不同的参数，请进入普通模式结束它们；伪造状态已清除，之后的对账不会再排入改选`
     : `${lead}：SFE-ROUTE 未能改选 REJECT（${hold.error ?? '原因未知'}）：Safari 请求可能仍经 SFE-ROUTE 当前选中的节点（可能是伪造的）发出，请立即进入普通模式；之后能连接 Surge 的对账会再次尝试改选（Surge 可连接而读回不一致时至少间隔 5 分钟；入口回到经确认的普通模式之后不再需要）`;
@@ -2951,7 +3557,8 @@ function finishForgedHold(engine: Engine, opId: string, hold: RejectHold): void 
   const cleared = forged === null;
   const lead = forgedHoldLead(forgedReasonText(reasons), cleared);
   const remedy = cleared ? FORGED_CLEARED_REMEDY : forgedRemedyText(engine);
-  const unreachable = !hold.confirmed && (hold.errorCode === 'SURGE_UNREACHABLE' || (hold.readback === null && engine.facts.reachable === false));
+  // 守卫保持（不能确认是固定工作配置）同样不受重试间隔限制：回到固定工作配置之后的对账立即再排入
+  const unreachable = !hold.confirmed && (hold.guard !== undefined || hold.errorCode === 'SURGE_UNREACHABLE' || (hold.readback === null && engine.facts.reachable === false));
   let activeEnv: string | null = null;
   let target: string | null = null;
   const done = repos.tx(() => {
@@ -2963,7 +3570,10 @@ function finishForgedHold(engine: Engine, opId: string, hold: RejectHold): void 
     const owner = before.operationId ? repos.operations.get(before.operationId) : null;
     target = owner ? (payloadOf(owner).route?.targetEnvironmentId ?? null) : null;
     const ownerOpen = recordForgedHold(engine, opId, hold);
-    const result = { ...(cur.result ?? {}), rejectSelected: hold.confirmed, rejectCause: 'node_resource_forged' as const, forgedReasons: [...reasons] };
+    // 没有在固定工作配置上确认：记 route:pendingHold（之后在固定工作配置上的对账读回核对，必要时排入改选）
+    recordPendingHold(engine, opId, { ...hold, cause: 'node_resource_forged' });
+    const rejectGuard = hold.guard ? { rejectGuard: { reason: hold.guard.block, stage: hold.guard.stage } } : {};
+    const result = { ...(cur.result ?? {}), rejectSelected: hold.confirmed, rejectCause: 'node_resource_forged' as const, forgedReasons: [...reasons], ...rejectGuard };
     if (hold.confirmed) {
       const text = forgedHoldConfirmedText(lead, remedy, ownerOpen);
       repos.operations.update(opId, { phase: 'COMPLETED', status: 'succeeded', result });
@@ -2974,7 +3584,11 @@ function finishForgedHold(engine: Engine, opId: string, hold: RejectHold): void 
       repos.operations.update(opId, {
         phase: 'FAILED',
         status: 'failed',
-        error: { code: unreachable ? 'SURGE_UNREACHABLE' : 'READBACK_MISMATCH', message: text, details: { reason: FORGED_WARNING, rejectSelected: false } },
+        error: {
+          code: hold.guard ? ((hold.errorCode as ApiErrorBody['code'] | undefined) ?? 'UNKNOWN_STATE') : unreachable ? 'SURGE_UNREACHABLE' : 'READBACK_MISMATCH',
+          message: text,
+          details: { reason: FORGED_WARNING, rejectSelected: false, ...rejectGuard },
+        },
         result,
       });
       repos.operations.appendStep(opId, 'FAILED', text);
@@ -2990,7 +3604,7 @@ function finishForgedHold(engine: Engine, opId: string, hold: RejectHold): void 
 }
 
 type ForgedHoldEnd =
-  | { kind: 'superseded'; normalId: string }
+  | { kind: 'superseded'; normalId: string; unresolved?: HoldBlock }
   | { kind: 'not_needed'; step: string }
   | { kind: 'unavailable'; code: 'SURGE_UNREACHABLE' | 'EXTERNAL_PROFILE'; message: string; cleared?: boolean }
   | { kind: 'error'; cause: string };
@@ -3008,7 +3622,9 @@ function endForgedHold(engine: Engine, opId: string, end: ForgedHoldEnd): void {
           repos.operations.appendStep(
             opId,
             'SUPERSEDED',
-            '已有进入普通模式的请求：没有改选 SFE-ROUTE，由普通模式先撤销本应用入口（之后 Safari 不经 SFE-ROUTE）；普通模式失败而入口可能仍让 Safari 经 SFE-ROUTE 时，它的失败路径改选 REJECT（节点可能被伪造时任何买家节点都不算已验证的出口）；否则之后的对账在需要时再排入改选',
+            end.unresolved
+              ? `已有进入普通模式的请求：服务中断之前可能已在固定工作配置上改选 REJECT（${HOLD_BLOCK_TEXT[end.unresolved]}，无法核对），本次未再改选 SFE-ROUTE；由普通模式先撤销本应用入口（之后 Safari 不经 SFE-ROUTE）；普通模式失败而入口可能仍让 Safari 经 SFE-ROUTE 时，它的失败路径在固定工作配置上改选 REJECT（节点可能被伪造时任何买家节点都不算已验证的出口）`
+              : '已有进入普通模式的请求：没有改选 SFE-ROUTE，由普通模式先撤销本应用入口（之后 Safari 不经 SFE-ROUTE）；普通模式失败而入口可能仍让 Safari 经 SFE-ROUTE 时，它的失败路径改选 REJECT（节点可能被伪造时任何买家节点都不算已验证的出口）；否则之后的对账在需要时再排入改选',
           );
           break;
         case 'not_needed':

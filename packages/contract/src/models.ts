@@ -332,7 +332,8 @@ export interface OperationView extends OperationSummary {
     probeWarning?: 'probe_failed' | 'exit_ip_mismatch';
     /**
      * 路由操作结束时服务失败即关闭地把 SFE-ROUTE 改选 REJECT（docs/ARCHITECTURE.md §6.3 第 14 步的结束点、普通模式）：true 为读回
-     * 确认，false 为改选或读回失败。有这一项就说明路由已改变（Safari 经本应用出口的新连接被拒绝、订单与填充停止），界面不能说
+     * 确认；false 为没有经读回确认——改选或读回失败，或 rejectGuard 写明没有在固定工作配置上改选（Surge 不可连接、当前不是或无法
+     * 确认是固定工作配置）、不能确认改选落在固定工作配置上，或无法确认中断之前是否已改选。有这一项就说明路由已改变（Safari 经本应用出口的新连接被拒绝、订单与填充停止），界面不能说
      * 「路由未改变」或「不受影响」；结束点改选时操作结束为 BLOCKED_NEEDS_ATTENTION。例外：节点资源可能被伪造时服务排入的
      * REJECT 保持（route.hold，用户决定 D11）读回确认时结束为 COMPLETED/succeeded（它本身就是这次改选），未能确认时为
      * FAILED；界面按 rejectSelected 与 rejectCause 写明，不按状态。
@@ -340,6 +341,18 @@ export interface OperationView extends OperationSummary {
     rejectSelected?: boolean;
     /** 改选 REJECT 的原因：节点资源可能被伪造（用户决定 D11；route.hold 与因此改选的结束点）。 */
     rejectCause?: 'node_resource_forged';
+    /**
+     * SFE-ROUTE 的选择属于固定工作配置（§6.6「配置身份」）：改选 REJECT 之前或之后不能确认 Surge 加载的是固定工作配置时的原因与
+     * 阶段（rejectSelected 此时为 false）。reason：无法连接 Surge、当前配置不是固定工作配置、无法确认当前配置是否是固定工作配置，
+     * 或（崩溃恢复中）读取 SFE-ROUTE 失败（这时 Surge 仍是确认的固定工作配置）。stage：not_attempted 没有改选（不改动其他配置中的
+     * 同名组）；profile_changed 改选期间配置变了，不能确认这次改选（REJECT，或回滚恢复的切换前节点）落在固定工作配置上，不记为路由
+     * 的选择；interrupted 无法确认服务中断之前是否已在固定工作配置上改选。之后确认是固定工作配置、读到 SFE-ROUTE 的对账核对（必要时
+     * 由服务排入一次改选，route.hold）。
+     */
+    rejectGuard?: {
+      reason: 'surge_unreachable' | 'external_profile' | 'profile_unknown' | 'selection_unreadable';
+      stage: 'not_attempted' | 'profile_changed' | 'interrupted';
+    };
     /** route.hold 开始时已不需要改选（伪造状态已清除、入口是经确认的普通模式，或 SFE-ROUTE 已是 REJECT）：没有读写 SFE-ROUTE。 */
     forgedHold?: 'not_needed';
     /** route.hold 排入或执行时节点资源可能被伪造的原因（代码，不含令牌、地址或端口）。 */

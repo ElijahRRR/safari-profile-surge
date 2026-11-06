@@ -107,7 +107,18 @@ describe('route warning text', () => {
     expect(warningText('node_resource_forged')).toContain('以 SFE-ROUTE 的当前选择');
     expect(warningText('node_resource_forged')).not.toContain('已把 SFE-ROUTE 改选');
     expect(warningText('node_resource_forged')).not.toContain('用户决定');
-    expect(OPERATION_KIND_LABELS['route.hold']).toBe('改选 REJECT（节点可能被伪造）');
+    expect(OPERATION_KIND_LABELS['route.hold']).toBe('改选 REJECT（失败即关闭）');
+  });
+
+  it('T12 / PG-T12: external_profile_change states the shared-entry exposure as history plus a condition and offers normal mode on the loaded profile', () => {
+    const t = warningText('external_profile_change');
+    expect(ROUTE_WARNING_TEXT.external_profile_change.severity).toBe('danger');
+    expect(t).toContain('可在当前配置上进入普通模式');
+    expect(t).toContain('Safari 请求可能经它的同名 SFE-ROUTE 发出');
+    expect(t).toContain('也含本应用入口');
+    // 粘性警告：回到固定工作配置之后仍显示，不能用现在时声称 Surge 已在其他配置
+    expect(t).toContain('曾切到（或仍在）');
+    expect(t).not.toContain('Surge 已切到其他配置');
   });
 
   it('marks loss-of-control warnings as danger', () => {

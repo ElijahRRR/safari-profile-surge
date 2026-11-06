@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { clean, displayWidth, formatAccepted, formatError, formatNeedsConfirmation, renderTable, shellQuote } from '../../src/cli/format.js';
+import { KIND_TEXT, clean, displayWidth, formatAccepted, formatError, formatNeedsConfirmation, renderTable, shellQuote } from '../../src/cli/format.js';
 
 describe('format', () => {
   test('displayWidth counts CJK as 2', () => {
@@ -27,6 +27,11 @@ describe('format', () => {
 
   test('formatError', () => {
     expect(formatError({ code: 'REVISION_CONFLICT', message: '保存失败：数据已被其他人修改' })).toBe('保存失败：数据已被其他人修改\n（错误码 REVISION_CONFLICT）\n');
+  });
+
+  test('RS1: route.hold is labelled without a cause (forged-node holds and service-enqueued deferred holds share the kind)', () => {
+    expect(KIND_TEXT['route.hold']).toBe('改选 REJECT（失败即关闭）');
+    expect(KIND_TEXT['route.hold']).not.toContain('伪造');
   });
 
   test('formatAccepted mentions that acceptance is not effect', () => {

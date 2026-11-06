@@ -34,6 +34,16 @@
 //      不同的列表）时：伪造标记在、路由不是经确认的普通模式、最近一次 REJECT 保持（route.hold）读回确认之后没有 Surge 重启时，
 //      SFE-ROUTE 是 REJECT；对账事件（Surge 可连接、是固定工作配置、没有注入忙碌失败）之后 SFE-ROUTE 是 REJECT，或这次对账排入的
 //      保持如实结束为失败（读回不一致之后 5 分钟内的周期对账除外）。I4（普通模式从不被拒绝）与 L1 在 forge 之后照常检查。
+//   I8 SFE-ROUTE 的选择属于固定工作配置（profile 事件：Surge 切到另一个配置——复制出的配置、同名 SFE-ROUTE 选着 REJECT 的配置、
+//      或同名 SFE-ROUTE 选着另一个环境节点的配置——或接下来三次读取当前配置失败（立即，或在下一次改选 REJECT 之后：写入落在固定
+//      工作配置上，而之后的核对读不到当前配置）；之后至多 6 个事件内回到固定工作配置并对账一次。多插在等待实测的激活或重测之后、
+//      它们的实测/取消/超时之前——守卫要拦的回滚与结束点的写入就在那里；另有一条固定的链：伪造标记 → 改选 REJECT 之后读不到当前
+//      配置 → 回到固定工作配置时按本应用的改选记下）：I8a 引擎从不在当前配置不是固定工作配置时改选 SFE-ROUTE（不改动其他配置中的
+//      同名组）；I8b 路由记录的选择每次改变时都等于固定工作配置中 SFE-ROUTE 的实际选择（如实记录）。当前不是固定工作配置期间
+//      Safari 经另一个配置的选择发出不判 I5 违例（本应用不能改动它）；读取当前配置的故障期间只在故障尚未用完、或留下了等待确认的
+//      推迟改选（route:pendingHold）时不判（设计接受的只有这一种暴露），回到固定工作配置并对账之后 I5 照常检查；I7 按固定工作
+//      配置的选择判断。覆盖项 guard.*（守卫结束的操作带 rejectGuard、记下的 route:pendingHold、对账按本应用的改选记下）在 TARGETED
+//      中：生成器不再到达守卫的分支时大规模运行失败。
 //   L1 每个受理的普通模式（含 normalDuring 排队受理的）在执行器空闲后都已结束（不停在 queued/running/waiting）；受理时与检查时
 //      文件监视延迟都短时，结束为 NORMAL_RESTORED（进入普通模式永远可用）。唯一的例外是文件监视比等待上限慢（latency 事件）。
 //      L1b：最后受理的路由操作（激活、普通模式、重测，或带路由参数的发布）是一次已 NORMAL_RESTORED 的普通模式时，路由记录仍是
@@ -76,6 +86,7 @@ import { readForgedNodes } from '../../src/resource/index.js';
 import { nodeLine, resourceBody } from '../../src/surge/generate.js';
 import { retiredSafariPaths, safariMayUseRouteMarked } from '../../src/engine/safari-route-marker.js';
 import { payloadOf } from '../../src/domain/operations.js';
+import { PENDING_HOLD_KEY } from '../../src/engine/pending-hold.js';
 import type { OperationRecord } from '../../src/db/index.js';
 import type { SurgeAdapter } from '../../src/ports.js';
 import { FAKE_CHROME_PATH, FAKE_SAFARI_PATH, FAKE_VERIFY_HOST, FakeSurge, type SimulatedRequest } from '../../src/surge/fake.js';
@@ -166,7 +177,14 @@ type Ev =
    * 用户决定 D11：fetch——Surge 的缓存变成一份本服务没有提供过的列表（成员同名、参数不同，更新时间为此刻；如同端口被他人占用时
    * 下载了占用者的列表）；drift——由本服务答复的、成员同名而参数不同的列表（下载可以解释，参数漂移）。
    */
-  | { t: 'forge'; mode: 'fetch' | 'drift'; host: number };
+  | { t: 'forge'; mode: 'fetch' | 'drift'; host: number }
+  /**
+   * SFE-ROUTE 的选择属于固定工作配置（I8）：other——Surge 切到复制出的另一个配置；otherReject——同上，且它的同名 SFE-ROUTE 选着
+   * REJECT；otherBuyer——同上，且它的同名 SFE-ROUTE 选着另一个环境的节点（不是固定工作配置的选择，也不是 REJECT）；unknown——接下来
+   * 三次读取当前配置失败（无法确认当前配置）；unknownAfterWrite——下一次改选 REJECT 生效之后的三次读取当前配置失败（读回之后的
+   * 核对不能确认）；working——回到固定工作配置并对账一次。
+   */
+  | { t: 'profile'; mode: 'other' | 'otherReject' | 'otherBuyer' | 'unknown' | 'unknownAfterWrite' | 'working' };
 
 interface Header {
   strategy: 'ruleset_resource' | 'temp_rule';
@@ -183,12 +201,15 @@ function pick<T>(rng: () => number, xs: readonly T[]): T {
  * 阻断、结束连接与选择这一段（约 70 次调用；写入 VERIFY_ONLY 的调用仍可由 any 到达）：在其中受理的普通模式让激活停在写入
  * VERIFY_ONLY 之前。
  */
-const NTH_MAX: Record<When, number> = { any: 130, early: 24, switch: 70, check: 80, rollback: 60, probe: 18, normal: 110 };
+const NTH_MAX: Record<When, number> = { any: 130, early: 24, switch: 74, check: 80, rollback: 60, probe: 18, normal: 110 };
 /** 激活核对已提交的实测时，写入 ACTIVE 之前的 Surge 调用数（选择、请求记录、重新读取事实）与 temp_rule 下整个核对的调用数。 */
 const CHECK_FACT_CALLS = 8;
 const CHECK_TEMP_RULE_CALLS = 55;
-/** Safari 重测核对已提交的实测时的 Surge 调用数（选择、请求记录）；重测开始（检查条件）约 17 次，见 NTH_MAX.probe。 */
-const PROBE_CHECK_CALLS = 2;
+/**
+ * Safari 重测核对已提交的实测时的 Surge 调用数（选择、请求记录、通过之前核对当前配置仍是固定工作配置）；重测开始（检查条件）约
+ * 17 次，见 NTH_MAX.probe。
+ */
+const PROBE_CHECK_CALLS = 3;
 
 function generate(seed: number): Ev[] {
   const rng = mulberry32(seed * 7919 + 17);
@@ -307,7 +328,7 @@ function generate(seed: number): Ev[] {
     } else {
       const probe: Ev = { t: 'probe', e: 0, kind: 'safari', via: pick(rng, ['web', 'profile'] as const) };
       const after: Ev = { t: 'verify', outcome: pick(rng, ['pass', 'pass', 'http_fail'] as const), longLived: false, tabs: false };
-      // 重测核对只有两次 Surge 调用（提交后的选择与请求记录）
+      // 重测核对只有几次 Surge 调用（提交后的选择与请求记录、通过之前核对当前配置）
       evs.push(activate, pass, ...(rng() < 0.5 ? [armed, probe, after] : [probe, { ...armed, nth: 1 + Math.floor(rng() * PROBE_CHECK_CALLS) } as Ev, after]));
     }
     return evs;
@@ -386,6 +407,47 @@ function generate(seed: number): Ev[] {
     if (candidates.length > 0) {
       const pos = candidates[Math.floor(frng() * candidates.length)]!;
       out.splice(pos, 0, { t: 'forge', mode: frng() < 0.6 ? 'fetch' : 'drift', host: Math.floor(frng() * 100) });
+    }
+  }
+  // I8：约一半的种子在序幕之后插入一次 profile 事件，之后至多 6 个事件内回到固定工作配置（另用独立的随机数：已有种子的其余事件
+  // 不变）。多插在等待实测的激活或 Safari 重测之后（它们的实测、取消或超时之前）：守卫要拦的回滚与结束点的写入就在那里
+  const prng = mulberry32(seed * 31_337 + 11);
+  const free = (i: number): boolean => i >= 3 && out[i - 1]!.t !== 'crash' && out[i - 1]!.t !== 'normalDuring';
+  if (prng() < 0.5 && out.length > 3) {
+    const candidates = out.map((_, i) => i).filter(free);
+    const waiting = candidates.filter((i) => {
+      const prev = out[i - 1]!;
+      return prev.t === 'activate' || (prev.t === 'probe' && prev.kind === 'safari');
+    });
+    const pool = waiting.length > 0 && prng() < 0.75 ? waiting : candidates;
+    if (pool.length > 0) {
+      const pos = pool[Math.floor(prng() * pool.length)]!;
+      const r = prng();
+      const mode = r < 0.25 ? 'other' : r < 0.45 ? 'otherReject' : r < 0.65 ? 'otherBuyer' : r < 0.82 ? 'unknown' : 'unknownAfterWrite';
+      out.splice(pos, 0, { t: 'profile', mode });
+      let back = Math.min(out.length, pos + 2 + Math.floor(prng() * 6));
+      while (back < out.length && !free(back)) back++;
+      out.splice(back, 0, { t: 'profile', mode: 'working' });
+    }
+  }
+  // I8：少数种子插入一条固定的链（同一随机数）：使用中的环境 → 伪造标记 → 改选 REJECT 生效之后读不到当前配置（profile_changed，
+  // route:pendingHold 记下意图）→ 回到固定工作配置的对账按本应用的改选记下（§6.6「推迟的改选」）
+  if (prng() < 0.12 && out.length > 3) {
+    const candidates = out.map((_, i) => i).filter(free);
+    if (candidates.length > 0) {
+      const pos = candidates[Math.floor(prng() * candidates.length)]!;
+      out.splice(
+        pos,
+        0,
+        { t: 'heal' },
+        { t: 'normal', via: 'web', policy: 'closed', pick: 0 },
+        { t: 'activate', e: 0, via: 'web', policy: 'closed', confirm: 'right', onNeed: 'retry' },
+        { t: 'verify', outcome: 'pass', longLived: false, tabs: false },
+        { t: 'forge', mode: 'fetch', host: Math.floor(prng() * 100) },
+        { t: 'profile', mode: 'unknownAfterWrite' },
+        { t: 'reconcile', kind: 'periodic' },
+        { t: 'profile', mode: 'working' },
+      );
     }
   }
   return out;
@@ -470,6 +532,12 @@ const TARGETED = [
   'yield.afterActive',
   'crashDuring.check',
   'crashDuring.rollback',
+  // I8：profile 事件与守卫真正走到的分支（不是只数事件）
+  'profileSwitch',
+  'profileUnknown',
+  'guard.rejectGuard',
+  'guard.pendingHold',
+  'guard.credit',
 ] as const;
 const COVERAGE_KEYS = [
   ...TARGETED,
@@ -485,6 +553,9 @@ const COVERAGE_KEYS = [
   'popupRaceSkipped',
   'forge',
   'forgedHeld',
+  'guard.deferredHold',
+  // T10：读取当前配置的故障期间（尚未经对账恢复）因故障已用完、没有等待中的记录而照常检查 I5 的取样次数（只作信息）
+  'profileUnknown.i5Checked',
 ] as const;
 type CoverageKey = (typeof COVERAGE_KEYS)[number];
 type Coverage = Record<CoverageKey, number>;
@@ -545,6 +616,18 @@ class World {
   lastHoldEvent = -1;
   /** I7：本事件开始时 route.hold 操作的个数。 */
   holdsBefore = 0;
+  /** I8：固定工作配置（准备好时记下）、当前是否在另一个配置上、接下来要失败的当前配置读取次数与尚未经对账恢复的身份故障。 */
+  workingProfile: { name: string; path: string | null } | null = null;
+  onOther = false;
+  profileFailures = 0;
+  /** unknownAfterWrite：下一次改选 REJECT 生效之后才开始失败的当前配置读取次数。 */
+  profileFailuresArmed = 0;
+  identityDegraded = false;
+  /** 覆盖项 guard.*：已计入的操作与 route:pendingHold 记录。 */
+  guardSeen = new Set<string>();
+  lastPendingKey: string | null = null;
+  /** I8b：上一次空闲检查时路由记录的选择（undefined：尚未检查）。 */
+  lastSelectedNode: string | null | undefined = undefined;
   /** 正在回放的事件。 */
   currentEvent: Ev | null = null;
   eventIndex = -1;
@@ -574,6 +657,14 @@ class World {
     for (const name of SURGE_PRIMITIVES) {
       out[name] = async (...args: unknown[]): Promise<unknown> => {
         if (gen.dead) return new Promise(() => undefined);
+        // I8a：从不在当前配置不是固定工作配置时改选 SFE-ROUTE（切换只发生在事件之间，守卫在改选之前核对，没有合理的竞争）
+        if (name === 'selectGroupPolicy' && this.ready && !this.onWorkingProfile()) {
+          this.violate('I8', `I8a|select-off-working|${String(args[1]) === 'REJECT' ? 'REJECT' : 'node'}`, `引擎在当前配置 ${fake.currentProfile.name} 不是固定工作配置时改选 SFE-ROUTE 为 ${String(args[1])}`);
+        }
+        if (name === 'getCurrentProfile' && this.profileFailures > 0) {
+          this.profileFailures--;
+          throw new SfeError('SURGE_COMMAND_FAILED', '读取当前配置失败：模拟失败');
+        }
         // 文件监视见证的轮询次数取决于真实时间：不计入（保持回放确定）
         const counted = !(name === 'matchRule' && ((args[0] as { processPath?: string } | undefined)?.processPath ?? '').startsWith(ENTRY_WITNESS_PROCESS_PREFIX));
         if (counted) this.beforeEngineCall(name);
@@ -606,6 +697,12 @@ class World {
           return r;
         } finally {
           if (name === 'killRequest') this.killFailPending = false;
+          // unknownAfterWrite：改选 REJECT 生效之后，读回之后的核对读不到当前配置
+          if (ok && name === 'selectGroupPolicy' && String(args[1]) === 'REJECT' && this.profileFailuresArmed > 0) {
+            this.profileFailures = this.profileFailuresArmed;
+            this.profileFailuresArmed = 0;
+            this.identityDegraded = true;
+          }
           this.afterEngineCall(name, ok);
         }
       };
@@ -647,7 +744,7 @@ class World {
     if (name === 'selectGroupPolicy' && ok) {
       // 引擎选择了另一个节点：开始新的一期（未实测；即使该节点以前实测过——例如回滚恢复之前的买家出口，也要重新实测）。
       // 重新选择已经选中的同一节点不改变出口（Safari 一直经它发出），本期的实测状态不变。
-      const node = this.internals.selection.get(ROUTE_GROUP_NAME) ?? null;
+      const node = this.homeSelection();
       if (node !== this.sel.node) this.sel = { node, verified: false, verifyOnlyReached: false };
     }
     this.sampleI5(`mid:after ${name}`);
@@ -729,8 +826,27 @@ class World {
   }
 
   private refreshSel(): void {
-    const actual = this.internals.selection.get(ROUTE_GROUP_NAME) ?? null;
+    const actual = this.homeSelection();
     if (actual !== this.sel.node) this.sel = { node: actual, verified: false, verifyOnlyReached: false };
+  }
+
+  /** 固定工作配置中 SFE-ROUTE 的选择（I5 的实测期、I7、I8b 都按它；另一个配置上的选择不属于本应用的路由）。 */
+  homeSelection(): string | null {
+    return this.h.fake.selectionFor('home', ROUTE_GROUP_NAME);
+  }
+
+  /** Surge 当前加载的是固定工作配置（按假 Surge 的当前配置）。 */
+  onWorkingProfile(): boolean {
+    return this.workingProfile === null || this.h.fake.currentProfile.path === this.workingProfile.path;
+  }
+
+  /**
+   * I5 暂不判违例：当前不是固定工作配置（本应用不改动其他配置中的同名组）；或读取当前配置的故障尚未经一次对账恢复，而且故障还没有
+   * 用完、或留下了等待确认是固定工作配置的推迟改选（route:pendingHold）——设计接受的只有这一种暴露。故障已被某次读取用完、也没有
+   * 等待中的记录时，之后的事件按正确的配置身份执行，I5 照常检查。
+   */
+  i5Suspended(): boolean {
+    return this.onOther || (this.identityDegraded && (this.profileFailures > 0 || this.h.app.engine.kv.get(PENDING_HOLD_KEY) !== null));
   }
 
   private currentOp(): OperationRecord | null {
@@ -799,7 +915,9 @@ class World {
 
   sampleI5(ctx: string): void {
     this.stats.i5Samples++;
-    for (const path of SAFARI_FAMILY) {
+    const suspended = this.i5Suspended();
+    if (this.identityDegraded && !suspended) this.cov['profileUnknown.i5Checked']++;
+    for (const path of suspended ? [] : SAFARI_FAMILY) {
       for (const hk of HOST_KEYS) {
         for (const proto of PROTOS) {
           const t = this.truth(path, HOSTS[hk], proto);
@@ -826,7 +944,7 @@ class World {
   /** Safari / Chrome 打开一个长连接（被拒绝的请求不会留在活动列表中）。 */
   open(processPath: string, hk: HostKey, proto: Proto, ctx: string): SimulatedRequest {
     const r = this.h.fake.simulateRequest({ processPath, host: HOSTS[hk], protocol: proto, longLived: true });
-    if (SAFARI_FAMILY.includes(processPath) && !r.failed && (r.policyName === ROUTE_GROUP_NAME || isSfe(r.leafPolicyName))) {
+    if (SAFARI_FAMILY.includes(processPath) && !r.failed && !this.i5Suspended() && (r.policyName === ROUTE_GROUP_NAME || isSfe(r.leafPolicyName))) {
       const why = this.routeDenied(processPath, HOSTS[hk], proto, r.leafPolicyName);
       if (why) this.violate('I5', `I5|${hk === 'verify' && proto === 'tcp' ? 'verify-tcp' : 'other-host-or-udp'}|route=${this.routeDesc()}`, `Safari 新请求（${short(processPath)} ${HOSTS[hk]} ${proto}）经 ${r.rule} → ${r.policyName}/${r.leafPolicyName}：${why}`);
     }
@@ -891,7 +1009,7 @@ class World {
       `路由：phase=${r.phase} entry=${r.entryMode} active=${r.activeEnvironmentId} selected=${r.selectedNode} epoch=${r.routeEpoch} warnings=${JSON.stringify(r.warnings)} snapshot=${r.activationSnapshot ? 'yes' : 'no'}`,
       `持久标记=${safariMayUseRouteMarked(this.h.app.engine)} normalModeOffered=${this.h.app.views.routeView().normalModeOffered} 进程路径=${JSON.stringify(this.configuredPaths().map(short))}`,
       `路由操作：${op ? `${op.kind} ${op.phase}/${op.status}` : '无'}${steps.length ? ` 最后步骤：${steps.join(' ｜ ')}` : ''}`,
-      `入口：${entry}；SFE-ROUTE 选择=${this.internals.selection.get(ROUTE_GROUP_NAME)}（本期 ${this.sel.verified ? '已实测' : '未实测'}）`,
+      `入口：${entry}；SFE-ROUTE 选择=${this.homeSelection()}${this.onOther ? `（当前配置 ${this.h.fake.currentProfile.name} 的选择=${this.internals.selection.get(ROUTE_GROUP_NAME)}）` : ''}（本期 ${this.sel.verified ? '已实测' : '未实测'}）`,
       `活动连接：${conns.length ? conns.join('；') : '无'}`,
     ].join('\n      ');
   }
@@ -1253,6 +1371,44 @@ async function exec(w: World, ev: Ev): Promise<void> {
       w.trace.push(`   → Surge 中的节点${ev.mode === 'fetch' ? '换成了本服务没有提供过的列表' : '参数漂移（由本服务答复）'}（${members.length} 个成员）`);
       return;
     }
+    case 'profile': {
+      // I8：Surge 切到另一个配置（第一次访问时复制固定工作配置此刻的选择）、读取当前配置连续失败，或回到固定工作配置并对账一次
+      const otherProfile = { name: 'FuzzOther', path: `${h.surgeDir}/FuzzOther.conf` };
+      if (ev.mode === 'other' || ev.mode === 'otherReject' || ev.mode === 'otherBuyer') {
+        h.fake.currentProfile = otherProfile;
+        if (ev.mode === 'otherReject') h.fake.setSelectionFor(otherProfile, ROUTE_GROUP_NAME, 'REJECT');
+        if (ev.mode === 'otherBuyer') {
+          // 另一个配置的同名 SFE-ROUTE 选着另一个环境的节点（不是固定工作配置当前的选择；没有这样的成员时选 REJECT）
+          const home = w.homeSelection();
+          const members = await h.fake.getGroupMembers(ROUTE_GROUP_NAME);
+          const buyer = members.find((m) => m !== 'REJECT' && m !== home) ?? 'REJECT';
+          h.fake.setSelectionFor(otherProfile, ROUTE_GROUP_NAME, buyer);
+        }
+        w.onOther = true;
+        w.cov.profileSwitch++;
+      } else if (ev.mode === 'unknown') {
+        w.profileFailures = 3;
+        w.identityDegraded = true;
+        w.cov.profileUnknown++;
+      } else if (ev.mode === 'unknownAfterWrite') {
+        w.profileFailuresArmed = 3;
+        w.cov.profileUnknown++;
+      } else {
+        // 回到固定工作配置并对账一次（对账排入的推迟改选在执行器空闲之前完成）；之后 I5 照常检查
+        h.fake.currentProfile = { ...w.workingProfile! };
+        w.profileFailures = 0;
+        w.profileFailuresArmed = 0;
+        await w.call(h.app.runPeriodicReconcile());
+        await w.settle();
+        w.onOther = false;
+        w.identityDegraded = false;
+      }
+      w.externalDirty = true;
+      w.trace.push(
+        `   → 当前配置：${h.fake.currentProfile.name}${ev.mode === 'unknown' ? '（之后三次读取当前配置失败）' : ev.mode === 'unknownAfterWrite' ? '（下一次改选 REJECT 之后三次读取当前配置失败）' : ''}${ev.mode === 'otherBuyer' ? `（同名 SFE-ROUTE 选着 ${String(h.fake.selectionFor(otherProfile, ROUTE_GROUP_NAME))}）` : ''}`,
+      );
+      return;
+    }
     case 'module':
       // 用户启用模块（不经引擎）：它的规则排在本应用入口之前，Safari 中被它匹配的请求按它发出
       w.moduleRule = { text: `DOMAIN-SUFFIX,${HOSTS[ev.host]},DIRECT`, host: ev.host };
@@ -1287,6 +1443,11 @@ async function exec(w: World, ev: Ev): Promise<void> {
     case 'reconcile':
       if (ev.kind === 'periodic') await w.call(h.app.runPeriodicReconcile());
       else await w.call(h.app.refreshSurge(WEB));
+      // 读取当前配置的故障已用完、这次对账确认是固定工作配置：之后服务排入的推迟改选在执行器空闲之前完成，I5 照常检查
+      if (w.profileFailures === 0 && w.onWorkingProfile()) {
+        await w.settle();
+        w.identityDegraded = false;
+      }
       return;
     case 'advance':
       h.clock.advance(ev.ms);
@@ -1412,7 +1573,7 @@ function checkForged(w: World, route: ReturnType<Harness['repos']['routeState'][
   const holds = holdOps(w);
   if (holds.length > w.holdsBefore) w.lastHoldEvent = w.eventIndex;
   if (readForgedNodes(engine.kv) === null || !routeNotConfirmedNormal(route)) return;
-  const selection = (h.fake as unknown as FakeInternals).selection.get(ROUTE_GROUP_NAME) ?? null;
+  const selection = w.homeSelection();
   const last = holds.at(-1);
   const lastHeld = last !== undefined && last.status === 'succeeded' && (last.result as { rejectSelected?: boolean } | null)?.rejectSelected === true;
   if (lastHeld) w.cov.forgedHeld++;
@@ -1431,6 +1592,29 @@ function checkForged(w: World, route: ReturnType<Harness['repos']['routeState'][
   if (attempted.length === 0 || attempted.every((o) => o.status === 'succeeded' && (o.result as { forgedHold?: string } | null)?.forgedHold === 'not_needed')) {
     w.violate('I7', 'I7|reconcile-did-not-hold', `对账之后伪造标记仍在、路由 ${w.routeDesc()} 不是经确认的普通模式、Surge 可连接且是工作配置，SFE-ROUTE 却是 ${String(selection)}，这次对账也没有排入（或执行）REJECT 保持`);
   }
+}
+
+/**
+ * 覆盖项 guard.*：守卫真正走到的分支——结束时带 rejectGuard 的操作、记下的 route:pendingHold（每条一次）、对账按本应用中断之前的
+ * 改选记下（maintenance.reconcile 的 payload.credited），以及服务排入的推迟改选（只作信息）。
+ */
+function countGuardCoverage(w: World): void {
+  const { h } = w;
+  for (const o of h.repos.operations.listRecent(500)) {
+    if (w.guardSeen.has(o.id)) continue;
+    const result = o.result as { rejectGuard?: unknown } | null;
+    const details = o.error?.details as { rejectGuard?: unknown } | undefined;
+    const terminal = o.status !== 'queued' && o.status !== 'running' && o.status !== 'waiting';
+    if (!terminal) continue;
+    w.guardSeen.add(o.id);
+    if (result?.rejectGuard !== undefined || details?.rejectGuard !== undefined) w.cov['guard.rejectGuard']++;
+    if (o.kind === 'maintenance.reconcile' && (o.payload as { credited?: unknown } | null)?.credited !== undefined) w.cov['guard.credit']++;
+    if (o.kind === 'route.hold' && payloadOf(o).endHoldDeferred !== undefined) w.cov['guard.deferredHold']++;
+  }
+  const rec = h.app.engine.kv.get<{ operationId: string; recordedAt: string }>(PENDING_HOLD_KEY);
+  const key = rec ? `${rec.operationId}@${rec.recordedAt}` : null;
+  if (key !== null && key !== w.lastPendingKey) w.cov['guard.pendingHold']++;
+  w.lastPendingKey = key;
 }
 
 function checkIdle(w: World): void {
@@ -1538,6 +1722,14 @@ function checkIdle(w: World): void {
 
   checkForged(w, route);
 
+  countGuardCoverage(w);
+
+  // I8b：路由记录的选择改变时等于固定工作配置中 SFE-ROUTE 的实际选择（另一个配置上读到的选择从不记为本应用的路由）
+  if (w.lastSelectedNode !== undefined && route.selectedNode !== w.lastSelectedNode && route.selectedNode !== w.homeSelection()) {
+    w.violate('I8', 'I8b|record-not-working-selection', `路由记录的选择改为 ${String(route.selectedNode)}，而固定工作配置中 SFE-ROUTE 是 ${String(w.homeSelection())}（当前配置 ${h.fake.currentProfile.name}）`);
+  }
+  w.lastSelectedNode = route.selectedNode;
+
   if (route.warnings.includes('buyer_exit_connections_unconfirmed')) w.stats.becWarnings++;
   if (route.phase === 'attention') w.stats.attention++;
 }
@@ -1546,12 +1738,16 @@ function checkIdle(w: World): void {
 
 async function runSequence(header: Header, events: readonly Ev[], opts: { trace?: boolean } = {}): Promise<World> {
   const w = new World(header);
+  // 读取当前配置失败的种子用 surge-cli 的检测原语（产品缺省）：一次失败是「无法确认当前配置」而不是「无法连接 Surge」
+  const unknownProfile = events.some((e) => e.t === 'profile' && (e.mode === 'unknown' || e.mode === 'unknownAfterWrite'));
   w.h = await createHarness({
     entryStrategy: header.strategy,
     surge: (fake) => w.wrap(fake),
     rulesetWatch: { timeoutMs: 30, pollMs: 10 },
+    ...(unknownProfile ? { livenessPrimitive: 'listExternalResources' as const } : {}),
   });
   const { h } = w;
+  w.workingProfile = { ...h.fake.currentProfile };
   h.fake.tempRuleInsertion = header.insertion;
   // 路由记录写入：重新读取过事实（对账、入口切换）之后，外部改动之前的声明不再是旧的
   const update = h.repos.routeState.update.bind(h.repos.routeState);

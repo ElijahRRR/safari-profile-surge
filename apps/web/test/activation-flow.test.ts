@@ -379,6 +379,74 @@ describe('activation from the environments page', () => {
     m.unmount();
   });
 
+  it('profile guard: an end hold refused or interrupted because Surge is not (or not confirmed as) the fixed working profile says so and offers normal mode now', async () => {
+    const skipped = operation({
+      id: 'op_7',
+      phase: 'BLOCKED_NEEDS_ATTENTION',
+      status: 'needs_attention',
+      error: { code: 'EXTERNAL_PROFILE', message: '激活失败：Surge 当前配置不是固定工作配置；…SFE-ROUTE 没有改选 REJECT…' },
+      result: { rejectSelected: false, rejectGuard: { reason: 'external_profile', stage: 'not_attempted' } },
+    });
+    const interrupted = operation({
+      id: 'op_8',
+      phase: 'BLOCKED_NEEDS_ATTENTION',
+      status: 'needs_attention',
+      error: { code: 'EXTERNAL_PROFILE', message: '…无法确认中断之前是否已在固定工作配置上改选 REJECT…' },
+      result: { rejectSelected: false, rejectGuard: { reason: 'profile_unknown', stage: 'interrupted' } },
+    });
+    const { ctx } = testContext((call: Call) => {
+      if (call.url === '/api/operations/op_7') return { status: 200, body: skipped };
+      if (call.url === '/api/operations/op_8') return { status: 200, body: interrupted };
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: '找不到' } } };
+    }, snapshot({ route: route({ operationId: null, phase: 'attention', entryMode: 'ACTIVE', activeEnvironmentId: 'env_1', activeProxyRevision: 1 }) }));
+    const m = await mountWith(RouteActionHost, ctx);
+    ctx.viewer.open('op_7', 'US-买家01');
+    await flush();
+    let held = document.body.querySelector('[data-test="reject-held"]')?.textContent ?? '';
+    expect(held).toContain('Surge 当前配置不是固定工作配置，服务没有改选 SFE-ROUTE（不改动其他配置中的同名组）');
+    expect(held).toContain('请立即进入普通模式（不必先切回固定工作配置）');
+    expect(held).not.toContain('未能把');
+    ctx.viewer.open('op_8', 'US-买家01');
+    await flush();
+    held = document.body.querySelector('[data-test="reject-held"]')?.textContent ?? '';
+    expect(held).toContain('无法确认服务中断之前是否已在固定工作配置上改选 REJECT（无法确认 Surge 当前配置是否是固定工作配置）');
+    m.unmount();
+  });
+
+  it('PG-T9: a profile_changed rollback restore is not called 「不记为 REJECT」, and selection_unreadable is not 「回到固定工作配置之后」', async () => {
+    const restore = operation({
+      id: 'op_9',
+      phase: 'BLOCKED_NEEDS_ATTENTION',
+      status: 'needs_attention',
+      error: { code: 'UNKNOWN_STATE', message: '回滚期间Surge 当前配置不是固定工作配置：不能确认已恢复切换前的节点…' },
+      result: { rejectSelected: false, rejectGuard: { reason: 'external_profile', stage: 'profile_changed' } },
+    });
+    const unreadable = operation({
+      id: 'op_10',
+      phase: 'BLOCKED_NEEDS_ATTENTION',
+      status: 'needs_attention',
+      error: { code: 'UNKNOWN_STATE', message: '…无法确认中断之前是否已在固定工作配置上改选 REJECT（读取 SFE-ROUTE 失败…' },
+      result: { rejectSelected: false, rejectGuard: { reason: 'selection_unreadable', stage: 'interrupted' } },
+    });
+    const { ctx } = testContext((call: Call) => {
+      if (call.url === '/api/operations/op_9') return { status: 200, body: restore };
+      if (call.url === '/api/operations/op_10') return { status: 200, body: unreadable };
+      return { status: 404, body: { error: { code: 'NOT_FOUND', message: '找不到' } } };
+    }, snapshot({ route: route({ operationId: null, phase: 'attention', entryMode: 'UNKNOWN', activeEnvironmentId: 'env_1', activeProxyRevision: 1 }) }));
+    const m = await mountWith(RouteActionHost, ctx);
+    ctx.viewer.open('op_9', 'US-买家01');
+    await flush();
+    let held = document.body.querySelector('[data-test="reject-held"]')?.textContent ?? '';
+    expect(held).toContain('不能确认这次改选（REJECT 或恢复的节点）落在固定工作配置上，不记为路由的选择');
+    expect(held).not.toContain('不记为 REJECT');
+    ctx.viewer.open('op_10', 'US-买家01');
+    await flush();
+    held = document.body.querySelector('[data-test="reject-held"]')?.textContent ?? '';
+    expect(held).toContain('之后读到 SFE-ROUTE 的对账会核对');
+    expect(held).not.toContain('回到固定工作配置之后');
+    m.unmount();
+  });
+
   it('a failed first activation (no verified route before the switch) never lists the failed target\'s node as a restored selection, even from an older service that still names it', async () => {
     const failed = operation({
       phase: 'FAILED',

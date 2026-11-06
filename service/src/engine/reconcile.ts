@@ -16,6 +16,8 @@ import { entryBlockIsFirstRule, parseProfile } from '../surge/profile.js';
 import { surgeRestartedBetween, type Engine } from './context.js';
 import { checkSegments } from './ownership.js';
 import { expireSafariProbe } from './handlers/probes.js';
+import { applyPendingHold, maybeEnqueueDeferredHold, planPendingHold, verifiedExitNodeIgnoringForged } from './pending-hold.js';
+import { profileStillWorking } from './route-guard.js';
 import {
   FORGED_WARNING,
   NODE_RESOURCE_WARNING,
@@ -159,6 +161,14 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
     engine.log('warn', 'resource.check_failed', { error: err instanceof Error ? err.name : 'unknown' });
     return null;
   });
+  // 推迟的改选（engine/pending-hold.ts）：有 route:pendingHold 或 route:unconfirmedWrite 而这次确认是固定工作配置、读到选择时，读取
+  // 之后再核对一次当前配置（只在需要时）；计划按本应用中断之前的改选记下时不再比较选择
+  const pendingPlan = await planPendingHold(engine, {
+    confirmedFacts: facts.reachable && facts.onWorkingProfile === true,
+    selection: extra?.selection,
+    before,
+    postCheck: async () => (await profileStillWorking(engine)) === null,
+  });
   const now = engine.nowIso();
 
   const warnings = new Set<RouteWarning>(before.warnings);
@@ -175,6 +185,8 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   let expireActive = false;
   let clearDeadline = false;
   const notes: string[] = [];
+  /** 选择与记录不一致而与本应用之前未经确认的写入一致（不是回滚恢复的节点）。 */
+  let ownUnconfirmedWrite = false;
 
   // 前置状态（数据）：消失 → missing；重新出现 → ok
   const frontChanges: Array<{ id: string; state: 'ok' | 'missing' }> = [];
@@ -234,9 +246,24 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
         notes.push('Surge 当前配置不是固定工作配置');
       }
       if (extra) {
-        if (extra.selection !== undefined && before.selectedNode !== null && extra.selection !== before.selectedNode && !IN_PROGRESS.includes(before.phase)) {
-          add('external_selection_change');
-          notes.push('SFE-ROUTE 的选择被外部修改');
+        // SFE-ROUTE 的选择属于固定工作配置：只在确认是固定工作配置时与记录比较（另一个配置或无法确认时读到的选择不说明固定工作配置
+        // 的选择变了，也从不认定；当前配置不是固定工作配置由 external_profile_change 报告）。按本应用中断之前的改选记下时不比较
+        const selectionComparable = facts.onWorkingProfile === true && extra.selection !== undefined && !pendingPlan.credit;
+        if (selectionComparable && before.selectedNode !== null && extra.selection !== before.selectedNode && !IN_PROGRESS.includes(before.phase)) {
+          const uw = pendingPlan.confirmed ? pendingPlan.unconfirmedWrite : null;
+          const ownWrite = uw !== null && uw.routeEpoch === before.routeEpoch && uw.policy === extra.selection;
+          if (ownWrite && verifiedExitNodeIgnoringForged(engine, before) === null) {
+            // 与本应用之前未经确认的写入（route:unconfirmedWrite）一致：不是外部修改，不记 external_selection_change（它的说明是「被外部
+            // 修改」）。选择与记录不一致仍不能当作已验证的路由：失败即关闭，入口未确认（entry_unverified，阶段 attention）。记录本来就
+            // 不表明选着已验证的出口（激活快照仍在或选择不同），已验证出口的判断不依赖外部修改警告
+            add('entry_unverified');
+            notes.push(`SFE-ROUTE 的选择与记录不一致：与本应用之前未经确认的写入（${uw.policy}）一致，不是外部修改；路由按未确认处理`);
+          } else {
+            // 记录表明选着已验证的出口时照样记 external_selection_change（已验证出口的判断据此不再认定记录中的选择）
+            add('external_selection_change');
+            notes.push(ownWrite ? `SFE-ROUTE 的选择与记录不一致：与本应用之前未经确认的写入（${uw!.policy}）一致，不是外部修改` : 'SFE-ROUTE 的选择被外部修改');
+          }
+          ownUnconfirmedWrite = ownWrite;
         }
         if (extra.segmentsChanged) {
           add('managed_segments_changed');
@@ -301,7 +328,7 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
       warnings.delete('rollback_needs_reverify');
       removed.push('rollback_needs_reverify');
       notes.push('回滚后的阻断已不能确认，去掉「已恢复原节点并保持阻断」');
-    } else if (warnings.has('rollback_needs_reverify') && warnings.has('external_selection_change')) {
+    } else if (warnings.has('rollback_needs_reverify') && (warnings.has('external_selection_change') || ownUnconfirmedWrite)) {
       warnings.delete('rollback_needs_reverify');
       removed.push('rollback_needs_reverify');
       notes.push('SFE-ROUTE 已不是回滚恢复的节点，去掉「已恢复原节点并保持阻断」');
@@ -319,13 +346,25 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   }
   // 读取事实期间，受理与原生桥处理器可能已在执行器之外改过路由警告（预期出口重新比较、确认窗口已关闭）：
   // 在提交事务中重读路由，只合并本次新增的警告；阶段与入口（以及空闲时的清除）只在它们仍是读取开始时的值时才改。
+  let pendingOutcome: ReturnType<typeof applyPendingHold> | null = null;
   const changed = repos.tx(() => {
+    // 推迟的改选：作废的记录在来源操作中写明；确认是固定工作配置时按本应用中断之前的改选记下，或决定排入改选（事务之后）
+    pendingOutcome = applyPendingHold(engine, pendingPlan, extra?.selection);
+    if (pendingOutcome.notes.length > 0) notes.push(...pendingOutcome.notes);
     const fresh = repos.routeState.get();
     const sameState = fresh.phase === before.phase && fresh.entryMode === before.entryMode;
     const nextPhase = sameState ? phase : fresh.phase;
     const nextEntryMode = sameState ? entryMode : fresh.entryMode;
     const dropped = sameState ? removed.filter((w) => fresh.warnings.includes(w)) : [];
-    const changed = added.length > 0 || dropped.length > 0 || nextPhase !== fresh.phase || nextEntryMode !== fresh.entryMode || frontChanges.length > 0;
+    const changed =
+      added.length > 0 ||
+      dropped.length > 0 ||
+      nextPhase !== fresh.phase ||
+      nextEntryMode !== fresh.entryMode ||
+      frontChanges.length > 0 ||
+      pendingOutcome.routeChanged ||
+      // 与本应用之前未经确认的写入一致（只发生一次：记录随这次对账删除）：即使警告没有变化也记下说明
+      ownUnconfirmedWrite;
     repos.routeState.update({
       warnings: [...new Set<RouteWarning>([...fresh.warnings.filter((w) => !dropped.includes(w)), ...added])],
       phase: nextPhase,
@@ -345,7 +384,12 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
         phase: 'COMPLETED',
         status: 'succeeded',
         routeEpoch: before.routeEpoch,
-        payload: { trigger: kind, added: [...added], ...(dropped.length > 0 ? { removed: dropped } : {}) },
+        payload: {
+          trigger: kind,
+          added: [...added],
+          ...(dropped.length > 0 ? { removed: dropped } : {}),
+          ...(pendingOutcome.credited !== null ? { credited: pendingOutcome.credited } : {}),
+        },
       });
       repos.operations.appendStep(op.id, 'COMPLETED', notes.length > 0 ? `对账发现变化：${notes.join('；')}` : '对账更新了路由状态');
       engine.emit({ operations: [op.id] });
@@ -354,8 +398,12 @@ export async function reconcile(engine: Engine, kind: ReconcileKind): Promise<Re
   });
   const route = repos.routeState.get();
   const envs = before.activeEnvironmentId ? [before.activeEnvironmentId] : [];
+  const pend = pendingOutcome as ReturnType<typeof applyPendingHold> | null;
+  if (pend !== null && pend.touchedOps.length > 0) engine.emit({ operations: pend.touchedOps });
   engine.emit({ route: changed, surge: true, environments: changed ? envs : [], fronts: frontChanges.length > 0 });
   if (changed) engine.log('info', 'reconcile.changed', { trigger: kind, added });
+  // 推迟的改选：确认是固定工作配置而入口仍可能让 Safari 经 SFE-ROUTE、选择不是 REJECT 或已验证的出口时排入一次 REJECT 保持
+  if (pend !== null && pend.enqueue !== null) maybeEnqueueDeferredHold(engine, pend.enqueue);
   // 节点资源可能被伪造（用户决定 D11）：需要时排入一次 REJECT 保持（执行器在系统强制刷新之前领取它）
   maybeEnqueueForgedHold(engine, { selection: extra?.selection, kind });
   // 需要与已提交版本重新核对（needsRefresh、资源错误或未就绪、成员不同）：没有进行中的发布时排入一次系统强制刷新发布

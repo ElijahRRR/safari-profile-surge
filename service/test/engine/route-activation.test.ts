@@ -1273,14 +1273,19 @@ describe('a route operation never ends while Safari can still reach an unverifie
     const fake = h.fake as unknown as { getCurrentProfile: () => Promise<unknown> };
     const orig = fake.getCurrentProfile.bind(h.fake);
     let entered = false;
+    /** 挂起时执行中的操作与它的阶段：确认挂起的是接手的激活读取事实的那一次调用（不是之后加入的配置身份核对）。 */
+    let hit: { op: string | null; phase: string | undefined; routePhase: string } | null = null;
     fake.getCurrentProfile = () => {
       entered = true;
+      const cur = h.app.executor.currentOperationId;
+      hit = { op: cur, phase: cur ? h.repos.operations.get(cur)?.phase : undefined, routePhase: h.repos.routeState.get().phase };
       return new Promise(() => undefined);
     };
     const second = (await h.app.activate(a, { request_id: rid('act') }, WEB)).operation_id;
     const end = Date.now() + 5000;
     while (!entered && Date.now() < end) await new Promise((r) => setTimeout(r, 2));
     expect(entered).toBe(true);
+    expect(hit).toMatchObject({ op: second, phase: 'VALIDATING' });
     fake.getCurrentProfile = orig;
     expect(h.repos.operations.get(first)!.phase).toBe('SUPERSEDED');
     await h.crash();

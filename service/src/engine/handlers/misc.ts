@@ -8,6 +8,7 @@ import { payloadOf } from '../../domain/operations.js';
 import type { Engine } from '../context.js';
 import { environmentRouteBusy } from '../route-control.js';
 import { committedNodeNames } from '../node-resource.js';
+import { ROUTE_GUARD_TEXT, readRouteSelection, routeGuard, writeRouteSelection } from '../route-guard.js';
 import { entryKey } from '../resource.js';
 import { currentNodeNames, retainedDeploymentKeys, scrubRetiredDeploymentDigests } from './publish.js';
 import { expireSafariProbe, recordPreflight } from './probes.js';
@@ -48,13 +49,45 @@ export async function runDelete(engine: Engine, op: OperationRecord): Promise<vo
         env.lastVerifiedProxyRevision === null &&
         revisions.every((r) => r.state === 'desired' || r.state === 'superseded');
       const groupAbsent = localOnly && !(await engine.surge.listPolicies()).groups.includes(ROUTE_GROUP_NAME);
-      const sel = groupAbsent ? null : await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-      if (sel !== null && names.has(sel)) {
-        await engine.surge.selectGroupPolicy(ROUTE_GROUP_NAME, 'REJECT');
-        const after = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-        if (after !== 'REJECT') throw new SfeError('READBACK_MISMATCH', '删除失败：SFE-ROUTE 改选 REJECT 后读回不一致');
-        repos.routeState.update({ selectedNode: after });
-        engine.step(op.id, 'SFE-ROUTE 原选择为该环境的节点：已改选 REJECT（读回确认）');
+      if (!groupAbsent) {
+        // SFE-ROUTE 的选择属于固定工作配置（engine/route-guard.ts）：不能确认 Surge 加载的是固定工作配置时不读、不改选（不改动其他
+        // 配置中的同名组）。从未部署的本机草稿的节点不可能在 SFE-ROUTE 中，跳过核对；其余拒绝删除（无法核对固定工作配置的选择）
+        const g = await routeGuard(engine);
+        const refuse = (text: string, code: 'SURGE_UNREACHABLE' | 'EXTERNAL_PROFILE'): void => {
+          const retry = code === 'SURGE_UNREACHABLE' ? 'Surge 可以连接、确认是固定工作配置之后重试' : '回到固定工作配置后重试';
+          const body = { code, message: `删除失败：${text}，无法核对 SFE-ROUTE 的选择，环境未删除；${retry}` };
+          engine.updateOp(op.id, { phase: 'FAILED', status: 'failed', error: body }, body.message);
+        };
+        if (!g.allowed) {
+          if (!localOnly) {
+            refuse(ROUTE_GUARD_TEXT[g.block], g.code);
+            return;
+          }
+          engine.step(op.id, `${ROUTE_GUARD_TEXT[g.block]}：该环境从未部署，节点不在 SFE-ROUTE 中，跳过选择核对`);
+        } else {
+          const r = await readRouteSelection(engine, { guard: g });
+          if (!r.ok) {
+            if (r.kind === 'guard') {
+              refuse(`读取 SFE-ROUTE 期间${ROUTE_GUARD_TEXT[r.block]}`, r.code);
+              return;
+            }
+            throw r.error;
+          }
+          const sel = r.selection;
+          if (sel !== null && names.has(sel)) {
+            const w = await writeRouteSelection(engine, 'REJECT', { guard: g });
+            if (!w.ok) {
+              if (w.kind === 'guard') {
+                refuse(`改选 SFE-ROUTE 期间${ROUTE_GUARD_TEXT[w.block]}`, w.code);
+                return;
+              }
+              if (w.failed === 'mismatch') throw new SfeError('READBACK_MISMATCH', '删除失败：SFE-ROUTE 改选 REJECT 后读回不一致');
+              throw w.error;
+            }
+            repos.routeState.update({ selectedNode: w.readback });
+            engine.step(op.id, 'SFE-ROUTE 原选择为该环境的节点：已改选 REJECT（读回确认）');
+          }
+        }
       }
     }
   } catch (err) {

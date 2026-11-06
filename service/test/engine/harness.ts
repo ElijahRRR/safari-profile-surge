@@ -384,6 +384,8 @@ export async function createHarness(opts: HarnessOptions = {}): Promise<Harness>
     ...(opts.resourceAuditToleranceMs !== undefined ? { resourceAuditToleranceMs: opts.resourceAuditToleranceMs } : {}),
     // 入口规则集的监视等待用真实定时器：假 Surge 的监视延迟为 0，见证在第一次读取时即命中；撤销入口的退路按时限等满
     rulesetWatch: opts.rulesetWatch ?? { timeoutMs: 40, pollMs: 10 },
+    // 配置身份读取失败时的重试不等待（假时钟不会自己推进）
+    profileReadRetryMs: 0,
     ...(opts.livenessPrimitive === 'auto' ? {} : { livenessPrimitive: opts.livenessPrimitive === undefined ? 'getCurrentProfile' : opts.livenessPrimitive }),
   });
   const events: ServiceEvent[] = [];

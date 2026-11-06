@@ -164,6 +164,11 @@ export interface OperationPayload {
   endHold?: EndHoldIntent;
   /** route.hold（用户决定 D11）：排入时的伪造原因；改选之前的意图记在 endHold（markEndHoldIntent）。 */
   forgedHold?: { reasons: ResourceForgedReason[] };
+  /**
+   * 服务排入的推迟改选（route.hold，engine/pending-hold.ts）：来源操作的结束点没有在固定工作配置上确认改选 REJECT（Surge 不可连接、
+   * 当前不是或无法确认是固定工作配置、中断之前的改选无法核对），Surge 回到固定工作配置之后的对账排入。cause 为来源记下的伪造原因。
+   */
+  endHoldDeferred?: { sourceOperationId: string; cause?: 'node_resource_forged' };
   frontProxyId?: string;
   [key: string]: unknown;
 }

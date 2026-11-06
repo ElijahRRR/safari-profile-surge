@@ -107,10 +107,42 @@ const timeoutText = computed(() =>
  * 结束时服务改选了 SFE-ROUTE（result.rejectSelected，§6.3 第 14 步的结束点；普通模式完成时另有完成说明）：路由已改变，订单与
  * 填充停止，需要处理——不是「路由不变」。原因是节点资源可能被伪造时（result.rejectCause）按它写明。
  */
+/** 没有在固定工作配置上确认改选（result.rejectGuard）的说明；无法连接 Surge 而没有改选时为 null（沿用未能改选的说法）。 */
+const REJECT_GUARD_REASON = {
+  surge_unreachable: '无法连接 Surge',
+  external_profile: 'Surge 当前配置不是固定工作配置',
+  profile_unknown: '无法确认 Surge 当前配置是否是固定工作配置',
+  selection_unreadable: '读取 SFE-ROUTE 失败',
+} as const;
+/** 之后由谁核对：读取 SFE-ROUTE 失败时 Surge 仍是确认的固定工作配置，不说「回到固定工作配置之后」。 */
+const REJECT_GUARD_FOLLOWUP = {
+  surge_unreachable: 'Surge 可以连接、确认是固定工作配置之后服务会核对',
+  external_profile: '回到固定工作配置之后服务会核对',
+  profile_unknown: '确认是固定工作配置之后服务会核对',
+  selection_unreadable: '之后读到 SFE-ROUTE 的对账会核对',
+} as const;
+function rejectGuardText(g: NonNullable<NonNullable<NonNullable<typeof op.value>['result']>['rejectGuard']>): string | null {
+  const reason = REJECT_GUARD_REASON[g.reason];
+  const remedy = '请立即进入普通模式（不必先切回固定工作配置）';
+  const followup = REJECT_GUARD_FOLLOWUP[g.reason];
+  if (g.stage === 'not_attempted') {
+    return g.reason === 'surge_unreachable'
+      ? null
+      : `${reason}，服务没有改选 SFE-ROUTE（不改动其他配置中的同名组）：Safari 请求可能仍经买家出口发出，${remedy}。回到固定工作配置之后，服务会在需要时再改选。`;
+  }
+  if (g.stage === 'profile_changed') {
+    // 改选可能是 REJECT，也可能是回滚恢复的节点：不说「不记为 REJECT」
+    return `改选 SFE-ROUTE 期间${reason}：不能确认这次改选（REJECT 或恢复的节点）落在固定工作配置上，不记为路由的选择；Safari 请求可能仍经买家出口发出，${remedy}。${followup}。`;
+  }
+  return `无法确认服务中断之前是否已在固定工作配置上改选 REJECT（${reason}）：按未改选处理，Safari 请求可能仍经买家出口发出，${remedy}。${followup}。`;
+}
 const rejectHeld = computed(() => {
   const o = op.value;
   const r = o?.result?.rejectSelected;
   if (!o || r === undefined || o.phase === 'NORMAL_RESTORED') return null;
+  // SFE-ROUTE 的选择属于固定工作配置：没有在固定工作配置上确认改选时按原因与阶段写明（不说「未能改选」以外的事实）
+  const guarded = !r && o.result?.rejectGuard ? rejectGuardText(o.result.rejectGuard) : null;
+  if (guarded !== null) return o.result?.rejectCause === 'node_resource_forged' ? `Surge 中的节点可能是伪造的；${guarded}` : guarded;
   // 节点资源可能被伪造（用户决定 D11）：服务排入的 REJECT 保持（route.hold，读回确认时结束为成功）与因此改选的结束点；不按状态判断
   if (o.result?.rejectCause === 'node_resource_forged') {
     return r

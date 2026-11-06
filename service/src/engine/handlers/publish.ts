@@ -94,6 +94,8 @@ import { checkSegments } from '../ownership.js';
 import { entryKey, generateResource, manifestMatches, type ResourceEntry } from '../resource.js';
 import { hmacHex } from '../../util/keyed-digest.js';
 import { enterWaitingRoute, isActiveEnvironment } from './route.js';
+import { recordUnconfirmedWrite } from '../pending-hold.js';
+import { ROUTE_GUARD_TEXT, profileStillWorking, readRouteSelection, routeGuard, writeRouteSelection, type RouteGuardBlock } from '../route-guard.js';
 import { recordPreflight } from './probes.js';
 
 interface Unit {
@@ -587,17 +589,47 @@ function fallbackToReject(selectionBefore: string | null, reads: ReadonlyArray<O
 
 /**
  * 回滚之后改回原选择：只在有回落证据（fallbackToReject）、原选择仍是成员、当前选择是 REJECT、且路由没有 node_resource_unverified
- * （也没有节点可能被伪造的标记，用户决定 D11）时；从不改选别的买家出口。返回是否改回。
+ * （也没有节点可能被伪造的标记，用户决定 D11）时；从不改选别的买家出口。只在固定工作配置上读取与改回（engine/route-guard.ts：前置
+ * 核对、读回、读回之后再核对配置未变）：不能确认时不改回（skipped 为原因；不改动其他配置中的同名组），改回期间配置变了时记下这次
+ * 未确认的写入（route:unconfirmedWrite）。返回是否改回（读回确认）。Surge 调用失败照样抛出（由回滚按读取失败处理）。
  */
-async function reselectAfterFallback(engine: Engine, selectionBefore: string | null, evidence: boolean): Promise<boolean> {
-  if (!evidence || selectionBefore === null) return false;
-  if (nodeResourceHeld(engine, engine.repos.routeState.get())) return false;
-  const sel = await engine.surge.getGroupSelection(ROUTE_GROUP_NAME);
-  if (sel === selectionBefore || sel === null || sel.toUpperCase() !== 'REJECT') return false;
+async function reselectAfterFallback(
+  engine: Engine,
+  opId: string,
+  selectionBefore: string | null,
+  evidence: boolean,
+): Promise<{ reselected: boolean; skipped?: RouteGuardBlock }> {
+  if (!evidence || selectionBefore === null) return { reselected: false };
+  if (nodeResourceHeld(engine, engine.repos.routeState.get())) return { reselected: false };
+  const g = await routeGuard(engine);
+  if (!g.allowed) return { reselected: false, skipped: g.block };
+  const r = await readRouteSelection(engine, { guard: g });
+  if (!r.ok) {
+    if (r.kind === 'guard') return { reselected: false, skipped: r.block };
+    throw r.error;
+  }
+  const sel = r.selection;
+  if (sel === selectionBefore || sel === null || sel.toUpperCase() !== 'REJECT') return { reselected: false };
   const members = await engine.surge.getGroupMembers(ROUTE_GROUP_NAME);
-  if (!members.includes(selectionBefore)) return false;
-  await engine.surge.selectGroupPolicy(ROUTE_GROUP_NAME, selectionBefore);
-  return true;
+  if (!members.includes(selectionBefore)) return { reselected: false };
+  const w = await writeRouteSelection(engine, selectionBefore, { guard: g });
+  if (w.ok) return { reselected: true };
+  if (w.kind === 'guard') {
+    if (w.stage === 'profile_changed') recordUnconfirmedWrite(engine, selectionBefore, opId);
+    return { reselected: false, skipped: w.block };
+  }
+  if (w.failed === 'mismatch') return { reselected: false };
+  throw w.error;
+}
+
+/**
+ * 有回落证据而没有改回原选择（守卫拒绝，reselectAfterFallback 的 skipped）时的说明。无法连接 Surge 时没有迹象表明加载的是另一个
+ * 配置：不说「不改动其他配置中的同名组」。
+ */
+function reselectSkippedText(block: RouteGuardBlock): string {
+  return `；${ROUTE_GUARD_TEXT[block]}：选中的节点曾从成员中消失，固定工作配置中的 SFE-ROUTE 可能已回落到 REJECT，回滚没有改回原选择${
+    block === 'surge_unreachable' ? '' : '（不改动其他配置中的同名组）'
+  }`;
 }
 
 // ---------- 主流程 ----------
@@ -1356,8 +1388,12 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
   let confirmation: { matchedSeq: number; snapshot: { updatedAt: Date; error: string | null }; clearNeedsRefresh: boolean; detailsChecked: boolean; failuresBaseline: number } | null = null;
   let reason: string | null = null;
   let reselected = false;
+  /** 有回落证据而不能确认是固定工作配置、没有改回原选择时的原因。 */
+  let reselectSkipped: RouteGuardBlock | null = null;
   /** 确认读回中读到的 SFE-ROUTE 选择（没有确认时不用）。 */
   let observedSelection: string | null | undefined;
+  /** 确认读回之后核对当前配置不是（或无法确认是）固定工作配置的原因：不认定读到的选择、不据此报告外部修改。 */
+  let selectionUnchecked: RouteGuardBlock | null = null;
   try {
     const committedGeneration = readServedPointer(kv)?.committed.generation ?? null;
     const committedNames = committedNodeNames(engine);
@@ -1392,11 +1428,17 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
           } else {
             const { settleMs } = engine.resourceUpdateWait();
             await sleep(engine, settleMs);
-            reselected = await reselectAfterFallback(engine, ctx.selectionBefore, fallback);
+            const re = await reselectAfterFallback(engine, batch.primary.id, ctx.selectionBefore, fallback);
+            reselected = re.reselected;
+            reselectSkipped = re.skipped ?? null;
             const failuresBaseline = servedFailureCount(host.failureCounters());
             const r1 = await observe(engine, url);
             await sleep(engine, settleMs);
             const r2 = await observe(engine, url);
+            // 回滚读回属于固定工作配置：r1、r2 读到的成员、参数与选择可能来自 Surge 当前加载的另一个配置（例如副本，与已提交版本一致），
+            // 据此确认会清除节点可能被伪造的标记与两项警告（confirmNodeResource）。读完之后再核对当前配置，不是（或无法确认）时按回滚
+            // 无法确认处理
+            const postR = await profileStillWorking(engine);
             const committedDeployment = repos.deployments.get(committedGeneration);
             const details = await readDetails(engine, committedDeployment?.nodeManifest ?? [], ctx.fronts);
             // 资源部分按已提交版本严格核对；选择只要求两次读取一致（外部修改由 noteExternalSelection 报告，回滚从不改回）
@@ -1414,7 +1456,10 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
               details,
             });
             const readFailed = [...r1.failed, ...r2.failed];
-            if (update.kind === 'downloaded' && assessment.ok && readFailed.length === 0) {
+            if (postR !== null) {
+              selectionUnchecked = postR;
+              reason = `${ROUTE_GUARD_TEXT[postR]}，不能确认回滚结果属于固定工作配置`;
+            } else if (update.kind === 'downloaded' && assessment.ok && readFailed.length === 0) {
               const u = snapshotOf(r1).updatedAt!;
               const matched = matchAuditRecord(host.audit(), u, engine.resourceAuditToleranceMs(), mark, committedGeneration)!;
               const unchecked = assessment.level === 'full' ? [] : [...UNCHECKED_DETAIL_FIELDS];
@@ -1441,15 +1486,21 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
       } else {
         // Surge 没有载入候选：核对它仍是更新之前的已提交版本（选择的变化只可能来自外部，见 noteExternalSelection）
         const now = await observe(engine, url);
+        // 读完之后再核对当前配置（同上）：不是（或无法确认）固定工作配置时不确认，不认定读到的选择
+        const postNow = await profileStillWorking(engine);
         const nowSnap = snapshotOf(now);
         const errorOk = nowSnap.error === afterSnap.error && (afterSnap.error === snapshotOf(ctx.before).error || (afterSnap.error !== null && isConnectionRefusedOrTimeout(afterSnap.error)));
         confirmed =
+          postNow === null &&
           now.failed.length === 0 &&
           membersMatchCommitted(now.members ?? [], committedNames) &&
           sameTime(nowSnap.updatedAt, ctx.before.resource?.lastUpdatedAt ?? null) &&
           errorOk;
         if (confirmed) observedSelection = now.selection;
-        else reason = 'Surge 中的节点资源与更新之前的已提交版本不一致';
+        else if (postNow !== null) {
+          selectionUnchecked = postNow;
+          reason = `${ROUTE_GUARD_TEXT[postNow]}，不能确认回滚结果属于固定工作配置`;
+        } else reason = 'Surge 中的节点资源与更新之前的已提交版本不一致';
       }
     }
   } catch {
@@ -1490,9 +1541,11 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
     }
     const selectionText = reselected
       ? '，原选择已恢复（选中的节点曾从成员中消失、回落到 REJECT）'
-      : observedSelection === ctx.selectionBefore
-        ? '，原选择未变'
-        : `；SFE-ROUTE 的选择在发布期间被外部修改，回滚没有改动它${selectionNoted ? '（路由需要处理）' : ''}`;
+      : reselectSkipped !== null
+        ? reselectSkippedText(reselectSkipped)
+        : observedSelection === ctx.selectionBefore
+          ? '，原选择未变'
+          : `；SFE-ROUTE 的选择在发布期间被外部修改，回滚没有改动它${selectionNoted ? '（路由需要处理）' : ''}`;
     finishOps(engine, batch, {
       phase: 'FAILED',
       status: 'failed',
@@ -1525,9 +1578,22 @@ async function rollbackPublish(engine: Engine, ctx: DeployContext, input: Rollba
     return r;
   });
   engine.log('warn', 'resource.unverified', { reasons: ['readback_unconfirmed'] });
+  // 选择部分按实际发生的写明：回滚已在固定工作配置上改回原选择（读回确认）时如实写明，之后配置变了只说明读到的内容不作认定；
+  // 没有改回时写明读到的选择不作认定、也没有改动它（确认读回总会读选择，不能说「没有读取」）
+  const reselectedText = '；SFE-ROUTE 已在固定工作配置上改回原选择（读回确认；选中的节点曾从成员中消失、回落到 REJECT）';
+  const skippedText =
+    reselectSkipped !== null
+      ? reselectSkippedText(reselectSkipped)
+      : reselected
+        ? selectionUnchecked !== null
+          ? `${reselectedText}；之后${ROUTE_GUARD_TEXT[selectionUnchecked]}，回滚读到的成员、参数与选择不作认定`
+          : reselectedText
+        : selectionUnchecked !== null
+          ? `；${ROUTE_GUARD_TEXT[selectionUnchecked]}：回滚读到的 SFE-ROUTE 选择不作认定，也没有改动它（不改动其他配置中的同名组）`
+          : '';
   const body: ApiErrorBody = {
     code: 'READBACK_MISMATCH',
-    message: `发布回滚失败：节点资源与选择无法确认（${reason ?? '原因不明'}），需要处理`,
+    message: `发布回滚失败：节点资源与选择无法确认（${reason ?? '原因不明'}），需要处理${skippedText}`,
     details: { cause: input.failure.code },
   };
   for (const u of batch.units) {
